@@ -71,6 +71,10 @@ impl VramLedger {
     /// one that failed while macOS was paging, which leaves every window that
     /// little room.
     ///
+    /// A worker that `died` running one unit counts whatever room the ledger
+    /// saw, where a death may be a host RAM kill ([`death_may_be_ram`]): the
+    /// batch cannot shrink further. The count passes to the next replica.
+    ///
     /// Condemning remembers the model's working set on this GPU: the next load
     /// is refused while the refusal room ([`Self::refusal_room_locked`],
     /// reserve not deducted) is below it.
@@ -80,28 +84,41 @@ impl VramLedger {
         worker: WorkerId,
         charge: Option<GrantCharge>,
         failed: bool,
+        died: bool,
         clean: bool,
     ) -> Option<UnrunnableReplica> {
         let entry = state.workers.get(&worker)?;
         let one_unit = self.one_unit_appetite_mb_locked(state, entry);
+        let key = (entry.inference_id.clone(), entry.gpu.clone());
         let at_floor = failed
             && charge
                 .filter(|charge| !charge.pressure.paging())
-                .is_some_and(|charge| charge.unit_budget <= 1 && (charge.room as f64) < one_unit);
+                .is_some_and(|charge| {
+                    charge.unit_budget <= 1
+                        && ((charge.room as f64) < one_unit
+                            || (died && death_may_be_ram(state, &key.1, &charge)))
+                });
         let entry = state.workers.get_mut(&worker)?;
         if clean {
             entry.oom_at_floor = 0;
             // A clean window, not a load, clears the working set: a load only
             // proves the weights fit.
-            let key = (entry.inference_id.clone(), entry.gpu.clone());
             state.remembered_working_sets.remove(&key);
+            if let Some(cal) = state.calibration.get_mut(&key) {
+                cal.floor_strikes = 0;
+            }
             return None;
         }
         if !at_floor {
             return None;
         }
         entry.oom_at_floor = entry.oom_at_floor.saturating_add(1);
-        if entry.oom_at_floor < OOM_WINDOWS_AT_FLOOR {
+        let strikes = entry.oom_at_floor;
+        if died {
+            state.calibration.entry(key).or_default().floor_strikes = strikes;
+        }
+        let entry = state.workers.get(&worker)?;
+        if strikes < OOM_WINDOWS_AT_FLOOR {
             return None;
         }
         let inference_id = entry.inference_id.clone();
@@ -153,10 +170,12 @@ impl VramLedger {
 
     /// A replica whose process died holding a granted window (`charge`).
     ///
-    /// On a unified-memory device, or if the window booked host RAM, the
+    /// Where the death may be a host RAM kill ([`death_may_be_ram`]), the
     /// (model, device) is capped at half that window's unit budget for the
     /// life of this process, at least one unit. Without the cap the next
-    /// replica is admitted for the batch that died, and dies again.
+    /// replica is admitted for the batch that died, and dies again. A window
+    /// the queue sized sets no cap: its size says nothing about the batch
+    /// the model can run. An item-capped window does, since the cap sized it.
     ///
     /// On a unified-memory device the death is also a negative: the replica
     /// is deflated and its (model, GPU) anchor halved, for this run only.
@@ -170,7 +189,8 @@ impl VramLedger {
         let entry = state.workers.get(&worker)?;
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let unified_ram_mb = state.gpus.get(&key.1)?.unified_ram_mb;
-        if unified_ram_mb.is_some() || charge.ram_mb > 0 {
+        let sized_by_queue = charge.queue_bound && !charge.squeezed && charge.item_cap.is_none();
+        if death_may_be_ram(state, &key.1, &charge) && !sized_by_queue {
             let cap = (charge.unit_budget / 2).max(1);
             let cal = state.calibration.entry(key.clone()).or_default();
             let cap = cal.death_cap_units.map_or(cap, |held| held.min(cap));
@@ -210,8 +230,18 @@ impl VramLedger {
     }
 }
 
-/// A replica that ran out of memory [`OOM_WINDOWS_AT_FLOOR`] windows running
-/// at one item. [`GrantToken::finish`] hands it to the dispatcher, which fails
+/// Whether a death holding `charge` on `gpu` may be the kernel killing the
+/// worker for host RAM: on a unified-memory device, or with host RAM booked.
+fn death_may_be_ram(state: &LedgerState, gpu: &str, charge: &GrantCharge) -> bool {
+    charge.ram_mb > 0
+        || state
+            .gpus
+            .get(gpu)
+            .is_some_and(|gpu| gpu.unified_ram_mb.is_some())
+}
+
+/// A replica that ran out of memory, or died, [`OOM_WINDOWS_AT_FLOOR`] windows
+/// running at one item. [`GrantToken::finish`] hands it to the dispatcher, which fails
 /// the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnrunnableReplica {

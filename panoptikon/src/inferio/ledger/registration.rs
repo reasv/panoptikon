@@ -715,6 +715,10 @@ impl VramLedger {
             Self::shift_free_locked(&mut state, cpu::DEVICE_KEY, 0, rss, loaded_at);
         }
         let pool_at_load = pool_at_load_mb(&gpu, &report);
+        let floor_strikes = state
+            .calibration
+            .get(&key)
+            .map_or(0, |cal| cal.floor_strikes);
         let id = state.next_id();
         let logged_gpu = gpu.clone();
         state.workers.insert(
@@ -749,7 +753,7 @@ impl VramLedger {
                 ramp_held: false,
                 held_units: None,
                 held_certified: false,
-                oom_at_floor: 0,
+                oom_at_floor: floor_strikes,
                 windows_queue_bound: 0,
                 hold_announced: false,
                 hold_reprobe_windows: 0,

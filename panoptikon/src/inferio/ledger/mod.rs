@@ -632,7 +632,8 @@ struct WorkerEntry {
     held_units: Option<u64>,
     /// The ring certified the held rung (a knee or a measured plateau).
     held_certified: bool,
-    /// Consecutive one-item OOM windows; see [`OOM_WINDOWS_AT_FLOOR`].
+    /// Consecutive one-item windows that ran out of memory or died; see
+    /// [`OOM_WINDOWS_AT_FLOOR`].
     oom_at_floor: u32,
     /// Consecutive queue-sized clean windows ([`Self::hold_reported`]).
     windows_queue_bound: u32,
@@ -1132,6 +1133,9 @@ struct ModelCalibration {
     /// mid-window; no later batch of this (model, device) is larger. Kept
     /// for the life of this process ([`VramLedger::note_death_locked`]).
     death_cap_units: Option<u64>,
+    /// [`WorkerEntry::oom_at_floor`] of a replica that died at one unit; the
+    /// next replica starts from it, a clean window clears it.
+    floor_strikes: u32,
     /// See [`PressureCap`]. Runtime-only; a reloaded replica inherits it.
     pressure_cap: Option<PressureCap>,
     /// Next [`ThroughputSample::seq`]; never rewinds.

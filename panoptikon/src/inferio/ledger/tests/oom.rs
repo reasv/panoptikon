@@ -195,6 +195,149 @@ fn repeated_deaths_halve_the_cap_down_to_one_unit() {
     assert_eq!(caps, [16, 8, 4, 2, 1, 1, 1]);
 }
 
+/// A window the queue sized says nothing about the batch the model can run:
+/// its death sets no cap, whether the unit is an item or a pixel. A full
+/// window that dies still caps at half.
+#[test]
+fn a_death_in_a_window_the_queue_sized_sets_no_cap() {
+    let megapixel = CostDimension {
+        unit: CostUnit::Pixel,
+        aggregation: Some(CostAggregation::Sum),
+        seed_units: Some(8_000_000),
+        ..item_cost(4)
+    };
+    // (cost, units per MiB, the units of the one request in the short window)
+    for (cost, per_mb, short) in [
+        (item_cost(4), 1, 1),
+        (item_cost(4), 1, 3),
+        (megapixel, 1_000_000, 1_000_000),
+    ] {
+        let ledger = cpu_ledger(no_margin());
+        let replica = || {
+            let handle = loaded_cpu(Some(CPU_RAM_MB));
+            let admission = ledger
+                .register_worker("g/a", cost, &handle, None)
+                .expect("admitted");
+            push_memory_with_total(&handle, 40_000, 0, Some(CPU_RAM_MB), "ram");
+            (handle, admission)
+        };
+        let (handle, admission) = replica();
+        let mut full = 0;
+        for _ in 0..7 {
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            full = token.grant().unit_budget;
+            let batch = measurement(full, 0, 100 + full / per_mb);
+            handle.lock().unwrap().record_measurements(vec![batch]);
+            token.finish(WindowOutcome::Responded { oom: None });
+        }
+        assert_eq!(full, cost.seed_units.map_or(0, u64::from) << 6);
+
+        let token = admission.request_grant(short, None, 1, 0).expect("granted");
+        assert_eq!(token.grant().unit_budget, short, "the request's own size");
+        token.finish(WindowOutcome::WorkerDied);
+        assert_eq!(death_cap(&ledger), None, "{short} units");
+        drop(admission);
+        if per_mb > 1 {
+            continue;
+        }
+
+        // A short window that memory cut further was sized by memory: with
+        // 50 MiB free above the reserve, 100 units in hand run as 50.
+        let (handle, admission) = replica();
+        push_memory_with_total(&handle, CPU_RAM_MB / 10 + 50, 0, Some(CPU_RAM_MB), "ram");
+        let token = admission.request_grant(100, None, 1, 0).expect("granted");
+        assert!(token.grant().squeezed);
+        assert_eq!(token.grant().unit_budget, 50);
+        token.finish(WindowOutcome::WorkerDied);
+        assert_eq!(death_cap(&ledger), Some(25));
+        ledger.lock().calibration.values_mut().for_each(|cal| {
+            cal.death_cap_units = None;
+        });
+        drop(admission);
+
+        // The reloaded model is back near its full size (each death halved
+        // the anchor), and a death in a full window caps.
+        let (_handle, admission) = replica();
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let units = token.grant().unit_budget;
+        assert!(units >= full / 4, "{units} after {full}");
+        token.finish(WindowOutcome::WorkerDied);
+        assert_eq!(death_cap(&ledger), Some(units / 2));
+    }
+}
+
+/// A worker that dies at one unit cannot be given a smaller batch. Three
+/// such deaths in a row, each a fresh replica, condemn the model as three
+/// one-item out-of-memory windows do, whatever room the ledger saw; a clean
+/// window in between starts the count again.
+#[test]
+fn three_deaths_in_a_row_at_one_unit_condemn_the_model() {
+    let cpu = cpu_ledger(no_margin());
+    let one_unit_window = |outcome| {
+        let handle = loaded_cpu(Some(CPU_RAM_MB));
+        let admission = cpu
+            .register_worker("g/a", item_cost(1), &handle, None)
+            .expect("admitted");
+        push_memory_with_total(&handle, 40_000, 0, Some(CPU_RAM_MB), "ram");
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().unit_budget, 1);
+        assert!(token.grant().mb > 0, "with room to spare");
+        token.finish(outcome)
+    };
+    let clean = WindowOutcome::Responded { oom: None };
+    // An out-of-memory error with room to spare is no strike, as before.
+    {
+        let handle = loaded_cpu(Some(CPU_RAM_MB));
+        let admission = cpu
+            .register_worker("g/a", item_cost(1), &handle, None)
+            .expect("admitted");
+        push_memory_with_total(&handle, 40_000, 0, Some(CPU_RAM_MB), "ram");
+        for _ in 0..OOM_WINDOWS_AT_FLOOR {
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            let oom = Some(ErrorFrameOom::Prose);
+            assert!(token.finish(WindowOutcome::Responded { oom }).is_none());
+        }
+    }
+    assert!(one_unit_window(WindowOutcome::WorkerDied).is_none());
+    assert!(one_unit_window(WindowOutcome::WorkerDied).is_none());
+    assert!(one_unit_window(clean).is_none());
+    assert!(!cpu.was_condemned("g/a", "CPU"));
+    for _ in 1..OOM_WINDOWS_AT_FLOOR {
+        assert!(one_unit_window(WindowOutcome::WorkerDied).is_none());
+    }
+    // An abort neither counts nor clears.
+    assert!(one_unit_window(WindowOutcome::Aborted).is_none());
+    let verdict = one_unit_window(WindowOutcome::WorkerDied).expect("the third in a row");
+    assert_eq!(
+        (verdict.inference_id.as_str(), verdict.gpu.as_str()),
+        ("g/a", "CPU")
+    );
+    assert!(cpu.was_condemned("g/a", "CPU"));
+
+    // On private memory with no host RAM booked a death teaches nothing.
+    let ledger = ledger(100_000, no_margin());
+    for _ in 0..(2 * OOM_WINDOWS_AT_FLOOR) {
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(1), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 60_000, 0);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert!(token.finish(WindowOutcome::WorkerDied).is_none());
+    }
+    assert!(!ledger.was_condemned("g/a", GPU));
+}
+
 /// The cap does not stand in for the verdict on a model that cannot run one
 /// item: a death and two out-of-memory windows at one item, with no room for
 /// one, still condemn the replica.

@@ -567,6 +567,31 @@ fn a_gpu_replica_that_dies_with_host_ram_booked_is_capped() {
     }
 }
 
+/// An item-capped window is sized by the cap, not by the queue, even when the
+/// dispatcher hands it exactly that many items: its death still caps.
+#[test]
+fn a_death_in_a_booked_item_capped_window_caps() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = cold_gpu_replica(&ledger, "g/capped", GPU, item_cost(64));
+    cpu_free_to_book(&ledger, 45_000);
+    single_item_window(&handle, &admission, 1, RAM_PER_UNIT_MB);
+    // Two items: the first size measured, so the next window is booked.
+    let token = admission.request_grant(2, None, 1, 0).expect("granted");
+    handle.lock().unwrap().record_measurements(vec![ram_batch(
+        2,
+        RSS_AT_LOAD_MB + 2 * RAM_PER_UNIT_MB,
+        RSS_AT_LOAD_MB,
+    )]);
+    token.finish(WindowOutcome::Responded { oom: None });
+
+    assert_eq!(admission.window_item_bound(), 4);
+    let token = admission.request_grant(4, None, 1, 0).expect("granted");
+    assert_eq!(token.grant().user_cap_items, Some(4));
+    assert!(row(&ledger, "g/capped").ram_booked_mb > 0);
+    token.finish(WindowOutcome::WorkerDied);
+    assert_eq!(row(&ledger, "g/capped").death_cap_units, Some(2));
+}
+
 /// A probe stub answering `free_mb` for the CPU device.
 fn host_ram_free(ledger: &VramLedger, free_mb: u64) {
     ledger.install_probe_stub(Some(vec![GpuMemory {
