@@ -2500,7 +2500,7 @@ So the config's `margin` is an **option**, and absence is a distinct state:
 ```
 reserve = ceil(external × margin)                          # margin configured
 reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
-reserve = max(reserve, min(1024 MiB, 3 % of total))        # unset, GPU with its own memory
+reserve = max(reserve, min(1024 MiB, 3 % of total))        # unset, any GPU but Apple's
 reserve = 1024 MiB                                         # unset, CUDA GPU that spills
 reserve = max(reserve, clamp(total / 10, min(2 GiB, total / 4), 16 GiB))  # the CPU device, always
 limit   = min(total × cap_fraction, total − external − reserve)
@@ -2522,7 +2522,7 @@ limit   = min(total × cap_fraction, total − external − reserve)
   re-reads live free memory before every batch, is what actually catches a
   bigger move.
 
-- On a GPU with memory of its own the unset reserve is **at least 3 % of the
+- On a GPU other than Apple's the unset reserve is **at least 3 % of the
   card, at most 1 GiB** (`reserve_rule = gpu_floor`). A tenth of other usage
   is nothing on a card nobody else uses (17 MiB beside a 165 MiB desktop),
   and a model with no throughput knee below the card's size is then granted
@@ -2537,8 +2537,13 @@ limit   = min(total × cap_fraction, total − external − reserve)
   - Once other processes hold 30 % of the card, a tenth of their usage is the
     larger figure and nothing changes. A flat 1 GiB would take 15–47 % of the
     room left on an 8 GB card shared with a 2–6 GB tenant.
-  - Not on the CPU device (its own floor, below) and not on unified memory,
-    where the device has no edge of its own and other usage is never small.
+  - Not on the CPU device (its own floor, below) and not on Apple Silicon,
+    whose limit is counted in RAM, where other usage is never small, and
+    which has the memory-pressure rules.
+  - A GPU carved out of host RAM on Linux (an APU) has the floor like a
+    discrete card. That is by reasoning, not measurement: with RAM to
+    spare its other usage reads small and a batch is granted to the last
+    MiB of what the driver will deliver, where the allocation fails.
   - A margin written in the config is applied as written, 0 included.
 - On a host where a full CUDA GPU spills to system RAM instead of failing
   the allocation (the Windows display driver: native Windows, or `/dev/dxg`

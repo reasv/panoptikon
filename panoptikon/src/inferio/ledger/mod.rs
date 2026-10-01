@@ -105,7 +105,7 @@ pub const DEFAULT_MARGIN: f64 = 0.10;
 /// not the same as `margin = 0.10`".
 pub const DEFAULT_RESERVE_CAP_MB: u64 = 1024;
 
-/// The least an unset margin reserves on a GPU with memory of its own, as a
+/// The least an unset margin reserves on a GPU other than Apple's, as a
 /// fraction of the card, itself at most [`DEFAULT_RESERVE_CAP_MB`]. On a
 /// card with little other usage the default fraction reserves almost
 /// nothing, and a batch priced to the room then runs at the card's physical
@@ -316,8 +316,8 @@ const MAX_RAMP_STEP: u32 = 32;
 pub struct VramBudget {
     /// Margin over external usage. `None` (unset) is not [`DEFAULT_MARGIN`]:
     /// its reserve is also capped at [`DEFAULT_RESERVE_CAP_MB`] and, on a
-    /// GPU with memory of its own, at least
-    /// [`DEFAULT_RESERVE_FLOOR_FRACTION`] of the card.
+    /// GPU other than Apple's, at least [`DEFAULT_RESERVE_FLOOR_FRACTION`]
+    /// of the card.
     pub margin: Option<f64>,
     /// Hard ceiling as a fraction of total; the server lever, off by default.
     pub cap_fraction: Option<f64>,

@@ -448,7 +448,8 @@ fn the_reserve_is_capped_only_under_an_unset_margin() {
 /// little other usage the default fraction reserves almost nothing. Once
 /// another process holds more than 30 % of the card the default fraction is
 /// the larger and nothing changes. A margin the user wrote still applies as
-/// written, and the CPU device and unified memory keep their own rules.
+/// written, and the CPU device and Apple's unified memory keep their own
+/// rules. A unified-memory GPU on Linux is a GPU like any other here.
 #[test]
 fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
     let unset = VramBudget::default();
@@ -485,7 +486,8 @@ fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
         );
     }
 
-    // The CPU device keeps its RAM floor, and unified memory the fraction.
+    // The CPU device keeps its RAM floor. A GPU carved out of host RAM has
+    // the floor on Linux, and on a Mac the fraction alone.
     let host = VramLedger::for_test(
         &[
             (GPU, "TEST 9000", 24_576),
@@ -494,11 +496,17 @@ fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
         unset,
     );
     host.lock().gpus.get_mut(GPU).unwrap().unified_ram_mb = Some(65_536);
-    for (device, expected) in [
-        (super::cpu::DEVICE_KEY, (6_553, RESERVE_RULE_RAM_FLOOR)),
-        (GPU, (17, RESERVE_RULE_CAPPED_DEFAULT)),
+    for (metal, device, expected) in [
+        (
+            false,
+            super::cpu::DEVICE_KEY,
+            (6_553, RESERVE_RULE_RAM_FLOOR),
+        ),
+        (false, GPU, (737, RESERVE_RULE_GPU_FLOOR)),
+        (true, GPU, (17, RESERVE_RULE_CAPPED_DEFAULT)),
     ] {
-        let state = host.lock();
+        let mut state = host.lock();
+        state.metal_allocator = metal;
         assert_eq!(
             host.reserve_locked(&state, device, 165, DEFAULT_MARGIN),
             expected

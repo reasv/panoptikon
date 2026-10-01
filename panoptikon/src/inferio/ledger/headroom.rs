@@ -272,10 +272,10 @@ impl VramLedger {
 
     /// The reserve withheld on top of external usage, and its rule:
     /// `ceil(external × margin)`. Only when the user set no margin for this
-    /// GPU it is capped at [`DEFAULT_RESERVE_CAP_MB`], on a GPU with memory
-    /// of its own at least [`DEFAULT_RESERVE_FLOOR_FRACTION`] of the card
-    /// (that cap at most), and exactly the cap on a CUDA GPU that spills to
-    /// system RAM. A margin of 0 reserves nothing.
+    /// GPU it is capped at [`DEFAULT_RESERVE_CAP_MB`], on a GPU other than
+    /// Apple's at least [`DEFAULT_RESERVE_FLOOR_FRACTION`] of the card (that
+    /// cap at most), and exactly the cap on a CUDA GPU that spills to system
+    /// RAM. A margin of 0 reserves nothing.
     /// On the CPU device the reserve is never below [`cpu::ram_reserve_mb`],
     /// whatever the margin. See docs/batch-calibration-design.md, "The
     /// reserve, and why an unset margin is not the same as `margin = 0.10`".
@@ -288,18 +288,16 @@ impl VramLedger {
     ) -> (u64, &'static str) {
         let budget = self.budgets.for_gpu(gpu);
         let raw = ((external as f64) * margin.max(0.0)).ceil().max(0.0) as u64;
-        let device = state.gpus.get(gpu);
-        let total_mb = device.map_or(0, |device| device.total_mb);
-        // A GPU with memory of its own; unified memory has no such edge.
-        let own_memory =
-            gpu != cpu::DEVICE_KEY && device.is_some_and(|device| device.unified_ram_mb.is_none());
+        let total_mb = state.gpus.get(gpu).map_or(0, |device| device.total_mb);
+        // Any GPU but Apple's: there the limit is in RAM, with its own rules.
+        let floored = gpu != cpu::DEVICE_KEY && !state.metal_allocator;
         let (reserve, rule) = if !budget.reserve_is_capped() {
             (raw, RESERVE_RULE_USER_MARGIN)
         } else if self.budgets.spills_to_ram && gpu != cpu::DEVICE_KEY && margin > 0.0 {
             (DEFAULT_RESERVE_CAP_MB, RESERVE_RULE_FLAT_DEFAULT)
         } else {
             let capped = raw.min(DEFAULT_RESERVE_CAP_MB);
-            let card_floor = if own_memory && margin > 0.0 {
+            let card_floor = if floored && margin > 0.0 {
                 ((total_mb as f64 * DEFAULT_RESERVE_FLOOR_FRACTION) as u64)
                     .min(DEFAULT_RESERVE_CAP_MB)
             } else {
