@@ -1743,7 +1743,8 @@ execute at this corpus's shapes.
   pre-fit grant booked 161 769 MiB of RAM). So pre-fit, with `n > 1`:
 
   ```text
-  price(u) = pool margin × max(δ(U) + (u − U) × per_unit, δ(s) for measured s ≤ u)
+  price(u) = pool margin × max(δ(U) + (u − U) × per_unit, δ(s) for measured s ≤ u)   # u ≥ U
+           = pool margin × max(the same, δ(U) × u / U)                              # u < U
              # U: the largest batch measured on this device; nothing measured: U = 0, δ = 0
   per_unit = SEED_BUDGET_MB / seed_units                 # none or one size measured
            = max(0, (δ(U) − δ(U')) / (U − U'))           # U': the next largest size
@@ -1790,13 +1791,20 @@ execute at this corpus's shapes.
     second item at 11 238 MiB, and one item was all it ever ran beside a
     busy neighbour. A rise of zero prices a larger batch at the largest
     one's cost; the ramp admits at most twice the largest batch run, which
-    bounds how far that reaches. A batch is never priced under a batch of
-    at most its size that was measured; a batch that measured no growth is
-    no price; and a batch that a smaller, later one undercut per unit is
-    dropped, because a batch's cost per unit only rises as it shrinks, so
-    the larger one measured memory that is no longer needed (a first batch
-    that needed 4000 MiB once would otherwise hold the replica under that
-    size for good). The grant is raised to the price, counting what the
+    bounds how far that reaches. A batch smaller than the largest measured
+    one is priced at least at its proportion of that batch, so it is never
+    free; a batch is never priced under a batch of at most its size that
+    was measured; a batch that measured no growth is no price; and a batch
+    that a smaller, later one undercut per unit is dropped, because a
+    batch's cost per unit only rises as it shrinks, so the larger one
+    measured memory that is no longer needed (a first batch that needed
+    4000 MiB once would otherwise hold the replica under that size for
+    good). If that later batch was only unusually cheap, the next larger
+    batch is under-priced for one window, by the pool margin times what the
+    cheap batch undershot its usual cost by, plus, for a model over its
+    design cost, the margin times the units added times that excess; its
+    own measurement then corrects it. The grant is raised to the price,
+    counting what the
     replica already holds, since the batch reuses its pool and the memory it
     kept is charged to it already.
   - *The batch is cut to what the grant covers* when the headroom cannot
@@ -1814,13 +1822,11 @@ execute at this corpus's shapes.
     replicas stay busy, so the same size would run in every window and the
     fit would never get its three. While fewer are measured, a batch cut to
     a size already measured runs the largest smaller size not measured yet
-    (8, then 7, then 6). Where there is none — the replica is cut to one or
-    two units — it runs one unit more, but only if the pool it holds is
-    already over what that batch is designed to cost: its batches took
-    memory the design does not account for, and one more unit tells whether
-    that was once or per unit. That one unit is outside its reservation, at
-    most twice per model and device (from one unit to two, and from two to
-    three).
+    (8, then 7, then 6). Where every size up to the cut is measured it
+    stays as it is: no batch runs outside its reservation. So a replica
+    that has measured a single unit, whose first item kept gigabytes, and
+    whose neighbour fills the device, stays at one unit until that
+    neighbour goes idle or leaves it the design price of a second unit.
 
   At the design price throughout, two cold models on an 8 GiB card (3817
   MiB of headroom) ran 8 and 3 units in every window, never fitted, and —
@@ -1840,9 +1846,9 @@ execute at this corpus's shapes.
   220 MiB over. The first batch on Metal, priced at the default pool margin
   before any is measured: with a pool 2.9 times its tensors, an MPS and a
   CPU replica on a 16 GB Mac are 1212 MiB over in their first two windows
-  and inside from the third (at 2.3 times, inside throughout). A first batch
-  that takes far more than its design, which nothing can price beforehand.
-  And the one unit more of a replica cut to one or two units, above. That is
+  and inside from the third (at 2.3 times, inside throughout). And a first
+  batch that takes far more than its design, which nothing can price
+  beforehand. That is
   about what the lone ramp was exposed to before this rule, which ran 8, 16,
   32 units against the whole headroom and passed it on its own at the second
   or third window on every one of these small devices; the rule is inside
