@@ -116,7 +116,8 @@ the orchestrator's staleness refresh).
 `ram_available` sources: `psutil.virtual_memory().available` worker-side
 (psutil is already a base dependency); orchestrator-side
 `host_statistics64` via `libc` on macOS, `sysinfo`-free reads of
-`/proc/meminfo` (`MemAvailable`) on Linux, `GlobalMemoryStatusEx` via
+`/proc/meminfo` (`MemAvailable`; the CPU device subtracts `SReclaimable`
+on both sides) on Linux, `GlobalMemoryStatusEx` via
 `windows-sys` on Windows. No new crates. The two producers must sum the
 **same terms** — on macOS that is free + inactive pages, which is what
 psutil's `available` is; counting anything more on the orchestrator side
@@ -576,7 +577,12 @@ carrying a footnote forever, and the footnote is the whole complaint.
 - **Total**: physical RAM. **DP-8 (decided) — default ceiling.** A RAM
   OOM is a process kill, not a catchable exception, so the CPU device
   ships with a default `cap_fraction = 0.75` rather than relying on
-  margin alone. Overridable like any GPU.
+  margin alone. Overridable like any GPU. It also keeps a reserve of a
+  tenth of RAM (at most 16 GiB; at least 2 GiB, or a quarter of RAM under
+  8 GiB) that no setting lowers, the worker's clamp
+  keeps the same reserve, and on Linux workers are the kernel's first
+  out-of-memory victim (docs/batch-calibration-design.md, "Host RAM on the
+  CPU device").
 - **Worker readings**: `free_source: "ram"` (`psutil.virtual_memory()`);
   base = RSS at load end minus RSS at spawn (`base_method: "rss"`); batch
   peaks from the OS high-water mark (`VmHWM` on Linux, `peak_wset` via
@@ -682,7 +688,12 @@ carrying a footnote forever, and the footnote is the whole complaint.
   by the MPS sampler's sibling (`_RssPeakSampler` in `memory.py`), and
   `allocated_at_load` is the live RSS at load end rather than the high-water. The pool figures are
   unchanged and keep their two jobs, the warm/high-water split and the pool
-  margin. The cost is one polling thread per batch on a CPU worker, and the
+  margin. They are no longer the ledger's footprint for a CPU replica: with
+  the heap trimmed after every batch the high-water is mostly memory already
+  back in the free reading, so charging it counted that memory twice, once
+  as ours and once as room for the next grant. The footprint is the live
+  resident set (docs/batch-calibration-design.md, "Host RAM on the CPU
+  device"). The cost is one polling thread per batch on a CPU worker, and the
   risk is a spike shorter than the interval — the same trade MPS already
   makes, bounded there and here by the pool figures and the free reading.
 

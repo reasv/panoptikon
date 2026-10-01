@@ -836,6 +836,92 @@ def test_a_cpu_priced_worker_credits_nothing(monkeypatch):
         assert live.free_source == "ram"
 
 
+def test_a_cpu_priced_worker_keeps_the_ram_reserve_free(tmp_path):
+    """Free RAM counts only above the reserve the grant carries, so a batch
+    cannot take the memory the orchestrator left for the rest of the machine.
+    A 128 GiB host with 30 605 MiB available, 6 000 of it reclaimable slab,
+    and a 12 864 MiB reserve has 11 741 MiB to spend.
+    """
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("SReclaimable:    6144000 kB\n")
+    ram = FakeRam(total_mb=128_649, available_mb=30_605, rss_mb=1_200)
+    with cpu_host(ram, meminfo=str(meminfo)):
+        live = packing.clamp_to_live_memory(265, 12_607, ram_reserve_mb=12_864)
+        assert live.units == 247, "11 741 / 12 607 of 265"
+        assert live.clamped == {"from_units": 265, "to_units": 247, "free_mb": 24_605}
+        assert (live.free_mb, live.free_source) == (24_605, "ram")
+        # A grant sized without the reserve, against all that reads available.
+        assert packing.clamp_to_live_memory(768, 36_538, 12_864).units == 247
+        assert packing.clamp_to_live_memory(768, 36_538).units == 517, "no reserve"
+
+        ram.available_mb = 6_000 + 12_864 + 12_607
+        assert packing.clamp_to_live_memory(265, 12_607, 12_864).clamped is None
+        ram.available_mb = 6_000 + 12_000
+        floor = packing.clamp_to_live_memory(265, 12_607, 12_864)
+        assert floor.units == 1, "nothing above the reserve: one unit"
+
+
+def test_a_window_runs_under_the_reserve_its_grant_carries():
+    """The grant's `ram_reserve_mb` reaches every batch's clamp, and the batch
+    reports the resident set it left."""
+    ram = FakeRam(total_mb=64_000, available_mb=6_000, rss_mb=1_000)
+    with cpu_host(ram):
+        model = Recorder()
+        payload = packing.run_window(
+            model, items(8), grant(unit_budget=8, mb=8_000, ram_reserve_mb=2_000)
+        )
+    assert [len(batch) for batch in model.batches] == [4, 4], "4 000 / 8 000 of 8"
+    for measurement in payload["measurements"]:
+        assert measurement["clamped"]["to_units"] == 4
+        assert measurement["rss_after_mb"] == 1_000
+
+
+def test_a_gpu_worker_keeps_the_ram_reserve_free(fake_torch):
+    """A GPU worker's grant books host RAM too. Its batch is scaled by free
+    RAM above the reserve against that booking, and runs at the smaller of
+    this and the device's own budget. The reserve is not taken from the
+    device's free reading.
+    """
+    fake_torch.free = 8_000 * MIB
+    host = {"free_mb": 20_000}
+    with mock.patch.object(
+        memory, "ram_free_total_mb", side_effect=lambda: (host["free_mb"], 64_000)
+    ):
+        roomy = packing.clamp_to_live_memory(64, 1_000, 6_000, 14_000)
+        assert (roomy.units, roomy.clamped) == (64, None), "14 000 above the reserve"
+
+        host["free_mb"] = 13_000
+        live = packing.clamp_to_live_memory(64, 1_000, 6_000, 14_000)
+        assert live.units == 32, "7 000 / 14 000 of 64"
+        assert live.clamped == {
+            "from_units": 64,
+            "to_units": 32,
+            "free_mb": 13_000,
+            "reason": "host_ram",
+        }
+        assert (live.free_mb, live.free_source) == (8_000, "torch")
+
+        # The device is the tighter of the two: its own clamp is reported.
+        fake_torch.free = 250 * MIB
+        device = packing.clamp_to_live_memory(64, 1_000, 6_000, 14_000)
+        assert device.clamped == {"from_units": 64, "to_units": 16, "free_mb": 250}
+        # No booking, no host reading; an unreadable host changes nothing.
+        fake_torch.free = 8_000 * MIB
+        host["free_mb"] = 0
+        assert packing.clamp_to_live_memory(64, 1_000, 6_000).units == 64
+        host["free_mb"] = None
+        assert packing.clamp_to_live_memory(64, 1_000, 6_000, 14_000).units == 64
+
+        host["free_mb"] = 13_000
+        model = Recorder()
+        packing.run_window(
+            model,
+            items(8),
+            grant(unit_budget=8, ram_mb=14_000, ram_reserve_mb=6_000),
+        )
+        assert [len(batch) for batch in model.batches] == [4, 4]
+
+
 def test_an_mps_worker_credits_the_metal_pool():
     """The Metal arm of the same credit: `driver_allocated -
     current_allocated`, 200 MiB of a 1 200 MiB driver pool."""

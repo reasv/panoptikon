@@ -737,6 +737,7 @@ mod load_reservations;
 mod memory_fit;
 mod oom;
 mod profiles;
+mod ram_budget;
 mod ramp;
 mod registration;
 mod shape_ceiling;

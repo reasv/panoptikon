@@ -1,6 +1,7 @@
 //! Child-process lifetime plumbing: a kill-on-close job object (Windows),
-//! console detachment, and the Unix counterparts ([`die_with_parent`],
-//! [`kill_process_group`]).
+//! console detachment, the Unix counterparts ([`die_with_parent`],
+//! [`kill_process_group`]) and the out-of-memory kill order
+//! ([`first_oom_victim`]).
 //!
 //! Invariant: on Linux the parent-death signal is tied to the forking *thread*,
 //! so every armed spawn goes through one permanently alive thread
@@ -105,6 +106,32 @@ pub(crate) fn die_with_parent<C: SpawnCommand>(command: &mut C) {
                 // The gateway may have died between fork and prctl.
                 if libc::getppid() != gateway {
                     libc::_exit(127);
+                }
+                Ok(())
+            }));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = command;
+    }
+}
+
+/// Make the child the first process the Linux kernel kills when the host runs
+/// out of memory (`oom_score_adj = 1000`), so a batch that outgrows RAM costs
+/// the child and not another program. Its own children inherit the value.
+/// Best effort: a failed write leaves the default. No-op off Linux.
+pub(crate) fn first_oom_victim<C: SpawnCommand>(command: &mut C) {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: post-fork in the child; open/write/close are
+        // async-signal-safe.
+        unsafe {
+            command.set_pre_exec(Box::new(|| {
+                let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY);
+                if fd >= 0 {
+                    libc::write(fd, c"1000".as_ptr().cast(), 4);
+                    libc::close(fd);
                 }
                 Ok(())
             }));
@@ -411,6 +438,27 @@ mod tests {
             alive,
             "the child must survive its requester: {died:?} (spawner thread gone?)"
         );
+    }
+
+    /// The armed child and what it spawns are the kernel's first choice when
+    /// the host runs out of memory; the process that spawned them is not.
+    #[test]
+    fn an_armed_child_is_the_first_oom_victim() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("cat /proc/$$/oom_score_adj /proc/self/oom_score_adj")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        first_oom_victim(&mut command);
+        let output = command.output().expect("ran sh");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "1000\n1000\n",
+            "the child, then a process it spawned"
+        );
+        let own = std::fs::read_to_string("/proc/self/oom_score_adj").expect("readable");
+        assert_ne!(own.trim(), "1000", "the spawning process is left alone");
     }
 
     /// One panicking job must not end the thread, because ending it is how
