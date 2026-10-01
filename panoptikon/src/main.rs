@@ -21,6 +21,7 @@ mod log_throttle;
 mod logging;
 mod media_tools;
 mod openapi;
+mod ownership;
 mod policy;
 mod policy_token;
 mod pql;
@@ -65,9 +66,10 @@ struct Args {
     config: Option<PathBuf>,
     /// Root directory for all relative path resolution: data_folder,
     /// config, python sources, runtime/ (global: also valid after the
-    /// subcommand). Default: the current working directory. Implemented as
-    /// a chdir at startup before anything else runs, so every CWD-relative
-    /// default resolves under it — .env auto-loading included.
+    /// subcommand). Default: the PANOPTIKON_ROOT environment variable, else
+    /// the current working directory. Implemented as a chdir at startup
+    /// before anything else runs, so every CWD-relative default resolves
+    /// under it — .env auto-loading included.
     #[arg(long, value_name = "DIR", global = true)]
     root: Option<PathBuf>,
     /// Skip the best-effort startup check for a newer Panoptikon release.
@@ -134,6 +136,26 @@ enum Command {
 /// route keeps the 2 MiB default.
 const PINBOARD_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
+/// The root to chdir into, if any: `--root` beats the environment variable.
+/// An empty variable counts as unset.
+fn root_dir(flag: Option<PathBuf>, env: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    flag.or_else(|| env.filter(|root| !root.is_empty()).map(PathBuf::from))
+}
+
+/// Runs the startup migrations `migrate`. Refused up front when another user
+/// owns a database the server could not write; a failure is explained by
+/// such a database or by a read-only filesystem.
+async fn migrate_at_startup(
+    data_folder: &std::path::Path,
+    index_db: &str,
+    migrate: impl Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    ownership::check_databases(data_folder, index_db)?;
+    migrate
+        .await
+        .map_err(|err| ownership::explain_databases(err, data_folder, index_db))
+}
+
 fn main() -> anyhow::Result<()> {
     // Before the runtime exists, so every thread and child inherits it.
     rlimit::raise_soft_limit_at_startup();
@@ -161,9 +183,9 @@ async fn async_main() -> anyhow::Result<()> {
     // config, python, runtime). It is implemented as exactly that: a chdir
     // before anything else touches the filesystem, so every CWD-relative
     // default below — including the .env auto-load — resolves under it.
-    if let Some(root) = &args.root {
-        env::set_current_dir(root)
-            .with_context(|| format!("failed to change to --root '{}'", root.display()))?;
+    if let Some(root) = root_dir(args.root, env::var_os(config::ROOT_ENV)) {
+        env::set_current_dir(&root)
+            .with_context(|| format!("failed to change to the root '{}'", root.display()))?;
     }
     desktop::set_managed(args.desktop_managed);
     env_template::capture_inherited_environment();
@@ -320,8 +342,11 @@ async fn async_main() -> anyhow::Result<()> {
     // Python-created DBs are baselined, not re-migrated — see
     // db::migrations::ensure_baseline_if_needed.
     if local_api && !db::readonly_mode() {
-        db::migrations::migrate_databases_on_disk(None, None).await?;
-        db::migrations::migrate_all_databases_on_disk().await?;
+        migrate_at_startup(&settings.data_folder, &settings.index_db, async {
+            db::migrations::migrate_databases_on_disk(None, None).await?;
+            db::migrations::migrate_all_databases_on_disk().await
+        })
+        .await?;
         // Vector-quant discrepancy check (crash/power-loss recovery and
         // first-post-upgrade convergence): metadata-only diffs are applied
         // synchronously, real data work enqueues a reconcile job. Runs in
@@ -986,6 +1011,50 @@ async fn inferio_main(
 #[cfg(test)]
 mod route_tests {
     use super::*;
+
+    #[test]
+    fn the_root_flag_beats_the_environment_variable() {
+        let (flag, env) = (PathBuf::from("/flag"), std::ffi::OsString::from("/env"));
+        assert_eq!(root_dir(Some(flag.clone()), Some(env.clone())), Some(flag));
+        assert_eq!(root_dir(None, Some(env)), Some(PathBuf::from("/env")));
+        assert_eq!(root_dir(None, None), None);
+        assert_eq!(root_dir(None, Some(std::ffi::OsString::new())), None);
+    }
+
+    /// The refusal comes before any migration: the default database's folder
+    /// is a symlink to a folder another user owns. A migration that fails
+    /// (here, after that folder appears) is explained by it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_refuses_or_explains_a_database_folder_another_user_owns() {
+        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        let Some((folder, owner)) = foreign_folder(false) else {
+            return;
+        };
+        let data = tempfile::tempdir().unwrap();
+        let default = data.path().join("index/default");
+        std::fs::create_dir_all(data.path().join("user_data")).unwrap();
+        std::fs::create_dir(default.parent().unwrap()).unwrap();
+        let expected = owned_by_another_user(&default, owner, data.path());
+
+        let migrate = async {
+            std::os::unix::fs::symlink(folder, &default)?;
+            Err::<(), anyhow::Error>(anyhow::anyhow!("migration failed"))
+        };
+        let error = migrate_at_startup(data.path(), "default", migrate)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!("{expected}: migration failed")
+        );
+
+        let migrate = async { Err(anyhow::anyhow!("migrated")) };
+        let error = migrate_at_startup(data.path(), "default", migrate)
+            .await
+            .unwrap_err();
+        assert_eq!(format!("{error:#}"), expected, "refused before migrating");
+    }
 
     /// What `axum::serve` gave us for free, asserted rather than assumed now
     /// that `serve_with_stream_limit` replaces it: it answers, `ConnectInfo` is
