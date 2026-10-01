@@ -153,8 +153,8 @@ impl VramLedger {
                     units = 1;
                 }
                 // Beside another replica's reservation, at most the batch the
-                // share covers at its design cost.
-                let covered = headroom::design_units(entry, share.mb);
+                // share covers at its pre-fit price.
+                let covered = Self::pre_fit_price_locked(&state, entry).units(share.mb);
                 let cut = covered < units && Self::neighbour_reserved_locked(&state, worker);
                 if cut {
                     units = covered;

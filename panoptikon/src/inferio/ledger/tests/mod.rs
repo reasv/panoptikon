@@ -730,6 +730,7 @@ fn mps_sampled_window(
     granted
 }
 
+mod cold_start;
 mod external_memory;
 mod grants;
 mod host_ram;

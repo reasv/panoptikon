@@ -1,9 +1,7 @@
 //! Pre-fit reservations beside other replicas: at most an equal part of the
-//! headroom, at least the batch's design cost, and a batch cut to what its
+//! headroom, at least the batch's price, and a batch cut to what its
 //! reservation covers while a neighbour holds one.
 use super::*;
-use crate::inferio::cost::SEED_BUDGET_MB;
-use crate::inferio::gpu::GpuInventory;
 
 /// A 16 GiB card with 15 333 MiB of headroom over two pre-fit models.
 const CARD_MB: u64 = 16_368;
@@ -30,100 +28,6 @@ fn window(admission: &Admission) -> GrantToken {
     admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted")
-}
-
-/// A cold replica whose batches cost what its seed was sized for.
-struct Cold {
-    handle: TelemetryHandle,
-    admission: Admission,
-    seed: u64,
-    /// The pool stays with the process after a batch, as on a GPU; host RAM
-    /// is handed back.
-    keeps_pool: bool,
-    pool_mb: u64,
-    open: Option<GrantToken>,
-}
-
-impl Cold {
-    fn new(handle: TelemetryHandle, admission: Admission, seed: u64, keeps_pool: bool) -> Self {
-        Self {
-            handle,
-            admission,
-            seed,
-            keeps_pool,
-            pool_mb: 0,
-            open: None,
-        }
-    }
-
-    fn on_gpu(ledger: &Arc<VramLedger>, model: &str, base_mb: u64, seed: u32) -> Self {
-        let handle = loaded(Some(base_mb), Some(0));
-        let admission = ledger
-            .register_worker(model, item_cost(seed), &handle, None)
-            .expect("registers");
-        Self::new(handle, admission, u64::from(seed), true)
-    }
-
-    fn cost_mb(&self, units: u64) -> u64 {
-        (units * SEED_BATCH_MB).div_ceil(self.seed)
-    }
-
-    /// The pool it holds, or what its open window is designed to grow it to.
-    fn designed_mb(&self) -> u64 {
-        let open = self.open.as_ref().map(|token| token.grant().unit_budget);
-        self.pool_mb
-            .max(open.map_or(0, |units| self.cost_mb(units)))
-    }
-
-    /// The open window ran one clean batch at its budget.
-    fn settle(&mut self) {
-        let Some(token) = self.open.take() else {
-            return;
-        };
-        let units = token.grant().unit_budget;
-        let peak = self.cost_mb(units);
-        self.pool_mb = if self.keeps_pool {
-            self.pool_mb.max(peak)
-        } else {
-            0
-        };
-        self.handle
-            .lock()
-            .unwrap()
-            .record_measurements(vec![BatchMeasurement {
-                peak_allocated_mb: Some(units * SEED_BUDGET_MB / self.seed),
-                reserved_after_mb: Some(self.pool_mb),
-                ..measurement(units, 0, peak)
-            }]);
-        token.finish(WindowOutcome::Responded { oom: None });
-    }
-}
-
-/// Windows 1 to 3 of a cold start under a full queue: each replica in turn
-/// settles its window and asks again while the others hold theirs. Returns
-/// each window's `(mb, units)` per replica. After every grant, what the
-/// replicas hold or are designed to use fits in `headroom`; a replica left
-/// with less than one unit's cost still runs one unit, which `floor_mb`
-/// allows for.
-fn cold_start(replicas: &mut [Cold], headroom: u64, floor_mb: u64) -> Vec<Vec<(u64, u64)>> {
-    (1..=3)
-        .map(|round| {
-            (0..replicas.len())
-                .map(|index| {
-                    replicas[index].settle();
-                    let token = window(&replicas[index].admission);
-                    let granted = (token.grant().mb, token.grant().unit_budget);
-                    replicas[index].open = Some(token);
-                    let designed: u64 = replicas.iter().map(Cold::designed_mb).sum();
-                    assert!(
-                        designed <= headroom + floor_mb,
-                        "window {round}, replica {index}: {designed} > {headroom}"
-                    );
-                    granted
-                })
-                .collect()
-        })
-        .collect()
 }
 
 /// Two pre-fit models on one GPU: the first reserves half the headroom, the
@@ -319,48 +223,103 @@ fn a_replica_whose_fit_cannot_price_reserves_a_part() {
     assert_eq!(window(&flat).grant().mb, 7666);
 }
 
-/// The two-model cold start through its three pre-fit windows: the ramp
-/// doubles until the two batches' design cost would pass the headroom, then
-/// each batch is cut to what its reservation covers.
-#[test]
-fn the_two_model_cold_start_stays_inside_the_headroom() {
-    let ledger = ledger(CARD_MB, no_margin());
-    let mut replicas = [
-        Cold::on_gpu(&ledger, "g/clip", CLIP_BASE_MB, 8),
-        Cold::on_gpu(&ledger, "g/tags", TAGS_BASE_MB, 64),
-    ];
-    ledger.record_free_for_test(GPU, HEADROOM_MB);
-    let windows = cold_start(&mut replicas, HEADROOM_MB, 0);
-    assert_eq!(windows[0], [(7666, 8), (3833, 64)]);
-    assert_eq!(windows[1], [(7030, 16), (5431, 128)]);
-    // 32 and 256 units would be designed to use 20 480 MiB.
-    assert_eq!(windows[2], [(9902, 30), (5431, 135)]);
-    assert!(replicas.iter().all(|cold| {
-        let grant = cold.open.as_ref().expect("a window").grant();
-        grant.squeezed
-    }));
-}
-
 /// An 8 GiB card with two cold models: the first reserves its seed batch's
 /// design cost, more than half the headroom, and the second is cut to the
 /// three units the rest covers.
 #[test]
 fn on_an_8_gib_card_the_second_cold_model_is_cut_to_what_is_left() {
     let ledger = ledger(8192, no_margin());
-    let mut replicas = [
-        Cold::on_gpu(&ledger, "g/a", 2000, 8),
-        Cold::on_gpu(&ledger, "g/b", 2375, 8),
-    ];
+    let first = pre_fit(&ledger, "g/a", 2000, 8);
+    let second = pre_fit(&ledger, "g/b", 2375, 8);
     ledger.record_free_for_test(GPU, 3817);
-    let windows = cold_start(&mut replicas, 3817, 0);
-    assert_eq!(windows[0], [(SEED_BATCH_MB, 8), (1257, 3)]);
-    // Nothing is left to double into: both stay at what they hold.
-    assert_eq!(windows[1], windows[0]);
-    assert_eq!(windows[2], windows[0]);
-    assert!(replicas.iter().all(|cold| {
-        let grant = cold.open.as_ref().expect("a window").grant();
-        grant.squeezed
-    }));
+    let held = window(&first);
+    assert_eq!(
+        (held.grant().mb, held.grant().unit_budget),
+        (SEED_BATCH_MB, 8)
+    );
+    assert!(!held.grant().squeezed);
+    let cut = window(&second);
+    assert_eq!((cut.grant().mb, cut.grant().unit_budget), (1257, 3));
+    assert!(cut.grant().squeezed);
+}
+
+/// A neighbour's unpriced one-unit window is not a reservation: the replica
+/// asking beside it keeps its seed batch on less than the batch's price.
+#[test]
+fn a_neighbours_unpriced_window_does_not_cut_the_batch() {
+    let ledger = ledger(8192, no_margin());
+    let asking = pre_fit(&ledger, "g/asking", 5000, 4);
+    let neighbour = pre_fit(&ledger, "g/neighbour", 2000, 4);
+    ledger.record_free_for_test(GPU, 0);
+    let unpriced = window(&neighbour);
+    assert_eq!((unpriced.grant().mb, unpriced.grant().unit_budget), (0, 1));
+
+    // The other process on the card let go of its 1192 MiB.
+    ledger.record_free_for_test(GPU, 1192);
+    let token = window(&asking);
+    assert_eq!((token.grant().mb, token.grant().unit_budget), (1192, 4));
+}
+
+/// A replica that has run a batch here is priced at what that batch
+/// measured, times the pool margin: a larger batch by scaling the largest
+/// one measured, and no batch under a smaller one that was measured.
+#[test]
+fn a_measured_replica_is_priced_at_its_largest_batch_and_never_under_a_measurement() {
+    // 3 units allocated 900 MiB and 8 units 1000: a large fixed part.
+    // (headroom, window, the grant and unit budget beside a neighbour's window)
+    let cases = [
+        // 16 units: 2 x 1000 x 1.25.
+        (6560, u64::MAX, (2500, 16)),
+        // 1100 MiB left: by that scale 7 units, but 3 measured 1125, so 2.
+        (3660, u64::MAX, (1100, 2)),
+        // A 4-unit window: not 4/8 of 1250, but the 1125 that 3 measured.
+        (4560, 4, (1125, 4)),
+    ];
+    for (headroom, window_units, granted) in cases {
+        let ledger = ledger(headroom + 2000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let measured = ledger
+            .register_worker("g/measured", item_cost(8), &handle, None)
+            .expect("registers");
+        let neighbour = pre_fit(&ledger, "g/neighbour", 1000, 8);
+        ledger.record_free_for_test(GPU, headroom);
+        let batch = |units: u64, allocated: u64| BatchMeasurement {
+            reserved_before_mb: None,
+            peak_reserved_mb: None,
+            ..measurement(units, 0, allocated)
+        };
+        let token = window(&measured);
+        let batches = vec![batch(3, 900), batch(8, 1000)];
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(WindowOutcome::Responded { oom: None });
+
+        let held = window(&neighbour);
+        assert_eq!(held.grant().mb, (headroom / 2).max(SEED_BATCH_MB));
+        let token = measured
+            .request_grant(window_units, None, 1, 0)
+            .expect("granted");
+        assert_eq!((token.grant().mb, token.grant().unit_budget), granted);
+    }
+}
+
+/// A batch that measured no growth is no price: the design cost stays.
+#[test]
+fn a_batch_that_measured_no_growth_leaves_the_design_price() {
+    let ledger = ledger(8192, no_margin());
+    let first = pre_fit(&ledger, "g/a", 2000, 8);
+    let handle = loaded(Some(2375), Some(0));
+    let second = ledger
+        .register_worker("g/b", item_cost(8), &handle, None)
+        .expect("registers");
+    ledger.record_free_for_test(GPU, 3817);
+    let token = window(&second);
+    let flat = vec![measurement(8, 0, 0)];
+    handle.lock().unwrap().record_measurements(flat);
+    token.finish(WindowOutcome::Responded { oom: None });
+
+    let _held = window(&first);
+    let cut = window(&second);
+    assert_eq!((cut.grant().mb, cut.grant().unit_budget), (1257, 3));
 }
 
 /// With less headroom than its seed batch is designed to cost and nobody in
@@ -411,120 +370,6 @@ fn a_replica_whose_pool_covers_its_batch_still_reserves_the_floor() {
     let other = window(&neighbour);
     assert_eq!((other.grant().mb, other.grant().unit_budget), (136, 1));
     assert!(other.grant().squeezed);
-}
-
-/// A 16 GB host with only the CPU device (limit 12 000 MiB): two cold
-/// replicas.
-#[test]
-fn two_cold_cpu_replicas_on_a_16_gb_host_stay_inside_the_headroom() {
-    let (ledger, mut replicas) = cold_cpu_host(2, 1750);
-    let headroom = ledger.headroom_mb(cpu::DEVICE_KEY);
-    assert_eq!(headroom, 8500);
-    let windows = cold_start(&mut replicas, headroom, 0);
-    assert_eq!(windows[0], [(4250, 8), (SEED_BATCH_MB, 8)]);
-    assert_eq!(windows[1], [(5120, 16), (3380, 10)]);
-    assert_eq!(windows[2], windows[1]);
-}
-
-/// The same host with four cold replicas: the third is cut, and the fourth
-/// has nothing left and runs one unit.
-#[test]
-fn four_cold_cpu_replicas_on_a_16_gb_host_are_cut_to_the_headroom() {
-    let (ledger, mut replicas) = cold_cpu_host(4, 1375);
-    let headroom = ledger.headroom_mb(cpu::DEVICE_KEY);
-    assert_eq!(headroom, 6500);
-    let one_unit = SEED_BATCH_MB / 8;
-    let windows = cold_start(&mut replicas, headroom, one_unit);
-    assert_eq!(
-        windows[0],
-        [(SEED_BATCH_MB, 8), (SEED_BATCH_MB, 8), (1380, 4), (0, 1)]
-    );
-    assert_eq!(windows[1], windows[0]);
-    assert_eq!(windows[2], windows[0]);
-}
-
-/// `count` cold replicas of `base_mb` each on a 16 GB CPU-only host under the
-/// shipped budget; nothing else holds RAM.
-fn cold_cpu_host(count: u64, base_mb: u64) -> (Arc<VramLedger>, Vec<Cold>) {
-    const RAM_MB: u64 = 16_000;
-    let ledger = VramLedger::new(
-        &GpuInventory::known_cpu(RAM_MB),
-        VramBudget::default().into(),
-        None,
-    );
-    let replicas = (0..count)
-        .map(|index| {
-            let handle = loaded_cpu(Some(RAM_MB));
-            handle
-                .lock()
-                .unwrap()
-                .load
-                .as_mut()
-                .expect("a load report")
-                .value
-                .base_mb = Some(base_mb);
-            let admission = ledger
-                .register_worker(&format!("g/c{index}"), item_cost(8), &handle, None)
-                .expect("registers");
-            Cold::new(handle, admission, 8, false)
-        })
-        .collect();
-    ledger.record_free_for_test(cpu::DEVICE_KEY, RAM_MB - count * base_mb);
-    (ledger, replicas)
-}
-
-/// A 16 GB Mac: a cold MPS replica and a cold CPU replica share its RAM, so
-/// each one's window counts as the other's neighbour.
-#[test]
-fn a_cold_mps_and_cpu_replica_on_a_16_gb_mac_stay_inside_the_headroom() {
-    const RAM_MB: u64 = 16_384;
-    const RECOMMENDED_MAX_MB: u64 = RAM_MB / 4 * 3;
-    const BASE_MB: u64 = 2500;
-    let ledger = VramLedger::new(
-        &GpuInventory::known_mps(RAM_MB),
-        VramBudget::default().into(),
-        None,
-    );
-    ledger.install_probe_stub(None);
-    let mut replicas = Vec::new();
-    for (model, device, handle) in [
-        ("g/mps", MPS_GPU, loaded_mps(Some(RECOMMENDED_MAX_MB))),
-        ("g/cpu", cpu::DEVICE_KEY, loaded_on_cpu(Some(RAM_MB))),
-    ] {
-        handle
-            .lock()
-            .unwrap()
-            .load
-            .as_mut()
-            .expect("a load report")
-            .value
-            .base_mb = Some(BASE_MB);
-        let admission = ledger
-            .register_worker(model, item_cost(8), &handle, Some(device))
-            .expect("admitted");
-        replicas.push(Cold::new(handle, admission, 8, device == MPS_GPU));
-    }
-    // Nothing else holds RAM: both bases are ours.
-    super::unified_memory::push_basis(
-        &replicas[0].handle,
-        RECOMMENDED_MAX_MB,
-        RAM_MB,
-        RAM_MB - 2 * BASE_MB,
-        0,
-        0,
-    );
-    ledger.ingest_all_for_test();
-    ledger.record_free_for_test(cpu::DEVICE_KEY, RAM_MB - 2 * BASE_MB);
-    let headroom = ledger.headroom_mb(MPS_GPU);
-    assert_eq!(headroom, 7288);
-    assert_eq!(ledger.headroom_mb(cpu::DEVICE_KEY), headroom);
-
-    let windows = cold_start(&mut replicas, headroom, 0);
-    assert_eq!(windows[0], [(3644, 8), (SEED_BATCH_MB, 8)]);
-    // The MPS replica keeps its 2560 MiB pool, and the CPU replica's window
-    // on the other device cuts its next batch from 16 units to 14.
-    assert_eq!(windows[1], [(4728, 14), (SEED_BATCH_MB, 8)]);
-    assert_eq!(windows[2], windows[1]);
 }
 
 /// The CPU device: two pre-fit CPU replicas share the RAM headroom the same

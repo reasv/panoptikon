@@ -3,25 +3,44 @@
 
 use super::*;
 
-/// Pool growth one seed batch is designed for: the registry's seed budget
-/// times the default pool margin.
-fn design_seed_batch_mb() -> u64 {
-    (SEED_BUDGET_MB as f64 * POOL_MARGIN_DEFAULT).ceil() as u64
+/// `allocated` MiB as pool growth under the default pool margin.
+fn pool_mb_default(allocated: u64) -> u64 {
+    (allocated as f64 * POOL_MARGIN_DEFAULT).ceil() as u64
 }
 
-/// What a pre-fit batch of `units` is designed to grow the pool by, rounded
-/// up. A design figure: exact only for a model whose seed was measured.
-fn design_cost_mb(entry: &WorkerEntry, units: u64) -> u64 {
-    let seed = u128::from(entry.seed_units.max(1));
-    let cost = (u128::from(units) * u128::from(design_seed_batch_mb())).div_ceil(seed);
-    u64::try_from(cost).unwrap_or(u64::MAX)
+/// How a batch is priced before the model's cost is fitted.
+pub(super) struct PreFitPrice {
+    seed_units: u64,
+    /// MiB of pool growth per seed batch: the largest batch measured on this
+    /// device, scaled to a seed batch and times the pool margin; until a batch
+    /// measured growth, the registry's seed budget times the default pool
+    /// margin (a design figure, exact only for a model whose seed was
+    /// measured).
+    seed_batch_mb: u64,
+    /// `(units, MiB)` of every batch size measured, so that no batch is
+    /// priced under a smaller one that was measured.
+    measured: Vec<(u64, u64)>,
 }
 
-/// The largest batch `mb` covers at the design cost, at least one unit.
-pub(super) fn design_units(entry: &WorkerEntry, mb: u64) -> u64 {
-    let seed = u128::from(entry.seed_units.max(1));
-    let units = u128::from(mb) * seed / u128::from(design_seed_batch_mb());
-    u64::try_from(units).unwrap_or(u64::MAX).max(1)
+impl PreFitPrice {
+    /// The price of a batch of `units`, rounded up.
+    fn cost_mb(&self, units: u64) -> u64 {
+        let scaled = (u128::from(units) * u128::from(self.seed_batch_mb))
+            .div_ceil(u128::from(self.seed_units));
+        let at_or_below = self.measured.iter().filter(|(size, _)| *size <= units);
+        at_or_below
+            .map(|(_, mb)| *mb)
+            .fold(u64::try_from(scaled).unwrap_or(u64::MAX), u64::max)
+    }
+
+    /// The largest batch `mb` covers, at least one unit.
+    pub(super) fn units(&self, mb: u64) -> u64 {
+        let scaled = u128::from(mb) * u128::from(self.seed_units) / u128::from(self.seed_batch_mb);
+        let over = self.measured.iter().filter(|(_, cost)| *cost > mb);
+        over.map(|(size, _)| size.saturating_sub(1))
+            .fold(u64::try_from(scaled).unwrap_or(u64::MAX), u64::min)
+            .max(1)
+    }
 }
 
 /// The ceiling on a learned pool margin for this device's allocator. Per
@@ -438,6 +457,32 @@ impl VramLedger {
         on(gpu) + Self::ram_domain_peer(state, gpu).map_or(0, on)
     }
 
+    /// [`PreFitPrice`] for this replica's (model, device).
+    pub(super) fn pre_fit_price_locked(state: &LedgerState, entry: &WorkerEntry) -> PreFitPrice {
+        let seed_units = entry.seed_units.max(1);
+        let margin = Self::pool_margin_locked(state, entry);
+        let pool_mb = |allocated: f64| (allocated * margin).ceil() as u64;
+        let samples = cal_locked(state, entry).map(|cal| &cal.samples);
+        let grew = samples
+            .into_iter()
+            .flatten()
+            .filter(|sample| sample.units > 0 && sample.delta_mb > 0);
+        let largest = grew.clone().max_by_key(|sample| sample.units);
+        let seed_batch_mb = match largest {
+            Some(sample) => {
+                pool_mb(sample.delta_mb as f64 * seed_units as f64 / sample.units as f64)
+            }
+            None => pool_mb_default(SEED_BUDGET_MB),
+        };
+        PreFitPrice {
+            seed_units,
+            seed_batch_mb: seed_batch_mb.max(1),
+            measured: grew
+                .map(|sample| (sample.units, pool_mb(sample.delta_mb as f64)))
+                .collect(),
+        }
+    }
+
     /// Whether another replica holds a reservation on `worker`'s device or
     /// its RAM-domain peer.
     pub(super) fn neighbour_reserved_locked(state: &LedgerState, worker: WorkerId) -> bool {
@@ -460,8 +505,7 @@ impl VramLedger {
     /// Pre-fit the share is the reservation. Beside other replicas
     /// ([`Self::replicas_locked`]) it is at most an equal part of the
     /// headroom, so the first to ask leaves room for the others, and with the
-    /// credit at least what a batch of `units` is designed to cost
-    /// ([`design_cost_mb`]).
+    /// credit at least the price of a batch of `units` ([`PreFitPrice`]).
     pub(super) fn share_locked(
         &self,
         state: &LedgerState,
@@ -498,9 +542,9 @@ impl VramLedger {
         };
         let replicas = Self::replicas_locked(state, &requesting.gpu).max(1);
         let pre_fit = Self::grant_slope_locked(state, requesting).is_none();
-        // (equal part, design cost the credit does not cover).
+        // (equal part, the batch's price the credit does not cover).
         let bounds = (pre_fit && replicas > 1).then(|| {
-            let cost = design_cost_mb(requesting, units);
+            let cost = Self::pre_fit_price_locked(state, requesting).cost_mb(units);
             (headroom / replicas, cost.saturating_sub(credit))
         });
         let reserved = |split: u64, floor: u64| -> u64 {
