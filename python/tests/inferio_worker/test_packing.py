@@ -1087,6 +1087,59 @@ def test_the_pool_is_credited_exactly_once(fake_torch, caplog):
     assert live.free_mb == 400, "the reported reading stays the raw one"
 
 
+def test_the_clamp_scales_only_the_part_of_the_grant_that_is_per_unit(fake_torch):
+    """A 2112 MiB grant for 16 units of which 800 is fixed is 82 MiB a unit.
+    With 1500 spendable, 8 units fit (800 + 8 x 82 = 1456); the plain ratio
+    1500/2112 of 16 is 11, which needs 1702.
+    """
+    fake_torch.reserved = 0
+    fake_torch.allocated = 0
+    fake_torch.free = 1_500 * MIB
+    assert packing.clamp_to_live_memory(16, 2_112).units == 11
+    live = packing.clamp_to_live_memory(16, 2_112, fixed_mb=800)
+    assert (live.units, live.clamped["to_units"]) == (9, 9), "700/1312 of 16, rounded"
+    fake_torch.free = 700 * MIB
+    assert packing.clamp_to_live_memory(16, 2_112, fixed_mb=800).units == 1
+    assert packing.clamp_to_live_memory(16, 800, fixed_mb=800).units == 1
+    fake_torch.free = 2_112 * MIB
+    assert packing.clamp_to_live_memory(16, 2_112, fixed_mb=800).clamped is None
+
+    fake_torch.free = 1_500 * MIB
+    model = Recorder()
+    packing.run_window(
+        model, items(16), grant(unit_budget=16, mb=2_112, fixed_mb=800)
+    )
+    assert [len(batch) for batch in model.batches] == [9, 7]
+
+
+def test_the_fixed_part_the_worker_already_holds_is_not_needed_again(
+    fake_torch, monkeypatch
+):
+    """The first batch left 800 MiB allocated over the 300 at load, so a 2112
+    MiB grant with 800 fixed needs 1312 more. The pool is 2000 with 1100
+    allocated: 900 releasable, and 412 free makes the 1312.
+    """
+    monkeypatch.setattr(memory, "_allocated_at_load_mb", 300)
+    fake_torch.reserved = 2_000 * MIB
+    fake_torch.allocated = 1_100 * MIB
+    fake_torch.free = 412 * MIB
+    assert memory.held_since_load_mb() == 800
+    assert packing.clamp_to_live_memory(16, 2_112, fixed_mb=800).clamped is None
+    # No more than the fixed part counts as held: 1312 of 2900.
+    assert packing.clamp_to_live_memory(16, 3_000, fixed_mb=100).units == 7
+    fake_torch.free = 0
+    live = packing.clamp_to_live_memory(16, 2_112, fixed_mb=800)
+    assert live.units == 11, "900 of the 1312 the units need"
+    monkeypatch.setattr(memory, "_allocated_at_load_mb", None)
+    assert memory.held_since_load_mb() == 0
+
+    # A RAM-priced worker's resident growth is already out of its fixed part.
+    with cpu_host(FakeRam(total_mb=64_000, available_mb=6_000, rss_mb=1_100)):
+        monkeypatch.setattr(memory, "_allocated_at_load_mb", 300)
+        assert memory.pool_stats_mb()[1] == 1_100
+        assert memory.held_since_load_mb() == 0
+
+
 def test_the_netting_and_the_rounding_each_keep_two_units(fake_torch):
     """Without the credit the window is 23 473/23 557 of 2 units, which a
     plain `int()` floors to 1. Round-half-up alone already lifts it back to 2,

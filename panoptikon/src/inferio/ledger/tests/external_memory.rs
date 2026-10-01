@@ -383,8 +383,8 @@ fn external_clamps_at_zero() {
     ledger.ingest_all_for_test();
     let gpu = &ledger.health()[0];
     assert_eq!(gpu.external_mb, 0, "clamped, never negative");
-    assert_eq!(gpu.limit_mb, 10_000, "no external usage to margin");
-    assert_eq!(gpu.headroom_mb, 2000, "10000 - 8000 footprint");
+    assert_eq!(gpu.limit_mb, 9_700, "no external usage: the card's 3 %");
+    assert_eq!(gpu.headroom_mb, 1700, "9700 - 8000 footprint");
 }
 
 /// A worker with no reported base (CTranslate2, a remote API) contributes

@@ -7763,7 +7763,7 @@
           "pool_margin": {
             "type": "number",
             "format": "double",
-            "description": "Observed reserved/allocated ratio; a grant is `slope × units ×\npool_margin`. Runtime-only."
+            "description": "Observed reserved/allocated ratio, raised a tenth (three times at\nmost) by out-of-memory windows at the limit of the device's room; a\ngrant is `(max(0, intercept) + slope × units) × pool_margin`.\nRuntime-only."
           },
           "residual_mb": {
             "type": "number",
@@ -7964,7 +7964,7 @@
           },
           "reserve_rule": {
             "type": "string",
-            "description": "`\"user_margin\"` (configured, uncapped), `\"capped_default\"` (default\nfraction, clamped), `\"flat_default\"` (the cap itself, on a CUDA GPU\nthat spills to system RAM) or `\"ram_floor\"` (the CPU device's minimum:\na tenth of RAM, at most 16 GiB, at least 2 GiB or a quarter of RAM)."
+            "description": "`\"user_margin\"` (configured, uncapped), `\"capped_default\"` (default\nfraction, clamped), `\"gpu_floor\"` (3 % of the card, at most 1 GiB,\nwhere the default fraction gives less; not on Apple Silicon),\n`\"flat_default\"` (the cap itself, on a CUDA GPU that spills to system\nRAM) or `\"ram_floor\"` (the CPU device's minimum: a tenth of RAM, at\nmost 16 GiB, at least 2 GiB or a quarter of RAM)."
           },
           "total_mb": {
             "type": "integer",

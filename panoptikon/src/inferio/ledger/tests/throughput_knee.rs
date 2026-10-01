@@ -1067,6 +1067,7 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         requests: 1,
         unit_budget: 64,
         squeezed: false,
+        room_bound: false,
         peak_occupants: 0,
         knee_bound: false,
         ample_headroom: true,

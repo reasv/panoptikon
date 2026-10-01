@@ -187,10 +187,11 @@ ignores them per the unknown-key rule and behaves exactly as before.
 | key | meaning |
 |---|---|
 | `unit_budget` | how many cost-dimension units one GPU batch may contain. The packing currency; the worker prices its decoded inputs in the declared `unit` and packs greedily up to this number |
-| `mb` | the MB the orchestrator has reserved out of the GPU's headroom for this window. The worker never spends against this directly — it is the reference for the **defensive clamp**: if live free memory *plus the worker's own releasable pool* has fallen below it, the batch is shrunk in proportion and rounded to nearest (shrink-only; the grant is never exceeded) |
+| `mb` | the MB the orchestrator has reserved out of the GPU's headroom for this window. The worker never spends against this directly — it is the reference for the **defensive clamp**: if live free memory *plus the worker's own releasable pool* has fallen below it, the batch is shrunk in proportion (of the part above `fixed_mb`) and rounded to nearest (shrink-only; the grant is never exceeded) |
 | `unit` | `"item"` \| `"pixel"` \| `"token"` \| `"audio-second"` — the model's declared cost dimension |
 | `aggregation` | `"count"` \| `"sum"` \| `"max-times-count"` — how per-item units combine into batch units |
 | `user_cap_items` | optional per-request cap on **item count** per batch (the user-facing "max batch size"). Never converted to units; enforced as an additional bound at pack time |
+| `fixed_mb` | the part of `mb` a batch costs whatever its size (the fitted cost's intercept); 0 before the cost is fitted, and absent from an older orchestrator, which means 0. The clamp scales only the rest: `unit_budget × (spendable − fixed_mb) / (mb − fixed_mb)`. What the worker still holds allocated since its load, up to `fixed_mb`, counts as spendable, because the batch does not allocate it again |
 | `ram_reserve_mb` | free host RAM the orchestrator keeps for the rest of the machine (the CPU device's reserve). The clamp counts free RAM only above it. 0 on a grant neither priced nor booked in host RAM |
 | `ram_mb` | host RAM a CUDA or ROCm worker's window may add to its resident set: its booking on the CPU device less the growth it already holds. 0 when nothing is booked. The clamp scales the batch by `(free RAM − ram_reserve_mb) / ram_mb` as well, and the batch runs at the smaller of the two budgets |
 | `max_tokens` | **new (2026-09-06)**: the model's *sequence window* — the most tokens of one input that ever occupy the GPU at once, whatever the input's length. Integer tokens; nil when there is none; meaningful only for a `token`-priced model. When present the worker prices every input at `min(raw_tokens, max_tokens)` before packing. Resolved and denominated exactly as `canvas_pixels` is, and on the same both-sides rule |
@@ -463,7 +464,7 @@ advisory, and applying it twice is applying it once:
 | key | meaning |
 |---|---|
 | `slope_mb_per_unit` | allocated MB per unit, fitted on `peak_allocated − allocated_at_load`; a grant prices one unit at this × the pool margin |
-| `intercept_mb` | free intercept of the fit; diagnostic only |
+| `intercept_mb` | free intercept of the fit: allocated MB a batch costs whatever its size. A grant prices it, when positive, times the pool margin (`grant.fixed_mb`) |
 | `residual_mb` | fit scatter (confidence) |
 | `samples` | how many fit samples the fit is built on (clean priced batches, at most one per distinct `units`) |
 
@@ -471,7 +472,10 @@ advisory, and applying it twice is applying it once:
 against `grant.mb` is the live free reading *plus* `reserved − allocated` on
 CUDA (`driver_allocated − current_allocated` on MPS): pool this process holds
 and the batch spends without asking the device for a page, which the free
-reading by construction excludes. It is not the ledger's own credit
+reading by construction excludes. Memory the worker has kept allocated since
+its load counts the same way, up to `grant.fixed_mb`: the grant prices the
+fixed part of a batch over the level at load, and a batch does not allocate
+again what an earlier one left in place. It is not the ledger's own credit
 (`reserved_now − reserved_at_load − grants`, `share_locked`), but it is why a
 grant can sit above the free reading at all — a pre-fit grant is `headroom +
 the requester's free pool`, or a part of the headroom plus that pool when
@@ -490,8 +494,8 @@ card an 84 MiB gap on a 23 557 MiB pre-fit grant floored a 2-unit budget to 1
 and the ramp never advanced again (measured on a 3090).
 
 **`fit` is advisory in v1.** The worker's defensive clamp compares that figure
-against `grant.mb` and scales the unit budget by the ratio, rounded to
-nearest; it does
+against `grant.mb` and scales the unit budget by the ratio (both taken above
+`grant.fixed_mb`), rounded to nearest; it does
 **not** consume `slope_mb_per_unit` to convert MB into units. So a worker may
 log the snapshot, expose it for diagnostics, or ignore it entirely — nothing on
 the worker side changes behaviour based on it, and a worker that drops it is

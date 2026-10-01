@@ -387,6 +387,16 @@ fn stored_anchor(profiles: &Arc<FakeProfiles>) -> u64 {
         .max_units_measured
 }
 
+/// How many times out-of-memory windows raised a (model, device)'s pool
+/// margin.
+fn margin_steps(ledger: &Arc<VramLedger>, model: &str, device: &str) -> u32 {
+    let state = ledger.lock();
+    let cal = state
+        .calibration
+        .get(&(model.to_owned(), device.to_owned()));
+    cal.map_or(0, |cal| cal.oom_margin_steps)
+}
+
 const MPS_GPU: &str = "GPU-MPS";
 /// A 128 GiB Mac, in MiB.
 const MAC_RAM_MB: u64 = 128 * 1024;

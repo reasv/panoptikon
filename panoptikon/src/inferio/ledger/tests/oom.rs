@@ -244,9 +244,9 @@ fn a_death_in_a_window_the_queue_sized_sets_no_cap() {
         }
 
         // A short window that memory cut further was sized by memory: with
-        // 50 MiB free above the reserve, 100 units in hand run as 50.
+        // 150 MiB free above the reserve, 100 units in hand run as 50.
         let (handle, admission) = replica();
-        push_memory_with_total(&handle, CPU_RAM_MB / 10 + 50, 0, Some(CPU_RAM_MB), "ram");
+        push_memory_with_total(&handle, CPU_RAM_MB / 10 + 150, 0, Some(CPU_RAM_MB), "ram");
         let token = admission.request_grant(100, None, 1, 0).expect("granted");
         assert!(token.grant().squeezed);
         assert_eq!(token.grant().unit_budget, 50);
@@ -1020,6 +1020,7 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
         requests: 1,
         unit_budget: 8,
         squeezed: false,
+        room_bound: false,
         peak_occupants: 0,
         knee_bound: false,
         ample_headroom: true,
@@ -1113,6 +1114,7 @@ fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
         requests: 1,
         unit_budget: 512,
         squeezed: false,
+        room_bound: false,
         peak_occupants: 0,
         knee_bound: false,
         ample_headroom: true,
@@ -1449,4 +1451,290 @@ fn out_of_memory_needs_a_device_to_be_a_device_out_of_memory() {
     ] {
         assert!(message_reports_oom(message), "{message}");
     }
+}
+
+/// A replica of `model` costing 10 MiB a unit, ramped to an anchor of 256 on
+/// a roomy card, so its next window asks for 512 units.
+fn fitted_replica(ledger: &Arc<VramLedger>, model: &str) -> (TelemetryHandle, Admission) {
+    let handle = loaded(Some(1000), Some(0));
+    let admission = ledger
+        .register_worker(model, item_cost(4), &handle, None)
+        .expect("registers");
+    push_memory(&handle, 190_000, 0);
+    for _ in 0..7 {
+        room_window(&handle, &admission, CLEAN);
+    }
+    (handle, admission)
+}
+
+/// [`fitted_replica`] as `g/a`, alone on a card with room for 100 units.
+fn at_the_rooms_limit() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
+    let ledger = ledger(200_000, no_margin());
+    let (handle, admission) = fitted_replica(&ledger, "g/a");
+    room(&ledger, &handle, 1_000);
+    (ledger, handle, admission)
+}
+
+/// Leave `mb` of headroom on the card.
+fn room(ledger: &Arc<VramLedger>, handle: &TelemetryHandle, mb: u64) {
+    push_memory(handle, mb, 0);
+    ledger.ingest_all_for_test();
+}
+
+/// One window with one batch at its budget, which is priced if the window is
+/// clean. Returns `(unit budget, MiB, squeezed)`.
+fn room_window(
+    handle: &TelemetryHandle,
+    admission: &Admission,
+    outcome: WindowOutcome,
+) -> (u64, u64, bool) {
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let grant = *token.grant();
+    if outcome == CLEAN {
+        let batch = measurement(grant.unit_budget, 0, 10 * grant.unit_budget);
+        handle.lock().unwrap().record_measurements(vec![batch]);
+    }
+    token.finish(outcome);
+    (grant.unit_budget, grant.mb, grant.squeezed)
+}
+
+const OUT_OF_MEMORY: WindowOutcome = WindowOutcome::Responded {
+    oom: Some(ErrorFrameOom::Marker),
+};
+const CLEAN: WindowOutcome = WindowOutcome::Responded { oom: None };
+
+/// A window cut to the device's room that runs out of memory was priced too
+/// low. The pool margin is raised by [`OOM_MARGIN_STEP`], so the next window
+/// in the same room is a tenth smaller, stays so once deflation is repaid,
+/// and a replica loaded later starts there. A second failure cuts again.
+#[test]
+fn an_out_of_memory_window_at_the_rooms_limit_makes_later_grants_smaller() {
+    let (ledger, handle, admission) = at_the_rooms_limit();
+    assert_eq!(
+        room_window(&handle, &admission, OUT_OF_MEMORY),
+        (100, 1_000, true)
+    );
+    let margin = || {
+        ledger.health()[0].workers[0]
+            .fit
+            .as_ref()
+            .unwrap()
+            .pool_margin
+    };
+    assert!((margin() - OOM_MARGIN_STEP).abs() < 1e-9, "{}", margin());
+
+    // 1000 / (10 × 1.1) = 90 units, below the 256 deflation leaves.
+    for window in 0..2 * CLEAN_WINDOWS_TO_RESTORE {
+        let granted = room_window(&handle, &admission, CLEAN);
+        assert_eq!(granted, (90, 990, true), "window {window}");
+    }
+    assert_eq!(ledger.health()[0].workers[0].deflation, 0, "repaid");
+
+    drop(admission);
+    let handle = loaded(Some(1000), Some(0));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    room(&ledger, &handle, 1_000);
+    // This time the worker reports the failure with the batch.
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(token.grant().unit_budget, 90);
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![BatchMeasurement {
+            oom: true,
+            ..BatchMeasurement::default()
+        }]);
+    token.finish(CLEAN);
+    // 1000 / (10 × 1.21).
+    assert_eq!(room_window(&handle, &admission, CLEAN), (82, 993, true));
+}
+
+/// Only a window the room sized through the fitted price raises the pool
+/// margin. Not one the queue sized, a one-unit window (no price can make it
+/// smaller), a window whose worker died, or an aborted one. Two units is
+/// enough.
+#[test]
+fn an_out_of_memory_window_the_room_did_not_size_leaves_the_pool_margin() {
+    let (ledger, handle, admission) = at_the_rooms_limit();
+    let steps = || margin_steps(&ledger, "g/a", GPU);
+
+    let token = admission.request_grant(60, None, 1, 0).expect("granted");
+    assert_eq!(
+        (token.grant().unit_budget, token.grant().squeezed),
+        (60, false)
+    );
+    token.finish(OUT_OF_MEMORY);
+    assert_eq!(steps(), 0, "the queue sized it");
+
+    room(&ledger, &handle, 15);
+    assert_eq!(
+        room_window(&handle, &admission, OUT_OF_MEMORY),
+        (1, 10, true)
+    );
+    assert_eq!(steps(), 0, "one unit");
+
+    room(&ledger, &handle, 1_000);
+    let died = room_window(&handle, &admission, WindowOutcome::WorkerDied);
+    assert_eq!((died, steps()), ((100, 1_000, true), 0), "a death");
+
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert!(token.grant().squeezed);
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![BatchMeasurement {
+            oom: true,
+            ..BatchMeasurement::default()
+        }]);
+    drop(token);
+    assert_eq!(steps(), 0, "aborted, though a batch ran out of memory");
+
+    room(&ledger, &handle, 25);
+    assert_eq!(
+        room_window(&handle, &admission, OUT_OF_MEMORY),
+        (2, 20, true)
+    );
+    assert_eq!(steps(), 1, "two units the room sized");
+}
+
+/// A spill or a throughput collapse in a window the room sized deflates, as
+/// any negative does, and leaves the pool margin: only running out of memory
+/// says the price was too low.
+#[test]
+fn a_spill_or_collapse_at_the_rooms_limit_leaves_the_pool_margin() {
+    let (ledger, handle, admission) = at_the_rooms_limit();
+    let negatives = [
+        BatchMeasurement {
+            spilled: true,
+            ..measurement(100, 0, 1_000)
+        },
+        spilled_past_free(100, 100.0, 1_000),
+    ];
+    for (window, batch) in negatives.into_iter().enumerate() {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            (token.grant().unit_budget, token.grant().squeezed),
+            (100, true)
+        );
+        handle.lock().unwrap().record_measurements(vec![batch]);
+        token.finish(CLEAN);
+        let deflation = ledger.health()[0].workers[0].deflation;
+        assert_eq!(deflation as usize, window + 1, "a negative");
+        assert_eq!(margin_steps(&ledger, "g/a", GPU), 0);
+    }
+}
+
+/// A pre-fit window has no fitted price, so its failures raise nothing:
+/// here a 64-unit seed batch with 200 MiB of room over the reserve, which
+/// the floor rule marks as held back by memory. Once fitted, the margin is
+/// the observed one.
+#[test]
+fn a_pre_fit_out_of_memory_window_leaves_the_pool_margin() {
+    let ledger = ledger(16_368, VramBudget::default());
+    let handle = loaded(Some(1000), Some(0));
+    let admission = ledger
+        .register_worker("g/a", item_cost(64), &handle, None)
+        .expect("registers");
+    room(&ledger, &handle, 200 + DEFAULT_RESERVE_CAP_MB);
+    let budgets: Vec<(u64, u64, bool)> = (0..3)
+        .map(|_| room_window(&handle, &admission, OUT_OF_MEMORY))
+        .collect();
+    assert_eq!(budgets, [(64, 200, true), (32, 200, true), (16, 200, true)]);
+    assert_eq!(margin_steps(&ledger, "g/a", GPU), 0);
+
+    room(&ledger, &handle, 15_000);
+    for _ in 0..12 {
+        room_window(&handle, &admission, CLEAN);
+    }
+    let margin = ledger.health()[0].workers[0]
+        .fit
+        .as_ref()
+        .unwrap()
+        .pool_margin;
+    assert!((margin - 1.0).abs() < 1e-9, "{margin}");
+}
+
+/// A window cut to a share of the room, beside another replica that is
+/// asking, was not sized by the room: its failure raises nothing. The same
+/// window alone on the card does.
+#[test]
+fn a_share_cut_by_a_neighbour_leaves_the_pool_margin() {
+    let ledger = ledger(200_000, no_margin());
+    let (handle, admission) = fitted_replica(&ledger, "g/a");
+    let (_, neighbour) = fitted_replica(&ledger, "g/b");
+    room(&ledger, &handle, 2_000);
+
+    neighbour.note_demand(5);
+    assert_eq!(
+        room_window(&handle, &admission, OUT_OF_MEMORY),
+        (100, 1_000, true),
+        "half the room"
+    );
+    assert_eq!(margin_steps(&ledger, "g/a", GPU), 0);
+
+    neighbour.note_demand(0);
+    assert_eq!(
+        room_window(&handle, &admission, OUT_OF_MEMORY),
+        (200, 2_000, true)
+    );
+    assert_eq!(margin_steps(&ledger, "g/a", GPU), 1);
+}
+
+/// At most [`OOM_MARGIN_MAX_STEPS`] raises, never repaid, and never past
+/// the allocator's ceiling.
+#[test]
+fn out_of_memory_windows_raise_the_pool_margin_three_times_at_most() {
+    let (ledger, handle, admission) = at_the_rooms_limit();
+    let mut budgets = Vec::new();
+    for _ in 0..6 {
+        budgets.push(room_window(&handle, &admission, OUT_OF_MEMORY).0);
+        // Repay the deflation, so the room is what sizes the next window.
+        for _ in 0..CLEAN_WINDOWS_TO_RESTORE {
+            room_window(&handle, &admission, CLEAN);
+        }
+    }
+    assert_eq!(budgets, [100, 90, 82, 75, 75, 75], "1000 / (10 × 1.1^k)");
+    assert_eq!(margin_steps(&ledger, "g/a", GPU), OOM_MARGIN_MAX_STEPS);
+    let margin = |worker: usize| {
+        let health = ledger.health();
+        health[0].workers[worker].fit.as_ref().unwrap().pool_margin
+    };
+    assert!((margin(0) - 1.331).abs() < 1e-9, "{}", margin(0));
+
+    // A model whose pool is 1.9 times what it allocates: one raise reaches
+    // the ceiling of 2.0.
+    let wide = loaded(Some(1000), Some(0));
+    let admission = ledger
+        .register_worker("g/wide", item_cost(4), &wide, None)
+        .expect("registers");
+    push_memory(&wide, 190_000, 0);
+    for _ in 0..7 {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let units = token.grant().unit_budget;
+        let batch = BatchMeasurement {
+            peak_reserved_mb: Some(19 * units),
+            ..measurement(units, 0, 10 * units)
+        };
+        wide.lock().unwrap().record_measurements(vec![batch]);
+        token.finish(CLEAN);
+    }
+    room(&ledger, &wide, 1_000);
+    assert_eq!(room_window(&wide, &admission, OUT_OF_MEMORY).0, 52);
+    assert!(
+        (margin(1) - POOL_MARGIN_MAX_CUDA).abs() < 1e-9,
+        "{}",
+        margin(1)
+    );
 }

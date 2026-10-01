@@ -1196,6 +1196,7 @@ mod tests {
             canvas_pixels: None,
             max_tokens: None,
             squeezed,
+            fixed_mb: 0,
             ram_mb: 0,
             ram_reserve_mb: 0,
         }
