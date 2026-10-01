@@ -371,19 +371,26 @@ fn the_16_gib_pair_is_cut_only_where_its_cost_passes_the_headroom() {
 
 /// A 16 GB host with only the CPU device. Host RAM is priced at 1.25 times
 /// the resident growth a batch measured, so at the design cost the pair
-/// settles a fifth under the headroom.
+/// settles a fifth under the headroom. The seed's size runs twice: a
+/// replica's first window is warm-up, which the ramp does not step on.
 #[test]
 fn cold_cpu_replicas_on_a_16_gb_host_stay_inside_the_headroom() {
     let (ledger, mut replicas) = cpu_host(2, 8500, 100);
-    let ran = run(&ledger, &mut replicas, 8500, 5);
-    assert_eq!(ran.units, [[8, 8], [16, 6], [14, 5], [14, 7], [14, 7]]);
-    assert_eq!(ran.fitted, [Some(4), Some(4)]);
-    assert_eq!(ran.over, [-3380, -820, -2100, -1780, -1780]);
+    let ran = run(&ledger, &mut replicas, 8500, 6);
+    assert_eq!(
+        ran.units,
+        [[8, 8], [8, 8], [14, 7], [13, 6], [13, 8], [13, 8]]
+    );
+    assert_eq!(ran.fitted, [Some(5), Some(5)]);
+    assert_eq!(ran.over, [-3380, -3380, -1460, -2100, -1780, -1780]);
 
     let (ledger, mut replicas) = cpu_host(2, 8500, 10);
-    let ran = run(&ledger, &mut replicas, 8500, 5);
-    assert_eq!(ran.units, [[8, 8], [16, 16], [32, 32], [64, 64], [128, 84]]);
-    assert_eq!(ran.fitted, [Some(4), Some(4)]);
+    let ran = run(&ledger, &mut replicas, 8500, 6);
+    assert_eq!(
+        ran.units,
+        [[8, 8], [8, 8], [16, 16], [32, 32], [64, 64], [128, 84]]
+    );
+    assert_eq!(ran.fitted, [Some(5), Some(5)]);
 
     // Four replicas: the last has nothing left in the first window and runs
     // one unit, 220 MiB past the headroom.

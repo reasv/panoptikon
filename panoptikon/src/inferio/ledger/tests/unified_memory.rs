@@ -1451,19 +1451,21 @@ fn a_long_job_of_sampled_mps_windows_holds_at_a_rung_it_measured() {
         "the sampler's peak no longer disqualifies every batch"
     );
     assert_eq!(
-        worker.knee_units,
-        Some(511),
-        "the ring certifies a knee off wd-vit's decline past 256"
+        (worker.held_units, worker.held_certified, worker.knee_units),
+        (Some(128), true, None),
+        "the gate holds on wd-vit's decline from 64 to 128, before the ring \
+         has the three sizes a knee needs"
     );
     assert_eq!(
-        (budgets[0], budgets[3], budgets.iter().copied().max()),
-        (64, 512, Some(512)),
-        "the ramp walked four rungs and the curve stopped it, against the \
-         nine doublings to 19 100 an empty ring never brakes: {:?}",
+        (budgets[0], budgets[2], budgets.iter().copied().max()),
+        (64, 128, Some(128)),
+        "the first size ran twice (its first window is warm-up), the ramp \
+         walked one rung and the curve stopped it, against the nine \
+         doublings to 19 100 an empty ring never brakes: {:?}",
         &budgets[..12]
     );
     let held = *budgets.last().expect("windows");
-    assert_eq!(held, 255, "and settled below the top rung it measured");
+    assert_eq!(held, 128, "and stays at the rung it measured");
     assert!(
         held <= worker.max_units_measured,
         "{held} is a rung that ran (measured up to {})",
@@ -1473,6 +1475,7 @@ fn a_long_job_of_sampled_mps_windows_holds_at_a_rung_it_measured() {
 
 /// Three warm windows ahead of the same job change nothing once the ring
 /// fills; with it empty they would pin the budget at an unmeasured 512.
+/// They and the job hold at 128, where the rate is no better than at 64.
 #[test]
 fn three_warm_windows_do_not_decide_the_budget_for_the_whole_job() {
     let (ledger, handle, admission) = ramping_from_seed(64);
@@ -1485,9 +1488,9 @@ fn three_warm_windows_do_not_decide_the_budget_for_the_whole_job() {
     }
     let worker = &ledger.health()[0].workers[0];
     let held = *budgets.last().expect("windows");
-    assert_eq!(worker.knee_units, Some(255), "a knee either way");
+    assert_eq!(worker.knee_units, None, "no knee either way");
     assert_eq!(
-        held, 255,
+        held, 128,
         "the same rung the job reaches without them, against the 512 \
          `held_units` pinned when nothing behind them measured anything"
     );
@@ -1638,10 +1641,11 @@ fn ramped_mac_replica() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("registers");
     push_ram(&handle, MAC_TOTAL_MB, 90_000, 0, 0);
-    let ramped: Vec<u64> = (0..5)
+    // The first size runs twice: its first window is warm-up.
+    let ramped: Vec<u64> = (0..6)
         .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
         .collect();
-    assert_eq!(ramped, [4, 8, 16, 32, 64]);
+    assert_eq!(ramped, [4, 4, 8, 16, 32, 64]);
     (ledger, handle, admission)
 }
 

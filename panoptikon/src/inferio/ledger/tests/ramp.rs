@@ -2040,6 +2040,13 @@ fn a_queue_sized_window_earns_no_doubling_and_a_full_one_does() {
     assert_eq!(granted, 1, "the ramp sized this one");
     assert_eq!(
         full.health()[0].workers[0].ramp_step,
+        0,
+        "its first window is warm-up, so the size runs once more"
+    );
+    let granted = ramp_window(&handle, &admission, &WDVIT_M3_MAX);
+    assert_eq!(granted, 1);
+    assert_eq!(
+        full.health()[0].workers[0].ramp_step,
         1,
         "and having run at its rung, it earns the next"
     );
@@ -2075,25 +2082,29 @@ fn a_batch_with_no_room_for_the_next_item_counts_as_full() {
     // 1 048 576-pixel images against a 2 000 000-pixel budget; the same
     // shape as 8 192-token texts, two per batch, against 21 000 tokens.
     let image = 1_048_576;
+    // Three such windows: the first is warm-up, and the gate reads two
+    // samples of a size.
     let window = |next_over_budget: bool, window_units: u64| {
         let (ledger, handle, admission) = ramping_from_seed(2_000_000);
-        let token = admission
-            .request_grant(window_units, None, 1, 0)
-            .expect("granted");
-        assert_eq!(token.grant().unit_budget, 2_000_000.min(window_units));
-        handle.lock().unwrap().record_measurements(vec![
-            BatchMeasurement {
-                next_over_budget,
-                ..measurement(image, 0, 110)
-            },
-            BatchMeasurement {
-                next_over_budget,
-                ..warm_batch(image, 100.0)
-            },
-            // The window's last batch: the queue ran out, never flagged.
-            warm_batch(image, 100.0),
-        ]);
-        token.finish(WindowOutcome::Responded { oom: None });
+        for _ in 0..3 {
+            let token = admission
+                .request_grant(window_units, None, 1, 0)
+                .expect("granted");
+            assert_eq!(token.grant().unit_budget, 2_000_000.min(window_units));
+            handle.lock().unwrap().record_measurements(vec![
+                BatchMeasurement {
+                    next_over_budget,
+                    ..measurement(image, 0, 110)
+                },
+                BatchMeasurement {
+                    next_over_budget,
+                    ..warm_batch(image, 100.0)
+                },
+                // The window's last batch: the queue ran out, never flagged.
+                warm_batch(image, 100.0),
+            ]);
+            token.finish(WindowOutcome::Responded { oom: None });
+        }
         let worker = &ledger.health()[0].workers[0];
         (worker.ramp_step, worker.throughput_samples)
     };
@@ -2102,7 +2113,7 @@ fn a_batch_with_no_room_for_the_next_item_counts_as_full() {
         (0, 0),
         "1 048 576 of 2 000 000 is below the floor"
     );
-    assert_eq!(window(true, u64::MAX), (1, 1));
+    assert_eq!(window(true, u64::MAX), (1, 3));
     assert_eq!(
         window(true, 1_900_000).0,
         0,
@@ -2180,7 +2191,7 @@ fn the_ramps_stop_still_holds_a_thousand_windows_later() {
 /// [`RATCHET_FACTOR`] x the anchor, because the exponent stayed put.
 #[test]
 fn a_flat_noisy_curve_neither_creeps_nor_bursts_when_its_knee_is_withdrawn() {
-    for (noise, peak) in [(0.05f64, 15u64), (0.10, 32)] {
+    for (noise, peak) in [(0.05f64, 7u64), (0.10, 16)] {
         let (ledger, handle, admission) = ramping();
         let state = std::cell::Cell::new(0x5eed_1234 + (noise * 1000.0) as u64);
         let rate = |_units: u64| 100.0 * (1.0 - noise + 2.0 * noise * next_unit(&state));
@@ -2233,7 +2244,7 @@ fn heavy_noise_stops_a_barely_rising_curve_in_a_minority_of_runs() {
     for (gain, noise, stopped_early) in [
         (1.44f64, 0.10f64, 0usize),
         (1.20, 0.10, 0),
-        (1.15, 0.10, 8),
+        (1.15, 0.10, 9),
         (1.15, 0.05, 0),
     ] {
         let mut peaks: Vec<u64> = Vec::new();
@@ -2539,4 +2550,50 @@ fn a_queue_sized_window_does_not_wait_for_a_knee_sample() {
     };
     let (budgets, _) = one_batch_windows(15_700, 3, queued, |_| 22.0, Pool::Kept);
     assert_eq!(budgets, [8, 16, 16]);
+}
+
+/// A replica's first window gives only warm-up samples, which the gate does
+/// not read: stepping on it left the first size unmeasured, and a flat rate
+/// unnoticed until two sizes later. The size runs once more instead, so a
+/// model whose rate is flat from its seed is held one size up, and a rising
+/// one loses a window.
+#[test]
+fn a_first_window_of_warm_up_samples_runs_the_size_once_more() {
+    let (_ledger, handle, admission) = ramping_from_seed(64);
+    let flat: Vec<u64> = (0..8)
+        .map(|_| window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0))
+        .collect();
+    assert_eq!(flat, [64, 64, 128, 128, 128, 128, 128, 128]);
+
+    let (_ledger, handle, admission) = ramping_from_seed(64);
+    let rising = |units| ladder_rate(&MINILM_M3_MAX, units);
+    let risen: Vec<u64> = (0..6)
+        .map(|_| window_leaving_warm(&handle, &admission, |_| 2, rising))
+        .collect();
+    assert_eq!(risen, [64, 64, 128, 256, 512, 1024]);
+}
+
+/// A resume from a stored anchor of 128 with no knee, at a flat rate: the
+/// anchor's size runs twice, the ring has nothing below it to compare with,
+/// and the ramp is held there, whether the seed is far below the anchor or
+/// one size below it. It does not double towards the card's limit.
+#[test]
+fn a_resume_from_an_anchor_without_a_knee_is_held_at_the_anchor() {
+    for (seed, warm) in [(64, 2), (64, 1), (4, 2)] {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(seeded_anchor(128, true)),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(seed), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 190_000, 1_000);
+        let budgets: Vec<u64> = (0..12)
+            .map(|_| window_leaving_warm(&handle, &admission, |_| warm, |_| 22.0))
+            .collect();
+        assert_eq!(budgets, [128; 12], "seed {seed}, {warm} warm batches");
+        assert!(ledger.health()[0].workers[0].ramp_held);
+    }
 }

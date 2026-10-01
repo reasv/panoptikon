@@ -1059,6 +1059,9 @@ struct Ingested {
     /// reported it still held after: no batch of that size has run warm yet,
     /// and the next one would.
     left_pool_grown: bool,
+    /// The window's knee samples are all warm-up (the replica's first
+    /// window): none the ramp gate reads.
+    warm_up_only: bool,
     /// Which kind of negative, for the log; all fold into `negative`.
     oom: bool,
     throughput_collapse: bool,

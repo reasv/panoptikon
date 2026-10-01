@@ -311,9 +311,10 @@ fn a_measured_replica_is_priced_from_its_largest_batch() {
 
 /// No batch is priced under a smaller one that measured more, at the pool
 /// margin the replica measured: 4 units allocated 1200 MiB under a pool
-/// twice that, then 8 units 1000. A batch of 16, and one of exactly 4, are
-/// both 2 x 1200. The fall from 4 to 8 units is no negative cost per unit:
-/// 3 units are priced like the 8, 2 x 1000.
+/// twice that, then 8 units 1000. A batch of 8 (the size runs once more,
+/// its first window being warm-up), and one of exactly 4, are both 2 x 1200.
+/// The fall from 4 to 8 units is no negative cost per unit: 3 units are
+/// priced like the 8, 2 x 1000.
 #[test]
 fn no_batch_is_priced_under_a_measured_batch_of_at_most_its_size() {
     for (window_units, mb) in [(u64::MAX, 2400), (4, 2400), (3, 2000)] {
@@ -345,7 +346,7 @@ fn no_batch_is_priced_under_a_measured_batch_of_at_most_its_size() {
         let token = measured
             .request_grant(window_units, None, 1, 0)
             .expect("granted");
-        let units = window_units.min(16);
+        let units = window_units.min(8);
         assert_eq!((token.grant().mb, token.grant().unit_budget), (mb, units));
     }
 }

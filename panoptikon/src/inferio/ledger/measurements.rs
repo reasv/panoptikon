@@ -901,6 +901,7 @@ impl VramLedger {
             filled: !queue_bound && !ram_bound && ran_full,
             throughput_samples,
             left_pool_grown,
+            warm_up_only: warmup_window && throughput_samples > 0,
             oom: saw_oom,
             throughput_collapse: saw_collapse,
             spill: saw_spill,
