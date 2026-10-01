@@ -141,6 +141,16 @@ fn single_item_window(
 /// every batch peaks [`RAM_PER_UNIT_MB`] per unit over [`RSS_AT_LOAD_MB`]
 /// and hands it back after. Returns the grant.
 fn ram_window(handle: &TelemetryHandle, admission: &Admission) -> Grant {
+    ram_window_costing(handle, admission, 0, RAM_PER_UNIT_MB)
+}
+
+/// [`ram_window`] with batches that peak `fixed_mb + per_unit_mb` per unit.
+fn ram_window_costing(
+    handle: &TelemetryHandle,
+    admission: &Admission,
+    fixed_mb: u64,
+    per_unit_mb: u64,
+) -> Grant {
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
@@ -148,7 +158,7 @@ fn ram_window(handle: &TelemetryHandle, admission: &Admission) -> Grant {
     let units = grant.unit_budget;
     let rate = ladder_rate(&RISING, units);
     let host_ram = |batch: BatchMeasurement| BatchMeasurement {
-        peak_rss_mb: Some(RSS_AT_LOAD_MB + RAM_PER_UNIT_MB * units),
+        peak_rss_mb: Some(RSS_AT_LOAD_MB + fixed_mb + per_unit_mb * units),
         rss_after_mb: Some(RSS_AT_LOAD_MB),
         ..batch
     };
@@ -634,6 +644,70 @@ fn the_ram_cost_is_the_fixed_part_plus_an_upper_per_unit_cost() {
         Some((0.0, 10.0, true, 40)),
         "a negative fixed part is 0"
     );
+}
+
+/// A fit from small batches prices at most twice the largest at its fitted
+/// figures. A larger batch books the measured batches' whole growth per
+/// unit, so a per-unit cost the fit read as fixed is not left out.
+#[test]
+fn a_fit_from_small_batches_does_not_price_a_far_larger_batch() {
+    let sample = |units, delta_mb| FitSample { units, delta_mb };
+    // Two and four items after a first batch of one: 223 MiB + 40 per unit.
+    let small = [sample(2, 303), sample(4, 383)];
+    let cost = ram_cost(&small, 1, 0).expect("a cost");
+    assert_eq!((cost.fixed_mb, cost.mb_per_unit), (223.0, 40.0));
+    assert_eq!((cost.fitted, cost.fitted_reach()), (true, 8));
+    assert_eq!(cost.whole_mb_per_unit, 151.5, "303 MiB over 2 units");
+    assert_eq!(cost.booking_mb(8), 223 + 8 * 40);
+    // 192 units that grow 9 700 MiB: 7 903 at the fitted figures.
+    assert_eq!(cost.booking_mb(192), 223 + 29_088);
+    // 10 000 MiB of room holds 64 units at the whole rate, not the 244 the
+    // fitted figures would admit; little room still holds the fitted reach.
+    assert_eq!(cost.units_within(10_000.0), 64);
+    assert_eq!(cost.units_within(700.0), 8);
+    assert_eq!(cost.units_within(100.0), 1);
+
+    // Measured at 192, the fitted figures reach 384.
+    let grown = [sample(2, 303), sample(4, 383), sample(192, 9_923)];
+    let cost = ram_cost(&grown, 1, 0).expect("a cost");
+    assert_eq!(cost.fitted_reach(), 384);
+    assert_eq!(
+        cost.booking_mb(384),
+        (cost.fixed_mb + 384.0 * cost.mb_per_unit).ceil() as u64
+    );
+    assert!(cost.booking_mb(385) > 385 * 51);
+
+    // One size: the fixed part is already priced per unit.
+    let one = ram_cost(&[sample(8, 280)], 0, 0).expect("a cost");
+    assert_eq!(one.whole_mb_per_unit, one.mb_per_unit);
+}
+
+/// Under tight host RAM the batch still grows window by window to what the
+/// RAM holds: each window is priced from the largest batch measured so far,
+/// and none books less than it uses.
+#[test]
+fn a_cost_measured_at_small_batches_does_not_stall_the_ramp() {
+    const FIXED: u64 = 200;
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = cold_gpu_replica(&ledger, "g/far", GPU, item_cost(64));
+    measure_ram_cost(&handle, &admission, FIXED, RAM_PER_UNIT_MB);
+    // 3 000 MiB to book: 280 units at 200 MiB + 10 per unit.
+    cpu_free_to_book(&ledger, 3_000);
+    let mut sizes = Vec::new();
+    for _ in 0..6 {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let units = token.grant().unit_budget;
+        let booked = row(&ledger, "g/far").ram_booked_mb;
+        assert!(booked >= FIXED + RAM_PER_UNIT_MB * units, "{units} units");
+        assert!(booked <= 3_000, "{units} units booked {booked}");
+        drop(token);
+        sizes.push(ram_window_costing(&handle, &admission, FIXED, RAM_PER_UNIT_MB).unit_budget);
+    }
+    // 25 at the whole rate, then doubling (the ratchet over the largest
+    // batch run) up to what the RAM holds.
+    assert_eq!(sizes, [25, 50, 100, 200, 280, 280]);
 }
 
 /// Start-up growth and cost per unit of the retention tests' model.

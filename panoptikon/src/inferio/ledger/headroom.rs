@@ -99,14 +99,14 @@ impl VramLedger {
         let headroom = self.overdraft_with_margin_locked(state, cpu::DEVICE_KEY, margin);
         let credit = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
         let room = (headroom + i128::from(credit)).max(0) as f64;
-        let mut units = ((room - cost.fixed_mb) / cost.mb_per_unit).floor().max(1.0) as u64;
+        let mut units = cost.units_within(room);
         // An item-capped window keeps the seed's unit budget; a one-size
         // cost prices no batch past twice the size it was measured at.
         if Self::item_cap_locked(state, entry).is_some() {
             units = units.min(entry.seed_units.max(1));
         }
         if !cost.fitted {
-            units = units.min(cost.measured_units.saturating_mul(RATCHET_FACTOR));
+            units = units.min(cost.fitted_reach());
         }
         Some(RamCeiling {
             units,

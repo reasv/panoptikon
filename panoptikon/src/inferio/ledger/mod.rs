@@ -523,21 +523,43 @@ struct RamCeiling {
 }
 
 /// What a GPU replica's batch books in host RAM: `fixed_mb + units ×
-/// mb_per_unit` ([`measurements::ram_cost`]).
+/// mb_per_unit` ([`measurements::ram_cost`]), up to
+/// [`Self::fitted_reach`]; a larger batch books `whole_mb_per_unit` per unit.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct RamCost {
     fixed_mb: f64,
     mb_per_unit: f64,
+    /// The costliest measured growth per unit with no fixed part taken out;
+    /// never below `mb_per_unit`.
+    whole_mb_per_unit: f64,
     /// From two sizes or more. From one size it prices item-capped windows,
-    /// and after those at most [`RATCHET_FACTOR`] × `measured_units`.
+    /// and after those at most [`Self::fitted_reach`].
     fitted: bool,
     /// The largest batch it was measured at.
     measured_units: u64,
 }
 
 impl RamCost {
+    /// The largest batch the fitted figures price: [`RATCHET_FACTOR`] × the
+    /// largest measured.
+    fn fitted_reach(&self) -> u64 {
+        self.measured_units.saturating_mul(RATCHET_FACTOR)
+    }
+
     fn booking_mb(&self, units: u64) -> u64 {
-        (self.fixed_mb + units as f64 * self.mb_per_unit).ceil() as u64
+        let per_unit = if units > self.fitted_reach() {
+            self.whole_mb_per_unit
+        } else {
+            self.mb_per_unit
+        };
+        (self.fixed_mb + units as f64 * per_unit).ceil() as u64
+    }
+
+    /// The largest batch whose booking fits `room_mb`, at least one unit.
+    fn units_within(&self, room_mb: f64) -> u64 {
+        let over = room_mb - self.fixed_mb;
+        let fitted = ((over / self.mb_per_unit).floor().max(1.0) as u64).min(self.fitted_reach());
+        fitted.max((over / self.whole_mb_per_unit).floor().max(0.0) as u64)
     }
 }
 
