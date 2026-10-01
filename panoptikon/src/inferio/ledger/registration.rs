@@ -908,6 +908,14 @@ impl Admission {
         self.ledger.window_item_bound(self.worker)
     }
 
+    /// The item cap in force ([`VramLedger::item_cap_locked`]).
+    #[cfg(test)]
+    pub(super) fn item_cap(&self) -> Option<u32> {
+        let state = self.ledger.lock();
+        let entry = state.workers.get(&self.worker)?;
+        VramLedger::item_cap_locked(&state, entry)
+    }
+
     /// [`Self::request_grant_byte_bound`] with `byte_bound = false`.
     #[cfg(test)]
     pub fn request_grant(

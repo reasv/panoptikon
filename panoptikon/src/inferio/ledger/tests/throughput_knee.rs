@@ -1098,13 +1098,6 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
     );
     assert!(
         !knee_admits_window(&GrantCharge {
-            item_cap: Some(4),
-            ..honest
-        }),
-        "an item cap set the size"
-    );
-    assert!(
-        !knee_admits_window(&GrantCharge {
             pressure: mps::MemoryPressure::Warning,
             ..honest
         }),

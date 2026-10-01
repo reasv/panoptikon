@@ -510,9 +510,8 @@ struct GrantCharge {
     /// do not count toward [`OOM_WINDOWS_AT_FLOOR`].
     pressure: mps::MemoryPressure,
     /// Items per batch while the replica's host RAM cost is not measured at
-    /// two sizes ([`VramLedger::item_cap_locked`]). Such a window's batches
-    /// measure memory only: the RAM cost and the GPU fit, with no anchor,
-    /// ramp step, knee sample or warm-up count.
+    /// two sizes ([`VramLedger::item_cap_locked`]). It only limits the
+    /// batch: to the GPU side the window is a window of that size.
     item_cap: Option<u32>,
 }
 

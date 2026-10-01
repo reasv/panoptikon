@@ -3,14 +3,11 @@
 use super::*;
 
 /// Whether a window's batches may feed the knee ring: not when it ran
-/// unpriced (`mb == 0`), host RAM set its budget, it was item-capped, or it
-/// ran under memory pressure. A squeezed window is admitted; its budget is
-/// what the card ran. Excluded windows still feed the cost fit.
+/// unpriced (`mb == 0`), host RAM set its budget, or it ran under memory
+/// pressure. A squeezed window is admitted; its budget is what the card ran.
+/// Excluded windows still feed the cost fit.
 pub(super) fn knee_admits_window(charge: &GrantCharge) -> bool {
-    charge.mb > 0
-        && !charge.ram_bound
-        && charge.item_cap.is_none()
-        && charge.pressure == mps::MemoryPressure::Normal
+    charge.mb > 0 && !charge.ram_bound && charge.pressure == mps::MemoryPressure::Normal
 }
 
 /// Add a fit sample to a ring holding at most one per distinct `units`, so a
@@ -603,11 +600,8 @@ impl VramLedger {
             let high_water = grew_pool == Some(true);
             let warm = grew_pool == Some(false);
             // Every batch that ran counts toward the warm-up, except negatives
-            // and dropped collapses (skipped above), and item-capped batches:
-            // to the ramp and the knee the next window is the replica's first.
-            if !item_capped {
-                ran_batches = ran_batches.saturating_add(1);
-            }
+            // and dropped collapses (skipped above).
+            ran_batches = ran_batches.saturating_add(1);
             // Knee samples (units/sec) exclude negatives, unpriced batches,
             // batches with no allocator reading or a growing pool, batches below
             // the full-batch floor, and clamped batches. All still feed the fit.
@@ -641,13 +635,9 @@ impl VramLedger {
                     units,
                     delta_mb: peak.saturating_sub(at_load),
                 });
-                // An item-capped batch is small by the host RAM rule: it is a
-                // fit sample, but no size the ratchet may hold the ramp to.
-                if !item_capped {
-                    anchor = anchor.max(units);
-                    ran_full |= budget_floor
-                        .is_some_and(|floor| units >= floor || measurement.next_over_budget);
-                }
+                anchor = anchor.max(units);
+                ran_full |= budget_floor
+                    .is_some_and(|floor| units >= floor || measurement.next_over_budget);
             }
             // Pool-over-allocated ratio, only where the pool grew and the delta
             // reaches [`POOL_MARGIN_MIN_DELTA_MB`].
@@ -770,9 +760,7 @@ impl VramLedger {
         }
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.fit_watermark = new_watermark;
-            if !item_capped {
-                entry.settled_windows = entry.settled_windows.saturating_add(1);
-            }
+            entry.settled_windows = entry.settled_windows.saturating_add(1);
             entry.ran_batches = ran_batches;
             // Doubled after a batch that filled it. It ends once it would
             // hold a seed batch: from there the unit budget bounds the batch

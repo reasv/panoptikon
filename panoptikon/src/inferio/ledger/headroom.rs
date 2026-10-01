@@ -26,9 +26,10 @@ pub(super) struct PreFitPrice {
 }
 
 impl PreFitPrice {
-    /// A batch of this model measured growth on this device.
-    pub(super) fn is_measured(&self) -> bool {
-        !self.measured.is_empty()
+    /// Two batch sizes of this model measured growth on this device, so
+    /// [`Self::per_unit`] is a measured rise, not the design figure.
+    pub(super) fn has_measured_rise(&self) -> bool {
+        self.measured.len() >= 2
     }
 
     /// The price of a batch of `units`, rounded up: the largest measured
