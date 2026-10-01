@@ -752,6 +752,7 @@ impl VramLedger {
                 windows_queue_bound: 0,
                 hold_announced: false,
                 hold_reprobe_windows: 0,
+                pressure_units: None,
                 deflation: 0,
                 deflation_repaid_at: None,
                 clean_windows: 0,

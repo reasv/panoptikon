@@ -76,6 +76,41 @@ fn oom_at_the_one_item_floor_declares_the_replica_unrunnable() {
     );
 }
 
+/// Under memory pressure every window is one item with no room, so an
+/// out-of-memory failure there says nothing about whether the model fits:
+/// it does not count toward [`OOM_WINDOWS_AT_FLOOR`], and does not clear it.
+#[test]
+fn an_oom_under_memory_pressure_does_not_condemn_the_replica() {
+    let ledger = ledger(10_000, no_margin());
+    let handle = loaded(Some(9_900), Some(0));
+    let admission = ledger
+        .register_worker("g/big", item_cost(4), &handle, None)
+        .expect("registers");
+    push_memory(&handle, 0, 0);
+    ledger.ingest_all_for_test();
+    let oom_window = || {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().unit_budget, 1);
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        })
+    };
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
+    for _ in 0..(2 * OOM_WINDOWS_AT_FLOOR) {
+        assert!(oom_window().is_none(), "pressure explains it");
+    }
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
+    for window in 1..=OOM_WINDOWS_AT_FLOOR {
+        assert_eq!(
+            oom_window().is_some(),
+            window == OOM_WINDOWS_AT_FLOOR,
+            "counted from zero once the pressure is gone"
+        );
+    }
+}
+
 /// Once the model is resident its memory is ours and `external` falls, so a
 /// one-item window gets a nominal share and still runs out of memory: the
 /// room against one item's cost says the replica is at its floor.

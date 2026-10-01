@@ -490,8 +490,9 @@ struct GrantCharge {
     /// step and feeds no knee.
     ram_bound: bool,
     /// macOS reported memory pressure while this window was out: it earns no
-    /// ramp step, feeds no knee, and its throughput-collapse flags are
-    /// ignored, since swapping explains any rate it ran at.
+    /// ramp step, feeds no knee, its throughput-collapse flags are ignored
+    /// and its out-of-memory failures do not count toward
+    /// [`OOM_WINDOWS_AT_FLOOR`], since the pressure explains them.
     pressure: bool,
     /// Items per batch while the replica's host RAM cost is not measured at
     /// two sizes ([`VramLedger::item_cap_locked`]).
@@ -607,6 +608,9 @@ struct WorkerEntry {
     hold_announced: bool,
     /// Clean windows towards widening the hold ([`HOLD_REPROBE_WINDOWS`]).
     hold_reprobe_windows: u32,
+    /// The unit budget this replica ran at under memory pressure, capping it
+    /// until it has grown back ([`VramLedger::note_pressure_size_locked`]).
+    pressure_units: Option<u64>,
     /// Halvings applied by deflation. Runtime-only, reset on respawn.
     deflation: u32,
     /// When deflation was last applied or repaid by time; `None` at 0.

@@ -33,8 +33,22 @@ pub(super) fn ramp_floor_step(seed_units: u64, anchor: u64) -> u32 {
 /// `anchor` (the largest clean priced batch measured) floors the ramp exponent
 /// and, times [`RATCHET_FACTOR`], caps the budget; `anchor == 0` disables the
 /// cap. `knee` and `ceiling` ([`ShapeCeiling`]) are further `min`s applied
-/// before deflation.
+/// before deflation. Last, the size memory pressure left the replica at
+/// ([`WorkerEntry::pressure_units`]).
 pub(super) fn admitted_units(
+    entry: &WorkerEntry,
+    anchor: u64,
+    knee: Option<u64>,
+    ceiling: Option<u64>,
+) -> u64 {
+    let admitted = units_before_pressure(entry, anchor, knee, ceiling);
+    entry
+        .pressure_units
+        .map_or(admitted, |held| admitted.min(held))
+}
+
+/// [`admitted_units`] without the size memory pressure left the replica at.
+fn units_before_pressure(
     entry: &WorkerEntry,
     anchor: u64,
     knee: Option<u64>,
@@ -84,6 +98,43 @@ fn ramped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
 }
 
 impl VramLedger {
+    /// Keep a replica at the size it ran under memory pressure, and let it
+    /// grow back from there by the ramp's own step. A pressure window that
+    /// memory or the ramp sized (not the queue) records its unit budget as
+    /// [`WorkerEntry::pressure_units`]; afterwards each clean window that
+    /// `filled` its budget doubles it, until it reaches what the ramp admits.
+    pub(super) fn note_pressure_size_locked(
+        state: &mut LedgerState,
+        worker: WorkerId,
+        charge: GrantCharge,
+        filled: bool,
+    ) {
+        let Some(entry) = state.workers.get(&worker) else {
+            return;
+        };
+        let held = if charge.pressure {
+            if charge.queue_bound && !charge.squeezed {
+                return;
+            }
+            Some(charge.unit_budget)
+        } else {
+            let Some(held) = entry.pressure_units.filter(|_| filled) else {
+                return;
+            };
+            let grown = held.saturating_mul(2);
+            let admitted = units_before_pressure(
+                entry,
+                Self::anchor_locked(state, entry),
+                Self::knee_locked(state, entry),
+                Self::shape_ceiling_locked(state, entry),
+            );
+            (grown < admitted).then_some(grown)
+        };
+        if let Some(entry) = state.workers.get_mut(&worker) {
+            entry.pressure_units = held;
+        }
+    }
+
     /// [`RampGate`] for this replica's (model, GPU), from the knee ring's
     /// sole-occupancy samples.
     pub(super) fn ramp_gate_locked(

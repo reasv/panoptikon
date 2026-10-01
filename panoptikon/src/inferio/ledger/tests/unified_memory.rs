@@ -1563,63 +1563,64 @@ fn the_pool_is_in_the_room_and_in_the_charge_so_only_free_ram_is_admitted() {
     token.finish(WindowOutcome::Responded { oom: None });
 }
 
-/// Under macOS memory pressure the reading leaves nothing available, so a
-/// replica's grant is cut to the pool it already holds: it stops growing even
-/// where its ramp would double. Those windows earn no ramp step, feed no knee
-/// and deflate nothing, since swapping explains any rate they ran at. When
-/// pressure ends the ramp resumes where it stood.
-#[test]
-fn under_memory_pressure_a_grant_fits_the_pool_held_and_the_ramp_waits() {
-    const TOTAL: u64 = 110_100;
+/// A Mac replica ramped 4 → 64 on an idle machine, its next budget 128.
+fn ramped_mac_replica() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
     let ledger = mps_ledger();
-    let handle = loaded_mps(Some(TOTAL));
+    let handle = loaded_mps(Some(MAC_TOTAL_MB));
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("registers");
-    push_ram(&handle, TOTAL, 90_000, 0, 0);
+    push_ram(&handle, MAC_TOTAL_MB, 90_000, 0, 0);
     let ramped: Vec<u64> = (0..5)
         .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
         .collect();
     assert_eq!(ramped, [4, 8, 16, 32, 64]);
-    // `(ramp_step, deflation, throughput_samples, unit_budget)`.
-    let worker = || {
-        let health = ledger.health();
-        let worker = &health[0].workers[0];
-        (
-            worker.ramp_step,
-            worker.deflation,
-            worker.throughput_samples,
-            worker.unit_budget,
-        )
-    };
-    let (step, _, samples, budget) = worker();
-    assert_eq!(budget, 128, "the ramp's next size");
-    // The largest window's batch left 10 MiB a unit plus 100 in the pool.
-    let pool = 10 * 64 + 100;
+    (ledger, handle, admission)
+}
 
+/// `recommended_max_memory()` of the Mac in [`ramped_mac_replica`].
+const MAC_TOTAL_MB: u64 = 110_100;
+
+/// `(ramp_step, deflation, throughput_samples, unit_budget)` of the replica.
+fn ramp_figures(ledger: &Arc<VramLedger>) -> (u32, u32, usize, u64) {
+    let health = ledger.health();
+    let worker = &health[0].workers[0];
+    (
+        worker.ramp_step,
+        worker.deflation,
+        worker.throughput_samples,
+        worker.unit_budget,
+    )
+}
+
+/// While the Mac pages under memory pressure the reading leaves nothing
+/// available, so a grant is cut to the pool the replica holds. Those windows
+/// earn no ramp step, feed no knee and deflate nothing. Afterwards the batch
+/// grows back from the size it ran at by doubling, not in one jump.
+#[test]
+fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
+    let (ledger, handle, admission) = ramped_mac_replica();
+    let (step, _, samples, budget) = ramp_figures(&ledger);
+    assert_eq!(budget, 128, "the ramp's next size");
+
+    // The worker reads 0 available and holds 80 MiB of pool: 8 units.
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
-    push_ram(&handle, TOTAL, 0, pool, 0);
-    for _ in 0..3 {
+    push_ram(&handle, MAC_TOTAL_MB, 0, 80, 0);
+    for window in 0..3 {
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
         let grant = *token.grant();
-        assert!(grant.squeezed, "memory held it back");
-        assert!(
-            grant.mb <= pool,
-            "{} MiB granted from a {pool} MiB pool",
-            grant.mb
-        );
-        assert!(grant.unit_budget < 128, "{}", grant.unit_budget);
+        assert_eq!((grant.unit_budget, grant.mb), (8, 80));
+        assert_eq!(grant.squeezed, window == 0, "cut once, then held there");
         // A warm batch, then collapses the pool growth would corroborate on
         // an idle machine.
-        let units = grant.unit_budget;
-        let mut batches = vec![measurement(units, 0, grant.mb), warm_batch(units, 100.0)];
-        batches.extend((2..WINDOW_DEPTH_MULTIPLIER).map(|_| spilled_past_free(units, 100.0, 0)));
+        let mut batches = vec![measurement(8, 0, 80), warm_batch(8, 100.0)];
+        batches.extend((2..WINDOW_DEPTH_MULTIPLIER).map(|_| spilled_past_free(8, 100.0, 0)));
         handle.lock().unwrap().record_measurements(batches);
         token.finish(WindowOutcome::Responded { oom: None });
     }
-    let (step_during, deflation, samples_during, _) = worker();
+    let (step_during, deflation, samples_during, _) = ramp_figures(&ledger);
     assert_eq!(step_during, step, "no window earned a step");
     assert_eq!(deflation, 0, "no collapse was counted");
     assert_eq!(samples_during, samples, "no rate reached the knee ring");
@@ -1630,29 +1631,73 @@ fn under_memory_pressure_a_grant_fits_the_pool_held_and_the_ramp_waits() {
         "a size run under pressure is not one the ramp reached"
     );
 
-    // Pressure that begins while a window is out taints that window too.
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
-    push_ram(&handle, TOTAL, 90_000, pool, 0);
-    let token = admission
-        .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
+    push_ram(&handle, MAC_TOTAL_MB, 90_000, 80, 0);
+    // A window the queue sized did not fill the size, so it earns no doubling.
+    queued_window_at_the_rate(&handle, &admission, 3, |_| 100.0);
+    assert_eq!(ramp_figures(&ledger).3, 8);
+    let regrown: Vec<u64> = (0..6)
+        .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
+        .collect();
     assert_eq!(
-        token.grant().unit_budget,
-        128,
-        "growth resumes where it stood"
+        regrown,
+        [8, 16, 32, 64, 128, 256],
+        "from the size it was cut to, one doubling per full window"
     );
-    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Critical);
-    let rate = ladder_rate(&MINILM_M3_MAX, 128);
-    let mut batches = vec![BatchMeasurement {
-        duration_ms: Some(128.0 * 1000.0 / rate),
-        ..measurement(128, 0, 10 * 128 + 100)
-    }];
-    batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| warm_batch(128, rate)));
-    handle.lock().unwrap().record_measurements(batches);
-    token.finish(WindowOutcome::Responded { oom: None });
-    assert_eq!(
-        worker().0,
-        step,
-        "a window that ended under pressure earns no step either"
-    );
+}
+
+/// At warning with memory still available (nothing is being paged out) the
+/// replica keeps the size it had: no shrink, no growth, no ramp step, no
+/// knee sample. Growth resumes from that size when the pressure ends.
+#[test]
+fn at_warning_without_paging_the_batch_size_is_held() {
+    let (ledger, handle, admission) = ramped_mac_replica();
+    let (step, _, samples, _) = ramp_figures(&ledger);
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
+    let held: Vec<u64> = (0..3)
+        .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
+        .collect();
+    assert_eq!(held, [128, 128, 128], "the budget in force, and no more");
+    let (step_during, _, samples_during, _) = ramp_figures(&ledger);
+    assert_eq!(step_during, step);
+    assert_eq!(samples_during, samples);
+
+    // A queue-sized window under pressure does not lower the held size.
+    queued_window_at_the_rate(&handle, &admission, 5, |_| 100.0);
+    assert_eq!(ramp_figures(&ledger).3, 128);
+
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
+    let after: Vec<u64> = (0..2)
+        .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
+        .collect();
+    assert_eq!(after, [128, 256]);
+}
+
+/// Pressure at either end of a window marks it: at the grant only, or at the
+/// settle only.
+#[test]
+fn a_window_under_pressure_at_either_end_earns_no_step() {
+    use mps::MemoryPressure::{Critical, Normal, Warning};
+    for (at_grant, at_settle) in [(Warning, Normal), (Normal, Critical)] {
+        let (ledger, handle, admission) = ramped_mac_replica();
+        let step = ramp_figures(&ledger).0;
+        ledger.set_memory_pressure_for_test(at_grant);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        ledger.set_memory_pressure_for_test(at_settle);
+        let rate = ladder_rate(&MINILM_M3_MAX, 128);
+        let mut batches = vec![BatchMeasurement {
+            duration_ms: Some(128.0 * 1000.0 / rate),
+            ..measurement(128, 0, 10 * 128 + 100)
+        }];
+        batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| warm_batch(128, rate)));
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            ramp_figures(&ledger).0,
+            step,
+            "{at_grant:?} at the grant, {at_settle:?} at the settle"
+        );
+    }
 }

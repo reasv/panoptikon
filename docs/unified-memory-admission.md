@@ -265,32 +265,49 @@ Single synthetic device:
   side. The refresh is **triggered by a grant request**, so an idle host
   publishes its seeded inventory on `/health` with `external_mb: 0` and
   `external_known: false` until the first window dispatches.
-- **Memory pressure: nothing is available.** The same call site reads
-  `kern.memorystatus_vm_pressure_level` (1 normal, 2 warning, 4 critical), and
-  at warning or worse `ram_available` is **0**. Under pressure macOS
-  compresses and swaps anonymous memory while it keeps file-backed pages —
-  about 9 GiB on the M3 Max while it swapped 20–38 GiB — so the formula above
-  still offered 8–10 GiB that did not exist. With 0 available, `external` is
-  everything but our own residents, and `limit` is what they already hold
-  less the reserve:
-  - a grant is cut to the replica's own free pool (the squeeze path), and the
-    worker's live clamp, which reads the same 0, cuts each batch to the pool
-    it holds (`releasable_pool_mb`); a replica with no pool runs one unit;
-  - a squeezed grant asks idle residents for their pools (the trim path);
-    under **critical** pressure the sweep releases any resident idle for
-    `IDLE_BEFORE_TRIM` without waiting out `IDLE_POOL_RELEASE`;
-  - the ledger reads the level itself at grant and at settle, and a window
-    under pressure at either end earns no ramp step, feeds no knee, does not
-    count as the size the ramp reached, and its throughput-collapse flags are
-    ignored: swapping explains any rate it ran at.
+- **Memory pressure: shrink while the Mac pages, hold otherwise.** The same
+  call site reads `kern.memorystatus_vm_pressure_level` (1 normal, 2 warning,
+  4 critical). Warning means a large share of memory is held compressed; it
+  does not mean anything is being paged out now (an idle neighbour that was
+  compressed minutes ago keeps the level at warning with GiBs free). So the
+  reading asks a second question, **is the kernel paging**: the `swapouts`
+  counter of the same `vm_statistics64` rose since the previous reading or
+  within the 10 s before this one (`PAGING_WINDOW` / `MAC_PAGING_SECONDS`,
+  one remembered counter per process; a first reading cannot tell and is not
+  paging).
+  - **Critical, or warning while paging: `ram_available` is 0.** macOS keeps
+    file-backed pages while it swaps — about 9 GiB on the M3 Max while it
+    swapped 20–38 GiB — so the formula still offered 8–10 GiB that did not
+    exist. With 0 available, `external` is everything but our own residents
+    and `limit` is what they hold less the reserve: a grant is cut to the
+    replica's own free pool (the squeeze path), and the worker's live clamp,
+    which reads the same 0, cuts each batch to the pool it holds
+    (`releasable_pool_mb`); a replica with no pool runs one unit. A squeezed
+    grant asks idle residents for their pools (the trim path).
+  - **Warning without paging: the formula stands**, and the replica keeps the
+    unit budget it had.
+  - **Any pressure window** (the ledger reads the level itself at grant and
+    at settle; pressure at either end counts) earns no ramp step, feeds no
+    knee, does not count as the size the ramp reached or toward a knee's
+    expiry, and its throughput-collapse flags are ignored. Its out-of-memory
+    failures still deflate, but do not count toward `OOM_WINDOWS_AT_FLOOR`:
+    under pressure every window is one unit with no room, and three failures
+    there would refuse the model for the rest of the run.
+  - **The size it ran at is kept** (`WorkerEntry::pressure_units`, set by each
+    pressure window that memory or the ramp sized, not the queue) and caps
+    the unit budget from then on. Once the level is normal, each clean window
+    that filled the cap doubles it, and it lifts on reaching what the ramp
+    admits. The batch therefore grows back by the ramp's own step instead of
+    returning at once to the size that may have tipped the machine.
+  - Under **critical** pressure the sweep releases any resident idle for
+    `IDLE_BEFORE_TRIM` without waiting out `IDLE_POOL_RELEASE`.
 
-  When the level returns to normal the ordinary reading applies again and the
-  ramp resumes where it stood. The CPU device on a Mac reads the same RAM
-  (`cpu.rs` delegates to `mps.rs`, the worker's `ram` source to
-  `mac_available_bytes`), so CPU replicas shrink the same way; its batches
-  have no pool to reuse and run at one unit while the pressure lasts. Linux
-  and Windows readings are unchanged. Loads are not refused under pressure:
-  refusal on a unified device is judged against capacity.
+  The CPU device on a Mac reads the same RAM (`cpu.rs` delegates to `mps.rs`,
+  the worker's `ram` source to `mac_available_bytes`), so CPU replicas follow
+  the same rule; their batches have no pool to reuse and run at one unit
+  while the Mac pages. Linux and Windows readings are unchanged. Loads are
+  not refused under pressure: refusal on a unified device is judged against
+  capacity.
 - **External usage is summed in the RAM domain.** `free` above is
   clipped to a `total` that is `recommended_max_memory()`, so the shipped
   `external = total − free − Σ ours` is arithmetic in two currencies and loses

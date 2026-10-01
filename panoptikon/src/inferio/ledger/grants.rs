@@ -498,6 +498,10 @@ impl VramLedger {
                     };
                 }
             }
+            if let Some(charge) = charge {
+                let filled = !negative && ingested.at_budget;
+                Self::note_pressure_size_locked(&mut state, worker, charge, filled);
+            }
             Self::reprobe_hold_locked(&mut state, worker, charge, negative);
             Self::log_ramp_hold_locked(&mut state, worker, gate, knee_binds);
             knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
