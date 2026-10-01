@@ -20,6 +20,12 @@
 //!                    priced window content)
 //! ```
 //!
+//! On the CPU device `reserved` is the live resident set and no growth is
+//! reusable: `charge(w) = footprint(w) + Σ grants(w)` and `room(w) = headroom`.
+//! Its reserve is never below [`cpu::ram_reserve_mb`]. A replica whose process
+//! dies mid-window there, or with host RAM booked, caps later batches of its
+//! (model, device) at half that batch ([`VramLedger::note_death_locked`]).
+//!
 //! A worker with no reported base contributes only growth; the rest of its
 //! memory reads as `external`. A unit budget never exceeds the ramp or
 //! [`RATCHET_FACTOR`] × the anchor (the largest clean batch run here, or
@@ -46,7 +52,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
-use super::cost::{CostAggregation, CostDimension, CostUnit};
+use super::cost::{CostAggregation, CostDimension, CostUnit, SEED_BUDGET_MB};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
 use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle, TrimReply};
 use super::{cpu, gpu, mps, worker};
@@ -80,7 +86,7 @@ use oom::{
     pool_grew_past_free,
 };
 pub use oom::{ErrorFrameOom, UnrunnableReplica, message_oom_tier};
-use ramp::{admitted_units, deflation_cap, ramp_floor_step, uncapped_units};
+use ramp::{deflation_cap, ramp_floor_step, uncapped_units};
 pub use registration::Admission;
 use registration::GpuLog;
 use throughput_knee::{
@@ -135,6 +141,11 @@ pub const CLEAN_WINDOWS_TO_RESTORE: u32 = 3;
 /// Consecutive one-item out-of-memory windows, with less room than one item,
 /// after which a replica is declared unable to run on this GPU.
 pub const OOM_WINDOWS_AT_FLOOR: u32 = CLEAN_WINDOWS_TO_RESTORE;
+
+/// How long a verdict reached by worker deaths refuses the model's loads; the
+/// strike count outlives it, so one more death at one unit refuses it again.
+/// The default ceiling of the load-failure cooldown.
+pub const DEATH_VERDICT_LAPSE: Duration = Duration::from_secs(300);
 
 /// Wall time that repays one level of deflation, for a replica too idle to
 /// earn clean windows.
@@ -251,6 +262,7 @@ const MAX_IDLE_TRIMS_PER_SWEEP: usize = 8;
 const TRIM_TRIGGER_SQUEEZED: &str = "squeezed";
 const TRIM_TRIGGER_IDLE: &str = "idle";
 const TRIM_TRIGGER_ALLOC_RETRIES: &str = "alloc_retries";
+const TRIM_TRIGGER_PRESSURE: &str = "memory_pressure";
 
 /// A measurement's `regrow_after` for a release the host asked for (the
 /// worker's own is `shrink`); only these reach `/health`.
@@ -323,6 +335,7 @@ impl VramBudget {
 pub const RESERVE_RULE_USER_MARGIN: &str = "user_margin";
 pub const RESERVE_RULE_CAPPED_DEFAULT: &str = "capped_default";
 pub const RESERVE_RULE_FLAT_DEFAULT: &str = "flat_default";
+pub const RESERVE_RULE_RAM_FLOOR: &str = "ram_floor";
 
 /// Budget settings: a default plus per-GPU overrides keyed by UUID. Profiles
 /// describe an architecture; a budget describes this host's use of one GPU.
@@ -448,9 +461,11 @@ pub enum WindowOutcome {
     Responded { oom: Option<ErrorFrameOom> },
     /// Aborted before a response: nothing is learned.
     Aborted,
-    /// The worker process died. Accounted as aborted, except on a
-    /// unified-memory device, where it is also a negative sample (an OOM kill
-    /// is a SIGKILL).
+    /// The worker process stopped answering with the window in flight: killed
+    /// (by the kernel or anyone but the gateway) or crashed. Accounted as
+    /// aborted, except that on a unified-memory device it is also a negative
+    /// sample (an OOM kill is a SIGKILL), and there or with host RAM booked
+    /// it caps later batches ([`VramLedger::note_death_locked`]).
     WorkerDied,
 }
 
@@ -488,6 +503,18 @@ struct GrantCharge {
     /// Host RAM, not the GPU, set this window's unit budget: it earns no ramp
     /// step and feeds no knee.
     ram_bound: bool,
+    /// macOS's memory pressure while this window was out, the higher of its
+    /// grant and its settle. Above normal the window earns no ramp step,
+    /// feeds no knee, and its throughput-collapse flags are ignored. While
+    /// paging it also sets the [`PressureCap`] and its out-of-memory failures
+    /// do not count toward [`OOM_WINDOWS_AT_FLOOR`].
+    pressure: mps::MemoryPressure,
+    /// Items per batch while the replica's host RAM cost is not measured at
+    /// two sizes ([`VramLedger::item_cap_locked`]).
+    item_cap: Option<u32>,
+    /// An item-capped window whose batches feed only the RAM cost
+    /// ([`WorkerEntry::capped_windows_feed_gpu`]).
+    ram_only: bool,
 }
 
 /// One requester's slice of a GPU's headroom, and the contention floor it was
@@ -512,16 +539,43 @@ struct RamCeiling {
 }
 
 /// What a GPU replica's batch books in host RAM: `fixed_mb + units ×
-/// mb_per_unit` ([`measurements::ram_cost`]).
+/// mb_per_unit` ([`measurements::ram_cost`]), up to
+/// [`Self::fitted_reach`]; a larger batch books `whole_mb_per_unit` per unit.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct RamCost {
     fixed_mb: f64,
     mb_per_unit: f64,
+    /// The costliest measured growth per unit with no fixed part taken out;
+    /// never below `mb_per_unit`.
+    whole_mb_per_unit: f64,
+    /// From two sizes or more. From one size it prices item-capped windows,
+    /// and after those at most [`Self::fitted_reach`].
+    fitted: bool,
+    /// The largest batch it was measured at.
+    measured_units: u64,
 }
 
 impl RamCost {
+    /// The largest batch the fitted figures price: [`RATCHET_FACTOR`] × the
+    /// largest measured.
+    fn fitted_reach(&self) -> u64 {
+        self.measured_units.saturating_mul(RATCHET_FACTOR)
+    }
+
     fn booking_mb(&self, units: u64) -> u64 {
-        (self.fixed_mb + units as f64 * self.mb_per_unit).ceil() as u64
+        let per_unit = if units > self.fitted_reach() {
+            self.whole_mb_per_unit
+        } else {
+            self.mb_per_unit
+        };
+        (self.fixed_mb + units as f64 * per_unit).ceil() as u64
+    }
+
+    /// The largest batch whose booking fits `room_mb`, at least one unit.
+    fn units_within(&self, room_mb: f64) -> u64 {
+        let over = room_mb - self.fixed_mb;
+        let fitted = ((over / self.mb_per_unit).floor().max(1.0) as u64).min(self.fitted_reach());
+        fitted.max((over / self.whole_mb_per_unit).floor().max(0.0) as u64)
     }
 }
 
@@ -583,7 +637,8 @@ struct WorkerEntry {
     held_units: Option<u64>,
     /// The ring certified the held rung (a knee or a measured plateau).
     held_certified: bool,
-    /// Consecutive one-item OOM windows; see [`OOM_WINDOWS_AT_FLOOR`].
+    /// Consecutive one-item windows that ran out of memory or died; see
+    /// [`OOM_WINDOWS_AT_FLOOR`].
     oom_at_floor: u32,
     /// Consecutive queue-sized clean windows ([`Self::hold_reported`]).
     windows_queue_bound: u32,
@@ -638,6 +693,17 @@ struct WorkerEntry {
     ram_mb: Option<u64>,
     /// Host RAM capped its last grant ([`GrantCharge::ram_bound`]).
     ram_bound: bool,
+    /// Its first batch ran; what that batch kept is in its load level.
+    ram_started: bool,
+    /// Items per batch until its host RAM cost is measured at two sizes
+    /// ([`VramLedger::item_cap_locked`]): 1 at load with a RAM side, doubled
+    /// after an item-capped window whose batch filled it, up to a seed batch.
+    item_cap: Option<u32>,
+    /// Item-capped windows that ran a clean batch.
+    item_capped_windows: u32,
+    /// Item-capped windows feed the GPU side too, once as many doublings as
+    /// such windows ran would hold a seed batch; before, only the RAM cost.
+    capped_windows_feed_gpu: bool,
 }
 
 impl WorkerEntry {
@@ -660,11 +726,29 @@ impl WorkerEntry {
         self.grants.values().map(|charge| charge.mb).sum()
     }
 
-    /// Footprint plus the part of outstanding grants beyond pool growth (a
-    /// grant and the pool it grows are the same memory).
+    /// Pool growth a later batch reuses without new device memory. None on
+    /// the CPU device: what a batch freed is already in the free reading, and
+    /// what stays resident is in use.
+    fn reusable_pool_mb(&self) -> u64 {
+        if self.gpu == cpu::DEVICE_KEY {
+            0
+        } else {
+            self.pool_growth_mb()
+        }
+    }
+
+    /// Growth since load that is in use, not [`Self::reusable_pool_mb`]: on
+    /// the CPU device, what stays resident.
+    fn growth_in_use_mb(&self) -> u64 {
+        self.pool_growth_mb()
+            .saturating_sub(self.reusable_pool_mb())
+    }
+
+    /// Footprint plus the part of outstanding grants beyond the reusable pool
+    /// (a grant and the pool it grows are the same memory).
     fn charge_mb(&self) -> u64 {
         self.footprint_mb()
-            .saturating_add(self.grants_mb().saturating_sub(self.pool_growth_mb()))
+            .saturating_add(self.grants_mb().saturating_sub(self.reusable_pool_mb()))
     }
 
     /// A replica on a private-memory GPU whose host RAM is booked on the CPU
@@ -737,10 +821,10 @@ impl WorkerEntry {
                 .is_none_or(|at| at.elapsed() >= quiet)
     }
 
-    /// Pool growth no outstanding grant claims: room a further grant can use at
-    /// no cost to the GPU.
+    /// Reusable pool no outstanding grant claims: room a further grant can
+    /// use at no cost to the GPU.
     fn free_pool_mb(&self) -> u64 {
-        self.pool_growth_mb().saturating_sub(self.grants_mb())
+        self.reusable_pool_mb().saturating_sub(self.grants_mb())
     }
 
     /// Account a clean window. First records the hold when `may_grow` (the
@@ -969,6 +1053,9 @@ struct Ingested {
     /// reached [`FULL_BATCH_RATIO`] of it or had no room for the next item.
     /// Only such a window earns a doubling.
     at_budget: bool,
+    /// The same, whatever the memory pressure: the [`PressureCap`] grows on
+    /// these.
+    filled: bool,
     /// Samples that entered the knee ring; logged only.
     throughput_samples: usize,
     /// Which kind of negative, for the log; all fold into `negative`.
@@ -985,6 +1072,22 @@ struct Ingested {
     /// Allocator retries summed over the window's batches; `None` if none
     /// reported.
     alloc_retries: Option<u64>,
+}
+
+/// What a paging episode left of a (model, device)'s batch size
+/// ([`VramLedger::note_pressure_size_locked`]). An episode is a run of
+/// windows during which macOS was swapping pages out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PressureCap {
+    /// Caps the unit budget: the size the last paging window ran at, doubled
+    /// by each clean full window since.
+    units: u64,
+    /// How far `units` may grow back while the level is warning: half the
+    /// unit budget in force when the first episode began, halved again by
+    /// each later episode. Kept until the cap lifts.
+    regrow_to: u64,
+    /// The last window was a paging one: the episode is still on.
+    paging: bool,
 }
 
 /// Per-(model, GPU) calibration state: the fit, its samples, the anchor and
@@ -1038,6 +1141,15 @@ struct ModelCalibration {
     persisted: Option<(u64, u64, Option<u64>)>,
     /// See [`ShapeCeiling`]. Runtime-only.
     shape_ceiling: Option<ShapeCeiling>,
+    /// Half the batch a replica was running when its process died
+    /// mid-window; no later batch of this (model, device) is larger. Kept
+    /// for the life of this process ([`VramLedger::note_death_locked`]).
+    death_cap_units: Option<u64>,
+    /// [`WorkerEntry::oom_at_floor`] of a replica that died at one unit; the
+    /// next replica starts from it, a clean window clears it.
+    floor_strikes: u32,
+    /// See [`PressureCap`]. Runtime-only; a reloaded replica inherits it.
+    pressure_cap: Option<PressureCap>,
     /// Next [`ThroughputSample::seq`]; never rewinds.
     throughput_seq: u64,
     /// A GPU replica's host RAM samples: batch units against the resident
@@ -1046,6 +1158,11 @@ struct ModelCalibration {
     /// What its batches book ([`measurements::ram_cost`]); `None` until a
     /// batch reported one.
     ram_cost: Option<RamCost>,
+    /// The most a replica's first batch kept (start-up memory), booked in the
+    /// first window of a replica loaded after the cost is known.
+    ram_startup_mb: u64,
+    /// The largest first batch, in units ([`measurements::ram_cost`]).
+    ram_first_units: u64,
 }
 
 /// Where a knee expiry left the model: a refit may put the knee back at or
@@ -1108,6 +1225,37 @@ fn shape_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Opt
         })
         .map(|ceiling| ceiling.units)
         .filter(|units| *units > 0)
+}
+
+/// The largest batch this replica may run whatever memory allows: the
+/// smaller of its shape ceiling ([`shape_ceiling_for`]) and the cap a death
+/// left ([`ModelCalibration::death_cap_units`]), if either stands.
+fn batch_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Option<u64> {
+    let death = cal.and_then(|cal| cal.death_cap_units);
+    match (shape_ceiling_for(cal, entry), death) {
+        (Some(shape), Some(death)) => Some(shape.min(death)),
+        (shape, death) => shape.or(death),
+    }
+}
+
+/// A memory sample's pool figure for a replica on `device`. On the CPU device
+/// it is the live resident set: `reserved` there is the lifetime peak, which
+/// still counts memory the replica has given back.
+fn sample_pool_mb(device: &str, sample: &MemorySample) -> Option<u64> {
+    if device == cpu::DEVICE_KEY {
+        sample.allocated_mb
+    } else {
+        sample.reserved_mb
+    }
+}
+
+/// [`sample_pool_mb`] for the load report's pool.
+fn pool_at_load_mb(device: &str, report: &LoadReport) -> Option<u64> {
+    if device == cpu::DEVICE_KEY {
+        report.allocated_at_load_mb
+    } else {
+        report.reserved_at_load_mb
+    }
 }
 
 /// The RAM domain of a unified device's free reading: `hw.memsize` and
@@ -1212,6 +1360,10 @@ struct LedgerState {
     /// The least an unrunnable replica showed a (model, GPU) needs for one
     /// item; later loads are refused against it until a clean window clears it.
     remembered_working_sets: HashMap<(String, String), u64>,
+    /// When a (model, GPU)'s worker last died its [`OOM_WINDOWS_AT_FLOOR`]th
+    /// time in a row at one unit; its loads are refused for
+    /// [`DEATH_VERDICT_LAPSE`] from then, or until a clean window.
+    death_verdicts: HashMap<(String, String), Instant>,
     /// Trims waiting for the manager to route to dispatchers.
     pending_trims: Vec<TrimRequest>,
     /// Once-per-(model, GPU) guard on the free-sample total mismatch WARN.
@@ -1229,6 +1381,9 @@ struct LedgerState {
     /// the calls, so the load-path probe runs without a driver.
     #[cfg(test)]
     probe_stub: Option<ProbeStub>,
+    /// Test seam for [`VramLedger::memory_pressure`].
+    #[cfg(test)]
+    pressure_stub: mps::MemoryPressure,
 }
 
 /// The fake host probe a test installs (see [`LedgerState::probe_stub`]).

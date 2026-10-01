@@ -114,6 +114,12 @@ impl VramLedger {
         });
     }
 
+    /// Set what [`Self::memory_pressure`] answers.
+    #[cfg(test)]
+    pub(super) fn set_memory_pressure_for_test(&self, pressure: mps::MemoryPressure) {
+        self.lock().pressure_stub = pressure;
+    }
+
     /// How many times the probe stub was asked.
     #[cfg(test)]
     pub(super) fn probe_calls(&self) -> u32 {
@@ -285,6 +291,14 @@ impl VramLedger {
         let back = |at: Option<Instant>| at.and_then(|at| at.checked_sub(by));
         entry.last_grant_settled_at = back(entry.last_grant_settled_at);
         entry.last_trim_at = back(entry.last_trim_at);
+    }
+
+    /// Age every death verdict by `by`.
+    #[cfg(test)]
+    pub(super) fn age_death_verdicts_for_test(&self, by: Duration) {
+        for died_at in self.lock().death_verdicts.values_mut() {
+            *died_at = died_at.checked_sub(by).expect("a clock that old");
+        }
     }
 
     /// Age this replica's deflation repayment clock by `by`.

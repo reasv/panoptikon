@@ -526,12 +526,12 @@ pub(crate) async fn run_dispatcher(
                 .as_ref()
                 .map(Admission::window_target_units);
             let bounds = match &replica.admission {
-                Some(_) => WindowBounds {
+                Some(admission) => WindowBounds {
                     units: in_flight_target_units(
                         window_target.expect("the priced arm has an admission"),
                         replica.last_grant.as_ref(),
                     ),
-                    items: priced_item_bound(cap),
+                    items: priced_item_bound(cap).min(admission.window_item_bound()),
                     bytes: MAX_WINDOW_BYTES,
                 },
                 None => WindowBounds {
@@ -1196,6 +1196,8 @@ mod tests {
             canvas_pixels: None,
             max_tokens: None,
             squeezed,
+            ram_mb: 0,
+            ram_reserve_mb: 0,
         }
     }
 
@@ -1817,6 +1819,8 @@ mod tests {
                 base_mb: Some(512),
                 reserved_at_load_mb: Some(0),
                 gpu_uuid: Some(gpu.to_owned()),
+                // Booked only on a ledger with a CPU device.
+                rss_at_load_mb: Some(1_000),
                 ..LoadReport::default()
             }));
         }
@@ -2205,6 +2209,53 @@ mod tests {
         uncapped.shutdown().await;
     }
 
+    /// End to end: a replica that books host RAM runs its first window as one
+    /// item in one batch, though three requests were queued. The fixture
+    /// reports no host RAM, so the next window holds two items in one batch.
+    #[tokio::test]
+    async fn the_first_window_after_load_runs_one_item() {
+        let cost = item_cost(8);
+        let ledger = VramLedger::for_test(
+            &[
+                (TEST_GPU, "TEST 9000", 32_768),
+                (super::super::cpu::DEVICE_KEY, "CPU", 65_536),
+            ],
+            VramBudget {
+                margin: Some(0.0),
+                cap_fraction: None,
+                knee_max_bucket_dispersion: None,
+            },
+        );
+        let replica = priced_replica(&ledger, TEST_GPU, "batchsize_test", cost, false).await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let dispatcher = tokio::spawn(run_dispatcher(
+            dispatcher_ctx(cost, Arc::new(ModelStats::default())),
+            vec![replica],
+            rx,
+        ));
+        // Queued before the dispatcher task first runs.
+        let answers: Vec<_> = (0..3)
+            .map(|_| {
+                let (reply, answer) = oneshot::channel();
+                tx.send(DispatchMsg::Predict(DispatchRequest {
+                    inputs: json_inputs(1),
+                    max_batch: None,
+                    reply,
+                }))
+                .expect("queued");
+                answer
+            })
+            .collect();
+        let mut sizes = Vec::new();
+        for answer in answers {
+            let outputs = answer.await.expect("replied").expect("succeeded");
+            sizes.extend(batch_sizes(&outputs));
+        }
+        assert_eq!(sizes, [1, 2, 2]);
+        tx.send(DispatchMsg::Shutdown).expect("shutdown");
+        dispatcher.await.expect("dispatcher exits");
+    }
+
     /// A [`DispatchMsg::Trim`] naming a free replica is delivered to it and
     /// the replica keeps serving — whether the worker obliges or answers with
     /// a per-request `error`, which is how an older harness replies to an
@@ -2352,16 +2403,44 @@ mod tests {
         );
     }
 
-    /// The other half: a replica killed out from under the supervisor — a
-    /// jetsam or OOM-killer SIGKILL, from this side of the pipe — really is a
-    /// death, and settles as one exactly once.
+    /// A replica that had already exited when its window was handed to it
+    /// (killed while idle, before the liveness sweep found it) did not die
+    /// running that window: the model goes down and the request fails as for
+    /// any death, but the window settles as an abort.
     #[tokio::test]
-    async fn a_worker_that_stopped_answering_settles_as_a_death() {
+    async fn a_worker_that_died_idle_settles_its_next_window_as_an_abort() {
         let mut worker = echo_worker().await;
         worker.kill_child_externally_for_test().await;
         let (request, answer) = lone_request();
 
         let (batch, window) = run_single("test/echo", &mut worker, request, None, None, None).await;
+        assert!(matches!(batch, BatchOutcome::Fatal(_)));
+        assert_eq!(window, WindowOutcome::Aborted);
+        let err = answer
+            .await
+            .expect("the caller was answered")
+            .expect_err("the request fails");
+        assert!(
+            err.downcast_ref::<Unattempted>().is_some(),
+            "and is re-queued like any other the worker never ran: {err:#}"
+        );
+    }
+
+    /// The other half: a replica that dies with the window in flight — a
+    /// jetsam or OOM-killer SIGKILL, from this side of the pipe — really is a
+    /// death, and settles as one exactly once.
+    #[tokio::test]
+    async fn a_worker_that_stopped_answering_settles_as_a_death() {
+        let cfg = super::super::worker::testing::test_spawn_config();
+        let spec = super::super::worker::testing::spec("dying_test");
+        let mut worker = Worker::spawn_configured(&cfg, "test/dying", &spec, None)
+            .await
+            .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+        let (request, answer) = lone_request();
+
+        let (batch, window) =
+            run_single("test/dying", &mut worker, request, None, None, None).await;
         assert!(matches!(batch, BatchOutcome::Fatal(_)));
         assert_eq!(window, WindowOutcome::WorkerDied);
         assert!(answer.await.expect("the caller was answered").is_err());
@@ -2370,7 +2449,7 @@ mod tests {
         // — unreachable today, but nothing in the types says so — cannot
         // halve the ratchet anchor a second time for it.
         let (request, answer) = lone_request();
-        let (_, window) = run_single("test/echo", &mut worker, request, None, None, None).await;
+        let (_, window) = run_single("test/dying", &mut worker, request, None, None, None).await;
         assert_eq!(window, WindowOutcome::Aborted);
         assert!(answer.await.expect("the caller was answered").is_err());
     }

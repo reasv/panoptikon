@@ -293,7 +293,7 @@ fn a_lopsided_pre_fit_split_on_a_wide_open_gpu_is_not_a_squeeze() {
     // Two hungry pre-fit models, appetites 1 vs 4000.
     let small = loaded(Some(1), Some(0));
     let asking = ledger
-        .register_worker("g/small", item_cost(4), &small, None)
+        .register_worker("g/small", item_cost(64), &small, None)
         .unwrap();
     let big = loaded(Some(4000), Some(0));
     let other = ledger
@@ -311,7 +311,9 @@ fn a_lopsided_pre_fit_split_on_a_wide_open_gpu_is_not_a_squeeze() {
         "nearly the whole 200 GB GPU is unclaimed"
     );
 
-    let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    // 6 units of a 64-unit seed are designed to cost 240 MiB, under the
+    // floor, so the share is not raised to the batch's cost.
+    let token = asking.request_grant(6, None, 1, 0).expect("granted");
     assert!(
         token.grant().mb <= SEED_BATCH_FLOOR_MB,
         "the premise: this share really did land on its floor ({} MiB)",
@@ -1163,4 +1165,37 @@ fn a_stale_sample_never_re_charges_a_trimmed_pool() {
         "the older reading must not re-charge the released slack"
     );
     assert_eq!(ledger.health()[0].workers[0].reserved_mb, Some(0));
+}
+
+/// Under critical memory pressure a stopped replica gives its pool back once
+/// it has been idle as long as the squeeze path requires, without the idle
+/// timeout; at warning the timeout still applies.
+#[test]
+fn critical_memory_pressure_releases_a_stopped_pool_without_the_idle_timeout() {
+    let ledger = ledger(10_000, no_margin());
+    let handle = loaded(Some(1000), Some(0));
+    let resident = ledger
+        .register_worker("g/stopped", item_cost(4), &handle, None)
+        .unwrap();
+    push_memory(&handle, 6000, 1000);
+    ledger.ingest_all_for_test();
+    clean_window(&resident);
+    ledger.age_trim_clocks_for_test(
+        resident.worker_id(),
+        IDLE_BEFORE_TRIM + Duration::from_secs(1),
+    );
+    use mps::MemoryPressure::{Normal, Paging, Warning};
+    for pressure in [Normal, Warning, Paging] {
+        ledger.set_memory_pressure_for_test(pressure);
+        ledger.flag_idle_pool_releases();
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "{pressure:?}: stopped for less than the idle timeout"
+        );
+    }
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Critical);
+    ledger.flag_idle_pool_releases();
+    let trims = ledger.take_pending_trims();
+    assert_eq!(trims.len(), 1, "it has stopped and is holding 1000 MiB");
+    assert_eq!(trims[0].trigger, TRIM_TRIGGER_PRESSURE);
 }

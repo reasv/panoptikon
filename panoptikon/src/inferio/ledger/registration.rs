@@ -714,6 +714,11 @@ impl VramLedger {
         if let Some(rss) = ram_at_load_mb {
             Self::shift_free_locked(&mut state, cpu::DEVICE_KEY, 0, rss, loaded_at);
         }
+        let pool_at_load = pool_at_load_mb(&gpu, &report);
+        let floor_strikes = state
+            .calibration
+            .get(&key)
+            .map_or(0, |cal| cal.floor_strikes);
         let id = state.next_id();
         let logged_gpu = gpu.clone();
         state.workers.insert(
@@ -738,9 +743,9 @@ impl VramLedger {
                 seed_units,
                 base_mb: report.base_mb,
                 base_recorded: report.base_mb.is_some(),
-                reserved_at_load_mb: report.reserved_at_load_mb,
+                reserved_at_load_mb: pool_at_load,
                 allocated_at_load_mb: report.allocated_at_load_mb,
-                reserved_mb: report.reserved_at_load_mb,
+                reserved_mb: pool_at_load,
                 reserved_seen_at: None,
                 grants: HashMap::new(),
                 pending_requests: 0,
@@ -748,7 +753,7 @@ impl VramLedger {
                 ramp_held: false,
                 held_units: None,
                 held_certified: false,
-                oom_at_floor: 0,
+                oom_at_floor: floor_strikes,
                 windows_queue_bound: 0,
                 hold_announced: false,
                 hold_reprobe_windows: 0,
@@ -773,6 +778,10 @@ impl VramLedger {
                 ram_base_mb: ram_at_load_mb,
                 ram_mb: None,
                 ram_bound: false,
+                ram_started: false,
+                item_cap: ram_at_load_mb.map(|_| 1),
+                item_capped_windows: 0,
+                capped_windows_feed_gpu: false,
             },
         );
         drop(state);
@@ -894,6 +903,11 @@ impl Admission {
     /// Units to aim for in the next window (see [`WINDOW_DEPTH_MULTIPLIER`]).
     pub fn window_target_units(&self) -> u64 {
         self.ledger.window_target_units(self.worker)
+    }
+
+    /// Items the next window may hold ([`VramLedger::window_item_bound`]).
+    pub fn window_item_bound(&self) -> usize {
+        self.ledger.window_item_bound(self.worker)
     }
 
     /// [`Self::request_grant_byte_bound`] with `byte_bound = false`.

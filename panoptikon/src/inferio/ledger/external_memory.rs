@@ -98,6 +98,20 @@ pub(super) fn free_source_is_authoritative(source: &str) -> bool {
 }
 
 impl VramLedger {
+    /// macOS's memory pressure level now; `Normal` on every other OS. On a
+    /// Mac every device's memory is its RAM, so the level applies to all of
+    /// them. Read without the ledger lock held.
+    pub(super) fn memory_pressure(&self) -> mps::MemoryPressure {
+        #[cfg(test)]
+        {
+            self.lock().pressure_stub
+        }
+        #[cfg(not(test))]
+        {
+            mps::memory_pressure()
+        }
+    }
+
     /// Carry `device`'s free reading forward to `at` across a change in our
     /// own memory made after it was taken (`before_mb` → `after_mb`), so
     /// `external` stays put until a later reading arrives; older readings are
@@ -244,7 +258,7 @@ impl VramLedger {
             if seen_at.is_some_and(|at| stamped.captured_at <= at) {
                 continue;
             }
-            if let Some(reserved) = stamped.value.reserved_mb
+            if let Some(reserved) = sample_pool_mb(&gpu, &stamped.value)
                 && let Some(entry) = state.workers.get_mut(&worker)
             {
                 entry.reserved_mb = Some(reserved);

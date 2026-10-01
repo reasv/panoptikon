@@ -129,6 +129,19 @@ impl VramLedger {
                 return Ok(None);
             }
             let measured = remembered.flatten().into_iter().chain(from_profile).max();
+            // A death verdict lapses; the strike count is kept.
+            if let Some(died_at) = state.death_verdicts.get(&key).copied() {
+                if died_at.elapsed() < DEATH_VERDICT_LAPSE {
+                    return Err(OversizedLoad {
+                        inference_id: inference_id.to_owned(),
+                        gpu: gpu.to_owned(),
+                        needs_mb: 0,
+                        room_mb: self.refusal_room_locked(&state, gpu),
+                        died: true,
+                    });
+                }
+                state.death_verdicts.remove(&key);
+            }
             // Refusal uses only known figures: a condemned working set, else
             // this run's base, else the profile's.
             let needs = state
@@ -144,6 +157,7 @@ impl VramLedger {
                         gpu: gpu.to_owned(),
                         needs_mb,
                         room_mb,
+                        died: false,
                     });
                 }
             }
@@ -205,9 +219,9 @@ impl VramLedger {
     /// cleared since. On a fatal death the manager then applies the load
     /// failure cooldown.
     pub fn was_condemned(&self, inference_id: &str, gpu: &str) -> bool {
-        self.lock()
-            .remembered_working_sets
-            .contains_key(&(inference_id.to_owned(), gpu.to_owned()))
+        let key = (inference_id.to_owned(), gpu.to_owned());
+        let state = self.lock();
+        state.remembered_working_sets.contains_key(&key) || state.death_verdicts.contains_key(&key)
     }
 
     fn release_load_reservation(&self, gpu: &str, id: u64) {
@@ -229,10 +243,25 @@ pub struct OversizedLoad {
     /// What is left after other processes, before the reserve and our own
     /// residents.
     pub room_mb: u64,
+    /// Refused because its worker kept dying at one item
+    /// ([`UnrunnableReplica::died`]), not for its size: `needs_mb` is 0.
+    pub died: bool,
 }
 
 impl std::fmt::Display for OversizedLoad {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.died {
+            return write!(
+                f,
+                "the worker of model {} died {} times in a row running a \
+                 single item on GPU {}; not loading it there again until {} s \
+                 after the last of those deaths",
+                self.inference_id,
+                OOM_WINDOWS_AT_FLOOR,
+                self.gpu,
+                DEATH_VERDICT_LAPSE.as_secs()
+            );
+        }
         write!(
             f,
             "model {} needs about {} MiB on GPU {}, which has room for {} MiB; \

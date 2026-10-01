@@ -21,6 +21,7 @@ impl VramLedger {
             .map(|(uuid, gpu)| {
                 let external = Self::external_locked(state, uuid);
                 let (reserve, reserve_rule) = self.reserve_locked(
+                    state,
                     uuid,
                     external.unwrap_or(0),
                     self.budgets.for_gpu(uuid).margin_in_force(),
@@ -56,13 +57,14 @@ impl VramLedger {
                             ramp_step: entry.ramp_step,
                             deflation: entry.deflation,
                             clean_windows: entry.clean_windows,
-                            unit_budget: admitted_units(entry, anchor, knee, shape_ceiling),
+                            unit_budget: Self::budget_locked(state, entry, knee),
                             ramp_held: held,
                             held_units: held.then_some(entry.held_units).flatten(),
                             held_certified: held && entry.held_certified,
                             max_units_measured: anchor,
                             knee_units: knee,
                             shape_ceiling_units: shape_ceiling,
+                            death_cap_units: cal.and_then(|cal| cal.death_cap_units),
                             knee_is_local: cal.is_some_and(|cal| cal.knee_is_local),
                             throughput_samples: cal.map(|cal| cal.throughput.len()).unwrap_or(0),
                             local_samples: cal.map(|cal| cal.local_samples).unwrap_or(0),
@@ -146,8 +148,9 @@ pub struct GpuBudgetHealth {
     /// The reserve applied to this GPU on top of `external_mb`.
     pub reserve_mb: u64,
     /// `"user_margin"` (configured, uncapped), `"capped_default"` (default
-    /// fraction, clamped) or `"flat_default"` (the cap itself, on a CUDA GPU
-    /// that spills to system RAM).
+    /// fraction, clamped), `"flat_default"` (the cap itself, on a CUDA GPU
+    /// that spills to system RAM) or `"ram_floor"` (the CPU device's minimum:
+    /// a tenth of RAM, at most 16 GiB, at least 2 GiB or a quarter of RAM).
     pub reserve_rule: String,
     /// `limit − Σ charges − Σ load reservations`; on unified memory the
     /// charges of both devices sharing the RAM.
@@ -182,8 +185,11 @@ pub struct LedgerWorkerHealth {
     /// `base + max(0, reserved − reserved_at_load)`: this resident's footprint.
     pub footprint_mb: u64,
     /// `footprint + max(0, grants − pool growth)`: this replica's charge now.
+    /// On the CPU device `footprint + grants`.
     pub charge_mb: u64,
     pub base_mb: Option<u64>,
+    /// The allocator pool at load and now; on the CPU device the replica's
+    /// resident set.
     pub reserved_at_load_mb: Option<u64>,
     pub reserved_mb: Option<u64>,
     /// Allocator retries in the last window that reported them, and the total.
@@ -226,6 +232,9 @@ pub struct LedgerWorkerHealth {
     pub knee_is_local: bool,
     /// Shape ceiling from `index_limit` clamps: caps `unit_budget`; runtime-only.
     pub shape_ceiling_units: Option<u64>,
+    /// Half the batch a replica of this model was running here when its
+    /// process died mid-window: caps `unit_budget` until the server restarts.
+    pub death_cap_units: Option<u64>,
     /// Samples in the knee ring (all occupancies); runtime-only.
     pub throughput_samples: usize,
     /// Local fit samples, including restored ones; the margin widens below

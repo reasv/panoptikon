@@ -103,6 +103,9 @@ _MPS_SAMPLE_JOIN_SECONDS = 1.0
 # Where Linux publishes this process's peak resident set.
 PROC_STATUS = "/proc/self/status"
 
+# Where Linux publishes the machine's memory statistics.
+PROC_MEMINFO = "/proc/meminfo"
+
 
 # --- torch, only if the impl already brought it *and* already used the GPU ---
 
@@ -783,7 +786,8 @@ def _fdinfo_base_mb(
 def amdgpu_free_total_mb(root: str | None = None) -> tuple[int | None, int | None]:
     """Device-wide `(free_mb, total_mb)` for this worker's GPU from amdgpu sysfs
     (the files the orchestrator reads), or `(None, None)`. On a unified-memory
-    device GTT is added, its free part clamped by available RAM.
+    device GTT is added, its free part clamped by available RAM (less
+    reclaimable slab, as `rocm.rs` reads it).
     """
     bdf = _identity_bdf()
     if bdf is None:
@@ -933,9 +937,8 @@ def _mps_free_with_basis() -> tuple[int | None, int | None, int | None, int | No
     facts = _mac_memory_counters()
     if not total or facts is None:
         return (None, None, None, None)
-    ram, wired, compressed, anonymous = facts
-    available = max(0, ram - wired - compressed - anonymous)
-    return (_mb(min(total, available)), _mb(total), _mb(ram), _mb(available))
+    available = _mac_available(facts)
+    return (_mb(min(total, available)), _mb(total), _mb(facts[0]), _mb(available))
 
 
 def mps_free_total_mb() -> tuple[int | None, int | None]:
@@ -951,32 +954,91 @@ def mps_ram_basis_mb() -> tuple[int | None, int | None]:
 
 
 def mac_available_bytes() -> int | None:
-    """RAM a new allocation could get on macOS, or None off it: total RAM minus
-    wired, compressed and anonymous pages. psutil's `available` does not track
-    MPS allocations. Same formula as `mps.rs::available_bytes`.
+    """RAM a new allocation could get on macOS, or None off it
+    (`_mac_available`). psutil's `available` does not track MPS allocations.
     """
     facts = _mac_memory_counters()
     if facts is None:
         return None
-    ram, wired, compressed, anonymous = facts
+    return _mac_available(facts)
+
+
+def _mac_available(facts: tuple[int, int, int, int, int, int]) -> int:
+    """Total RAM minus wired, compressed and anonymous pages; 0 at critical
+    memory pressure, and at warning while the kernel is paging
+    (`_mac_paging`): the file cache this formula counts as available is not
+    free then. Warning without paging only means memory is held compressed.
+    Same as `mps.rs::available_bytes`.
+    """
+    ram, wired, compressed, anonymous, pressure, swapouts = facts
+    paging = _mac_paging(swapouts)
+    if pressure >= MAC_PRESSURE_CRITICAL:
+        return 0
+    if pressure >= MAC_PRESSURE_WARNING and paging:
+        return 0
     return max(0, ram - wired - compressed - anonymous)
 
 
+def _mac_paging(swapouts: int) -> bool:
+    """Whether macOS swapped pages out between the previous reading and this
+    one, or within `MAC_PAGING_SECONDS` before it. A first reading, or one
+    whose predecessor is older than `MAC_PAGING_STALE_SECONDS`, has nothing
+    to compare with and is not paging.
+    """
+    now = time.monotonic()
+    previous, read_at = _swapouts["count"], _swapouts["read_at"]
+    _swapouts["count"], _swapouts["read_at"] = swapouts, now
+    if (
+        previous is not None
+        and swapouts > previous
+        and now - read_at <= MAC_PAGING_STALE_SECONDS
+    ):
+        _swapouts["rose_at"] = now
+    rose_at = _swapouts["rose_at"]
+    return rose_at is not None and now - rose_at <= MAC_PAGING_SECONDS
+
+
 # `vm_statistics64_data_t` (<mach/vm_statistics.h>) layout and the flavour
-# that fills it. Indexes: `wire_count`, `compressor_page_count`,
+# that fills it. Indexes: `wire_count`, `swapouts`, `compressor_page_count`,
 # `internal_page_count` (pageable anonymous pages, so wired are not counted).
 _VM_STATISTICS64 = "@4I9Q2I4Q4IQ"
-_VM_WIRE, _VM_COMPRESSOR, _VM_INTERNAL = 3, 19, 22
+_VM_WIRE, _VM_SWAPOUTS, _VM_COMPRESSOR, _VM_INTERNAL = 3, 18, 19, 22
 _HOST_VM_INFO64 = 4
 
+# `kern.memorystatus_vm_pressure_level` values.
+MAC_PRESSURE_NORMAL, MAC_PRESSURE_WARNING, MAC_PRESSURE_CRITICAL = 1, 2, 4
 
-def _mac_memory_counters() -> tuple[int, int, int, int] | None:
-    """`(ram, wired, compressed, anonymous)` bytes from macOS, or None."""
+# How long after the swap-out counter last rose the kernel counts as paging.
+# Must match `mps.rs::PAGING_WINDOW`.
+MAC_PAGING_SECONDS = 10.0
+
+# The oldest previous reading a rise is still judged against: an older one
+# cannot say when the counter rose. Longer than `MAC_PAGING_SECONDS` so that
+# batches longer than that still see the kernel paging. Must match
+# `mps.rs::PAGING_STALE`.
+MAC_PAGING_STALE_SECONDS = 60.0
+
+# The swap-out counter at the previous reading, when that was, and when the
+# counter was last seen to rise.
+_swapouts: dict[str, Any] = {"count": None, "read_at": None, "rose_at": None}
+
+
+def _mac_pressure_level() -> int:
+    """macOS's memory pressure level; unreadable counts as normal."""
+    level = _sysctl_u32("kern.memorystatus_vm_pressure_level")
+    return level or MAC_PRESSURE_NORMAL
+
+
+def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
+    """`(ram, wired, compressed, anonymous)` bytes, the memory pressure level
+    and the pages swapped out since boot, from macOS; or None.
+    """
     if sys.platform != "darwin":
         return None
     ram = _sysctl_u64("hw.memsize")
     if not ram:
         return None
+    pressure = _mac_pressure_level()
     try:
         import ctypes
         import ctypes.util
@@ -1006,6 +1068,8 @@ def _mac_memory_counters() -> tuple[int, int, int, int] | None:
         stats[_VM_WIRE] * page,
         stats[_VM_COMPRESSOR] * page,
         stats[_VM_INTERNAL] * page,
+        pressure,
+        stats[_VM_SWAPOUTS],
     )
 
 
@@ -1022,12 +1086,13 @@ def _virtual_memory() -> Any | None:
 
 
 def _ram_available_bytes() -> int | None:
-    """psutil's `virtual_memory().available` in bytes, or None."""
+    """psutil's `virtual_memory().available` in bytes, on Linux less
+    reclaimable slab (`_reclaimable_slab_bytes`), or None."""
     memory = _virtual_memory()
     if memory is None:
         return None
     try:
-        return int(memory.available)
+        return max(int(memory.available) - _reclaimable_slab_bytes(), 0)
     except Exception:
         return None
 
@@ -1077,6 +1142,13 @@ def _sysctl_string(name: str) -> str | None:
 def _sysctl_u64(name: str) -> int | None:
     raw = _sysctl(name, 8)
     if raw is None or len(raw) != 8:
+        return None
+    return int.from_bytes(raw, sys.byteorder)
+
+
+def _sysctl_u32(name: str) -> int | None:
+    raw = _sysctl(name, 4)
+    if raw is None or len(raw) != 4:
         return None
     return int.from_bytes(raw, sys.byteorder)
 
@@ -1148,10 +1220,29 @@ def _cgroup_file_lru(path: str, keys: tuple[str, ...]) -> int:
     return total
 
 
+def _reclaimable_slab_bytes() -> int:
+    """`SReclaimable` from `/proc/meminfo` in bytes; 0 off Linux or if unread.
+    `MemAvailable` counts it, but the kernel may not free it before it kills a
+    process, so the free reading leaves it out, as `cpu.rs` does.
+    """
+    if not sys.platform.startswith("linux"):
+        return 0
+    try:
+        with open(PROC_MEMINFO, encoding="utf-8", errors="replace") as meminfo:
+            for line in meminfo:
+                key, _, rest = line.partition(":")
+                if key == "SReclaimable":
+                    value, unit = rest.split()
+                    return int(value) * 1024 if unit == "kB" else 0
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
 def _ram_bounds_bytes(root: str | None = None) -> tuple[int | None, int | None]:
     """`(total, available)` in bytes for a CPU-priced host, or `(None, None)`:
-    psutil (macOS available from `mac_available_bytes`), bounded by the cgroup
-    limit. Must match `cpu.rs`.
+    psutil (macOS available from `mac_available_bytes`; Linux less
+    `SReclaimable`), bounded by the cgroup limit. Must match `cpu.rs`.
     """
     memory = _virtual_memory()
     if memory is None:
@@ -1166,6 +1257,7 @@ def _ram_bounds_bytes(root: str | None = None) -> tuple[int | None, int | None]:
     mac_available = mac_available_bytes()
     if mac_available is not None:
         available = mac_available
+    available = max(available - _reclaimable_slab_bytes(), 0)
     limit, used = cgroup_limit_used_bytes(root)
     if limit is not None:
         total = min(total, limit)
@@ -1268,6 +1360,31 @@ def _peak_rss_bytes() -> int | None:
     if peak is None:
         return rss
     return peak if rss is None else max(peak, rss)
+
+
+@lru_cache(maxsize=1)
+def _malloc_trim() -> Any | None:
+    """glibc's `malloc_trim`, or None where the C library has none."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+
+        return ctypes.CDLL(None).malloc_trim
+    except (OSError, AttributeError):
+        return None
+
+
+def return_freed_memory() -> None:
+    """Hand the C heap's free pages back to the OS (glibc `malloc_trim(0)`),
+    so the resident set holds only live memory. A no-op without glibc."""
+    trim = _malloc_trim()
+    if trim is None:
+        return
+    try:
+        trim(0)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("malloc_trim failed: %s", exc)
 
 
 def ram_pool_mb() -> tuple[int | None, int | None]:
@@ -1829,6 +1946,9 @@ def finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
 def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     # First: everything below may use the context figure.
     _collect_context_probe(before.get("context_probe"))
+    # The resident figures below then hold the loaded model and nothing the
+    # load freed.
+    return_freed_memory()
     reserved, allocated, _, peak_allocated = _allocator_stats()
     free_after, _ = _free_mb(before.get("free_source"))
 
@@ -2358,6 +2478,9 @@ def measure_batch(
         if isinstance(started, float)
         else None
     )
+    # After the timed section: the resident readings below exclude what the
+    # batch freed.
+    return_freed_memory()
     measurement: dict[str, Any] = {
         "items": items,
         "reserved_before_mb": state.get("reserved_before_mb"),
@@ -2393,9 +2516,11 @@ def measure_batch(
             measurement["ram_total_mb"], measurement["ram_available_mb"] = ram_mb
     if clamped:
         measurement["clamped"] = clamped
-    if state.get("host_ram"):
-        if sampled_rss is not None:
-            measurement["peak_rss_mb"] = sampled_rss
+    if state.get("host_ram") and sampled_rss is not None:
+        measurement["peak_rss_mb"] = sampled_rss
+    # The level the batch left: a GPU worker's host RAM, and a RAM-priced
+    # worker's footprint (its `reserved` is a peak that never falls).
+    if state.get("host_ram") or _ram_currency():
         rss_after = _mb(_rss_bytes())
         if rss_after is not None:
             measurement["rss_after_mb"] = rss_after

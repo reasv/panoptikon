@@ -12,8 +12,10 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import platform
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -1908,7 +1910,11 @@ def fake_mps_torch_module(mps: object | None, available: bool = True) -> SimpleN
 
 @contextmanager
 def mps_host(
-    available_mb: int, mps: FakeMpsAllocator | None = None, ram_mb: int = 128 * 1024
+    available_mb: int,
+    mps: FakeMpsAllocator | None = None,
+    ram_mb: int = 128 * 1024,
+    pressure: int = 1,
+    paging: bool = False,
 ):
     """An MPS worker whose kernel counters leave `available_mb` of RAM: the
     machine holds the rest as anonymous pages. psutil is mocked too, and to a
@@ -1919,12 +1925,21 @@ def mps_host(
         0,
         0,
         max(0, ram_mb - available_mb) * MIB,
+        pressure,
+        0,
     )
     memory_info = SimpleNamespace(total=ram_mb * MIB, available=7 * MIB)
-    with isolated(fake_mps_torch_module(mps)):
-        with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
-            with mock.patch("psutil.virtual_memory", return_value=memory_info):
-                yield mps
+    with isolated(fake_mps_torch_module(mps)), mac_counters(counters, paging):
+        with mock.patch("psutil.virtual_memory", return_value=memory_info):
+            yield mps
+
+
+@contextmanager
+def mac_counters(counters: tuple[int, ...], paging: bool = False):
+    """macOS kernel counters, and whether the kernel counts as paging."""
+    with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
+        with mock.patch.object(memory, "_mac_paging", return_value=paging):
+            yield
 
 
 def test_the_mps_sample_reports_the_pool_and_ram_clamped_free() -> None:
@@ -2030,13 +2045,20 @@ def test_an_mps_batch_reports_the_pool_and_the_allocated_peak_apart() -> None:
 
 
 def available_mb(
-    ram_mb: int, wired_mb: int, compressed_mb: int, anonymous_mb: int
+    ram_mb: int,
+    wired_mb: int,
+    compressed_mb: int,
+    anonymous_mb: int,
+    pressure: int = 1,
+    paging: bool = False,
 ) -> int:
     """`mac_available_bytes` over one set of counters, in MiB."""
-    counters = tuple(
-        value * MIB for value in (ram_mb, wired_mb, compressed_mb, anonymous_mb)
+    counters = (
+        *(value * MIB for value in (ram_mb, wired_mb, compressed_mb, anonymous_mb)),
+        pressure,
+        0,
     )
-    with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
+    with mac_counters(counters, paging):
         available = memory.mac_available_bytes()
     assert available is not None
     return available // MIB
@@ -2084,6 +2106,93 @@ def test_the_mac_reading_falls_with_this_processs_own_allocation() -> None:
         assert allocated_mb <= taken <= allocated_mb + allocated_mb // 20, taken
         if allocated_gib >= 8:
             assert psutil_mb == 111_196, "the reading that stopped moving"
+
+
+def test_nothing_is_available_while_the_mac_pages_under_pressure() -> None:
+    """At critical (4), or at warning (2) while it is paging, macOS keeps
+    several GiB of file cache that the formula counts as available: 9 963 MiB
+    here. Warning without paging only means memory is held compressed."""
+    for level, paging, expected in [
+        (1, False, 9_963),
+        (1, True, 9_963),
+        (2, False, 9_963),
+        (2, True, 0),
+        (3, True, 0),
+        (4, False, 0),
+        (4, True, 0),
+    ]:
+        available = available_mb(131_072, 5_189, 55_599, 60_321, level, paging)
+        assert available == expected, (level, paging)
+
+
+NO_SWAPOUTS_SEEN = {"count": None, "read_at": None, "rose_at": None}
+
+
+def test_paging_is_a_swap_out_counter_that_rose_recently() -> None:
+    """Since the previous reading, or within `MAC_PAGING_SECONDS` before this
+    one. A first reading has nothing to compare with, nor has one whose
+    predecessor is older than `MAC_PAGING_STALE_SECONDS`."""
+    readings = [  # (seconds, swap-out counter, paging)
+        (0, 500, False),
+        (1, 500, False),
+        (2, 501, True),
+        (12, 501, True),
+        (13, 501, False),
+        (73, 600, True),  # 60 s after the last reading
+        (134, 900, False),  # 61 s: too old to compare with
+        (135, 901, True),
+        (150, 100, False),  # a counter that fell is not a rise
+        (151, 100, False),
+    ]
+    with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
+        for seconds, swapouts, paging in readings:
+            with mock.patch("time.monotonic", return_value=1000.0 + seconds):
+                assert memory._mac_paging(swapouts) is paging, seconds
+
+
+def test_the_swap_out_counter_is_followed_at_every_pressure_level() -> None:
+    """A reading at normal is the one the next is compared with, so paging
+    that starts as the level turns to warning is seen at once."""
+    def available(seconds: int, level: int, swapouts: int) -> int | None:
+        counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, level, swapouts)
+        with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
+            with mock.patch("time.monotonic", return_value=1000.0 + seconds):
+                return memory.mac_available_bytes()
+
+    with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
+        assert available(0, 1, 500) == 40 * 1024 * MIB
+        assert available(5, 2, 700) == 0
+
+
+def test_an_unreadable_pressure_level_counts_as_normal() -> None:
+    for read, level in [(None, 1), (0, 1), (1, 1), (2, 2), (4, 4)]:
+        with mock.patch.object(memory, "_sysctl_u32", return_value=read):
+            assert memory._mac_pressure_level() == level
+
+
+def test_while_the_mac_pages_an_mps_batch_fits_the_pool_it_holds() -> None:
+    """Nothing is free beyond this process's own pool, so the live clamp cuts
+    a batch to what that pool can hold. At warning without paging the reading
+    stands and the batch keeps its size."""
+    with mps_host(available_mb=40 * 1024, pressure=2, paging=True) as mps:
+        mps.allocate(1000, driver_mb=3000)
+        reading = memory.free_total_reading()
+        assert (reading.free_mb, reading.ram_available_mb) == (0, 0)
+        live = packing.clamp_to_live_memory(64, 4000)
+        assert live.units == 32, "2000 MiB of pool buys half a 4000 MiB grant"
+    with mps_host(available_mb=40 * 1024, pressure=2) as mps:
+        mps.allocate(1000, driver_mb=3000)
+        assert memory.free_total_reading().free_mb == 40 * 1024
+        assert packing.clamp_to_live_memory(64, 4000).units == 64
+
+
+def test_while_the_mac_pages_a_cpu_worker_on_it_has_nothing_free() -> None:
+    """A CPU replica draws from the same RAM as Metal, so the same reading."""
+    counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 4, 0)
+    memory_info = SimpleNamespace(total=128 * 1024 * MIB, available=40 * 1024 * MIB)
+    with mac_counters(counters):
+        with mock.patch("psutil.virtual_memory", return_value=memory_info):
+            assert memory.ram_free_total_mb()[0] == 0
 
 
 def test_the_mps_oom_figure_is_what_the_allocator_had_left() -> None:
@@ -2244,11 +2353,13 @@ def cpu_host(
     torch_module=None,
     pinned: bool = True,
     cgroup: str | None = None,
+    meminfo: str | None = None,
 ):
     """A worker priced against system RAM. `pinned` writes the spawner's
     `INFERIO_DEVICE=cpu`, which is the whole of the signal. `cgroup` points at
-    a fake cgroup root; absent, at nothing, so the host running the suite
-    cannot lend its own limit to a test that says nothing about one."""
+    a fake cgroup root and `meminfo` at a fake `/proc/meminfo`; absent, at
+    nothing, so the host running the suite cannot lend its own limit or slab
+    to a test that says nothing about one."""
     ram = ram if ram is not None else FakeRam()
     with isolated(torch_module):
         os.environ.pop("PANOPTIKON_DEVICE_PIN", None)
@@ -2266,6 +2377,9 @@ def cpu_host(
             mock.patch.object(memory, "_peak_rss_bytes", lambda: ram.peak_mb * MIB),
             mock.patch.object(
                 memory, "CGROUP_ROOT", cgroup or "/nonexistent/cgroup-root"
+            ),
+            mock.patch.object(
+                memory, "PROC_MEMINFO", meminfo or "/nonexistent/meminfo"
             ),
         ):
             yield ram
@@ -2381,7 +2495,138 @@ def test_only_a_gpu_worker_reports_host_ram() -> None:
             measurement = memory.measure_batch(state, items=1, units=1)
             assert "rss_at_load_mb" not in report
             assert "peak_rss_mb" not in measurement
-            assert "rss_after_mb" not in measurement
+            assert ("rss_after_mb" in measurement) == memory._ram_currency()
+
+
+def test_a_cpu_worker_reports_the_resident_set_a_batch_left() -> None:
+    # Its `reserved` figures are the lifetime peak, which never falls; the
+    # orchestrator takes its footprint from the level after the batch.
+    with cpu_host() as ram:
+        memory.finish_load(memory.begin_load(), object())
+        state = memory.begin_batch()
+        ram.grow(5_000)
+        state["rss_sampler"].observe()
+        ram.release(4_600)
+        measurement = memory.measure_batch(state, items=8, units=8)
+    assert measurement["reserved_after_mb"] == 5_200, "the peak"
+    assert measurement["peak_allocated_mb"] == 5_200
+    assert measurement["rss_after_mb"] == 600, "what it still holds"
+
+
+def test_linux_free_ram_leaves_out_reclaimable_slab(tmp_path) -> None:
+    # `MemAvailable` (psutil's `available`) counts slab the kernel may not
+    # free in time; `cpu.rs` subtracts the same row.
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        "MemTotal:       131737460 kB\nMemAvailable:   31339520 kB\n"
+        "Slab:            9000000 kB\nSReclaimable:    6144000 kB\n"
+    )
+    machine = FakeRam(total_mb=128 * 1024, available_mb=30_605)
+    with cpu_host(machine, meminfo=str(meminfo)):
+        assert memory._reclaimable_slab_bytes() == 6_000 * MIB
+        assert memory.ram_free_total_mb() == (24_605, 128 * 1024)
+        with mock.patch.object(sys, "platform", "win32"):
+            assert memory._reclaimable_slab_bytes() == 0
+        # A unified ROCm GPU clamps its GTT by the same figure.
+        assert memory._ram_available_bytes() == 24_605 * MIB
+    # More slab than is available, a row in another unit, no row, no file.
+    for text, free_mb in (
+        ("SReclaimable:   99999999 kB\n", 0),
+        ("SReclaimable:    6144000 MB\n", 30_605),
+        ("SReclaimable:    garbage\n", 30_605),
+        ("MemAvailable:   31339520 kB\n", 30_605),
+        (None, 30_605),
+    ):
+        if text is not None:
+            meminfo.write_text(text)
+        path = str(meminfo) if text is not None else None
+        with cpu_host(FakeRam(128 * 1024, 30_605), meminfo=path):
+            assert memory.ram_free_total_mb()[0] == free_mb, text
+    # The cgroup limit still bounds what is left.
+    group = tmp_path / "group"
+    group.mkdir()
+    (group / "memory.max").write_text("17179869184\n")
+    (group / "memory.current").write_text("6442450944\n")
+    meminfo.write_text("SReclaimable:    6144000 kB\n")
+    with cpu_host(FakeRam(128 * 1024, 30_605), cgroup=str(group), meminfo=str(meminfo)):
+        assert memory.ram_free_total_mb() == (10 * 1024, 16 * 1024)
+
+
+def test_freed_host_memory_is_returned_before_the_resident_readings(
+    monkeypatch,
+) -> None:
+    # The C heap keeps what the load and each batch freed until it is
+    # trimmed; the baseline at load and the level after a batch are read
+    # after the trim, so they hold live memory only.
+    ram = FakeRam(rss_mb=3_000)
+    retained = {"mb": 0}
+
+    def trim(_pad: int) -> None:
+        ram.release(retained["mb"])
+        retained["mb"] = 0
+
+    monkeypatch.setattr(memory, "_rss_bytes", lambda: ram.rss_mb * MIB)
+    monkeypatch.setattr(memory, "_malloc_trim", lambda: trim)
+    with isolated(fake_torch_module(FakeCuda())):
+        before = memory.begin_load()
+        retained["mb"] = 1_000  # freed by the load, still resident
+        report = memory.finish_load(before, object())
+        assert report["rss_at_load_mb"] == 2_000
+        state = memory.begin_batch()
+        ram.grow(700)
+        state["rss_sampler"].observe()
+        retained["mb"] = 500  # the batch's transients, freed
+        measurement = memory.measure_batch(state, items=8, units=8)
+    assert measurement["peak_rss_mb"] == 2_700
+    assert measurement["rss_after_mb"] == 2_200
+
+
+def test_a_cpu_workers_resident_figures_are_read_after_the_trim() -> None:
+    # On the CPU device the RSS is the allocated figure itself: the load's
+    # `allocated_at_load_mb` and the batch's `allocated_before_mb` exclude what
+    # the load and the batch freed.
+    retained = {"mb": 0}
+    with cpu_host() as ram, mock.patch.object(
+        memory, "_malloc_trim", lambda: lambda _pad: ram.release(retained.pop("mb", 0))
+    ):
+        before = memory.begin_load()
+        ram.grow(2048)
+        retained["mb"] = 1_000  # freed by the load, still resident
+        report = memory.finish_load(before, object())
+        assert report["allocated_at_load_mb"] == 200 + 1_048
+        state = memory.begin_batch()
+        ram.grow(700)
+        state["rss_sampler"].observe()
+        retained["mb"] = 500
+        memory.measure_batch(state, items=8, units=8)
+        assert memory.device_memory_sample()["allocated_mb"] == 200 + 1_048 + 200
+
+
+def test_the_trim_is_not_timed_as_part_of_the_batch(monkeypatch) -> None:
+    # `duration_ms` feeds the throughput fit; a trim of a large heap takes
+    # tens to hundreds of milliseconds and must not count as batch time.
+    monkeypatch.setattr(memory, "_malloc_trim", lambda: lambda _pad: time.sleep(0.3))
+    with cpu_host():
+        state = memory.begin_batch()
+        measurement = memory.measure_batch(state, items=1, units=1)
+    assert measurement["duration_ms"] < 300, measurement["duration_ms"]
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or platform.libc_ver()[0] != "glibc",
+    reason="malloc_trim is glibc's",
+)
+def test_return_freed_memory_releases_blocks_freed_between_live_ones() -> None:
+    # 100 KiB blocks come from the heap; freeing every other one leaves holes
+    # that glibc cannot return through the top of the heap by itself.
+    blocks = [b"\x01" * (100 * 1024) for _ in range(512)]
+    kept = blocks[1::2]
+    del blocks
+    resident = memory._rss_bytes()
+    memory.return_freed_memory()
+    returned = resident - memory._rss_bytes()
+    assert returned > 12 * MIB, f"{returned / MIB:.1f} of 25 MiB returned"
+    del kept
 
 
 def test_the_cpu_base_is_the_load_windows_rss_growth() -> None:
@@ -3082,7 +3327,7 @@ def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:
     with mps_host(available_mb=40 * 1024):
         with mock.patch.object(
             memory, "_mac_memory_counters",
-            side_effect=[(128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB)],
+            side_effect=[(128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 1, 0)],
         ) as counters:
             reading = memory.free_total_reading()
         assert counters.call_count == 1, "one read, not one per term"
@@ -3090,6 +3335,6 @@ def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:
             40 * 1024, 128 * 1024, 40 * 1024,
         )
     source = inspect.getsource(packing.run_window)
-    clamp = source.index("clamp_to_live_memory(budget, grant_mb)")
+    clamp = source.index("clamp_to_live_memory(budget, grant_mb,")
     begin = source.index("state = memory.begin_batch()")
     assert clamp < begin, "the counter read is outside the timed section"

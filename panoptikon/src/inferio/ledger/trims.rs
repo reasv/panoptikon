@@ -75,18 +75,24 @@ impl VramLedger {
     /// Idle release: flag every resident idle for [`IDLE_POOL_RELEASE`] that
     /// still holds [`TRIM_SLACK_MB`] of pool, with no one short first. Only
     /// the pool goes; the weights stay. Called from the manager's sweep tick.
+    /// Under critical memory pressure the wait is [`IDLE_BEFORE_TRIM`].
     ///
     /// Debounced by [`TRIM_DEBOUNCE`]. A release that gave nothing back stops
     /// this path until the replica settles a window
     /// ([`WorkerEntry::idle_release_gave_nothing`]). At most
     /// [`MAX_IDLE_TRIMS_PER_SWEEP`] per sweep, shared equally between GPUs.
     pub fn flag_idle_pool_releases(&self) {
+        let (idle, trigger) = if self.memory_pressure() == mps::MemoryPressure::Critical {
+            (IDLE_BEFORE_TRIM, TRIM_TRIGGER_PRESSURE)
+        } else {
+            (IDLE_POOL_RELEASE, TRIM_TRIGGER_IDLE)
+        };
         let mut state = self.lock();
         let mut by_gpu: BTreeMap<String, Vec<(WorkerId, String, u64)>> = BTreeMap::new();
         for (id, entry) in state.workers.iter() {
             if entry.pool_growth_mb() >= TRIM_SLACK_MB
                 && !entry.idle_release_gave_nothing
-                && entry.idle_for(IDLE_POOL_RELEASE)
+                && entry.idle_for(idle)
                 && entry
                     .last_trim_at
                     .is_none_or(|at| at.elapsed() >= TRIM_DEBOUNCE)
@@ -104,7 +110,7 @@ impl VramLedger {
         for (gpu, mut candidates) in by_gpu {
             candidates.truncate(share.min(budget));
             budget -= candidates.len();
-            Self::queue_trims_locked(&mut state, &gpu, TRIM_TRIGGER_IDLE, None, candidates);
+            Self::queue_trims_locked(&mut state, &gpu, trigger, None, candidates);
         }
     }
 
@@ -226,7 +232,7 @@ impl VramLedger {
         }
         if let Some(stamped) = memory {
             let fresher = seen_at.is_none_or(|at| stamped.captured_at > at);
-            if let Some(reserved) = stamped.value.reserved_mb.filter(|_| fresher)
+            if let Some(reserved) = sample_pool_mb(&gpu, &stamped.value).filter(|_| fresher)
                 && let Some(entry) = state.workers.get_mut(&worker)
             {
                 entry.reserved_mb = Some(reserved);

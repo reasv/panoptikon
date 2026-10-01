@@ -912,12 +912,12 @@ fn a_configured_ceiling_overrides_the_cpu_default() {
         cap_fraction: Some(1.0),
         knee_max_bucket_dispersion: None,
     });
+    assert_eq!(section_wide.health()[0].cap_fraction, Some(1.0));
     assert_eq!(
-        section_wide.health()[0].cap_fraction,
-        Some(1.0),
-        "a user who asked for the whole machine gets the whole machine"
+        section_wide.health()[0].limit_mb,
+        CPU_RAM_MB - CPU_RAM_MB / 10,
+        "the whole machine but its RAM reserve, which no setting lowers"
     );
-    assert_eq!(section_wide.health()[0].limit_mb, CPU_RAM_MB);
 }
 
 /// On a CPU host the join is the single-GPU fallback, cross-checked against
@@ -1135,6 +1135,11 @@ fn a_death_mid_window_deflates_only_a_unified_device() {
         assert_eq!(worker.deflation, deflation, "{label}");
         assert_eq!(worker.max_units_measured, anchor, "{label}");
         assert_eq!(
+            worker.death_cap_units.is_some(),
+            deflation == 1,
+            "{label}: capped exactly where the death is a negative"
+        );
+        assert_eq!(
             ledger
                 .calibration_state("g/a", gpu)
                 .map(|state| state.samples.len()),
@@ -1145,7 +1150,7 @@ fn a_death_mid_window_deflates_only_a_unified_device() {
 }
 
 /// The RAM basis on a machine whose size the fixture chooses.
-fn push_basis(
+pub(super) fn push_basis(
     handle: &TelemetryHandle,
     total_mb: u64,
     ram_total_mb: u64,
@@ -1367,6 +1372,68 @@ fn the_unified_pair_charges_each_others_residents() {
     grant.finish(WindowOutcome::Responded { oom: None });
 }
 
+/// The MPS and CPU devices of a Mac share its RAM, so a CPU replica counts
+/// as a replica on the MPS device: a pre-fit MPS grant reserves half the
+/// headroom and the CPU replica's window is still priced.
+#[test]
+fn a_pre_fit_mps_grant_leaves_ram_for_the_cpu_replica() {
+    const RECMAX: u64 = MAC_RAM_MB / 4 * 3;
+    let ledger = VramLedger::new(
+        &GpuInventory::known_mps(MAC_RAM_MB),
+        no_margin().into(),
+        None,
+    );
+    ledger.install_probe_stub(None);
+    let mps_handle = loaded_mps(Some(RECMAX));
+    let on_mps = ledger
+        .register_worker("g/mps", item_cost(4), &mps_handle, Some(MPS_GPU))
+        .expect("admitted on Metal");
+    let cpu_handle = loaded_on_cpu(Some(MAC_RAM_MB));
+    let on_cpu = ledger
+        .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+        .expect("admitted on RAM");
+    // Nothing else holds RAM: both bases are ours.
+    push_basis(&mps_handle, RECMAX, MAC_RAM_MB, MAC_RAM_MB - 2_000, 0, 0);
+    ledger.ingest_all_for_test();
+    let headroom = ledger.headroom_mb(MPS_GPU);
+
+    let held = on_mps.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert_eq!(held.grant().mb, headroom / 2);
+    let other = on_cpu.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert!(other.grant().mb > 0);
+    assert_eq!(other.grant().unit_budget, 4);
+}
+
+/// A load in flight on the CPU device of a Mac counts as a replica on the
+/// MPS device too: the MPS replica's pre-fit grant is half of what the
+/// load's reservation leaves.
+#[tokio::test]
+async fn a_load_on_the_cpu_device_of_a_mac_counts_on_the_mps_device() {
+    const RECMAX: u64 = MAC_RAM_MB / 4 * 3;
+    let ledger = VramLedger::new(
+        &GpuInventory::known_mps(MAC_RAM_MB),
+        no_margin().into(),
+        None,
+    );
+    ledger.install_probe_stub(None);
+    let mps_handle = loaded_mps(Some(RECMAX));
+    let on_mps = ledger
+        .register_worker("g/mps", item_cost(4), &mps_handle, Some(MPS_GPU))
+        .expect("admitted on Metal");
+    push_basis(&mps_handle, RECMAX, MAC_RAM_MB, MAC_RAM_MB - 1_000, 0, 0);
+    ledger.ingest_all_for_test();
+    ledger.record_free_for_test(cpu::DEVICE_KEY, MAC_RAM_MB - 1_000);
+    let _loading = ledger
+        .reserve_load_for_test("g/cpu", item_cost(4), cpu::DEVICE_KEY, None)
+        .await
+        .expect("the CPU device");
+    let headroom = ledger.headroom_mb(MPS_GPU);
+    assert_eq!(headroom, RECMAX - 1_000 - CONSERVATIVE_BASE_MB);
+
+    let held = on_mps.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert_eq!(held.grant().mb, headroom / 2);
+}
+
 /// With MPS sampled peaks, no batch reads warm off `peak_reserved`, and an
 /// empty ring would let the ramp double to the memory ceiling. Read off the
 /// **post-batch** pool, the ring fills and the ramp holds at a rung it
@@ -1561,4 +1628,335 @@ fn the_pool_is_in_the_room_and_in_the_charge_so_only_free_ram_is_admitted() {
         token.grant().mb
     );
     token.finish(WindowOutcome::Responded { oom: None });
+}
+
+/// A Mac replica ramped 4 → 64 on an idle machine, its next budget 128.
+fn ramped_mac_replica() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
+    let ledger = mps_ledger();
+    let handle = loaded_mps(Some(MAC_TOTAL_MB));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    push_ram(&handle, MAC_TOTAL_MB, 90_000, 0, 0);
+    let ramped: Vec<u64> = (0..5)
+        .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
+        .collect();
+    assert_eq!(ramped, [4, 8, 16, 32, 64]);
+    (ledger, handle, admission)
+}
+
+/// `recommended_max_memory()` of the Mac in [`ramped_mac_replica`].
+const MAC_TOTAL_MB: u64 = 110_100;
+
+/// `(ramp_step, deflation, throughput_samples, unit_budget)` of the replica.
+fn ramp_figures(ledger: &Arc<VramLedger>) -> (u32, u32, usize, u64) {
+    let health = ledger.health();
+    let worker = &health[0].workers[0];
+    (
+        worker.ramp_step,
+        worker.deflation,
+        worker.throughput_samples,
+        worker.unit_budget,
+    )
+}
+
+/// What paging left of the replica's batch size, if anything.
+fn pressure_cap(ledger: &Arc<VramLedger>) -> Option<PressureCap> {
+    ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].pressure_cap
+}
+
+/// `windows` windows while macOS pages: the worker reads nothing available
+/// and holds 80 MiB of pool, which is 8 units.
+fn paging_windows(
+    ledger: &Arc<VramLedger>,
+    handle: &TelemetryHandle,
+    admission: &Admission,
+    windows: usize,
+) {
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
+    push_ram(handle, MAC_TOTAL_MB, 0, 80, 0);
+    for window in 0..windows {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let grant = *token.grant();
+        assert_eq!((grant.unit_budget, grant.mb), (8, 80));
+        assert_eq!(grant.squeezed, window == 0, "cut once, then held there");
+        // A warm batch, then collapses the pool growth would corroborate on
+        // an idle machine.
+        let mut batches = vec![measurement(8, 0, 80), warm_batch(8, 100.0)];
+        batches.extend((2..WINDOW_DEPTH_MULTIPLIER).map(|_| spilled_past_free(8, 100.0, 0)));
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(WindowOutcome::Responded { oom: None });
+    }
+}
+
+/// `windows` full windows on an idle-looking machine, and their unit budgets.
+fn ramp_windows(handle: &TelemetryHandle, admission: &Admission, windows: usize) -> Vec<u64> {
+    push_ram(handle, MAC_TOTAL_MB, 90_000, 80, 0);
+    (0..windows)
+        .map(|_| ramp_window(handle, admission, &MINILM_M3_MAX))
+        .collect()
+}
+
+/// While the Mac pages the reading leaves nothing available, so a grant is
+/// cut to the pool the replica holds. Those windows earn no ramp step, feed
+/// no knee and deflate nothing. At normal the batch grows back from the size
+/// it ran at by doubling, not in one jump.
+#[test]
+fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
+    let (ledger, handle, admission) = ramped_mac_replica();
+    let (step, _, samples, budget) = ramp_figures(&ledger);
+    assert_eq!(budget, 128, "the ramp's next size");
+    paging_windows(&ledger, &handle, &admission, 3);
+    let (step_during, deflation, samples_during, _) = ramp_figures(&ledger);
+    assert_eq!(step_during, step, "no window earned a step");
+    assert_eq!(deflation, 0, "no collapse was counted");
+    assert_eq!(samples_during, samples, "no rate reached the knee ring");
+
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
+    push_ram(&handle, MAC_TOTAL_MB, 90_000, 80, 0);
+    // A window the queue sized did not fill the size, so it earns no doubling.
+    queued_window_at_the_rate(&handle, &admission, 3, |_| 100.0);
+    assert_eq!(ramp_figures(&ledger).3, 8);
+    assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 64]);
+    assert_eq!(pressure_cap(&ledger), None, "back at what the ramp admits");
+    assert_eq!(ramp_windows(&handle, &admission, 2), [128, 256]);
+}
+
+/// At warning, once the paging has stopped, the batch grows back by doubling
+/// to half the size the episode began at and no further; a second episode
+/// halves that bound again. The full size returns only at normal.
+#[test]
+fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() {
+    use mps::MemoryPressure::{Normal, Warning};
+    let (ledger, handle, admission) = ramped_mac_replica();
+    let step = ramp_figures(&ledger).0;
+    paging_windows(&ledger, &handle, &admission, 2);
+    ledger.set_memory_pressure_for_test(Warning);
+    assert_eq!(
+        ramp_windows(&handle, &admission, 5),
+        [8, 16, 32, 64, 64],
+        "half of the 128 in force when the paging began"
+    );
+    paging_windows(&ledger, &handle, &admission, 2);
+    ledger.set_memory_pressure_for_test(Warning);
+    assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 32]);
+    assert_eq!(
+        ramp_figures(&ledger).0,
+        step,
+        "no pressure window earned a step"
+    );
+
+    ledger.set_memory_pressure_for_test(Normal);
+    assert_eq!(ramp_windows(&handle, &admission, 4), [32, 64, 128, 256]);
+    assert_eq!(pressure_cap(&ledger), None);
+}
+
+/// The bound lasts until the batch is back at what the ramp admits. A
+/// warning that returns before then grows back to the same bound, and holds
+/// there; an episode that begins before then halves the bound again.
+#[test]
+fn a_warning_or_an_episode_before_the_batch_is_back_keeps_the_bound() {
+    use mps::MemoryPressure::{Normal, Warning};
+    let (ledger, handle, admission) = ramped_mac_replica();
+    paging_windows(&ledger, &handle, &admission, 1);
+    ledger.set_memory_pressure_for_test(Normal);
+    assert_eq!(ramp_windows(&handle, &admission, 2), [8, 16]);
+    ledger.set_memory_pressure_for_test(Warning);
+    assert_eq!(
+        ramp_windows(&handle, &admission, 3),
+        [32, 64, 64],
+        "half of the 128 in force when the paging began"
+    );
+
+    ledger.set_memory_pressure_for_test(Normal);
+    assert_eq!(ramp_windows(&handle, &admission, 1), [64]);
+    assert_eq!(pressure_cap(&ledger), None, "back at what the ramp admits");
+    paging_windows(&ledger, &handle, &admission, 1);
+    ledger.set_memory_pressure_for_test(Normal);
+    assert_eq!(ramp_windows(&handle, &admission, 1), [8]);
+    paging_windows(&ledger, &handle, &admission, 1);
+    ledger.set_memory_pressure_for_test(Warning);
+    assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 32]);
+}
+
+/// The bound is at least one unit, or a batch already at one unit would be
+/// capped at none and never grow back.
+#[test]
+fn the_bound_of_a_one_unit_batch_is_one_unit() {
+    let ledger = mps_ledger();
+    let handle = loaded_mps(Some(MAC_TOTAL_MB));
+    let admission = ledger
+        .register_worker("g/a", item_cost(1), &handle, None)
+        .expect("registers");
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
+    push_ram(&handle, MAC_TOTAL_MB, 0, 0, 0);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(token.grant().unit_budget, 1);
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![measurement(1, 0, 10)]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(
+        pressure_cap(&ledger),
+        Some(PressureCap {
+            units: 1,
+            regrow_to: 1,
+            paging: true,
+        })
+    );
+}
+
+/// The size paging left belongs to the model on the device, so a replica
+/// loaded afterwards runs what the one that lived through it runs.
+#[test]
+fn a_reloaded_replica_inherits_the_size_paging_left() {
+    let (ledger, handle, admission) = ramped_mac_replica();
+    paging_windows(&ledger, &handle, &admission, 1);
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
+    let reloaded = loaded_mps(Some(MAC_TOTAL_MB));
+    let _admission = ledger
+        .register_worker("g/a", item_cost(4), &reloaded, None)
+        .expect("registers");
+    let budgets: Vec<u64> = ledger.health()[0]
+        .workers
+        .iter()
+        .map(|worker| worker.unit_budget)
+        .collect();
+    assert_eq!(budgets, [8, 8]);
+    assert_eq!(
+        ledger.window_target_units(admission.worker_id()),
+        8 * WINDOW_DEPTH_MULTIPLIER,
+        "the dispatcher fills windows for the size kept"
+    );
+}
+
+/// Only a paging window that memory or the ramp sized sets the size kept: not
+/// one the queue sized, unless memory cut that too. The size kept is a
+/// ceiling: a knee below it still decides.
+#[test]
+fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
+    let (ledger, handle, admission) = ramped_mac_replica();
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
+    queued_window_at_the_rate(&handle, &admission, 5, |_| 100.0);
+    assert_eq!(
+        pressure_cap(&ledger),
+        None,
+        "5 units of work, room for more"
+    );
+
+    push_ram(&handle, MAC_TOTAL_MB, 0, 80, 0);
+    let granted = queued_window_at_the_rate(&handle, &admission, 20, |_| 100.0);
+    assert_eq!(granted, 8, "20 units of work, memory for 8");
+    assert_eq!(pressure_cap(&ledger).map(|cap| cap.units), Some(8));
+
+    ledger.set_knee_for_test("g/a", MPS_GPU, 3);
+    assert_eq!(ramp_figures(&ledger).3, 3);
+}
+
+/// At warning with nothing being paged out the replica keeps the size it
+/// had: no growth, no ramp step, no knee sample. A squeeze there is not
+/// kept once its cause is gone. Growth resumes when the pressure ends.
+#[test]
+fn at_warning_without_paging_the_batch_size_is_held() {
+    let (ledger, handle, admission) = ramped_mac_replica();
+    let (step, _, samples, _) = ramp_figures(&ledger);
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
+    let held: Vec<u64> = (0..3)
+        .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
+        .collect();
+    assert_eq!(held, [128, 128, 128], "the budget in force, and no more");
+    let (step_during, _, samples_during, _) = ramp_figures(&ledger);
+    assert_eq!(step_during, step);
+    assert_eq!(samples_during, samples);
+    let reached =
+        ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].max_units_measured_here;
+    assert_eq!(
+        reached, 64,
+        "a size run under pressure is not one the ramp reached"
+    );
+
+    // Memory for 8 units for one window, then room again.
+    push_ram(&handle, MAC_TOTAL_MB, 0, 80, 0);
+    assert_eq!(ramp_window(&handle, &admission, &MINILM_M3_MAX), 8);
+    assert_eq!(
+        pressure_cap(&ledger),
+        None,
+        "a squeeze, not a paging episode"
+    );
+    assert_eq!(ramp_windows(&handle, &admission, 1), [128]);
+
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
+    assert_eq!(ramp_windows(&handle, &admission, 2), [128, 256]);
+}
+
+/// Pressure at either end of a window marks it: at the grant only, or at the
+/// settle only.
+#[test]
+fn a_window_under_pressure_at_either_end_earns_no_step() {
+    use mps::MemoryPressure::{Critical, Normal, Warning};
+    for (at_grant, at_settle) in [(Warning, Normal), (Normal, Critical)] {
+        let (ledger, handle, admission) = ramped_mac_replica();
+        let step = ramp_figures(&ledger).0;
+        ledger.set_memory_pressure_for_test(at_grant);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        ledger.set_memory_pressure_for_test(at_settle);
+        let rate = ladder_rate(&MINILM_M3_MAX, 128);
+        let mut batches = vec![BatchMeasurement {
+            duration_ms: Some(128.0 * 1000.0 / rate),
+            ..measurement(128, 0, 10 * 128 + 100)
+        }];
+        batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| warm_batch(128, rate)));
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            ramp_figures(&ledger).0,
+            step,
+            "{at_grant:?} at the grant, {at_settle:?} at the settle"
+        );
+    }
+}
+
+/// The cap a death left and the cap paging left bound the batch together,
+/// the smaller ruling, and each ends on its own terms. A worker that dies
+/// while the Mac pages sets the death cap like any other death; the paging
+/// cap lifts once the batch has grown back, the death cap stays.
+#[test]
+fn a_death_cap_and_a_paging_cap_hold_the_smaller_batch() {
+    let (ledger, handle, admission) = ramped_mac_replica();
+    paging_windows(&ledger, &handle, &admission, 2);
+    let paged = pressure_cap(&ledger).expect("capped by the paging windows");
+    assert_eq!(paged.units, 8);
+
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(token.grant().unit_budget, 8);
+    token.finish(WindowOutcome::WorkerDied);
+    assert_eq!(
+        pressure_cap(&ledger),
+        Some(paged),
+        "a death leaves it alone"
+    );
+    drop(admission);
+
+    // The model is reloaded while the Mac still pages.
+    let handle = loaded_mps(Some(MAC_TOTAL_MB));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    let worker = |ledger: &Arc<VramLedger>| ledger.health().swap_remove(0).workers.swap_remove(0);
+    assert_eq!(worker(&ledger).death_cap_units, Some(4));
+    assert_eq!(worker(&ledger).unit_budget, 4, "the smaller of 4 and 8");
+
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
+    assert_eq!(ramp_windows(&handle, &admission, 4), [4, 4, 4, 4]);
+    assert_eq!(pressure_cap(&ledger), None, "back at what is admitted");
+    assert_eq!(worker(&ledger).death_cap_units, Some(4), "until restart");
 }

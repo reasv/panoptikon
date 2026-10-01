@@ -40,14 +40,20 @@ impl VramLedger {
             return 1;
         };
         // The knee caps the batch; a window is still several batches deep.
-        admitted_units(
-            entry,
-            Self::anchor_locked(&state, entry),
-            Self::knee_locked(&state, entry),
-            Self::shape_ceiling_locked(&state, entry),
-        )
-        .saturating_mul(WINDOW_DEPTH_MULTIPLIER)
-        .max(1)
+        Self::budget_locked(&state, entry, Self::knee_locked(&state, entry))
+            .saturating_mul(WINDOW_DEPTH_MULTIPLIER)
+            .max(1)
+    }
+
+    /// Items the dispatcher may put in one window: one batch at the item cap
+    /// ([`Self::item_cap_locked`]), else no bound.
+    pub(super) fn window_item_bound(&self, worker: WorkerId) -> usize {
+        let state = self.lock();
+        state
+            .workers
+            .get(&worker)
+            .and_then(|entry| Self::item_cap_locked(&state, entry))
+            .map_or(usize::MAX, |cap| cap as usize)
     }
 
     /// Reserve headroom for one window and hand back the grant.
@@ -70,6 +76,7 @@ impl VramLedger {
         }
         self.maybe_refresh_external(worker);
         self.refresh_host_ram_now(worker);
+        let pressure = self.memory_pressure();
         let mut state = self.lock();
         Self::repay_deflation_locked(&mut state, worker);
         let gpu = state.workers.get(&worker)?.gpu.clone();
@@ -83,7 +90,13 @@ impl VramLedger {
         };
         let signed_headroom = self.overdraft_with_margin_locked(&state, &gpu, margin);
         let headroom = signed_headroom.max(0) as u64;
-        let share = self.share_locked(&state, worker, signed_headroom);
+        // The ramp value, and what of it the window's content asks for.
+        let (capped, wanted) = {
+            let entry = state.workers.get(&worker)?;
+            let capped = Self::budget_locked(&state, entry, Self::knee_locked(&state, entry));
+            (capped, capped.min(window_units.max(1)).max(1))
+        };
+        let share = self.share_locked(&state, worker, signed_headroom, wanted);
         let (
             mut unit_budget,
             mut mb,
@@ -98,18 +111,15 @@ impl VramLedger {
             ram_mb,
             ram_bound,
             ram_mb_per_unit,
+            item_cap,
+            ram_only,
         ) = {
             let entry = state.workers.get(&worker)?;
-            let anchor = Self::anchor_locked(&state, entry);
             let slope = Self::grant_slope_locked(&state, entry);
-            let ceiling = Self::shape_ceiling_locked(&state, entry);
-            let capped = admitted_units(entry, anchor, Self::knee_locked(&state, entry), ceiling);
-            let wanted = capped.min(window_units.max(1)).max(1);
             // The knee decided this window's size: it bit (compared with the
             // shape ceiling still applied) and the work in hand reached it.
-            let knee_bound = capped < admitted_units(entry, anchor, None, ceiling)
-                && wanted >= capped
-                && capped > 0;
+            let knee_bound =
+                capped < Self::budget_locked(&state, entry, None) && wanted >= capped && capped > 0;
             // Room for `RATCHET_FACTOR` × the appetite, measured against the
             // requester's own room (its pool included).
             let ample_headroom = (share.room as f64)
@@ -130,9 +140,21 @@ impl VramLedger {
                 if share.mb == 0 {
                     units = 1;
                 }
-                // Pre-fit, squeezed means held at the floor while the floors
+                // Beside another replica's reservation, at most the batch
+                // that the share and what the replica holds cover at its
+                // pre-fit price.
+                let within = share
+                    .mb
+                    .saturating_add(entry.growth_in_use_mb())
+                    .max(entry.pool_growth_mb());
+                let covered = Self::pre_fit_price_locked(&state, entry).units(within, units);
+                let cut = covered < units && Self::neighbour_reserved_locked(&state, worker);
+                if cut {
+                    units = Self::cut_size_locked(&state, entry, covered);
+                }
+                // Otherwise squeezed means held at the floor while the floors
                 // do not all fit.
-                share.mb <= share.floor && headroom < share.floor_sum
+                cut || (share.mb <= share.floor && headroom < share.floor_sum)
             };
             // Host RAM caps a GPU replica's batch as the edge of a full card
             // would; the GPU side above is unchanged.
@@ -144,6 +166,22 @@ impl VramLedger {
                     mb = ((units as f64) * slope).ceil() as u64;
                 }
             }
+            // An item-capped window bounds batches in items, the user's cap
+            // included; for a count-priced model that is its unit budget too.
+            let item_cap = Self::item_cap_locked(&state, entry)
+                .map(|cap| user_cap_items.map_or(cap, |user| cap.min(user)));
+            if let Some(cap) = item_cap.map(u64::from).filter(|cap| *cap < units)
+                && entry.aggregation == CostAggregation::Count
+            {
+                units = cap;
+                if let Some(slope) = slope {
+                    mb = ((units as f64) * slope).ceil() as u64;
+                }
+            }
+            // Until the GPU side learns from them, an item-capped window is
+            // not a RAM bound to it; after, the cap holds it back as one.
+            let ram_only = item_cap.is_some() && !entry.capped_windows_feed_gpu;
+            let ram_bound = !ram_only && (ram_bound || item_cap.is_some());
             let ram_cost = ram.and_then(|ram| ram.cost);
             let ram_mb = ram_cost.map_or(0, |cost| cost.booking_mb(units));
             let ram_mb_per_unit = ram_cost.map(|cost| cost.mb_per_unit);
@@ -156,12 +194,17 @@ impl VramLedger {
                 entry.max_tokens,
                 squeezed,
                 knee_bound,
-                ample_headroom && !squeezed && !ram_bound,
+                ample_headroom
+                    && !squeezed
+                    && !ram_bound
+                    && pressure == mps::MemoryPressure::Normal,
                 // queue_bound: less work in hand than the ramp admits.
                 wanted < capped,
                 ram_mb,
                 ram_bound,
                 ram_mb_per_unit,
+                item_cap,
+                ram_only,
             )
         };
         // At least one unit, or the queue stalls; the MB side has no floor.
@@ -174,6 +217,12 @@ impl VramLedger {
             let busy_holder = starved.then(|| Self::largest_free_pool_locked(&state, &gpu, worker));
             Self::flag_trims_locked(&mut state, &gpu, worker, starved, busy_holder.flatten());
         }
+        // What the booking may take out of free host RAM: the replica reuses
+        // the growth it already holds.
+        let ram_new_mb = state.workers.get(&worker).map_or(0, |entry| {
+            let held = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
+            ram_mb.saturating_sub(held)
+        });
         let grant_id = state.next_id();
         state
             .workers
@@ -195,6 +244,9 @@ impl VramLedger {
                     byte_bound,
                     ram_mb,
                     ram_bound,
+                    pressure,
+                    item_cap,
+                    ram_only,
                 },
             );
         if let Some(entry) = state.workers.get_mut(&worker) {
@@ -203,7 +255,18 @@ impl VramLedger {
         Self::note_occupancy_locked(&mut state, &gpu);
         // Logged after the lock is dropped.
         let external_mb = Self::external_locked(&state, &gpu).unwrap_or(0);
-        let (reserve_mb, reserve_rule) = self.reserve_locked(&gpu, external_mb, margin);
+        let (reserve_mb, reserve_rule) = self.reserve_locked(&state, &gpu, external_mb, margin);
+        // The worker's clamp keeps the CPU device's reserve free.
+        let ram_reserve_mb = if gpu == cpu::DEVICE_KEY {
+            reserve_mb
+        } else if ram_new_mb > 0 {
+            let external = Self::external_locked(&state, cpu::DEVICE_KEY).unwrap_or(0);
+            let margin = self.budgets.for_gpu(cpu::DEVICE_KEY).margin_in_force();
+            self.reserve_locked(&state, cpu::DEVICE_KEY, external, margin)
+                .0
+        } else {
+            0
+        };
         let issued = state.workers.get(&worker).map(|entry| {
             let anchor = Self::anchor_locked(&state, entry);
             (
@@ -235,9 +298,12 @@ impl VramLedger {
                 window_requests,
                 ram_mb,
                 ram_bound,
+                memory_pressure = ?pressure,
+                item_cap = ?item_cap,
                 "issued a memory grant"
             );
-            if ram_bound && RAM_BOUND_LOG.admit_for(&format!("{model} {gpu}")) {
+            if ram_bound && item_cap.is_none() && RAM_BOUND_LOG.admit_for(&format!("{model} {gpu}"))
+            {
                 tracing::info!(
                     model = %model,
                     gpu = %gpu,
@@ -257,10 +323,12 @@ impl VramLedger {
                 mb,
                 unit,
                 aggregation,
-                user_cap_items,
+                user_cap_items: item_cap.or(user_cap_items),
                 canvas_pixels,
                 max_tokens,
                 squeezed: squeezed || ram_bound,
+                ram_mb: ram_new_mb,
+                ram_reserve_mb,
             },
             settled: false,
         })
@@ -343,6 +411,7 @@ impl VramLedger {
                 gpu = %verdict.gpu,
                 base_mb = verdict.base_mb,
                 room_mb = verdict.room_mb,
+                died = verdict.died,
                 windows = OOM_WINDOWS_AT_FLOOR,
                 "this model cannot run a single item on this GPU; failing it \
                  instead of dispatching to it again"
@@ -352,6 +421,7 @@ impl VramLedger {
     }
 
     fn settle_locked(&self, worker: WorkerId, grant_id: u64, outcome: WindowOutcome) -> Settled {
+        let pressure = self.memory_pressure();
         let mut state = self.lock();
         // Time repayment first, whatever the outcome.
         Self::repay_deflation_locked(&mut state, worker);
@@ -359,7 +429,12 @@ impl VramLedger {
             return Settled::default();
         };
         // This window's requests leave the demand signal on every outcome.
-        let charge = entry.grants.remove(&grant_id);
+        // Pressure that began while the window was out counts as well.
+        let charge = entry.grants.remove(&grant_id).map(|charge| GrantCharge {
+            pressure: charge.pressure.max(pressure),
+            ample_headroom: charge.ample_headroom && pressure == mps::MemoryPressure::Normal,
+            ..charge
+        });
         if let Some(charge) = charge {
             entry.pending_requests = entry.pending_requests.saturating_sub(charge.requests);
         }
@@ -389,14 +464,20 @@ impl VramLedger {
             WindowOutcome::Responded { oom } => oom,
             _ => None,
         };
-        if let WindowOutcome::Responded { oom } = outcome {
+        // A clean RAM-only window leaves the ramp and the knee as they were.
+        let clean_ram_only = charge.is_some_and(|charge| charge.ram_only)
+            && matches!(outcome, WindowOutcome::Responded { oom: None })
+            && !ingested.negative;
+        if let WindowOutcome::Responded { oom } = outcome
+            && !clean_ram_only
+        {
             let negative = ingested.negative || oom.is_some();
             responded_negative = negative;
             // Read after the ingest, which may move both.
             let (anchor, ceiling) = match state.workers.get(&worker) {
                 Some(entry) => (
                     Self::anchor_locked(&state, entry),
-                    Self::shape_ceiling_locked(&state, entry),
+                    Self::batch_ceiling_locked(&state, entry),
                 ),
                 None => (0, None),
             };
@@ -448,13 +529,17 @@ impl VramLedger {
                     };
                 }
             }
+            if let Some(charge) = charge {
+                let filled = !negative && ingested.filled;
+                Self::note_pressure_size_locked(&mut state, worker, charge, filled);
+            }
             Self::reprobe_hold_locked(&mut state, worker, charge, negative);
             Self::log_ramp_hold_locked(&mut state, worker, gate, knee_binds);
             knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
         }
         let died = matches!(outcome, WindowOutcome::WorkerDied);
         let death = died
-            .then(|| Self::note_unified_death_locked(&mut state, worker, charge.is_some()))
+            .then(|| Self::note_death_locked(&mut state, worker, charge))
             .flatten();
         // Any OOM or death lowers a seeded anchor, unless the unified-memory
         // death path already halved it.
@@ -468,6 +553,7 @@ impl VramLedger {
             worker,
             charge,
             frame_oom.is_some() || ingested.oom || died,
+            died,
             matches!(outcome, WindowOutcome::Responded { .. }) && !responded_negative,
         );
         Self::refit_locked(&mut state, worker);
@@ -550,7 +636,8 @@ pub struct Grant {
     pub mb: u64,
     pub unit: CostUnit,
     pub aggregation: CostAggregation,
-    /// The user's per-request max batch size, in items; never converted.
+    /// The user's per-request max batch size, in items; never converted. At
+    /// most the item cap while the host RAM cost is unknown.
     pub user_cap_items: Option<u32>,
     /// Per-item pixel cap; `None` = uncapped. Worker and host both price an
     /// input at `min(raw_pixels, canvas_pixels)`.
@@ -561,6 +648,12 @@ pub struct Grant {
     /// Memory (the GPU's or host RAM), not the ramp, ratchet or queue, held
     /// this window back.
     pub squeezed: bool,
+    /// Host RAM a GPU replica's window may add to its resident set: its
+    /// booking on the CPU device less the growth it already holds; 0 if none.
+    pub ram_mb: u64,
+    /// Free host RAM the worker's live clamp leaves alone: the CPU device's
+    /// reserve, for a replica priced or booked in host RAM; 0 otherwise.
+    pub ram_reserve_mb: u64,
 }
 
 /// A held grant. Dropping it releases the reservation as an abort;

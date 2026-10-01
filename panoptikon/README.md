@@ -368,6 +368,15 @@ but not necessarily in-place file edits, so scheduled full scans remain the
 ground truth. There is no separate continuous-scan exclude list; the database's
 global `excluded_folders` still apply.
 
+On Linux the server caps glibc's allocator at four arenas and returns freed
+memory to the OS when a job ends and, at most every 10 s, at a moment with no
+request or job in flight, so its resident memory falls back to about its idle
+level instead of keeping the buffers of finished work. Inference workers
+return it after every batch; CUDA and ROCm workers also run with four arenas,
+and workers on the CPU device keep fixed malloc thresholds for exact RAM
+pricing. On Windows and macOS the system allocator returns freed memory by
+itself.
+
 ## Local inference (inferio orchestrator)
 
 With `[inference_local].enabled = true` the gateway serves `/api/inference/*`
@@ -498,6 +507,19 @@ A model on a GPU is sized against host RAM as well. The RAM its batches use
 for decoded inputs, preprocessing and outputs is booked against the `CPU`
 device's budget, so its batch size stops growing where RAM runs out, even
 when VRAM has room.
+
+Host RAM is budgeted more carefully than VRAM, because running out of it
+kills a process instead of failing an allocation. The `CPU` device always
+keeps a tenth of the machine's RAM free (at most 16 GiB; at least 2 GiB, or
+a quarter of RAM on a machine under 8 GiB): `margin` can raise that reserve,
+never lower it, and its `cap_fraction` (0.75 by default) still applies. So
+under `[inference_local.vram.gpu."CPU"]`, `margin = 0` and
+`cap_fraction = 1.0` do not hand over all of RAM: the reserve is still kept.
+On Linux, reclaimable kernel slab is not counted as free RAM, and inference
+workers are the first processes the kernel kills if RAM does run out, so
+other programs are spared and the job re-queues the affected items. A model
+whose worker died in the middle of a batch runs at most half that batch size
+on that device until the server restarts.
 
 Overrides are per **GPU instance**, keyed by GPU UUID (`nvidia-smi -L`
 prints them; ROCm keys its GPUs differently — see below), not by card model
@@ -897,7 +919,8 @@ once they are over a day old.
 
 ### `--root`
 
-The global `--root <dir>` flag (default: the current working directory) is
+The global `--root <dir>` flag (default: the `PANOPTIKON_ROOT` environment
+variable, else the current working directory) is
 the base for all relative path resolution — `data_folder`, `config/`, the
 python tree, `runtime/`. It is implemented as a chdir at startup before
 anything else runs, so every CWD-relative default (including the `.env`
@@ -1186,6 +1209,8 @@ These are deliberately *not* TOML keys:
 
 - `PANOPTIKON_CONFIG_PATH` — bootstrap: locates the config file, so it cannot
   live inside it. (`--config` wins over it.)
+- `PANOPTIKON_ROOT` — bootstrap: the root directory, which locates everything
+  else. (`--root` wins over it; empty counts as unset.)
 - `RUST_LOG` — standard tracing debug tool; overrides `[logging].level` when
   set and supports per-module directives.
 - Variables the gateway *sets* on child processes (internal protocol):

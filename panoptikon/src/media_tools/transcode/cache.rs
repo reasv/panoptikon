@@ -182,6 +182,23 @@ impl TranscodeCache {
         // consumers and the relay's mapping hints, which expect plain paths.
         let dir = std::path::absolute(&dir)
             .with_context(|| format!("failed to absolutize the cache dir {}", dir.display()))?;
+        // The cache is optional: a folder another user owns fails the open
+        // when SQLite cannot open it at all, and is a warning when it opens
+        // for reading only.
+        let problem = || crate::ownership::database_problem(&dir, DB_FILE_NAME);
+        let cache = Self::open_absolute(dir.clone(), budget_mb, limit_mb)
+            .await
+            .map_err(|err| match problem() {
+                Some(reason) => err.context(reason),
+                None => err,
+            })?;
+        if let Some(reason) = problem() {
+            tracing::warn!("new renditions cannot be stored in the transcode cache: {reason}");
+        }
+        Ok(cache)
+    }
+
+    async fn open_absolute(dir: PathBuf, budget_mb: u64, limit_mb: u64) -> Result<Self> {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create transcode cache dir {}", dir.display()))?;
         let options = SqliteConnectOptions::new()
@@ -1172,6 +1189,28 @@ mod tests {
         let cache = TranscodeCache::open(dir.to_path_buf(), 1, 1).await.unwrap();
         cache.budget_bytes.store(budget_bytes, Ordering::Relaxed);
         cache
+    }
+
+    /// A cache folder another user owns cannot be opened; the error names
+    /// the folder and its owner above the SQLite failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cache_folder_another_user_owns_is_named() {
+        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        let Some((folder, owner)) = foreign_folder(false) else {
+            return;
+        };
+        let own = tempfile::tempdir().unwrap();
+        let dir = own.path().join("cache");
+        std::os::unix::fs::symlink(folder, &dir).unwrap();
+        let error = TranscodeCache::open(dir.clone(), 1, 1).await.err().unwrap();
+        let error = format!("{error:#}");
+        let expected = owned_by_another_user(&dir, owner, &dir);
+        assert!(error.starts_with(&expected), "{error}");
+        assert!(
+            error.contains("failed to open the transcode cache db"),
+            "{error}"
+        );
     }
 
     /// Writes `bytes` into `temp` and commits it under `key`, carrying the

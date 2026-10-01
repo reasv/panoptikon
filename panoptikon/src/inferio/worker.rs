@@ -52,7 +52,8 @@ use super::ledger::{FitSnapshot, Grant};
 use super::registry::SpawnSpec;
 use super::slot_error::{ERROR_SLOT_KEY, SlotError, Unattempted, slot_error_from_parts};
 use crate::process_tree::{
-    JobGuard, detach_from_console, die_with_parent, kill_process_group, spawn_supervised_tokio,
+    JobGuard, detach_from_console, die_with_parent, first_oom_victim, kill_process_group,
+    spawn_supervised_tokio,
 };
 
 /// Protocol version this orchestrator speaks; workers answering anything
@@ -182,13 +183,13 @@ impl WorkerSpawnConfig {
     }
 
     /// Adds `INFERIO_DEVICE=cpu` for a replica on the CPU device: it is priced
-    /// against RAM, so it must run there.
+    /// against RAM, so it must run there. Its malloc settings are the CPU
+    /// device's, in place of the host accelerator's.
     pub fn for_cpu_device(&self) -> Self {
         let mut cfg = self.clone();
-        cfg.env.push((
-            crate::accelerator_env::DEVICE_ENV_VAR.to_owned(),
-            "cpu".to_owned(),
-        ));
+        cfg.env
+            .retain(|(key, _)| !crate::accelerator_env::is_device_env(key));
+        cfg.env.extend(crate::accelerator_env::cpu_device_env());
         cfg
     }
 }
@@ -564,9 +565,18 @@ fn leader_is_unwinding(pid: Option<u32>) -> bool {
     let Some(pid) = pid else {
         return false;
     };
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+    stat_reads_exited(std::fs::read_to_string(format!("/proc/{pid}/stat")))
+}
+
+/// Whether a read of `/proc/<pid>/stat` shows a process that is gone or a
+/// zombie. A read that failed for another reason (no descriptor to spare)
+/// says nothing about the process.
+#[cfg(target_os = "linux")]
+fn stat_reads_exited(stat: std::io::Result<String>) -> bool {
+    let stat = match stat {
+        Ok(stat) => stat,
         // Gone while we still hold it unreaped: no longer a process.
-        return true;
+        Err(err) => return err.kind() == std::io::ErrorKind::NotFound,
     };
     let Some((_, after_comm)) = stat.rsplit_once(')') else {
         return false;
@@ -650,6 +660,9 @@ enum FatalCause {
     Unreachable,
     /// We killed a live worker whose stream can no longer be trusted.
     Desync,
+    /// The process had exited before the request was sent: it died idle, not
+    /// running this request.
+    ExitedIdle,
 }
 
 /// The child command for one worker, with its environment
@@ -696,6 +709,8 @@ fn worker_command(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Result<Comma
     detach_from_console(&mut command);
     // The kernel reaps the worker if the gateway dies without cleanup.
     die_with_parent(&mut command);
+    // Out of RAM, the kernel kills the worker, not another process.
+    first_oom_victim(&mut command);
     Ok(command)
 }
 
@@ -1249,6 +1264,13 @@ impl Worker {
                     FatalCause::Desync,
                 )
                 .await);
+        }
+        // Not `Unreachable`: this request did not kill it.
+        if (!self.exit_hidden() && matches!(self.child.try_wait(), Ok(Some(_))))
+            || leader_is_unwinding(self.pid)
+        {
+            let why = format!("the worker process had exited before this {request_type} request");
+            return Err(self.fatal(why, FatalCause::ExitedIdle).await);
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -1867,6 +1889,11 @@ fn encode_grant(grant: &Grant) -> Value {
                 .map(|tokens| Value::from(u64::from(tokens)))
                 .unwrap_or(Value::Nil),
         ),
+        (Value::from("ram_mb"), Value::from(grant.ram_mb)),
+        (
+            Value::from("ram_reserve_mb"),
+            Value::from(grant.ram_reserve_mb),
+        ),
     ])
 }
 
@@ -2090,6 +2117,8 @@ mod tests {
             canvas_pixels: None,
             max_tokens: None,
             squeezed: false,
+            ram_mb: 0,
+            ram_reserve_mb: 0,
         }
     }
 
@@ -2183,7 +2212,13 @@ mod tests {
         // `cpu` request), and the marker `get_device` reads, so the model runs
         // where it is priced.
         for cfg in [&cuda, &rocm] {
-            let on_cpu = cfg.for_cpu_device();
+            // Spawned from the GPU host's worker env, arena cap included.
+            let mut gpu_host = cfg.clone();
+            gpu_host.env = crate::accelerator_env::worker_env(
+                crate::config::Accelerator::Cuda,
+                std::path::Path::new("/nonexistent/venv/bin/python"),
+            );
+            let on_cpu = gpu_host.for_cpu_device();
             assert_eq!(
                 env_of(&on_cpu, Some(""), cfg.pin_env_var).as_deref(),
                 Some(""),
@@ -2198,6 +2233,13 @@ mod tests {
                 None,
                 "and nothing else gets the marker"
             );
+            // Its memory is priced as resident set, like a CPU host's workers:
+            // the CPU thresholds, not the GPU workers' arena cap.
+            assert_eq!(
+                env_of(&on_cpu, Some(""), "MALLOC_MMAP_THRESHOLD_").as_deref(),
+                Some("131072")
+            );
+            assert_eq!(env_of(&on_cpu, Some(""), "MALLOC_ARENA_MAX"), None);
         }
     }
 
@@ -2492,10 +2534,22 @@ mod tests {
         worker.kill().await;
     }
 
-    /// A worker killed externally mid-session fails the next predict promptly
-    /// (EOF on stdout is the wakeup; predict has no deadline), poisons the
-    /// worker, and records *why* it is gone — signal, pid, status, stderr tail
-    /// and attribution, gathered eagerly because the reap destroys them.
+    /// A worker is spawned as the kernel's first out-of-memory victim, so a
+    /// batch that outgrows RAM kills it and no other program.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_worker_is_the_first_oom_victim() {
+        let worker = loaded("test/echo", "echo_test").await;
+        let pid = worker.pid.expect("a live worker has a pid");
+        let adj = std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj")).expect("readable");
+        assert_eq!(adj.trim(), "1000");
+        worker.shutdown().await.expect("graceful shutdown");
+    }
+
+    /// A worker killed externally while idle fails the next predict before a
+    /// frame is sent, poisons the worker, and records *why* it is gone:
+    /// signal, pid, status, stderr tail and attribution, gathered eagerly
+    /// because the reap destroys them.
     #[tokio::test]
     async fn a_fatal_path_records_the_exit_signal_and_pid() {
         let mut worker = loaded("test/echo", "echo_test").await;
@@ -2520,6 +2574,7 @@ mod tests {
         // Poisoned: further requests fail fast rather than hanging.
         let err = worker.ping().await.expect_err("dead worker stays dead");
         assert!(format!("{err:#}").contains("dead"));
+        assert!(!worker.take_death(), "it did not die running the request");
 
         let death = worker
             .last_death()
@@ -2528,7 +2583,7 @@ mod tests {
         assert!(death.pid.is_some(), "the pid was latched before the reap");
         assert!(death.status.is_some(), "reaped, status kept: {death}");
         assert!(
-            death.why.contains("predict request failed"),
+            death.why.contains("had exited before this predict request"),
             "the record says what the orchestrator was doing: {}",
             death.why
         );
@@ -2591,6 +2646,13 @@ mod tests {
         let death = worker.last_death().expect("the fatal path recorded it");
         assert_eq!(death.attribution, DeathAttribution::Dying, "{death}");
         assert!(!death.attribution.killed_by_gateway());
+        // `/proc` alone showed it gone before the request was sent, so it
+        // did not die running it.
+        #[cfg(target_os = "linux")]
+        {
+            assert!(death.why.contains("had exited before"), "{}", death.why);
+            assert!(!worker.take_death());
+        }
     }
 
     /// The `/proc` probe on this process and on a pid that cannot exist.
@@ -2600,6 +2662,18 @@ mod tests {
         assert!(!leader_is_unwinding(Some(std::process::id())));
         assert!(!leader_is_unwinding(None), "no pid is not evidence");
         assert!(leader_is_unwinding(Some(u32::MAX)));
+        // Only "not there" and a zombie state mean exited; a read that
+        // failed for any other reason leaves a live worker alone.
+        use std::io::{Error, ErrorKind};
+        assert!(stat_reads_exited(Err(Error::from(ErrorKind::NotFound))));
+        assert!(!stat_reads_exited(Err(Error::from_raw_os_error(
+            libc::EMFILE
+        ))));
+        assert!(!stat_reads_exited(Err(Error::from(
+            ErrorKind::PermissionDenied
+        ))));
+        assert!(stat_reads_exited(Ok("7 (python) Z 1 7".to_owned())));
+        assert!(!stat_reads_exited(Ok("7 (python) S 1 7".to_owned())));
     }
 
     /// The attribution probes against an unread response frame in stdout: a
@@ -3181,6 +3255,8 @@ mod tests {
             canvas_pixels,
             max_tokens,
             squeezed: false,
+            ram_mb: 0,
+            ram_reserve_mb: 0,
         };
         let on_the_wire = |key: &str, canvas_pixels, max_tokens| {
             let encoded = encode_grant(&grant(canvas_pixels, max_tokens));
@@ -3207,6 +3283,18 @@ mod tests {
             Some(Value::Nil),
             "present and nil, not absent"
         );
+
+        // The host RAM a window may take and the reserve its clamp keeps.
+        let encoded = encode_grant(&Grant {
+            ram_mb: 4_100,
+            ram_reserve_mb: 6_553,
+            ..grant(None, None)
+        });
+        let Value::Map(map) = &encoded else {
+            panic!("a grant encodes as a map, got {encoded:?}");
+        };
+        assert_eq!(map_get(map, "ram_mb"), Some(&Value::from(4_100u64)));
+        assert_eq!(map_get(map, "ram_reserve_mb"), Some(&Value::from(6_553u64)));
     }
 
     /// The other direction: the canvas the worker resolved for the model it
