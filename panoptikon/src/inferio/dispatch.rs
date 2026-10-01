@@ -2403,16 +2403,44 @@ mod tests {
         );
     }
 
-    /// The other half: a replica killed out from under the supervisor — a
-    /// jetsam or OOM-killer SIGKILL, from this side of the pipe — really is a
-    /// death, and settles as one exactly once.
+    /// A replica that had already exited when its window was handed to it
+    /// (killed while idle, before the liveness sweep found it) did not die
+    /// running that window: the model goes down and the request fails as for
+    /// any death, but the window settles as an abort.
     #[tokio::test]
-    async fn a_worker_that_stopped_answering_settles_as_a_death() {
+    async fn a_worker_that_died_idle_settles_its_next_window_as_an_abort() {
         let mut worker = echo_worker().await;
         worker.kill_child_externally_for_test().await;
         let (request, answer) = lone_request();
 
         let (batch, window) = run_single("test/echo", &mut worker, request, None, None, None).await;
+        assert!(matches!(batch, BatchOutcome::Fatal(_)));
+        assert_eq!(window, WindowOutcome::Aborted);
+        let err = answer
+            .await
+            .expect("the caller was answered")
+            .expect_err("the request fails");
+        assert!(
+            err.downcast_ref::<Unattempted>().is_some(),
+            "and is re-queued like any other the worker never ran: {err:#}"
+        );
+    }
+
+    /// The other half: a replica that dies with the window in flight — a
+    /// jetsam or OOM-killer SIGKILL, from this side of the pipe — really is a
+    /// death, and settles as one exactly once.
+    #[tokio::test]
+    async fn a_worker_that_stopped_answering_settles_as_a_death() {
+        let cfg = super::super::worker::testing::test_spawn_config();
+        let spec = super::super::worker::testing::spec("dying_test");
+        let mut worker = Worker::spawn_configured(&cfg, "test/dying", &spec, None)
+            .await
+            .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+        let (request, answer) = lone_request();
+
+        let (batch, window) =
+            run_single("test/dying", &mut worker, request, None, None, None).await;
         assert!(matches!(batch, BatchOutcome::Fatal(_)));
         assert_eq!(window, WindowOutcome::WorkerDied);
         assert!(answer.await.expect("the caller was answered").is_err());
@@ -2421,7 +2449,7 @@ mod tests {
         // — unreachable today, but nothing in the types says so — cannot
         // halve the ratchet anchor a second time for it.
         let (request, answer) = lone_request();
-        let (_, window) = run_single("test/echo", &mut worker, request, None, None, None).await;
+        let (_, window) = run_single("test/dying", &mut worker, request, None, None, None).await;
         assert_eq!(window, WindowOutcome::Aborted);
         assert!(answer.await.expect("the caller was answered").is_err());
     }

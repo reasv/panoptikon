@@ -651,6 +651,9 @@ enum FatalCause {
     Unreachable,
     /// We killed a live worker whose stream can no longer be trusted.
     Desync,
+    /// The process had exited before the request was sent: it died idle, not
+    /// running this request.
+    ExitedIdle,
 }
 
 /// The child command for one worker, with its environment
@@ -1252,6 +1255,13 @@ impl Worker {
                     FatalCause::Desync,
                 )
                 .await);
+        }
+        // Not `Unreachable`: this request did not kill it.
+        if !self.exit_hidden()
+            && (matches!(self.child.try_wait(), Ok(Some(_))) || leader_is_unwinding(self.pid))
+        {
+            let why = format!("the worker process had exited before this {request_type} request");
+            return Err(self.fatal(why, FatalCause::ExitedIdle).await);
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -2527,10 +2537,10 @@ mod tests {
         worker.shutdown().await.expect("graceful shutdown");
     }
 
-    /// A worker killed externally mid-session fails the next predict promptly
-    /// (EOF on stdout is the wakeup; predict has no deadline), poisons the
-    /// worker, and records *why* it is gone — signal, pid, status, stderr tail
-    /// and attribution, gathered eagerly because the reap destroys them.
+    /// A worker killed externally while idle fails the next predict before a
+    /// frame is sent, poisons the worker, and records *why* it is gone:
+    /// signal, pid, status, stderr tail and attribution, gathered eagerly
+    /// because the reap destroys them.
     #[tokio::test]
     async fn a_fatal_path_records_the_exit_signal_and_pid() {
         let mut worker = loaded("test/echo", "echo_test").await;
@@ -2555,6 +2565,7 @@ mod tests {
         // Poisoned: further requests fail fast rather than hanging.
         let err = worker.ping().await.expect_err("dead worker stays dead");
         assert!(format!("{err:#}").contains("dead"));
+        assert!(!worker.take_death(), "it did not die running the request");
 
         let death = worker
             .last_death()
@@ -2563,7 +2574,7 @@ mod tests {
         assert!(death.pid.is_some(), "the pid was latched before the reap");
         assert!(death.status.is_some(), "reaped, status kept: {death}");
         assert!(
-            death.why.contains("predict request failed"),
+            death.why.contains("had exited before this predict request"),
             "the record says what the orchestrator was doing: {}",
             death.why
         );
