@@ -1880,6 +1880,7 @@ def mps_host(
     mps: FakeMpsAllocator | None = None,
     ram_mb: int = 128 * 1024,
     pressure: int = 1,
+    paging: bool = False,
 ):
     """An MPS worker whose kernel counters leave `available_mb` of RAM: the
     machine holds the rest as anonymous pages. psutil is mocked too, and to a
@@ -1891,12 +1892,20 @@ def mps_host(
         0,
         max(0, ram_mb - available_mb) * MIB,
         pressure,
+        0,
     )
     memory_info = SimpleNamespace(total=ram_mb * MIB, available=7 * MIB)
-    with isolated(fake_mps_torch_module(mps)):
-        with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
-            with mock.patch("psutil.virtual_memory", return_value=memory_info):
-                yield mps
+    with isolated(fake_mps_torch_module(mps)), mac_counters(counters, paging):
+        with mock.patch("psutil.virtual_memory", return_value=memory_info):
+            yield mps
+
+
+@contextmanager
+def mac_counters(counters: tuple[int, ...], paging: bool = False):
+    """macOS kernel counters, and whether the kernel counts as paging."""
+    with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
+        with mock.patch.object(memory, "_mac_paging", return_value=paging):
+            yield
 
 
 def test_the_mps_sample_reports_the_pool_and_ram_clamped_free() -> None:
@@ -2007,13 +2016,15 @@ def available_mb(
     compressed_mb: int,
     anonymous_mb: int,
     pressure: int = 1,
+    paging: bool = False,
 ) -> int:
     """`mac_available_bytes` over one set of counters, in MiB."""
     counters = (
         *(value * MIB for value in (ram_mb, wired_mb, compressed_mb, anonymous_mb)),
         pressure,
+        0,
     )
-    with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
+    with mac_counters(counters, paging):
         available = memory.mac_available_bytes()
     assert available is not None
     return available // MIB
@@ -2063,30 +2074,68 @@ def test_the_mac_reading_falls_with_this_processs_own_allocation() -> None:
             assert psutil_mb == 111_196, "the reading that stopped moving"
 
 
-def test_under_memory_pressure_the_mac_reading_leaves_nothing_available() -> None:
-    """At warning (2) or critical (4) macOS is compressing and swapping while
-    it keeps several GiB of file cache, which the formula counts as available:
-    9 963 MiB here, on a Mac swapping 20 GiB."""
-    for level, expected in [(1, 9_963), (2, 0), (4, 0)]:
-        assert available_mb(131_072, 5_189, 55_599, 60_321, level) == expected
+def test_nothing_is_available_while_the_mac_pages_under_pressure() -> None:
+    """At critical (4), or at warning (2) while it is paging, macOS keeps
+    several GiB of file cache that the formula counts as available: 9 963 MiB
+    here. Warning without paging only means memory is held compressed."""
+    for level, paging, expected in [
+        (1, False, 9_963),
+        (1, True, 9_963),
+        (2, False, 9_963),
+        (2, True, 0),
+        (3, True, 0),
+        (4, False, 0),
+        (4, True, 0),
+    ]:
+        available = available_mb(131_072, 5_189, 55_599, 60_321, level, paging)
+        assert available == expected, (level, paging)
 
 
-def test_under_memory_pressure_an_mps_batch_fits_the_pool_it_holds() -> None:
+def test_paging_is_a_swap_out_counter_that_rose_recently() -> None:
+    """Since the previous reading, or within `MAC_PAGING_SECONDS` before this
+    one; a first reading has nothing to compare with."""
+    readings = [  # (seconds, swap-out counter, paging)
+        (0, 500, False),
+        (1, 500, False),
+        (2, 501, True),
+        (12, 501, True),
+        (13, 501, False),
+        (600, 900, True),
+        (611, 900, False),
+    ]
+    with mock.patch.dict(memory._swapouts, {"count": None, "rose_at": None}):
+        for seconds, swapouts, paging in readings:
+            with mock.patch("time.monotonic", return_value=1000.0 + seconds):
+                assert memory._mac_paging(swapouts) is paging, seconds
+
+
+def test_an_unreadable_pressure_level_counts_as_normal() -> None:
+    for read, level in [(None, 1), (0, 1), (1, 1), (2, 2), (4, 4)]:
+        with mock.patch.object(memory, "_sysctl_u32", return_value=read):
+            assert memory._mac_pressure_level() == level
+
+
+def test_while_the_mac_pages_an_mps_batch_fits_the_pool_it_holds() -> None:
     """Nothing is free beyond this process's own pool, so the live clamp cuts
-    a batch to what that pool can hold."""
-    with mps_host(available_mb=40 * 1024, pressure=2) as mps:
+    a batch to what that pool can hold. At warning without paging the reading
+    stands and the batch keeps its size."""
+    with mps_host(available_mb=40 * 1024, pressure=2, paging=True) as mps:
         mps.allocate(1000, driver_mb=3000)
         reading = memory.free_total_reading()
         assert (reading.free_mb, reading.ram_available_mb) == (0, 0)
         live = packing.clamp_to_live_memory(64, 4000)
         assert live.units == 32, "2000 MiB of pool buys half a 4000 MiB grant"
+    with mps_host(available_mb=40 * 1024, pressure=2) as mps:
+        mps.allocate(1000, driver_mb=3000)
+        assert memory.free_total_reading().free_mb == 40 * 1024
+        assert packing.clamp_to_live_memory(64, 4000).units == 64
 
 
-def test_under_memory_pressure_a_cpu_worker_on_a_mac_has_nothing_free() -> None:
+def test_while_the_mac_pages_a_cpu_worker_on_it_has_nothing_free() -> None:
     """A CPU replica draws from the same RAM as Metal, so the same reading."""
-    counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 4)
+    counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 4, 0)
     memory_info = SimpleNamespace(total=128 * 1024 * MIB, available=40 * 1024 * MIB)
-    with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
+    with mac_counters(counters):
         with mock.patch("psutil.virtual_memory", return_value=memory_info):
             assert memory.ram_free_total_mb()[0] == 0
 
@@ -3164,7 +3213,7 @@ def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:
     with mps_host(available_mb=40 * 1024):
         with mock.patch.object(
             memory, "_mac_memory_counters",
-            side_effect=[(128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 1)],
+            side_effect=[(128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 1, 0)],
         ) as counters:
             reading = memory.free_total_reading()
         assert counters.call_count == 1, "one read, not one per term"

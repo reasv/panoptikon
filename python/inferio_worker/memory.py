@@ -953,39 +953,70 @@ def mac_available_bytes() -> int | None:
     return _mac_available(facts)
 
 
-def _mac_available(facts: tuple[int, int, int, int, int]) -> int:
-    """Total RAM minus wired, compressed and anonymous pages, or 0 while macOS
-    reports memory pressure: it is then compressing and swapping, and the file
-    cache this formula counts as available is not free. Same as
-    `mps.rs::available_bytes`.
+def _mac_available(facts: tuple[int, int, int, int, int, int]) -> int:
+    """Total RAM minus wired, compressed and anonymous pages; 0 at critical
+    memory pressure, and at warning while the kernel is paging
+    (`_mac_paging`): the file cache this formula counts as available is not
+    free then. Warning without paging only means memory is held compressed.
+    Same as `mps.rs::available_bytes`.
     """
-    ram, wired, compressed, anonymous, pressure = facts
-    if pressure >= MAC_PRESSURE_WARNING:
+    ram, wired, compressed, anonymous, pressure, swapouts = facts
+    paging = _mac_paging(swapouts)
+    if pressure >= MAC_PRESSURE_CRITICAL:
+        return 0
+    if pressure >= MAC_PRESSURE_WARNING and paging:
         return 0
     return max(0, ram - wired - compressed - anonymous)
 
 
+def _mac_paging(swapouts: int) -> bool:
+    """Whether macOS swapped pages out between the previous reading and this
+    one, or within `MAC_PAGING_SECONDS` before it. The first reading has
+    nothing to compare with and is not paging.
+    """
+    now = time.monotonic()
+    previous = _swapouts["count"]
+    _swapouts["count"] = swapouts
+    if previous is not None and swapouts > previous:
+        _swapouts["rose_at"] = now
+    rose_at = _swapouts["rose_at"]
+    return rose_at is not None and now - rose_at <= MAC_PAGING_SECONDS
+
+
 # `vm_statistics64_data_t` (<mach/vm_statistics.h>) layout and the flavour
-# that fills it. Indexes: `wire_count`, `compressor_page_count`,
+# that fills it. Indexes: `wire_count`, `swapouts`, `compressor_page_count`,
 # `internal_page_count` (pageable anonymous pages, so wired are not counted).
 _VM_STATISTICS64 = "@4I9Q2I4Q4IQ"
-_VM_WIRE, _VM_COMPRESSOR, _VM_INTERNAL = 3, 19, 22
+_VM_WIRE, _VM_SWAPOUTS, _VM_COMPRESSOR, _VM_INTERNAL = 3, 18, 19, 22
 _HOST_VM_INFO64 = 4
 
-# `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical.
-MAC_PRESSURE_WARNING = 2
+# `kern.memorystatus_vm_pressure_level` values.
+MAC_PRESSURE_NORMAL, MAC_PRESSURE_WARNING, MAC_PRESSURE_CRITICAL = 1, 2, 4
+
+# How long after the swap-out counter last rose the kernel counts as paging.
+# Must match `mps.rs::PAGING_WINDOW`.
+MAC_PAGING_SECONDS = 10.0
+
+# The swap-out counter at the previous reading, and when it last rose.
+_swapouts: dict[str, Any] = {"count": None, "rose_at": None}
 
 
-def _mac_memory_counters() -> tuple[int, int, int, int, int] | None:
-    """`(ram, wired, compressed, anonymous)` bytes and the memory pressure
-    level from macOS, or None. An unreadable level counts as normal.
+def _mac_pressure_level() -> int:
+    """macOS's memory pressure level; unreadable counts as normal."""
+    level = _sysctl_u32("kern.memorystatus_vm_pressure_level")
+    return level or MAC_PRESSURE_NORMAL
+
+
+def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
+    """`(ram, wired, compressed, anonymous)` bytes, the memory pressure level
+    and the pages swapped out since boot, from macOS; or None.
     """
     if sys.platform != "darwin":
         return None
     ram = _sysctl_u64("hw.memsize")
     if not ram:
         return None
-    pressure = _sysctl_u32("kern.memorystatus_vm_pressure_level") or 1
+    pressure = _mac_pressure_level()
     try:
         import ctypes
         import ctypes.util
@@ -1016,6 +1047,7 @@ def _mac_memory_counters() -> tuple[int, int, int, int, int] | None:
         stats[_VM_COMPRESSOR] * page,
         stats[_VM_INTERNAL] * page,
         pressure,
+        stats[_VM_SWAPOUTS],
     )
 
 
