@@ -780,7 +780,8 @@ def _fdinfo_base_mb(
 def amdgpu_free_total_mb(root: str | None = None) -> tuple[int | None, int | None]:
     """Device-wide `(free_mb, total_mb)` for this worker's GPU from amdgpu sysfs
     (the files the orchestrator reads), or `(None, None)`. On a unified-memory
-    device GTT is added, its free part clamped by available RAM.
+    device GTT is added, its free part clamped by available RAM (less
+    reclaimable slab, as `rocm.rs` reads it).
     """
     bdf = _identity_bdf()
     if bdf is None:
@@ -1019,12 +1020,13 @@ def _virtual_memory() -> Any | None:
 
 
 def _ram_available_bytes() -> int | None:
-    """psutil's `virtual_memory().available` in bytes, or None."""
+    """psutil's `virtual_memory().available` in bytes, on Linux less
+    reclaimable slab (`_reclaimable_slab_bytes`), or None."""
     memory = _virtual_memory()
     if memory is None:
         return None
     try:
-        return int(memory.available)
+        return max(int(memory.available) - _reclaimable_slab_bytes(), 0)
     except Exception:
         return None
 

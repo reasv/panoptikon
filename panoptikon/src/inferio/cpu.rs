@@ -182,15 +182,13 @@ fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
 }
 
 /// RAM the OS could deliver now, in MiB, as the worker's `"ram"` reading
-/// counts it. On Linux that is `MemAvailable` less `SReclaimable` (slab the
-/// kernel may not free before it kills a process), bounded by the cgroup
-/// limit.
+/// counts it. On Linux that is [`super::rocm::ram_deliverable_mb`], bounded
+/// by the cgroup limit.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let available = super::rocm::meminfo_mb(&roots.meminfo, "MemAvailable")?
-            .saturating_sub(super::rocm::meminfo_mb(&roots.meminfo, "SReclaimable").unwrap_or(0));
+        let available = super::rocm::ram_deliverable_mb(&roots.meminfo)?;
         let Some(limit) = cgroup_limit_mb(roots) else {
             return Some(available);
         };

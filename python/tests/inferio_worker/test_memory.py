@@ -2386,6 +2386,8 @@ def test_linux_free_ram_leaves_out_reclaimable_slab(tmp_path) -> None:
         assert memory.ram_free_total_mb() == (24_605, 128 * 1024)
         with mock.patch.object(sys, "platform", "win32"):
             assert memory._reclaimable_slab_bytes() == 0
+        # A unified ROCm GPU clamps its GTT by the same figure.
+        assert memory._ram_available_bytes() == 24_605 * MIB
     # More slab than is available, a row in another unit, no row, no file.
     for text, free_mb in (
         ("SReclaimable:   99999999 kB\n", 0),
