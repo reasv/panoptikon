@@ -395,6 +395,7 @@ impl VramLedger {
                 gpu = %verdict.gpu,
                 base_mb = verdict.base_mb,
                 room_mb = verdict.room_mb,
+                died = verdict.died,
                 windows = OOM_WINDOWS_AT_FLOOR,
                 "this model cannot run a single item on this GPU; failing it \
                  instead of dispatching to it again"

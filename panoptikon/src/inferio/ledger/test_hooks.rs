@@ -293,6 +293,14 @@ impl VramLedger {
         entry.last_trim_at = back(entry.last_trim_at);
     }
 
+    /// Age every death verdict by `by`.
+    #[cfg(test)]
+    pub(super) fn age_death_verdicts_for_test(&self, by: Duration) {
+        for died_at in self.lock().death_verdicts.values_mut() {
+            *died_at = died_at.checked_sub(by).expect("a clock that old");
+        }
+    }
+
     /// Age this replica's deflation repayment clock by `by`.
     #[cfg(test)]
     pub(super) fn age_deflation_clock_for_test(&self, worker: WorkerId, by: Duration) {

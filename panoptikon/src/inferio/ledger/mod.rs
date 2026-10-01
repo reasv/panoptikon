@@ -142,6 +142,11 @@ pub const CLEAN_WINDOWS_TO_RESTORE: u32 = 3;
 /// after which a replica is declared unable to run on this GPU.
 pub const OOM_WINDOWS_AT_FLOOR: u32 = CLEAN_WINDOWS_TO_RESTORE;
 
+/// How long a verdict reached by worker deaths refuses the model's loads; the
+/// strike count outlives it, so one more death at one unit refuses it again.
+/// The default ceiling of the load-failure cooldown.
+pub const DEATH_VERDICT_LAPSE: Duration = Duration::from_secs(300);
+
 /// Wall time that repays one level of deflation, for a replica too idle to
 /// earn clean windows.
 pub const DEFLATION_REPAY_SECS: Duration = TRIM_DEBOUNCE;
@@ -1348,6 +1353,10 @@ struct LedgerState {
     /// The least an unrunnable replica showed a (model, GPU) needs for one
     /// item; later loads are refused against it until a clean window clears it.
     remembered_working_sets: HashMap<(String, String), u64>,
+    /// When a (model, GPU)'s worker last died its [`OOM_WINDOWS_AT_FLOOR`]th
+    /// time in a row at one unit; its loads are refused for
+    /// [`DEATH_VERDICT_LAPSE`] from then, or until a clean window.
+    death_verdicts: HashMap<(String, String), Instant>,
     /// Trims waiting for the manager to route to dispatchers.
     pending_trims: Vec<TrimRequest>,
     /// Once-per-(model, GPU) guard on the free-sample total mismatch WARN.

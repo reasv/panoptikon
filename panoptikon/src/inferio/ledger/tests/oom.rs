@@ -338,6 +338,108 @@ fn three_deaths_in_a_row_at_one_unit_condemn_the_model() {
     assert!(!ledger.was_condemned("g/a", GPU));
 }
 
+/// A fresh CPU replica of `g/a` with RAM to spare whose one window of
+/// `units` (its seed) ends in `outcome`.
+fn seed_window(
+    ledger: &Arc<VramLedger>,
+    units: u32,
+    outcome: WindowOutcome,
+) -> Option<UnrunnableReplica> {
+    let handle = loaded_cpu(Some(CPU_RAM_MB));
+    let admission = ledger
+        .register_worker("g/a", item_cost(units), &handle, None)
+        .expect("admitted");
+    push_memory_with_total(&handle, 40_000, 0, Some(CPU_RAM_MB), "ram");
+    admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted")
+        .finish(outcome)
+}
+
+/// A verdict reached by deaths says the worker died, with no memory figure,
+/// and refuses loads for [`DEATH_VERDICT_LAPSE`] only. The strike count
+/// outlives it: the next death at one unit refuses the model again at once,
+/// and a clean window clears everything.
+#[tokio::test]
+async fn a_verdict_reached_by_deaths_says_so_and_lapses() {
+    let mut ledger = cpu_ledger(no_margin());
+    Arc::get_mut(&mut ledger).unwrap().probe_external = false;
+    let died = || seed_window(&ledger, 1, WindowOutcome::WorkerDied);
+    let load = || ledger.reserve_load("g/a", item_cost(1), "CPU", None);
+    assert!(died().is_none() && died().is_none());
+    let verdict = died().expect("the third death in a row");
+    assert!(verdict.died);
+    assert_eq!(verdict.needs_mb, 0);
+
+    let refusal = load().await.err().expect("refused");
+    assert!(refusal.died);
+    assert_eq!(refusal.needs_mb, 0);
+    for text in [verdict.to_string(), refusal.to_string()] {
+        assert!(
+            text.contains("died 3 times in a row running a single item on GPU CPU"),
+            "{text}"
+        );
+        assert!(!text.contains("MiB") && !text.contains("memory"), "{text}");
+    }
+
+    ledger.age_death_verdicts_for_test(DEATH_VERDICT_LAPSE - Duration::from_secs(1));
+    assert!(load().await.is_err(), "one second short");
+    ledger.age_death_verdicts_for_test(Duration::from_secs(1));
+    assert!(load().await.is_ok(), "one attempt");
+    assert!(!ledger.was_condemned("g/a", "CPU"));
+
+    // Still at three strikes: one more death refuses it for another term.
+    assert!(died().is_some_and(|verdict| verdict.died));
+    assert!(load().await.is_err());
+
+    // A clean window clears the verdict and the count.
+    assert!(seed_window(&ledger, 1, WindowOutcome::Responded { oom: None }).is_none());
+    assert!(!ledger.was_condemned("g/a", "CPU"));
+    assert!(load().await.is_ok());
+    assert!(died().is_none() && died().is_none());
+    assert!(load().await.is_ok());
+}
+
+/// Only a death at one unit is a strike, and only a death passes the count
+/// to the next replica: a replica that struck out-of-memory errors and was
+/// then replaced leaves none behind.
+#[test]
+fn a_death_at_two_units_and_a_replaced_replicas_errors_leave_no_strike() {
+    let died = WindowOutcome::WorkerDied;
+    let cpu = cpu_ledger(no_margin());
+    assert!(seed_window(&cpu, 2, died).is_none(), "two units: no strike");
+    let key = ("g/a".to_owned(), "CPU".to_owned());
+    assert_eq!(cpu.lock().calibration[&key].death_cap_units, Some(1));
+    assert!(seed_window(&cpu, 2, died).is_none(), "the first strike");
+    assert!(seed_window(&cpu, 2, died).is_none(), "the second");
+    assert!(seed_window(&cpu, 2, died).is_some(), "the third");
+
+    // No room for one item: two out-of-memory strikes on one replica.
+    let ledger = ledger(10_000, no_margin());
+    let strikes = |count| {
+        let handle = loaded(Some(9_900), Some(0));
+        let admission = ledger
+            .register_worker("g/big", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 0, 0);
+        ledger.ingest_all_for_test();
+        (0..count).fold(None, |_, _| {
+            admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted")
+                .finish(WindowOutcome::Responded {
+                    oom: Some(ErrorFrameOom::Prose),
+                })
+        })
+    };
+    assert!(strikes(OOM_WINDOWS_AT_FLOOR - 1).is_none());
+    assert!(
+        strikes(OOM_WINDOWS_AT_FLOOR - 1).is_none(),
+        "its replacement starts from none"
+    );
+    assert!(strikes(OOM_WINDOWS_AT_FLOOR).is_some());
+}
+
 /// The cap does not stand in for the verdict on a model that cannot run one
 /// item: a death and two out-of-memory windows at one item, with no room for
 /// one, still condemn the replica.

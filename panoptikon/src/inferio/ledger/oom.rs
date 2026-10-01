@@ -104,6 +104,7 @@ impl VramLedger {
             // A clean window, not a load, clears the working set: a load only
             // proves the weights fit.
             state.remembered_working_sets.remove(&key);
+            state.death_verdicts.remove(&key);
             if let Some(cal) = state.calibration.get_mut(&key) {
                 cal.floor_strikes = 0;
             }
@@ -124,6 +125,20 @@ impl VramLedger {
         let inference_id = entry.inference_id.clone();
         let gpu = entry.gpu.clone();
         let base_mb = entry.base_mb.unwrap_or(0);
+        // A death says nothing about what the model needs: no working set.
+        if died {
+            state
+                .death_verdicts
+                .insert((inference_id.clone(), gpu.clone()), Instant::now());
+            return Some(UnrunnableReplica {
+                inference_id,
+                room_mb: self.limit_locked(state, &gpu),
+                gpu,
+                base_mb,
+                needs_mb: 0,
+                died: true,
+            });
+        }
         // A lower bound: base plus more than the failed window's room, and
         // above the current refusal room so an unchanged card refuses it.
         let needs_mb = base_mb
@@ -138,6 +153,7 @@ impl VramLedger {
             gpu,
             base_mb,
             needs_mb,
+            died: false,
         })
     }
 
@@ -255,10 +271,24 @@ pub struct UnrunnableReplica {
     /// The GPU's limit with the reserve deducted, which a window is priced
     /// against; the refusal room and `needs_mb` leave the reserve out.
     pub room_mb: u64,
+    /// The last strike was a worker death, not an out-of-memory error:
+    /// `needs_mb` is 0 and the refusal lapses ([`DEATH_VERDICT_LAPSE`]).
+    pub died: bool,
 }
 
 impl std::fmt::Display for UnrunnableReplica {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.died {
+            return write!(
+                f,
+                "the worker of model {} died {} times in a row running a \
+                 single item on GPU {}; it is not loaded there again for {} s",
+                self.inference_id,
+                OOM_WINDOWS_AT_FLOOR,
+                self.gpu,
+                DEATH_VERDICT_LAPSE.as_secs()
+            );
+        }
         write!(
             f,
             "model {} ran out of memory on GPU {} at a one-item batch {} \

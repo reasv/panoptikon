@@ -366,6 +366,11 @@ async fn a_condemned_replicas_working_set_refuses_the_reload() {
         "the base alone is not *over* this room, which is why the base \
          alone reloaded the same worker"
     );
+    // An out-of-memory verdict does not lapse with time.
+    assert!(!refusal.died && refusal.to_string().contains("needs about 9901 MiB"));
+    ledger.age_death_verdicts_for_test(2 * DEATH_VERDICT_LAPSE);
+    let later = ledger.reserve_load("g/big", item_cost(4), GPU, None).await;
+    assert_eq!(later.err(), Some(refusal));
 }
 
 /// On a memory-blind grant `base + room + 1` pins at the base, which would
