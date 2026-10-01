@@ -80,7 +80,7 @@ use oom::{
     pool_grew_past_free,
 };
 pub use oom::{ErrorFrameOom, UnrunnableReplica, message_oom_tier};
-use ramp::{admitted_units, deflation_cap, ramp_floor_step, uncapped_units};
+use ramp::{deflation_cap, ramp_floor_step, uncapped_units};
 pub use registration::Admission;
 use registration::GpuLog;
 use throughput_knee::{
@@ -489,11 +489,12 @@ struct GrantCharge {
     /// Host RAM, not the GPU, set this window's unit budget: it earns no ramp
     /// step and feeds no knee.
     ram_bound: bool,
-    /// macOS reported memory pressure while this window was out: it earns no
-    /// ramp step, feeds no knee, its throughput-collapse flags are ignored
-    /// and its out-of-memory failures do not count toward
-    /// [`OOM_WINDOWS_AT_FLOOR`], since the pressure explains them.
-    pressure: bool,
+    /// macOS's memory pressure while this window was out, the higher of its
+    /// grant and its settle. Above normal the window earns no ramp step,
+    /// feeds no knee, and its throughput-collapse flags are ignored. While
+    /// paging it also sets the [`PressureCap`] and its out-of-memory failures
+    /// do not count toward [`OOM_WINDOWS_AT_FLOOR`].
+    pressure: mps::MemoryPressure,
     /// Items per batch while the replica's host RAM cost is not measured at
     /// two sizes ([`VramLedger::item_cap_locked`]).
     item_cap: Option<u32>,
@@ -608,9 +609,6 @@ struct WorkerEntry {
     hold_announced: bool,
     /// Clean windows towards widening the hold ([`HOLD_REPROBE_WINDOWS`]).
     hold_reprobe_windows: u32,
-    /// The unit budget this replica ran at under memory pressure, capping it
-    /// until it has grown back ([`VramLedger::note_pressure_size_locked`]).
-    pressure_units: Option<u64>,
     /// Halvings applied by deflation. Runtime-only, reset on respawn.
     deflation: u32,
     /// When deflation was last applied or repaid by time; `None` at 0.
@@ -1000,6 +998,9 @@ struct Ingested {
     /// reached [`FULL_BATCH_RATIO`] of it or had no room for the next item.
     /// Only such a window earns a doubling.
     at_budget: bool,
+    /// The same, whatever the memory pressure: the [`PressureCap`] grows on
+    /// these.
+    filled: bool,
     /// Samples that entered the knee ring; logged only.
     throughput_samples: usize,
     /// Which kind of negative, for the log; all fold into `negative`.
@@ -1016,6 +1017,22 @@ struct Ingested {
     /// Allocator retries summed over the window's batches; `None` if none
     /// reported.
     alloc_retries: Option<u64>,
+}
+
+/// What a paging episode left of a (model, device)'s batch size
+/// ([`VramLedger::note_pressure_size_locked`]). An episode is a run of
+/// windows during which macOS was swapping pages out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PressureCap {
+    /// Caps the unit budget: the size the last paging window ran at, doubled
+    /// by each clean full window since.
+    units: u64,
+    /// How far `units` may grow back while the level is warning: half the
+    /// unit budget in force when the first episode began, halved again by
+    /// each later episode. `None` once the level has been normal.
+    regrow_to: Option<u64>,
+    /// The last window was a paging one: the episode is still on.
+    paging: bool,
 }
 
 /// Per-(model, GPU) calibration state: the fit, its samples, the anchor and
@@ -1069,6 +1086,8 @@ struct ModelCalibration {
     persisted: Option<(u64, u64, Option<u64>)>,
     /// See [`ShapeCeiling`]. Runtime-only.
     shape_ceiling: Option<ShapeCeiling>,
+    /// See [`PressureCap`]. Runtime-only; a reloaded replica inherits it.
+    pressure_cap: Option<PressureCap>,
     /// Next [`ThroughputSample::seq`]; never rewinds.
     throughput_seq: u64,
     /// A GPU replica's host RAM samples: batch units against the resident

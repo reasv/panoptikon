@@ -7,7 +7,7 @@ use super::*;
 /// pressure. A squeezed window is admitted; its budget is what the card ran.
 /// Excluded windows still feed the cost fit.
 pub(super) fn knee_admits_window(charge: &GrantCharge) -> bool {
-    charge.mb > 0 && !charge.ram_bound && !charge.pressure
+    charge.mb > 0 && !charge.ram_bound && charge.pressure == mps::MemoryPressure::Normal
 }
 
 /// Add a fit sample to a ring holding at most one per distinct `units`, so a
@@ -358,7 +358,7 @@ impl VramLedger {
         // A window host RAM sized counts toward neither, and feeds no knee;
         // nor does one run under memory pressure.
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
-        let pressure = window.is_some_and(|charge| charge.pressure);
+        let pressure = window.is_some_and(|charge| charge.pressure != mps::MemoryPressure::Normal);
         let item_capped = window.is_some_and(|charge| charge.item_cap.is_some());
         let ram_only = window.is_some_and(|charge| charge.ram_only);
         // The largest units per item an item-capped batch ran, if one ran,
@@ -716,8 +716,8 @@ impl VramLedger {
                 gpu = %gpu,
                 pressure_collapses,
                 "ignored this window's throughput-collapse flags: macOS reported \
-                 memory pressure while it ran, so the system's swapping explains \
-                 the rate drop and it is not evidence about the batch size"
+                 memory pressure while it ran, so the rate drop is not evidence \
+                 about the batch size"
             );
         }
         if uncorroborated_collapses > 0 {
@@ -889,6 +889,7 @@ impl VramLedger {
             negative,
             fit_samples: fit_sample_count,
             at_budget: !queue_bound && !ram_bound && !pressure && ran_full,
+            filled: !queue_bound && !ram_bound && ran_full,
             throughput_samples,
             oom: saw_oom,
             throughput_collapse: saw_collapse,

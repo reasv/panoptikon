@@ -56,7 +56,7 @@ impl VramLedger {
                             ramp_step: entry.ramp_step,
                             deflation: entry.deflation,
                             clean_windows: entry.clean_windows,
-                            unit_budget: admitted_units(entry, anchor, knee, shape_ceiling),
+                            unit_budget: Self::budget_locked(state, entry, knee),
                             ramp_held: held,
                             held_units: held.then_some(entry.held_units).flatten(),
                             held_certified: held && entry.held_certified,

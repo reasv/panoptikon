@@ -1182,7 +1182,8 @@ fn critical_memory_pressure_releases_a_stopped_pool_without_the_idle_timeout() {
         resident.worker_id(),
         IDLE_BEFORE_TRIM + Duration::from_secs(1),
     );
-    for pressure in [mps::MemoryPressure::Normal, mps::MemoryPressure::Warning] {
+    use mps::MemoryPressure::{Normal, Paging, Warning};
+    for pressure in [Normal, Warning, Paging] {
         ledger.set_memory_pressure_for_test(pressure);
         ledger.flag_idle_pool_releases();
         assert!(

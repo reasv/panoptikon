@@ -2091,22 +2091,43 @@ def test_nothing_is_available_while_the_mac_pages_under_pressure() -> None:
         assert available == expected, (level, paging)
 
 
+NO_SWAPOUTS_SEEN = {"count": None, "read_at": None, "rose_at": None}
+
+
 def test_paging_is_a_swap_out_counter_that_rose_recently() -> None:
     """Since the previous reading, or within `MAC_PAGING_SECONDS` before this
-    one; a first reading has nothing to compare with."""
+    one. A first reading has nothing to compare with, nor has one whose
+    predecessor is older than `MAC_PAGING_STALE_SECONDS`."""
     readings = [  # (seconds, swap-out counter, paging)
         (0, 500, False),
         (1, 500, False),
         (2, 501, True),
         (12, 501, True),
         (13, 501, False),
-        (600, 900, True),
-        (611, 900, False),
+        (73, 600, True),  # 60 s after the last reading
+        (134, 900, False),  # 61 s: too old to compare with
+        (135, 901, True),
+        (150, 100, False),  # a counter that fell is not a rise
+        (151, 100, False),
     ]
-    with mock.patch.dict(memory._swapouts, {"count": None, "rose_at": None}):
+    with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
         for seconds, swapouts, paging in readings:
             with mock.patch("time.monotonic", return_value=1000.0 + seconds):
                 assert memory._mac_paging(swapouts) is paging, seconds
+
+
+def test_the_swap_out_counter_is_followed_at_every_pressure_level() -> None:
+    """A reading at normal is the one the next is compared with, so paging
+    that starts as the level turns to warning is seen at once."""
+    def available(seconds: int, level: int, swapouts: int) -> int | None:
+        counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, level, swapouts)
+        with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
+            with mock.patch("time.monotonic", return_value=1000.0 + seconds):
+                return memory.mac_available_bytes()
+
+    with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
+        assert available(0, 1, 500) == 40 * 1024 * MIB
+        assert available(5, 2, 700) == 0
 
 
 def test_an_unreadable_pressure_level_counts_as_normal() -> None:

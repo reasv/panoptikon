@@ -971,13 +971,18 @@ def _mac_available(facts: tuple[int, int, int, int, int, int]) -> int:
 
 def _mac_paging(swapouts: int) -> bool:
     """Whether macOS swapped pages out between the previous reading and this
-    one, or within `MAC_PAGING_SECONDS` before it. The first reading has
-    nothing to compare with and is not paging.
+    one, or within `MAC_PAGING_SECONDS` before it. A first reading, or one
+    whose predecessor is older than `MAC_PAGING_STALE_SECONDS`, has nothing
+    to compare with and is not paging.
     """
     now = time.monotonic()
-    previous = _swapouts["count"]
-    _swapouts["count"] = swapouts
-    if previous is not None and swapouts > previous:
+    previous, read_at = _swapouts["count"], _swapouts["read_at"]
+    _swapouts["count"], _swapouts["read_at"] = swapouts, now
+    if (
+        previous is not None
+        and swapouts > previous
+        and now - read_at <= MAC_PAGING_STALE_SECONDS
+    ):
         _swapouts["rose_at"] = now
     rose_at = _swapouts["rose_at"]
     return rose_at is not None and now - rose_at <= MAC_PAGING_SECONDS
@@ -997,8 +1002,15 @@ MAC_PRESSURE_NORMAL, MAC_PRESSURE_WARNING, MAC_PRESSURE_CRITICAL = 1, 2, 4
 # Must match `mps.rs::PAGING_WINDOW`.
 MAC_PAGING_SECONDS = 10.0
 
-# The swap-out counter at the previous reading, and when it last rose.
-_swapouts: dict[str, Any] = {"count": None, "rose_at": None}
+# The oldest previous reading a rise is still judged against: an older one
+# cannot say when the counter rose. Longer than `MAC_PAGING_SECONDS` so that
+# batches longer than that still see the kernel paging. Must match
+# `mps.rs::PAGING_STALE`.
+MAC_PAGING_STALE_SECONDS = 60.0
+
+# The swap-out counter at the previous reading, when that was, and when the
+# counter was last seen to rise.
+_swapouts: dict[str, Any] = {"count": None, "read_at": None, "rose_at": None}
 
 
 def _mac_pressure_level() -> int:
