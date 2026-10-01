@@ -1029,8 +1029,8 @@ struct PressureCap {
     units: u64,
     /// How far `units` may grow back while the level is warning: half the
     /// unit budget in force when the first episode began, halved again by
-    /// each later episode. `None` once the level has been normal.
-    regrow_to: Option<u64>,
+    /// each later episode. Kept until the cap lifts.
+    regrow_to: u64,
     /// The last window was a paging one: the episode is still on.
     paging: bool,
 }

@@ -1686,18 +1686,62 @@ fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() 
     assert_eq!(pressure_cap(&ledger), None);
 }
 
-/// An episode that begins while the batch is still growing back at normal
-/// starts from the size then in force, not from what the ramp would admit.
+/// The bound lasts until the batch is back at what the ramp admits. A
+/// warning that returns before then grows back to the same bound, and holds
+/// there; an episode that begins before then halves the bound again.
 #[test]
-fn an_episode_while_growing_back_halves_the_size_in_force() {
+fn a_warning_or_an_episode_before_the_batch_is_back_keeps_the_bound() {
+    use mps::MemoryPressure::{Normal, Warning};
     let (ledger, handle, admission) = ramped_mac_replica();
     paging_windows(&ledger, &handle, &admission, 1);
-    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
+    ledger.set_memory_pressure_for_test(Normal);
     assert_eq!(ramp_windows(&handle, &admission, 2), [8, 16]);
-    assert_eq!(ramp_figures(&ledger).3, 32, "the size in force");
+    ledger.set_memory_pressure_for_test(Warning);
+    assert_eq!(
+        ramp_windows(&handle, &admission, 3),
+        [32, 64, 64],
+        "half of the 128 in force when the paging began"
+    );
+
+    ledger.set_memory_pressure_for_test(Normal);
+    assert_eq!(ramp_windows(&handle, &admission, 1), [64]);
+    assert_eq!(pressure_cap(&ledger), None, "back at what the ramp admits");
     paging_windows(&ledger, &handle, &admission, 1);
-    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
-    assert_eq!(ramp_windows(&handle, &admission, 3), [8, 16, 16]);
+    ledger.set_memory_pressure_for_test(Normal);
+    assert_eq!(ramp_windows(&handle, &admission, 1), [8]);
+    paging_windows(&ledger, &handle, &admission, 1);
+    ledger.set_memory_pressure_for_test(Warning);
+    assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 32]);
+}
+
+/// The bound is at least one unit, or a batch already at one unit would be
+/// capped at none and never grow back.
+#[test]
+fn the_bound_of_a_one_unit_batch_is_one_unit() {
+    let ledger = mps_ledger();
+    let handle = loaded_mps(Some(MAC_TOTAL_MB));
+    let admission = ledger
+        .register_worker("g/a", item_cost(1), &handle, None)
+        .expect("registers");
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
+    push_ram(&handle, MAC_TOTAL_MB, 0, 0, 0);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(token.grant().unit_budget, 1);
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![measurement(1, 0, 10)]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(
+        pressure_cap(&ledger),
+        Some(PressureCap {
+            units: 1,
+            regrow_to: 1,
+            paging: true,
+        })
+    );
 }
 
 /// The size paging left belongs to the model on the device, so a replica
@@ -1717,6 +1761,11 @@ fn a_reloaded_replica_inherits_the_size_paging_left() {
         .map(|worker| worker.unit_budget)
         .collect();
     assert_eq!(budgets, [8, 8]);
+    assert_eq!(
+        ledger.window_target_units(admission.worker_id()),
+        8 * WINDOW_DEPTH_MULTIPLIER,
+        "the dispatcher fills windows for the size kept"
+    );
 }
 
 /// Only a paging window that memory or the ramp sized sets the size kept: not

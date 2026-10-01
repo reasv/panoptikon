@@ -112,7 +112,8 @@ impl VramLedger {
     ///
     /// Otherwise a clean window that `filled` its budget doubles the cap: at
     /// warning up to that bound, at normal until it reaches what the ramp
-    /// admits, where it lifts.
+    /// admits, where it lifts. The bound lasts as long as the cap, so a
+    /// warning that returns first grows back to the same bound.
     pub(super) fn note_pressure_size_locked(
         state: &mut LedgerState,
         worker: WorkerId,
@@ -139,11 +140,7 @@ impl VramLedger {
             }
             let regrow_to = match cap {
                 Some(cap) if cap.paging => cap.regrow_to,
-                _ => {
-                    let in_force = cap.map_or(ramp, |cap| ramp.min(cap.units));
-                    let bound = cap.and_then(|cap| cap.regrow_to).unwrap_or(in_force);
-                    Some((bound / 2).max(1))
-                }
+                _ => (cap.map_or(ramp, |cap| cap.regrow_to) / 2).max(1),
             };
             Some(PressureCap {
                 units: charge.unit_budget,
@@ -158,15 +155,15 @@ impl VramLedger {
             };
             if charge.pressure != mps::MemoryPressure::Normal {
                 Some(PressureCap {
-                    units: grown.min(cap.regrow_to.unwrap_or(cap.units)),
+                    units: grown.min(cap.regrow_to),
                     paging: false,
                     ..cap
                 })
             } else {
                 (grown < ramp).then_some(PressureCap {
                     units: grown,
-                    regrow_to: None,
                     paging: false,
+                    ..cap
                 })
             }
         } else {

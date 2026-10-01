@@ -308,7 +308,8 @@ Single synthetic device:
     cause the paging settles within log2(size) episodes.
   - **Growing back.** Each clean window that filled its budget doubles the
     cap: at warning up to that bound, at normal until it reaches what the
-    ramp admits, where the cap lifts and the bound is forgotten.
+    ramp admits, where the cap lifts and the bound is forgotten. A warning
+    that returns before then grows back to the same bound.
   - **Out-of-memory failures in a paging window** still deflate, but do not
     count toward `OOM_WINDOWS_AT_FLOOR` and do not clear it: while paging
     every window is one unit with no room, and three failures there would
