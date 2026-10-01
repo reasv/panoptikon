@@ -1098,13 +1098,25 @@ therefore differs from a GPU in six ways.
   a replica on a private-memory GPU whose window had host RAM booked. That
   GPU death is still no memory negative: its anchor and ramp are untouched.
   A window the gateway tore down itself (a cancel) and the death of an idle
-  replica cap nothing. The cap and the one a paging episode leaves on a Mac
+  replica cap nothing; the latter includes a replica that had already exited
+  when the next request reached it, which the worker handle checks before it
+  sends a frame. A window the queue sized (fewer units in hand than the model
+  is admitted for) caps nothing either: one failed search query must not
+  hold a model that ran 256 at one unit. An item-capped cold-start window is
+  sized by its cap and does count. The cap and the one a paging episode leaves on a Mac
   bound the batch together, the smaller ruling: the paging cap lifts as the
   batch grows back, this one stays. A death while the Mac pages sets it
   like any other death (it is most likely the system killing the worker),
   though an out-of-memory error there still does not count toward the
   one-item verdict. A model that cannot run one item is still condemned
-  as before.
+  as before, and a death at one unit counts toward that verdict whatever
+  room the ledger saw, on the devices where a death caps: the batch cannot
+  shrink further, so three such deaths in a row (a clean window clears the
+  count, which passes from a dead replica to the next) refuse the model's
+  next load and arm the load cooldown instead of reloading it for ever. The
+  ledger cannot tell a memory kill from another crash, so a model that
+  crashes three times running at one unit is refused the same way, and the
+  refusal speaks of memory.
 
 The reserve and the free reading apply to every replica whose host RAM is
 booked on the CPU device, GPU replicas included (next section), and to the
@@ -1393,7 +1405,9 @@ so the manager's sweeper ticks a liveness message that `try_wait`s every free
 replica and takes the same path, minus the window settlement it has no window
 for. An idle replica's death settles nothing on purpose: a death mid-window
 is a synthetic memory negative on unified-memory devices, and a replica with
-no window in flight can say nothing honest about a batch size. On Linux a
+no window in flight can say nothing honest about a batch size. A request
+that reaches such a replica before the sweep does finds the process already
+gone before it sends a frame; that window settles as aborted. On Linux a
 worker is spawned as the kernel's first out-of-memory victim
 (`oom_score_adj = 1000`), so a host that runs out of RAM takes this path
 rather than losing another program, and the death caps the model's batch

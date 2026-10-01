@@ -1484,6 +1484,10 @@ either way, so a trim never races a batch.
   `WorkerDied`, the job re-queues the items, and the model's batches on that
   device are capped at half the batch that died until the server restarts
   (design doc, "Host RAM on the CPU device"). The write is best effort.
+- **A request is not sent to a process that has already exited.** Before a
+  frame is written the handle checks the child's exit status; a worker that
+  died idle fails the request as any death does (the job re-queues it), but
+  the window settles as aborted, not as a death while running it.
 - `load` deadline is long (weights + dep imports; config, default 600 s).
 - **A load blocks nothing but itself.** The orchestrator holds one load
   lock *per model*, not per host: a predict to a model that is already
