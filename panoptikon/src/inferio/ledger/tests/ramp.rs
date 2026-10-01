@@ -2423,14 +2423,15 @@ enum Pool {
 /// with `room_mb` for its batches, whose windows hold `queued` units: one
 /// batch at the budget and a remainder too short to count, as when the
 /// caller keeps fewer items in flight than the ramp's window. Returns each
-/// window's unit budget; a batch that needs more than the room panics.
+/// window's unit budget and whether the ramp is held after the last; a batch
+/// that needs more than the room panics.
 fn one_batch_windows(
     room_mb: u64,
     windows: usize,
     queued: impl Fn(u64) -> u64,
     rate: impl Fn(u64) -> f64,
     pool: Pool,
-) -> Vec<u64> {
+) -> (Vec<u64>, bool) {
     const PER_UNIT_MB: u64 = 82;
     let ledger = ledger(1000 + room_mb, no_margin());
     let handle = loaded(Some(1000), Some(0));
@@ -2475,7 +2476,8 @@ fn one_batch_windows(
         token.finish(WindowOutcome::Responded { oom: None });
         budgets.push(units);
     }
-    budgets
+    let held = ledger.health()[0].workers[0].ramp_held;
+    (budgets, held)
 }
 
 /// A window's unit queue of one batch and a half at the budget.
@@ -2490,16 +2492,23 @@ fn a_batch_and_a_half(capped: u64) -> u64 {
 /// holds at 128, where the rate is no better than at 64.
 #[test]
 fn a_window_that_gave_no_knee_sample_runs_once_more_before_the_ramp_steps() {
-    let budgets = one_batch_windows(15_700, 9, a_batch_and_a_half, |_| 22.0, Pool::Kept);
+    let (budgets, held) = one_batch_windows(15_700, 9, a_batch_and_a_half, |_| 22.0, Pool::Kept);
     assert_eq!(budgets, [64, 64, 64, 128, 128, 128, 128, 128, 128]);
+    assert!(held);
 }
 
 /// A rate that keeps rising still ramps to what the card holds.
 #[test]
 fn a_rising_rate_reaches_the_room_through_one_batch_windows() {
     let rising = |units| ladder_rate(&MINILM_M3_MAX, units);
-    let budgets = one_batch_windows(15_700, 8, a_batch_and_a_half, rising, Pool::Kept);
+    let (budgets, _) = one_batch_windows(15_700, 8, a_batch_and_a_half, rising, Pool::Kept);
     assert_eq!(budgets, [64, 64, 64, 128, 128, 128, 191, 191]);
+
+    // 100 units fill a smaller card: the same log2 size as 64, which ran its
+    // one more window, so 100 does not run another for want of a sample.
+    let (budgets, held) = one_batch_windows(8_200, 4, |capped| capped, rising, Pool::Kept);
+    assert_eq!(budgets, [64, 64, 64, 100]);
+    assert!(!held);
 }
 
 /// The extra window is one per size: a worker whose pool is gone again by
@@ -2507,9 +2516,10 @@ fn a_rising_rate_reaches_the_room_through_one_batch_windows() {
 /// one that reports no pool figures ramps as before.
 #[test]
 fn a_worker_that_never_gives_a_knee_sample_still_ramps() {
-    let released = one_batch_windows(15_700, 6, a_batch_and_a_half, |_| 22.0, Pool::Released);
+    let (released, _) = one_batch_windows(15_700, 6, a_batch_and_a_half, |_| 22.0, Pool::Released);
     assert_eq!(released, [64, 64, 128, 128, 191, 191]);
-    let unreported = one_batch_windows(150_000, 4, a_batch_and_a_half, |_| 22.0, Pool::Unreported);
+    let (unreported, _) =
+        one_batch_windows(150_000, 4, a_batch_and_a_half, |_| 22.0, Pool::Unreported);
     assert_eq!(unreported, [64, 128, 256, 512]);
 }
 
@@ -2527,6 +2537,6 @@ fn a_queue_sized_window_does_not_wait_for_a_knee_sample() {
             a_batch_and_a_half(capped)
         }
     };
-    let budgets = one_batch_windows(15_700, 3, queued, |_| 22.0, Pool::Kept);
+    let (budgets, _) = one_batch_windows(15_700, 3, queued, |_| 22.0, Pool::Kept);
     assert_eq!(budgets, [8, 16, 16]);
 }

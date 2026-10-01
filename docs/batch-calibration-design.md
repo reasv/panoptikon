@@ -1246,8 +1246,11 @@ booked centrally on the CPU device. It is never a throughput signal.
   by CPU preprocessing is held at 7 units, where starting at its seed of 64
   it doubled to the edge of a 16 GB card before the ring had three sizes.
   And beside another process that leaves 2 GB of a card, the sizes run
-  give the fit before a batch could pass the room. Only the single-item
-  window is one batch deep.
+  give the fit before a batch could pass the room. The single-item window
+  is one batch deep; any other capped window holds at most
+  `WINDOW_DEPTH_MULTIPLIER` batches of the cap, whatever the ramp's budget
+  (under a stored anchor it would otherwise run hundreds of two-item
+  batches).
   What that item keeps is start-up and gives no RAM sample, so the cost stays
   unknown, and further windows stay item-capped with the cap doubling after
   each window whose batch filled it: 2, 4, …; a short window leaves it.

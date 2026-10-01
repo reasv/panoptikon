@@ -1210,6 +1210,18 @@ fn the_first_window_after_load_is_a_single_item() {
     assert_eq!(after.ram_mb_per_unit, None, "start-up is no cost");
 
     assert_eq!(item_bound(&admission), 2);
+    assert_eq!(
+        admission.window_item_bound(),
+        6,
+        "three batches of two, not three of the anchor's 1 024 units"
+    );
+    // A window that holds less than the cap is sized by what it holds.
+    let short = admission.request_grant(1, None, 1, 0).expect("granted");
+    assert_eq!(
+        (short.grant().unit_budget, short.grant().user_cap_items),
+        (1, Some(2))
+    );
+    drop(short);
     let token = admission.request_grant(64, None, 1, 0).expect("granted");
     assert_eq!(token.grant().user_cap_items, Some(2));
     assert_eq!(row(&ledger, "g/first").ram_booked_mb, 0);
@@ -1226,6 +1238,7 @@ fn the_first_window_after_load_is_a_single_item() {
     assert_eq!(after.ram_mb_per_unit, Some(2.0 * RAM_PER_UNIT_MB as f64));
 
     // One size measured: the next is item-capped still, now booked.
+    assert_eq!(admission.window_item_bound(), 12);
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
@@ -1237,6 +1250,7 @@ fn the_first_window_after_load_is_a_single_item() {
     drop(token);
     let third = ram_window_kept(&handle, &admission, INIT);
     assert_eq!(third.unit_budget, 4);
+    assert_eq!(admission.window_item_bound(), usize::MAX);
     let fourth = ram_window_kept(&handle, &admission, INIT);
     assert_eq!(fourth.unit_budget, 1_024, "the ramp's own size");
     assert_eq!(

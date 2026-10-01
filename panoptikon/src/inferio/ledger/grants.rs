@@ -45,14 +45,21 @@ impl VramLedger {
             .max(1)
     }
 
-    /// Items the dispatcher may put in one window: one while the item cap
-    /// ([`Self::item_cap_locked`]) is one, the replica's first window; else
-    /// no bound.
+    /// Items the dispatcher may put in one window. Under an item cap
+    /// ([`Self::item_cap_locked`]) that is [`WINDOW_DEPTH_MULTIPLIER`]
+    /// batches of it, whatever the ramp's budget, and one item while the cap
+    /// is one, the replica's first window; else no bound.
     pub(super) fn window_item_bound(&self, worker: WorkerId) -> usize {
         let state = self.lock();
-        match state.workers.get(&worker) {
-            Some(entry) if Self::item_cap_locked(&state, entry) == Some(1) => 1,
-            _ => usize::MAX,
+        let cap = state
+            .workers
+            .get(&worker)
+            .and_then(|entry| Self::item_cap_locked(&state, entry));
+        match cap {
+            None => usize::MAX,
+            Some(1) => 1,
+            Some(cap) => usize::try_from(u64::from(cap).saturating_mul(WINDOW_DEPTH_MULTIPLIER))
+                .unwrap_or(usize::MAX),
         }
     }
 
