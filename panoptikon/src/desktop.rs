@@ -27,12 +27,14 @@ pub(crate) struct RootLock {
 impl RootLock {
     pub(crate) fn acquire(root: PathBuf) -> anyhow::Result<Self> {
         let runtime = root.join("runtime");
-        std::fs::create_dir_all(&runtime).with_context(|| {
-            format!(
-                "failed to create Server runtime directory '{}'",
-                runtime.display()
-            )
-        })?;
+        std::fs::create_dir_all(&runtime)
+            .with_context(|| {
+                format!(
+                    "failed to create Server runtime directory '{}'",
+                    runtime.display()
+                )
+            })
+            .map_err(|err| crate::ownership::explain(err, &root))?;
         let path = runtime.join("server.lock");
         let file = OpenOptions::new()
             .create(true)
@@ -40,7 +42,8 @@ impl RootLock {
             .read(true)
             .write(true)
             .open(&path)
-            .with_context(|| format!("failed to open root lock '{}'", path.display()))?;
+            .with_context(|| format!("failed to open root lock '{}'", path.display()))
+            .map_err(|err| crate::ownership::explain(err, &runtime))?;
         if let Err(error) = file.try_lock_exclusive() {
             bail!(
                 "Panoptikon Server root '{}' is already owned by another process (lock '{}'): {error}. Stop the other Server or Panoptikon Desktop instance before using this root.",

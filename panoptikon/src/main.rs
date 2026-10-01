@@ -21,6 +21,7 @@ mod log_throttle;
 mod logging;
 mod media_tools;
 mod openapi;
+mod ownership;
 mod policy;
 mod policy_token;
 mod pql;
@@ -326,6 +327,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Python-created DBs are baselined, not re-migrated — see
     // db::migrations::ensure_baseline_if_needed.
     if local_api && !db::readonly_mode() {
+        ownership::check_databases(&settings.data_folder)?;
         db::migrations::migrate_databases_on_disk(None, None).await?;
         db::migrations::migrate_all_databases_on_disk().await?;
         // Vector-quant discrepancy check (crash/power-loss recovery and
