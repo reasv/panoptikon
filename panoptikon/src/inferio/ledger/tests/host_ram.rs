@@ -537,6 +537,36 @@ fn two_replicas_book_no_more_than_is_truly_free() {
     assert_eq!(a_grant.grant().unit_budget, 512);
 }
 
+/// A GPU replica that dies while its window holds a host RAM booking is
+/// capped at half that batch, since host RAM may be what killed it. Its
+/// anchor and ramp are left alone: on private memory a death is no negative.
+#[test]
+fn a_gpu_replica_that_dies_with_host_ram_booked_is_capped() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/died", GPU, 64);
+    cpu_free_to_book(&ledger, 45_000);
+    assert_eq!(ram_window(&handle, &admission).unit_budget, 64);
+    assert_eq!(ram_window(&handle, &admission).unit_budget, 128);
+    let before = row(&ledger, "g/died");
+
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(token.grant().unit_budget, 256);
+    assert_eq!(before.ram_booked_mb, 0);
+    assert_eq!(row(&ledger, "g/died").ram_booked_mb, 2_560);
+    token.finish(WindowOutcome::WorkerDied);
+
+    let after = row(&ledger, "g/died");
+    assert_eq!(after.death_cap_units, Some(128));
+    assert_eq!(after.unit_budget, 128);
+    assert_eq!(after.max_units_measured, before.max_units_measured);
+    assert_eq!((after.deflation, after.ramp_step), (0, before.ramp_step));
+    for _ in 0..4 {
+        assert_eq!(ram_window(&handle, &admission).unit_budget, 128);
+    }
+}
+
 /// A probe stub answering `free_mb` for the CPU device.
 fn host_ram_free(ledger: &VramLedger, free_mb: u64) {
     ledger.install_probe_stub(Some(vec![GpuMemory {

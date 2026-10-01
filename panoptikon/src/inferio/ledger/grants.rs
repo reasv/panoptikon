@@ -44,7 +44,7 @@ impl VramLedger {
             entry,
             Self::anchor_locked(&state, entry),
             Self::knee_locked(&state, entry),
-            Self::shape_ceiling_locked(&state, entry),
+            Self::batch_ceiling_locked(&state, entry),
         )
         .saturating_mul(WINDOW_DEPTH_MULTIPLIER)
         .max(1)
@@ -115,7 +115,7 @@ impl VramLedger {
             let entry = state.workers.get(&worker)?;
             let anchor = Self::anchor_locked(&state, entry);
             let slope = Self::grant_slope_locked(&state, entry);
-            let ceiling = Self::shape_ceiling_locked(&state, entry);
+            let ceiling = Self::batch_ceiling_locked(&state, entry);
             let capped = admitted_units(entry, anchor, Self::knee_locked(&state, entry), ceiling);
             let wanted = capped.min(window_units.max(1)).max(1);
             // The knee decided this window's size: it bit (compared with the
@@ -456,7 +456,7 @@ impl VramLedger {
             let (anchor, ceiling) = match state.workers.get(&worker) {
                 Some(entry) => (
                     Self::anchor_locked(&state, entry),
-                    Self::shape_ceiling_locked(&state, entry),
+                    Self::batch_ceiling_locked(&state, entry),
                 ),
                 None => (0, None),
             };
@@ -514,7 +514,7 @@ impl VramLedger {
         }
         let died = matches!(outcome, WindowOutcome::WorkerDied);
         let death = died
-            .then(|| Self::note_unified_death_locked(&mut state, worker, charge.is_some()))
+            .then(|| Self::note_death_locked(&mut state, worker, charge))
             .flatten();
         // Any OOM or death lowers a seeded anchor, unless the unified-memory
         // death path already halved it.

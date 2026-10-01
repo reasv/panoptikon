@@ -148,21 +148,41 @@ impl VramLedger {
         );
     }
 
-    /// A replica that died holding a granted window on a unified-memory device
-    /// is a negative: it is deflated and its (model, GPU) anchor halved, for
-    /// this run only. `None` on a discrete GPU, without a grant, or for a
-    /// forgotten replica.
-    pub(super) fn note_unified_death_locked(
+    /// A replica whose process died holding a granted window (`charge`).
+    ///
+    /// On a unified-memory device, or if the window booked host RAM, the
+    /// (model, device) is capped at half that window's unit budget for the
+    /// life of this process, at least one unit. Without the cap the next
+    /// replica is admitted for the batch that died, and dies again.
+    ///
+    /// On a unified-memory device the death is also a negative: the replica
+    /// is deflated and its (model, GPU) anchor halved, for this run only.
+    /// `None` on a discrete GPU, without a grant, or for a forgotten replica.
+    pub(super) fn note_death_locked(
         state: &mut LedgerState,
         worker: WorkerId,
-        held_grant: bool,
+        charge: Option<GrantCharge>,
     ) -> Option<DeathNegative> {
-        if !held_grant {
-            return None;
-        }
+        let charge = charge?;
         let entry = state.workers.get(&worker)?;
         let key = (entry.inference_id.clone(), entry.gpu.clone());
-        let ram_mb = state.gpus.get(&key.1)?.unified_ram_mb?;
+        let unified_ram_mb = state.gpus.get(&key.1)?.unified_ram_mb;
+        if unified_ram_mb.is_some() || charge.ram_mb > 0 {
+            let cap = (charge.unit_budget / 2).max(1);
+            let cal = state.calibration.entry(key.clone()).or_default();
+            let cap = cal.death_cap_units.map_or(cap, |held| held.min(cap));
+            cal.death_cap_units = Some(cap);
+            tracing::warn!(
+                model = %key.0,
+                gpu = %key.1,
+                died_at_units = charge.unit_budget,
+                batch_cap_units = cap,
+                "a worker died while running a granted window; this model's \
+                 batches on this device are capped at half that batch until \
+                 the server restarts"
+            );
+        }
+        let ram_mb = unified_ram_mb?;
         let anchor_before = Self::anchor_locked(state, entry);
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.note_negative_sample(anchor_before);

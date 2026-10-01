@@ -8983,6 +8983,15 @@
             "description": "Consecutive clean windows since the last negative sample.",
             "minimum": 0
           },
+          "death_cap_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Half the batch a replica of this model was running here when its\nprocess died mid-window: caps `unit_budget` until the server restarts.",
+            "minimum": 0
+          },
           "deflation": {
             "type": "integer",
             "format": "int32",

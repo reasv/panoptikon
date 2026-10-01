@@ -1135,6 +1135,11 @@ fn a_death_mid_window_deflates_only_a_unified_device() {
         assert_eq!(worker.deflation, deflation, "{label}");
         assert_eq!(worker.max_units_measured, anchor, "{label}");
         assert_eq!(
+            worker.death_cap_units.is_some(),
+            deflation == 1,
+            "{label}: capped exactly where the death is a negative"
+        );
+        assert_eq!(
             ledger
                 .calibration_state("g/a", gpu)
                 .map(|state| state.samples.len()),

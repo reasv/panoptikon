@@ -22,7 +22,9 @@
 //!
 //! On the CPU device `reserved` is the live resident set and no growth is
 //! reusable: `charge(w) = footprint(w) + Σ grants(w)` and `room(w) = headroom`.
-//! Its reserve is never below a tenth of RAM (2 to 16 GiB).
+//! Its reserve is never below [`cpu::ram_reserve_mb`]. A replica whose process
+//! dies mid-window there, or with host RAM booked, caps later batches of its
+//! (model, device) at half that batch ([`VramLedger::note_death_locked`]).
 //!
 //! A worker with no reported base contributes only growth; the rest of its
 //! memory reads as `external`. A unit budget never exceeds the ramp or
@@ -453,9 +455,11 @@ pub enum WindowOutcome {
     Responded { oom: Option<ErrorFrameOom> },
     /// Aborted before a response: nothing is learned.
     Aborted,
-    /// The worker process died. Accounted as aborted, except on a
-    /// unified-memory device, where it is also a negative sample (an OOM kill
-    /// is a SIGKILL).
+    /// The worker process stopped answering with the window in flight: killed
+    /// (by the kernel or anyone but the gateway) or crashed. Accounted as
+    /// aborted, except that on a unified-memory device it is also a negative
+    /// sample (an OOM kill is a SIGKILL), and there or with host RAM booked
+    /// it caps later batches ([`VramLedger::note_death_locked`]).
     WorkerDied,
 }
 
@@ -1098,6 +1102,10 @@ struct ModelCalibration {
     persisted: Option<(u64, u64, Option<u64>)>,
     /// See [`ShapeCeiling`]. Runtime-only.
     shape_ceiling: Option<ShapeCeiling>,
+    /// Half the batch a replica was running when its process died
+    /// mid-window; no later batch of this (model, device) is larger. Kept
+    /// for the life of this process ([`VramLedger::note_death_locked`]).
+    death_cap_units: Option<u64>,
     /// Next [`ThroughputSample::seq`]; never rewinds.
     throughput_seq: u64,
     /// A GPU replica's host RAM samples: batch units against the resident
@@ -1173,6 +1181,17 @@ fn shape_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Opt
         })
         .map(|ceiling| ceiling.units)
         .filter(|units| *units > 0)
+}
+
+/// The largest batch this replica may run whatever memory allows: the
+/// smaller of its shape ceiling ([`shape_ceiling_for`]) and the cap a death
+/// left ([`ModelCalibration::death_cap_units`]), if either stands.
+fn batch_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Option<u64> {
+    let death = cal.and_then(|cal| cal.death_cap_units);
+    match (shape_ceiling_for(cal, entry), death) {
+        (Some(shape), Some(death)) => Some(shape.min(death)),
+        (shape, death) => shape.or(death),
+    }
 }
 
 /// A memory sample's pool figure for a replica on `device`. On the CPU device

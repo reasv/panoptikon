@@ -35,6 +35,7 @@ impl VramLedger {
                         let anchor = cal.map(|cal| cal.max_units_measured).unwrap_or(0);
                         let knee = cal.and_then(|cal| cal.knee_units).filter(|knee| *knee > 0);
                         let shape_ceiling = shape_ceiling_for(cal, entry);
+                        let ceiling = batch_ceiling_for(cal, entry);
                         let held = entry.hold_reported();
                         LedgerWorkerHealth {
                             inference_id: entry.inference_id.clone(),
@@ -57,13 +58,14 @@ impl VramLedger {
                             ramp_step: entry.ramp_step,
                             deflation: entry.deflation,
                             clean_windows: entry.clean_windows,
-                            unit_budget: admitted_units(entry, anchor, knee, shape_ceiling),
+                            unit_budget: admitted_units(entry, anchor, knee, ceiling),
                             ramp_held: held,
                             held_units: held.then_some(entry.held_units).flatten(),
                             held_certified: held && entry.held_certified,
                             max_units_measured: anchor,
                             knee_units: knee,
                             shape_ceiling_units: shape_ceiling,
+                            death_cap_units: cal.and_then(|cal| cal.death_cap_units),
                             knee_is_local: cal.is_some_and(|cal| cal.knee_is_local),
                             throughput_samples: cal.map(|cal| cal.throughput.len()).unwrap_or(0),
                             local_samples: cal.map(|cal| cal.local_samples).unwrap_or(0),
@@ -231,6 +233,9 @@ pub struct LedgerWorkerHealth {
     pub knee_is_local: bool,
     /// Shape ceiling from `index_limit` clamps: caps `unit_budget`; runtime-only.
     pub shape_ceiling_units: Option<u64>,
+    /// Half the batch a replica of this model was running here when its
+    /// process died mid-window: caps `unit_budget` until the server restarts.
+    pub death_cap_units: Option<u64>,
     /// Samples in the knee ring (all occupancies); runtime-only.
     pub throughput_samples: usize,
     /// Local fit samples, including restored ones; the margin widens below

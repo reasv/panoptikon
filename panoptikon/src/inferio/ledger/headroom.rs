@@ -333,10 +333,9 @@ impl VramLedger {
             .filter(|knee| *knee > 0)
     }
 
-    /// The [`ShapeCeiling`] in force for this replica, if it matches its
-    /// canvas and cost epoch ([`shape_ceiling_for`]).
-    pub(super) fn shape_ceiling_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
-        shape_ceiling_for(cal_locked(state, entry), entry)
+    /// The batch ceiling in force for this replica ([`batch_ceiling_for`]).
+    pub(super) fn batch_ceiling_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
+        batch_ceiling_for(cal_locked(state, entry), entry)
     }
 
     pub(super) fn fit_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<FitSnapshot> {

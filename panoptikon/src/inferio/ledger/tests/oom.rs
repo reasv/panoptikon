@@ -76,6 +76,155 @@ fn oom_at_the_one_item_floor_declares_the_replica_unrunnable() {
     );
 }
 
+/// A CPU replica of `g/a` with RAM to spare, as a load after a death brings
+/// up: the ledger's calibration for the model is the one the last left.
+fn cpu_replica(ledger: &Arc<VramLedger>) -> (TelemetryHandle, Admission) {
+    let handle = loaded_cpu(Some(CPU_RAM_MB));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("admitted");
+    push_memory_with_total(&handle, 40_000, 0, Some(CPU_RAM_MB), "ram");
+    (handle, admission)
+}
+
+fn death_cap(ledger: &Arc<VramLedger>) -> Option<u64> {
+    ledger.health()[0].workers[0].death_cap_units
+}
+
+/// A worker that dies whenever its batch reaches 32 units dies once: the
+/// model is then held at half that batch, where without the cap the next
+/// replica ramps back to 32 and dies again, window after window.
+#[test]
+fn a_death_mid_window_caps_the_model_at_half_the_batch_that_died() {
+    const FATAL: u64 = 32;
+    let ledger = cpu_ledger(no_margin());
+    let mut replica = cpu_replica(&ledger);
+    let (mut deaths, mut sizes) = (0, Vec::new());
+    for _ in 0..40 {
+        let (handle, admission) = &replica;
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let units = token.grant().unit_budget;
+        sizes.push(units);
+        if units < FATAL {
+            handle.lock().unwrap().record_measurements(vec![measurement(
+                units,
+                0,
+                10 * units + 100,
+            )]);
+            token.finish(WindowOutcome::Responded { oom: None });
+            continue;
+        }
+        deaths += 1;
+        token.finish(WindowOutcome::WorkerDied);
+        assert_eq!(death_cap(&ledger), Some(FATAL / 2));
+        // The model is reloaded: a new replica, the same calibration.
+        replica = cpu_replica(&ledger);
+    }
+    assert_eq!(deaths, 1, "{sizes:?}");
+    assert_eq!(sizes[..6], [4, 8, 16, 32, 8, 16], "{sizes:?}");
+    assert!(sizes[6..].iter().all(|units| *units == 16), "{sizes:?}");
+    assert_eq!(ledger.health()[0].workers[0].unit_budget, 16);
+
+    // A shape ceiling under the cap binds in its place: the smaller rules.
+    let (handle, admission) = &replica;
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![BatchMeasurement {
+            clamped: Some(ClampReport {
+                from_units: 16,
+                to_units: 4,
+                free_mb: None,
+                reason: Some(CLAMP_REASON_INDEX_LIMIT.to_owned()),
+            }),
+            ..measurement(4, 0, 140)
+        }]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    let worker = &ledger.health()[0].workers[0];
+    assert_eq!(
+        (worker.shape_ceiling_units, worker.unit_budget),
+        (Some(4), 4)
+    );
+    assert_eq!(worker.death_cap_units, Some(16));
+}
+
+/// Each further death halves the cap, down to one unit and no further. A
+/// window that ends any other way leaves it alone.
+#[test]
+fn repeated_deaths_halve_the_cap_down_to_one_unit() {
+    let ledger = cpu_ledger(no_margin());
+    let (handle, admission) = cpu_replica(&ledger);
+    for units in [4, 8, 16, 32] {
+        measured_window(&handle, &admission, units);
+    }
+    assert_eq!(death_cap(&ledger), None);
+    for outcome in [
+        WindowOutcome::Aborted,
+        WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        },
+    ] {
+        admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .finish(outcome);
+        assert_eq!(death_cap(&ledger), None, "{outcome:?}");
+    }
+    drop(admission);
+
+    let mut caps = Vec::new();
+    for _ in 0..7 {
+        let (_handle, admission) = cpu_replica(&ledger);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let units = token.grant().unit_budget;
+        if let Some(cap) = caps.last() {
+            assert!(units <= *cap, "{units} units under a cap of {cap}");
+        }
+        token.finish(WindowOutcome::WorkerDied);
+        let cap = death_cap(&ledger).expect("capped");
+        assert_eq!(cap, (units / 2).max(1));
+        caps.push(cap);
+    }
+    assert_eq!(caps, [16, 8, 4, 2, 1, 1, 1]);
+}
+
+/// The cap does not stand in for the verdict on a model that cannot run one
+/// item: a death and two out-of-memory windows at one item, with no room for
+/// one, still condemn the replica.
+#[test]
+fn a_capped_model_is_still_condemned_at_the_one_item_floor() {
+    let ledger = cpu_ledger(no_margin());
+    let handle = loaded_cpu(Some(CPU_RAM_MB));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("admitted");
+    push_memory_with_total(&handle, 0, 0, Some(CPU_RAM_MB), "ram");
+    ledger.ingest_all_for_test();
+    let window = |outcome| {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().unit_budget, 1, "no room: one item");
+        token.finish(outcome)
+    };
+    let oom = WindowOutcome::Responded {
+        oom: Some(ErrorFrameOom::Prose),
+    };
+    assert!(window(WindowOutcome::WorkerDied).is_none());
+    assert_eq!(death_cap(&ledger), Some(1));
+    assert!(window(oom).is_none());
+    let verdict = window(oom).expect("three failed one-item windows");
+    assert_eq!(verdict.inference_id, "g/a");
+    assert!(ledger.was_condemned("g/a", "CPU"));
+}
+
 /// Once the model is resident its memory is ours and `external` falls, so a
 /// one-item window gets a nominal share and still runs out of memory: the
 /// room against one item's cost says the replica is at its floor.
