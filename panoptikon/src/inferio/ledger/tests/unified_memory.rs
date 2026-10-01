@@ -1624,12 +1624,6 @@ fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
     assert_eq!(step_during, step, "no window earned a step");
     assert_eq!(deflation, 0, "no collapse was counted");
     assert_eq!(samples_during, samples, "no rate reached the knee ring");
-    let reached =
-        ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].max_units_measured_here;
-    assert_eq!(
-        reached, 64,
-        "a size run under pressure is not one the ramp reached"
-    );
 
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
     push_ram(&handle, MAC_TOTAL_MB, 90_000, 80, 0);
@@ -1661,6 +1655,12 @@ fn at_warning_without_paging_the_batch_size_is_held() {
     let (step_during, _, samples_during, _) = ramp_figures(&ledger);
     assert_eq!(step_during, step);
     assert_eq!(samples_during, samples);
+    let reached =
+        ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].max_units_measured_here;
+    assert_eq!(
+        reached, 64,
+        "a size run under pressure is not one the ramp reached"
+    );
 
     // A queue-sized window under pressure does not lower the held size.
     queued_window_at_the_rate(&handle, &admission, 5, |_| 100.0);
