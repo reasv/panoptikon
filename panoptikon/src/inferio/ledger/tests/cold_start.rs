@@ -468,8 +468,10 @@ fn a_joiner_beside_busy_fitted_replicas_fits_once_its_cost_is_measured() {
 /// at the design cost that asks first and stays busy. What the first batch
 /// kept, or needed only then, is not charged again for every unit: the
 /// replica ramps or, where nothing is left to grow into, runs a unit fewer
-/// for two windows, and is fitted. The exception is a replica that has
-/// measured one unit only and has no room for a second.
+/// for two windows, and is fitted. Once fitted, what it kept is priced once
+/// per batch, so its windows take nothing more past the headroom. The
+/// exception is a replica that has measured one unit only and has no room
+/// for a second.
 #[test]
 fn memory_a_first_batch_takes_once_is_not_priced_per_unit() {
     // (headroom, kept MiB, first batch only MiB, MiB per seed batch, first
@@ -485,7 +487,7 @@ fn memory_a_first_batch_takes_once_is_not_priced_per_unit() {
             0,
             720,
             u64::MAX,
-            [8, 7, 6, 16, 32, 64],
+            [8, 7, 6, 10, 10, 10],
             Some(4),
         ),
         (
@@ -497,8 +499,8 @@ fn memory_a_first_batch_takes_once_is_not_priced_per_unit() {
             [8, 7, 16, 32, 64, 88],
             Some(4),
         ),
-        (7900, 4000, 0, 200, u64::MAX, [8, 7, 6, 16, 32, 64], Some(4)),
-        (7900, 1000, 0, 800, 1, [1, 2, 4, 8, 14, 14], Some(4)),
+        (7900, 4000, 0, 200, u64::MAX, [8, 7, 6, 1, 1, 1], Some(4)),
+        (7900, 1000, 0, 800, 1, [1, 2, 4, 4, 4, 4], Some(4)),
         (7900, 0, 4000, 200, 1, [1, 1, 2, 4, 8, 16], Some(5)),
     ];
     for (headroom, kept_mb, first_only_mb, allocated_mb, first_window, units, fitted) in cases {
@@ -518,6 +520,11 @@ fn memory_a_first_batch_takes_once_is_not_priced_per_unit() {
         assert_eq!(
             (budgets, ran.fitted[1]),
             (units.to_vec(), fitted),
+            "{case:?}"
+        );
+        let pre_fit = ran.over[2].max(0);
+        assert!(
+            ran.over[3..].iter().all(|over| *over <= pre_fit),
             "{case:?}"
         );
     }

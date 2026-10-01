@@ -16,7 +16,8 @@
 //!                   total − external × (1 + margin)) # desktop lever, default on
 //! headroom     = limit − Σ charge(w) − Σ load_reservations  # may go negative
 //! room(w)      = headroom + max(0, growth(w) − Σ grants(w))
-//! grant        = min(room(w) share, ramp step, slope × knee_units,
+//! price(u)     = pool margin × (max(0, intercept) + slope × u)
+//! grant        = min(room(w) share, ramp step, price(knee_units),
 //!                    priced window content)
 //! ```
 //!
@@ -103,6 +104,13 @@ pub const DEFAULT_MARGIN: f64 = 0.10;
 /// docs/batch-calibration-design.md, "The reserve, and why an unset margin is
 /// not the same as `margin = 0.10`".
 pub const DEFAULT_RESERVE_CAP_MB: u64 = 1024;
+
+/// The least an unset margin reserves on a GPU other than Apple's, as a
+/// fraction of the card, itself at most [`DEFAULT_RESERVE_CAP_MB`]. On a
+/// card with little other usage the default fraction reserves almost
+/// nothing, and a batch priced to the room then runs at the card's physical
+/// limit.
+pub const DEFAULT_RESERVE_FLOOR_FRACTION: f64 = 0.03;
 
 /// Base reserved for a load no measurement or profile knows. Erring high only
 /// shrinks concurrent grants while the load runs.
@@ -285,6 +293,16 @@ pub const POOL_MARGIN_MIN: f64 = 1.0;
 pub const POOL_MARGIN_MAX_CUDA: f64 = 2.0;
 pub const POOL_MARGIN_MAX_MPS: f64 = 4.0;
 
+/// What one out-of-memory window at the limit of a device's room raises the
+/// pool margin by ([`VramLedger::raise_pool_margin_locked`]): the next grant
+/// in the same room is a tenth smaller.
+pub const OOM_MARGIN_STEP: f64 = 1.1;
+
+/// The most such raises a (model, device) takes. The pool ratio of one batch
+/// size varies by a few percent with the pool's history; a failure past
+/// three raises has another cause, and deflation alone answers it.
+pub const OOM_MARGIN_MAX_STEPS: u32 = 3;
+
 /// Allocated delta below which a batch's pool ratio is allocator granularity,
 /// not a margin.
 pub const POOL_MARGIN_MIN_DELTA_MB: u64 = 64;
@@ -297,7 +315,9 @@ const MAX_RAMP_STEP: u32 = 32;
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct VramBudget {
     /// Margin over external usage. `None` (unset) is not [`DEFAULT_MARGIN`]:
-    /// its reserve is also capped at [`DEFAULT_RESERVE_CAP_MB`].
+    /// its reserve is also capped at [`DEFAULT_RESERVE_CAP_MB`] and, on a
+    /// GPU other than Apple's, at least [`DEFAULT_RESERVE_FLOOR_FRACTION`]
+    /// of the card.
     pub margin: Option<f64>,
     /// Hard ceiling as a fraction of total; the server lever, off by default.
     pub cap_fraction: Option<f64>,
@@ -335,6 +355,7 @@ impl VramBudget {
 pub const RESERVE_RULE_USER_MARGIN: &str = "user_margin";
 pub const RESERVE_RULE_CAPPED_DEFAULT: &str = "capped_default";
 pub const RESERVE_RULE_FLAT_DEFAULT: &str = "flat_default";
+pub const RESERVE_RULE_GPU_FLOOR: &str = "gpu_floor";
 pub const RESERVE_RULE_RAM_FLOOR: &str = "ram_floor";
 
 /// Budget settings: a default plus per-GPU overrides keyed by UUID. Profiles
@@ -445,7 +466,8 @@ pub struct FitSnapshot {
     /// MiB of allocated memory per unit; a grant multiplies it by the pool
     /// margin.
     pub slope_mb_per_unit: f64,
-    /// Free intercept, diagnostic only: forcing it would bias the slope.
+    /// Free intercept: the allocated MiB a batch costs whatever its size. A
+    /// grant prices it too, times the pool margin; a negative one as 0.
     pub intercept_mb: f64,
     pub residual_mb: f64,
     pub samples: usize,
@@ -484,6 +506,10 @@ struct GrantCharge {
     unit_budget: u64,
     /// Memory held this window back ([`Grant::squeezed`]).
     squeezed: bool,
+    /// The fitted price cut this window's batch to the device's room: not
+    /// pre-fit, not a share beside another replica that is asking, and not
+    /// cut further by host RAM or an item cap.
+    room_bound: bool,
     /// The contention tag: the most other replicas holding a window on this GPU
     /// at once while this one was out; 0 is sole occupancy. See
     /// docs/batch-calibration-design.md, "Throughput knee: narrowing the
@@ -491,7 +517,7 @@ struct GrantCharge {
     peak_occupants: u32,
     /// The knee limited this window's batch size.
     knee_bound: bool,
-    /// Room for [`RATCHET_FACTOR`] × the appetite, and not squeezed.
+    /// Room for a batch [`RATCHET_FACTOR`] × the appetite's, and not squeezed.
     ample_headroom: bool,
     /// Less work in hand than the budget admitted; earns no doubling.
     queue_bound: bool,
@@ -1100,6 +1126,11 @@ struct ModelCalibration {
     /// [`POOL_MARGIN_MIN_DELTA_MB`]. Runtime-only: the ratio does not reproduce
     /// across processes.
     margin_ring: VecDeque<(u64, f64)>,
+    /// Out-of-memory windows at the limit of the device's room, each raising
+    /// the pool margin by [`OOM_MARGIN_STEP`], at most
+    /// [`OOM_MARGIN_MAX_STEPS`]. Kept for the life of this process; a
+    /// reloaded replica inherits it.
+    oom_margin_steps: u32,
     fit: Option<FitSnapshot>,
     /// The fit is this machine's own (computed here, or a local profile on the
     /// exact torch version); only such a fit is written back.

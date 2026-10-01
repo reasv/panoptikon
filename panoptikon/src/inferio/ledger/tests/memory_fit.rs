@@ -394,3 +394,203 @@ fn an_undelivered_fit_is_re_sent_on_the_next_window() {
     });
     assert!(admission.fit_to_send().is_some());
 }
+
+/// A replica of `model` whose batches allocate `fixed_mb + per_unit_mb ×
+/// units`, ramped from a seed of 2 to 32 units on a roomy card.
+fn fitted_with_a_fixed_part(
+    ledger: &Arc<VramLedger>,
+    model: &str,
+    fixed_mb: u64,
+    per_unit_mb: u64,
+) -> (TelemetryHandle, Admission) {
+    let handle = loaded(Some(1000), Some(0));
+    let admission = ledger
+        .register_worker(model, item_cost(2), &handle, None)
+        .unwrap();
+    push_memory(&handle, 90_000, 0);
+    for _ in 0..5 {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let units = token.grant().unit_budget;
+        let batch = measurement(units, 0, fixed_mb + per_unit_mb * units);
+        handle.lock().unwrap().record_measurements(vec![batch]);
+        token.finish(WindowOutcome::Responded { oom: None });
+    }
+    (handle, admission)
+}
+
+/// A grant covers the fit's intercept as well as its slope: with 800 MiB a
+/// batch and 82 MiB a unit, 2186 MiB of room holds 16 units, not the 26 that
+/// 2186 / 82 gives. The worker is told the fixed part.
+#[test]
+fn a_grant_prices_what_a_batch_costs_whatever_its_size() {
+    let ledger = ledger(100_000, no_margin());
+    let (handle, admission) = fitted_with_a_fixed_part(&ledger, "g/a", 800, 82);
+    let fit = ledger.calibration_state("g/a", GPU).unwrap().fit.unwrap();
+    assert!((fit.slope_mb_per_unit - 82.0).abs() < 1e-9, "{fit:?}");
+    assert!((fit.intercept_mb - 800.0).abs() < 1e-9, "{fit:?}");
+
+    // Ramped 2 → 32: the next size is 64, with room to spare.
+    let roomy = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+    let grant = *roomy.grant();
+    assert_eq!((grant.unit_budget, grant.mb), (64, 800 + 64 * 82));
+    assert_eq!((grant.fixed_mb, grant.squeezed), (800, false));
+    drop(roomy);
+
+    push_memory(&handle, 2186, 0);
+    ledger.ingest_all_for_test();
+    assert_eq!(ledger.headroom_mb(GPU), 2186);
+    let tight = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+    let grant = *tight.grant();
+    assert_eq!((grant.unit_budget, grant.mb), (16, 800 + 16 * 82));
+    assert_eq!((grant.fixed_mb, grant.squeezed), (800, true));
+    drop(tight);
+
+    // Less room than the fixed part: one unit, and all the room there is.
+    // It is less than one unit costs, so running out of memory there
+    // counts towards declaring the replica unable to run.
+    push_memory(&handle, 700, 0);
+    ledger.ingest_all_for_test();
+    let mut verdict = None;
+    for _ in 0..OOM_WINDOWS_AT_FLOOR {
+        let floor = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let grant = *floor.grant();
+        assert_eq!((grant.unit_budget, grant.mb, grant.fixed_mb), (1, 700, 700));
+        verdict = floor.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Marker),
+        });
+    }
+    assert!(
+        verdict.is_some(),
+        "700 MiB is less than the 882 one unit costs"
+    );
+}
+
+/// Two fitted models asking at once are weighed by the price of their
+/// batches, fixed part included, and each one's floor is the price of its
+/// seed batch.
+#[test]
+fn the_contention_split_counts_the_fixed_part() {
+    let ledger = ledger(100_000, no_margin());
+    // 32 units cost 1120 MiB with the fixed part and 320 without.
+    let (handle, fixed) = fitted_with_a_fixed_part(&ledger, "g/fixed", 800, 10);
+    let (_, plain) = fitted_with_a_fixed_part(&ledger, "g/plain", 0, 10);
+    plain.note_demand(5);
+    // (headroom, the units and MiB `g/fixed` is granted)
+    for (headroom, granted) in [
+        // 1120 / 1440 of the headroom.
+        (1440, (32, 1120)),
+        // 1120 / 1440 of 900 is 700: below the 820 its seed batch costs.
+        (900, (2, 820)),
+    ] {
+        push_memory(&handle, headroom, 0);
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.headroom_mb(GPU), headroom);
+        let token = fixed.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!((token.grant().unit_budget, token.grant().mb), granted);
+    }
+}
+
+/// A negative intercept prices as 0: a grant is never below `slope × units`.
+#[test]
+fn a_negative_intercept_is_not_priced() {
+    let ledger = ledger(100_000, no_margin());
+    let (_handle, admission) = fitted_with_a_fixed_part(&ledger, "g/a", 0, 10);
+    let mut fit = ledger.calibration_state("g/a", GPU).unwrap().fit.unwrap();
+    fit.intercept_mb = -300.0;
+    ledger.install_fit_for_test("g/a", GPU, fit);
+    let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+    let grant = *token.grant();
+    assert_eq!((grant.unit_budget, grant.mb, grant.fixed_mb), (64, 640, 0));
+}
+
+/// On the CPU device what a replica keeps of the fixed part stays resident
+/// and is in its footprint, so a grant charges only the rest of it, times
+/// the pool margin (1.25 here); a fixed part the replica hands back after
+/// each batch is charged whole.
+#[test]
+fn the_cpu_device_charges_the_fixed_part_only_when_it_is_not_resident() {
+    for (kept_mb, fixed_mb) in [(800, 0), (500, 375), (0, 1000)] {
+        let ledger = cpu_ledger(no_margin());
+        let handle = loaded_cpu(Some(CPU_RAM_MB));
+        let admission = ledger
+            .register_worker("g/a", item_cost(2), &handle, None)
+            .expect("admitted");
+        push_memory_with_total(&handle, 40_000, kept_mb, Some(CPU_RAM_MB), "ram");
+        for _ in 0..5 {
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            let units = token.grant().unit_budget;
+            let allocated = 800 + 82 * units;
+            let batch = BatchMeasurement {
+                rss_after_mb: Some(kept_mb),
+                peak_reserved_mb: Some(allocated * 5 / 4),
+                ..measurement(units, 0, allocated)
+            };
+            handle.lock().unwrap().record_measurements(vec![batch]);
+            token.finish(WindowOutcome::Responded { oom: None });
+        }
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let grant = *token.grant();
+        assert_eq!(
+            (grant.unit_budget, grant.mb, grant.fixed_mb),
+            (64, fixed_mb + 64 * 82 * 5 / 4, fixed_mb),
+            "{kept_mb} MiB kept"
+        );
+    }
+}
+
+/// Ample headroom is room for one batch twice the appetite's size: the fixed
+/// part counts once. With an anchor of 32 that is 800 + 64 × 10 MiB, not
+/// twice the 1120 MiB of 32 units. Pre-fit it is twice the base.
+#[test]
+fn ample_headroom_is_the_price_of_the_doubled_batch() {
+    let ample = |ledger: &Arc<VramLedger>, admission: &Admission| {
+        let token = admission.request_grant(32, None, 1, 0).unwrap();
+        assert!(!token.grant().squeezed);
+        let state = ledger.lock();
+        let grants = state
+            .workers
+            .values()
+            .flat_map(|entry| entry.grants.values());
+        grants
+            .map(|charge| charge.ample_headroom)
+            .collect::<Vec<_>>()
+    };
+    let fitted = ledger(100_000, no_margin());
+    let (handle, admission) = fitted_with_a_fixed_part(&fitted, "g/a", 800, 10);
+    for (room_mb, expected) in [(1440, true), (1439, false)] {
+        push_memory(&handle, room_mb, 0);
+        fitted.ingest_all_for_test();
+        assert_eq!(ample(&fitted, &admission), [expected], "{room_mb} MiB");
+    }
+    // A card that affords the 32 units but not 64 has no room for 64: the
+    // doubled batch is not cut to what the card affords. With no base of
+    // its own, the replica's room is the card's whole limit.
+    let small = ledger(100_000, no_margin());
+    let (handle, admission) = fitted_with_a_fixed_part(&small, "g/a", 800, 10);
+    small.lock().workers.values_mut().for_each(|entry| {
+        entry.base_mb = None;
+    });
+    push_memory(&handle, 1300, 0);
+    small.ingest_all_for_test();
+    let limit = small.health()[0].limit_mb;
+    assert_eq!((limit, small.headroom_mb(GPU)), (1300, 1300));
+    assert_eq!(ample(&small, &admission), [false], "1300 MiB card");
+    for (room_mb, expected) in [(2000, true), (1999, false)] {
+        let cold = ledger(1000 + room_mb, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = cold
+            .register_worker("g/a", item_cost(32), &handle, None)
+            .unwrap();
+        push_memory(&handle, room_mb, 0);
+        cold.ingest_all_for_test();
+        assert_eq!(
+            ample(&cold, &admission),
+            [expected],
+            "pre-fit, {room_mb} MiB"
+        );
+    }
+}

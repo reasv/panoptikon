@@ -148,9 +148,11 @@ pub struct GpuBudgetHealth {
     /// The reserve applied to this GPU on top of `external_mb`.
     pub reserve_mb: u64,
     /// `"user_margin"` (configured, uncapped), `"capped_default"` (default
-    /// fraction, clamped), `"flat_default"` (the cap itself, on a CUDA GPU
-    /// that spills to system RAM) or `"ram_floor"` (the CPU device's minimum:
-    /// a tenth of RAM, at most 16 GiB, at least 2 GiB or a quarter of RAM).
+    /// fraction, clamped), `"gpu_floor"` (3 % of the card, at most 1 GiB,
+    /// where the default fraction gives less; not on Apple Silicon),
+    /// `"flat_default"` (the cap itself, on a CUDA GPU that spills to system
+    /// RAM) or `"ram_floor"` (the CPU device's minimum: a tenth of RAM, at
+    /// most 16 GiB, at least 2 GiB or a quarter of RAM).
     pub reserve_rule: String,
     /// `limit − Σ charges − Σ load reservations`; on unified memory the
     /// charges of both devices sharing the RAM.
@@ -260,7 +262,9 @@ pub struct FitHealth {
     pub intercept_mb: f64,
     pub residual_mb: f64,
     pub samples: usize,
-    /// Observed reserved/allocated ratio; a grant is `slope × units ×
-    /// pool_margin`. Runtime-only.
+    /// Observed reserved/allocated ratio, raised a tenth (three times at
+    /// most) by out-of-memory windows at the limit of the device's room; a
+    /// grant is `(max(0, intercept) + slope × units) × pool_margin`.
+    /// Runtime-only.
     pub pool_margin: f64,
 }

@@ -309,7 +309,7 @@ fn host_ram_caps_a_gpu_replica_without_moving_its_ramp() {
         for _ in 0..3 {
             let grant = ram_window(&handle, &admission);
             assert_eq!(grant.unit_budget, 300);
-            assert_eq!(grant.mb, 3_000, "the GPU reserves only what 300 units need");
+            assert_eq!(grant.mb, 3_100, "the GPU reserves only what 300 units need");
             assert!(grant.squeezed, "memory held it back");
         }
     });
@@ -1684,5 +1684,57 @@ fn only_a_private_memory_gpu_replica_books_host_ram() {
         .expect("admitted");
     for (ledger, model) in [(&mixed, "g/cpu"), (&mac, "g/mps"), (&bare, "g/bare")] {
         assert_eq!(row(ledger, model).ram_resident_mb, None, "{model}");
+    }
+}
+
+/// An item-capped window of a fitted model is priced with the fixed part
+/// like any other: one unit at the default pool margin, 1.25 × (100 + 10).
+#[test]
+fn an_item_capped_window_is_priced_with_the_fixed_part() {
+    let ring = [4u64, 8, 16].map(|units| FitSample {
+        units,
+        delta_mb: 100 + 10 * units,
+    });
+    let profiles = Arc::new(FakeProfiles {
+        seed: Some(ProfileSeed {
+            ring: ring.to_vec(),
+            ..seeded_anchor(16, true)
+        }),
+        ..FakeProfiles::default()
+    });
+    let ledger = host(&[GPU], Some(profiles));
+    let (_handle, admission) = cold_gpu_replica(&ledger, "g/a", GPU, item_cost(4));
+    let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+    let grant = *token.grant();
+    assert_eq!(
+        (grant.user_cap_items, grant.unit_budget, grant.mb),
+        (Some(1), 1, 138)
+    );
+}
+
+/// A window the GPU's room cut and host RAM then cut further was sized by
+/// host RAM: its failure leaves the pool margin. With RAM to spare the room
+/// sizes it, and its failure raises the margin.
+#[test]
+fn an_out_of_memory_window_host_ram_sized_leaves_the_pool_margin() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/a", GPU, 3);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    for _ in 0..7 {
+        ram_window(&handle, &admission);
+    }
+    // The card has room for 100 units of the 384 asked: 100 + 100 × 10 MiB.
+    push_memory(&handle, 100, 1000);
+    ledger.ingest_all_for_test();
+    for (ram_to_book, units, raised) in [(500, 50, 0), (45_000, 100, 1)] {
+        cpu_free_to_book(&ledger, ram_to_book);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().unit_budget, units);
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Marker),
+        });
+        assert_eq!(margin_steps(&ledger, "g/a", GPU), raised);
     }
 }

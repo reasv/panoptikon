@@ -297,7 +297,7 @@ function updateGpuMemory() {
     ? 'Keeps free this percentage of the GPU memory other programs use, with no upper limit. 0 keeps nothing free.'
     : memory.flat_default
       ? 'Keeps 1 GiB free on each NVIDIA GPU. When a GPU is full, the NVIDIA driver moves memory to system RAM, and inference becomes several times slower.'
-      : 'Keeps free 10 % of the GPU memory other programs use, at most 1 GiB.';
+      : 'Keeps free 10 % of the GPU memory other programs use: at most 1 GiB and, except on a Mac, at least 3 % of the GPU.';
   const gpus = memory.custom_gpus === 0 ? ''
     : memory.custom_gpus === 1 ? ' One GPU has its own margin in the config file, which applies to it instead.'
       : ` ${memory.custom_gpus} GPUs have their own margin in the config file, which applies to them instead.`;
