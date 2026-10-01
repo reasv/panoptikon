@@ -3,6 +3,27 @@
 
 use super::*;
 
+/// Pool growth one seed batch is designed for: the registry's seed budget
+/// times the default pool margin.
+fn design_seed_batch_mb() -> u64 {
+    (SEED_BUDGET_MB as f64 * POOL_MARGIN_DEFAULT).ceil() as u64
+}
+
+/// What a pre-fit batch of `units` is designed to grow the pool by, rounded
+/// up. A design figure: exact only for a model whose seed was measured.
+fn design_cost_mb(entry: &WorkerEntry, units: u64) -> u64 {
+    let seed = u128::from(entry.seed_units.max(1));
+    let cost = (u128::from(units) * u128::from(design_seed_batch_mb())).div_ceil(seed);
+    u64::try_from(cost).unwrap_or(u64::MAX)
+}
+
+/// The largest batch `mb` covers at the design cost, at least one unit.
+pub(super) fn design_units(entry: &WorkerEntry, mb: u64) -> u64 {
+    let seed = u128::from(entry.seed_units.max(1));
+    let units = u128::from(mb) * seed / u128::from(design_seed_batch_mb());
+    u64::try_from(units).unwrap_or(u64::MAX).max(1)
+}
+
 /// The ceiling on a learned pool margin for this device's allocator. Per
 /// device, not per host: on a Mac the CPU device uses the process heap, not
 /// Metal.
@@ -417,18 +438,36 @@ impl VramLedger {
         on(gpu) + Self::ram_domain_peer(state, gpu).map_or(0, on)
     }
 
+    /// Whether another replica holds a reservation on `worker`'s device or
+    /// its RAM-domain peer.
+    pub(super) fn neighbour_reserved_locked(state: &LedgerState, worker: WorkerId) -> bool {
+        let Some(requesting) = state.workers.get(&worker) else {
+            return false;
+        };
+        let peer = Self::ram_domain_peer(state, &requesting.gpu);
+        state.workers.iter().any(|(id, entry)| {
+            *id != worker
+                && (entry.grants_on(&requesting.gpu) > 0
+                    || peer.is_some_and(|peer| entry.grants_on(peer) > 0))
+        })
+    }
+
     /// Contention split among hungry workers (pending requests, no grant
     /// held): appetite-weighted shares with a floor of one seed batch each,
-    /// the floors shrunk pro-rata when they oversubscribe. Pre-fit the share
-    /// is the reservation, so it is also at most an equal part of the
-    /// headroom among [`Self::replicas_locked`]: the first replica to ask
-    /// must leave room for the others. The requester alone is credited its
-    /// own [`WorkerEntry::free_pool_mb`] on top.
+    /// the floors shrunk pro-rata when they oversubscribe. The requester alone
+    /// is credited its own [`WorkerEntry::free_pool_mb`] on top.
+    ///
+    /// Pre-fit the share is the reservation. Beside other replicas
+    /// ([`Self::replicas_locked`]) it is at most an equal part of the
+    /// headroom, so the first to ask leaves room for the others, and with the
+    /// credit at least what a batch of `units` is designed to cost
+    /// ([`design_cost_mb`]).
     pub(super) fn share_locked(
         &self,
         state: &LedgerState,
         worker: WorkerId,
         signed_headroom: i128,
+        units: u64,
     ) -> Share {
         let Some(requesting) = state.workers.get(&worker) else {
             return Share {
@@ -459,19 +498,24 @@ impl VramLedger {
         };
         let replicas = Self::replicas_locked(state, &requesting.gpu).max(1);
         let pre_fit = Self::grant_slope_locked(state, requesting).is_none();
-        let equal_part = |share: u64, floor: u64| -> u64 {
-            if pre_fit {
-                share.min((headroom / replicas).max(floor))
-            } else {
-                share
-            }
+        // (equal part, design cost the credit does not cover).
+        let bounds = (pre_fit && replicas > 1).then(|| {
+            let cost = design_cost_mb(requesting, units);
+            (headroom / replicas, cost.saturating_sub(credit))
+        });
+        let reserved = |split: u64, floor: u64| -> u64 {
+            let share = match bounds {
+                Some((part, cost)) => split.min(part).max(cost),
+                None => split,
+            };
+            share.max(floor).min(headroom)
         };
-        // Sole claimant: the whole room (pre-fit, its equal part of it), but
-        // the floor is still reported for the squeeze test.
+        // Sole claimant: the whole headroom is its split, but the floor is
+        // still reported for the squeeze test.
         if hungry.len() <= 1 {
             let floor = floor_mb(requesting);
             return Share {
-                mb: equal_part(headroom, floor)
+                mb: reserved(headroom, floor)
                     .saturating_add(credit)
                     .min(own_room),
                 room: own_room,
@@ -490,7 +534,7 @@ impl VramLedger {
         if floor_sum > headroom && floor_sum > 0 {
             floor = ((u128::from(floor) * u128::from(headroom)) / u128::from(floor_sum)) as u64;
         }
-        share = equal_part(share, floor).max(floor).min(headroom);
+        share = reserved(share, floor);
         Share {
             // The credit is added after the split, never divided among others.
             mb: share.saturating_add(credit).min(own_room),

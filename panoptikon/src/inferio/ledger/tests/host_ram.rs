@@ -380,6 +380,33 @@ fn a_pre_fit_cpu_replica_leaves_host_ram_for_a_gpu_replicas_batch() {
     assert_eq!(ram_window(&handle, &admission).unit_budget, 256);
 }
 
+/// A replica alone on its card reserves the card's whole headroom, whatever
+/// is on the other card: a replica that books host RAM, and a load in flight.
+#[tokio::test]
+async fn a_replica_alone_on_its_card_is_not_cut_for_another_cards_replicas() {
+    const OTHER: &str = "GPU-bbbb";
+    let ledger = host(&[GPU, OTHER], None);
+    let mut admissions = Vec::new();
+    for (model, card) in [("g/alone", GPU), ("g/other", OTHER)] {
+        let handle = with_rss(loaded_on(card, Some(1000), Some(0)));
+        let admission = ledger
+            .register_worker(model, item_cost(4), &handle, Some(card))
+            .expect("admitted on its card");
+        push_memory(&handle, 199_000, 0);
+        admissions.push(admission);
+    }
+    ledger.ingest_all_for_test();
+    let _loading = ledger
+        .reserve_load_for_test("g/loading", item_cost(4), OTHER, None)
+        .await
+        .expect("known GPU");
+
+    let token = admissions[0]
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(token.grant().mb, 199_000);
+}
+
 /// A GPU replica's resident set is ours on the CPU device, counted once:
 /// not external usage too, whether the free reading predates its load or the
 /// memory it kept after a window. Gone, it is credited back to the reading.

@@ -20,6 +20,11 @@ use super::registry::Registry;
 /// Seed batch when a model declares nothing at all.
 pub const FALLBACK_SEED_UNITS: u32 = 4;
 
+/// Allocated memory, in MiB, a seed batch is sized to grow by: a measured
+/// `seed_units` is this over the model's MiB per unit
+/// (docs/model-cost-measurement.md, "Choose `seed_units`").
+pub const SEED_BUDGET_MB: u64 = 2048;
+
 /// `metadata.cost.epoch` default.
 pub const DEFAULT_EPOCH: u32 = 1;
 

@@ -832,13 +832,17 @@ def test_a_part_of_the_headroom_pre_fit_grant_clamps_only_below_itself(fake_torc
     fake_torch.free = 3_833 * MIB
     assert packing.clamp_to_live_memory(8, 7_666).units == 4
 
-    # An 8 GiB card: 256 of headroom plus the worker's own 800 MiB pool. The
-    # grant covers the pool, so neither the clamp nor the pool release fires.
-    fake_torch.free = 392 * MIB
-    fake_torch.reserved = 800 * MIB
-    assert packing.clamp_to_live_memory(4, 1_056).clamped is None
+    # An 8 GiB card, 3 817 MiB of headroom: the second model is granted the
+    # 1 257 left for 3 units. The first one spending its 2 560 does not clamp
+    # it. Its next grant is the same 1 257 with a 960 MiB pool inside it, so
+    # neither the clamp nor the pool release fires.
+    fake_torch.free = (3_817 - 2_560) * MIB
+    assert packing.clamp_to_live_memory(3, 1_257).clamped is None
+    fake_torch.free = (3_817 - 2_560 - 960) * MIB
+    fake_torch.reserved = 960 * MIB
+    assert packing.clamp_to_live_memory(3, 1_257).clamped is None
     for _ in range(packing.SHRINK_WINDOWS + 1):
-        assert packing.maybe_shrink(1_056) is False
+        assert packing.maybe_shrink(1_257) is False
     assert fake_torch.empty_cache_calls == 0
 
 

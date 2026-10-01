@@ -293,7 +293,7 @@ fn a_lopsided_pre_fit_split_on_a_wide_open_gpu_is_not_a_squeeze() {
     // Two hungry pre-fit models, appetites 1 vs 4000.
     let small = loaded(Some(1), Some(0));
     let asking = ledger
-        .register_worker("g/small", item_cost(4), &small, None)
+        .register_worker("g/small", item_cost(64), &small, None)
         .unwrap();
     let big = loaded(Some(4000), Some(0));
     let other = ledger
@@ -311,7 +311,9 @@ fn a_lopsided_pre_fit_split_on_a_wide_open_gpu_is_not_a_squeeze() {
         "nearly the whole 200 GB GPU is unclaimed"
     );
 
-    let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    // 6 units of a 64-unit seed are designed to cost 240 MiB, under the
+    // floor, so the share is not raised to the batch's cost.
+    let token = asking.request_grant(6, None, 1, 0).expect("granted");
     assert!(
         token.grant().mb <= SEED_BATCH_FLOOR_MB,
         "the premise: this share really did land on its floor ({} MiB)",

@@ -94,7 +94,18 @@ impl VramLedger {
         };
         let signed_headroom = self.overdraft_with_margin_locked(&state, &gpu, margin);
         let headroom = signed_headroom.max(0) as u64;
-        let share = self.share_locked(&state, worker, signed_headroom);
+        // The ramp value, and what of it the window's content asks for.
+        let (capped, wanted) = {
+            let entry = state.workers.get(&worker)?;
+            let capped = admitted_units(
+                entry,
+                Self::anchor_locked(&state, entry),
+                Self::knee_locked(&state, entry),
+                Self::shape_ceiling_locked(&state, entry),
+            );
+            (capped, capped.min(window_units.max(1)).max(1))
+        };
+        let share = self.share_locked(&state, worker, signed_headroom, wanted);
         let (
             mut unit_budget,
             mut mb,
@@ -116,8 +127,6 @@ impl VramLedger {
             let anchor = Self::anchor_locked(&state, entry);
             let slope = Self::grant_slope_locked(&state, entry);
             let ceiling = Self::shape_ceiling_locked(&state, entry);
-            let capped = admitted_units(entry, anchor, Self::knee_locked(&state, entry), ceiling);
-            let wanted = capped.min(window_units.max(1)).max(1);
             // The knee decided this window's size: it bit (compared with the
             // shape ceiling still applied) and the work in hand reached it.
             let knee_bound = capped < admitted_units(entry, anchor, None, ceiling)
@@ -143,9 +152,16 @@ impl VramLedger {
                 if share.mb == 0 {
                     units = 1;
                 }
-                // Pre-fit, squeezed means held at the floor while the floors
+                // Beside another replica's reservation, at most the batch the
+                // share covers at its design cost.
+                let covered = headroom::design_units(entry, share.mb);
+                let cut = covered < units && Self::neighbour_reserved_locked(&state, worker);
+                if cut {
+                    units = covered;
+                }
+                // Otherwise squeezed means held at the floor while the floors
                 // do not all fit.
-                share.mb <= share.floor && headroom < share.floor_sum
+                cut || (share.mb <= share.floor && headroom < share.floor_sum)
             };
             // Host RAM caps a GPU replica's batch as the edge of a full card
             // would; the GPU side above is unchanged.

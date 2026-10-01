@@ -1145,7 +1145,7 @@ fn a_death_mid_window_deflates_only_a_unified_device() {
 }
 
 /// The RAM basis on a machine whose size the fixture chooses.
-fn push_basis(
+pub(super) fn push_basis(
     handle: &TelemetryHandle,
     total_mb: u64,
     ram_total_mb: u64,
@@ -1397,6 +1397,36 @@ fn a_pre_fit_mps_grant_leaves_ram_for_the_cpu_replica() {
     let other = on_cpu.request_grant(u64::MAX, None, 1, 0).expect("granted");
     assert!(other.grant().mb > 0);
     assert_eq!(other.grant().unit_budget, 4);
+}
+
+/// A load in flight on the CPU device of a Mac counts as a replica on the
+/// MPS device too: the MPS replica's pre-fit grant is half of what the
+/// load's reservation leaves.
+#[tokio::test]
+async fn a_load_on_the_cpu_device_of_a_mac_counts_on_the_mps_device() {
+    const RECMAX: u64 = MAC_RAM_MB / 4 * 3;
+    let ledger = VramLedger::new(
+        &GpuInventory::known_mps(MAC_RAM_MB),
+        no_margin().into(),
+        None,
+    );
+    ledger.install_probe_stub(None);
+    let mps_handle = loaded_mps(Some(RECMAX));
+    let on_mps = ledger
+        .register_worker("g/mps", item_cost(4), &mps_handle, Some(MPS_GPU))
+        .expect("admitted on Metal");
+    push_basis(&mps_handle, RECMAX, MAC_RAM_MB, MAC_RAM_MB - 1_000, 0, 0);
+    ledger.ingest_all_for_test();
+    ledger.record_free_for_test(cpu::DEVICE_KEY, MAC_RAM_MB - 1_000);
+    let _loading = ledger
+        .reserve_load_for_test("g/cpu", item_cost(4), cpu::DEVICE_KEY, None)
+        .await
+        .expect("the CPU device");
+    let headroom = ledger.headroom_mb(MPS_GPU);
+    assert_eq!(headroom, RECMAX - 1_000 - CONSERVATIVE_BASE_MB);
+
+    let held = on_mps.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert_eq!(held.grant().mb, headroom / 2);
 }
 
 /// With MPS sampled peaks, no batch reads warm off `peak_reserved`, and an

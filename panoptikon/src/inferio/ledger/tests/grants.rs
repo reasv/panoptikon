@@ -199,10 +199,11 @@ fn contention_splits_by_demand_then_appetite() {
 }
 
 /// A busy replica is not a claimant in the appetite split, because its claim
-/// is already subtracted: the one asking gets its equal part of what is
-/// left, not the quarter its appetite would get against the busy one.
+/// is already subtracted, but it counts in the equal part: pre-fit, the one
+/// asking gets half of what is left, not the quarter its appetite would get
+/// against the busy one.
 #[test]
-fn a_busy_replica_does_not_dilute_the_requester() {
+fn a_busy_replica_counts_in_the_equal_part_but_not_in_the_appetite_split() {
     let ledger = ledger(20_000, no_margin());
     let busy = loaded(Some(3000), Some(0));
     let asking = loaded(Some(1000), Some(0));
@@ -1038,10 +1039,10 @@ fn a_split_adds_the_credit_after_the_division_and_still_fits() {
         .expect("granted");
     assert_eq!(
         neighbour.grant().mb,
-        542,
-        "its equal part of the 1084 left under the effective limit"
+        1084,
+        "what is left of the effective limit, and no more"
     );
-    assert_eq!(charges_now(&ledger), 6583);
+    assert_eq!(charges_now(&ledger), 7125, "Σ charges == limit_eff exactly");
     assert!(charges_now(&ledger) <= limit_eff);
     drop(neighbour);
     drop(held);
@@ -1070,12 +1071,9 @@ async fn the_credit_does_not_reach_past_a_load_reservation() {
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
-    // Headroom 4445 - 4096 = 349. The load counts as a replica, so pre-fit
-    // the share is the floor (above 349 / 2), then the 300 of credit.
-    assert_eq!(reserved, CONSERVATIVE_BASE_MB);
     assert_eq!(
         token.grant().mb,
-        SEED_BATCH_FLOOR_MB + 300,
+        4745 - reserved,
         "the reservation comes off the headroom before the credit"
     );
     assert!(

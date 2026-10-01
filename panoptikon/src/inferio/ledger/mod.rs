@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
-use super::cost::{CostAggregation, CostDimension, CostUnit};
+use super::cost::{CostAggregation, CostDimension, CostUnit, SEED_BUDGET_MB};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
 use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle, TrimReply};
 use super::{cpu, gpu, mps, worker};
