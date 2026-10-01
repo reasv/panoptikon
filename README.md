@@ -438,9 +438,9 @@ on your client (see above).
 - **root** (`--user 0`, `user: "0"`, or a host that only runs containers as
   root) works, with two differences. Models are downloaded to `/root/.cache`,
   so mount the cache volume there instead of `/home/ubuntu/.cache`. And what
-  root writes to the volumes belongs to root: a later start as the default
-  user stops with an error naming the first such file. Hand the volumes back
-  first:
+  root writes to the volumes belongs to root: once that includes a database,
+  a later start as the default user stops with an error naming it. Hand the
+  volumes back first (with the cache volume at its default mount point):
 
   ```bash
   docker compose run --rm --user 0 --entrypoint chown panoptikon \

@@ -142,6 +142,18 @@ fn root_dir(flag: Option<PathBuf>, env: Option<std::ffi::OsString>) -> Option<Pa
     flag.or_else(|| env.filter(|root| !root.is_empty()).map(PathBuf::from))
 }
 
+/// Startup migrations of every database on disk. Refused up front when
+/// another user owns a database the server could not write.
+async fn migrate_at_startup(data_folder: &std::path::Path, index_db: &str) -> anyhow::Result<()> {
+    ownership::check_databases(data_folder, index_db)?;
+    async {
+        db::migrations::migrate_databases_on_disk(None, None).await?;
+        db::migrations::migrate_all_databases_on_disk().await
+    }
+    .await
+    .map_err(|err| ownership::explain_databases(err, data_folder, index_db))
+}
+
 fn main() -> anyhow::Result<()> {
     // Before the runtime exists, so every thread and child inherits it.
     rlimit::raise_soft_limit_at_startup();
@@ -328,9 +340,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Python-created DBs are baselined, not re-migrated — see
     // db::migrations::ensure_baseline_if_needed.
     if local_api && !db::readonly_mode() {
-        ownership::check_databases(&settings.data_folder)?;
-        db::migrations::migrate_databases_on_disk(None, None).await?;
-        db::migrations::migrate_all_databases_on_disk().await?;
+        migrate_at_startup(&settings.data_folder, &settings.index_db).await?;
         // Vector-quant discrepancy check (crash/power-loss recovery and
         // first-post-upgrade convergence): metadata-only diffs are applied
         // synchronously, real data work enqueues a reconcile job. Runs in
@@ -1003,6 +1013,29 @@ mod route_tests {
         assert_eq!(root_dir(None, Some(env)), Some(PathBuf::from("/env")));
         assert_eq!(root_dir(None, None), None);
         assert_eq!(root_dir(None, Some(std::ffi::OsString::new())), None);
+    }
+
+    /// The refusal comes before any migration: the default database's folder
+    /// is a symlink to a folder another user owns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_refuses_a_database_folder_another_user_owns() {
+        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        let Some((folder, owner)) = foreign_folder(false) else {
+            return;
+        };
+        let data = tempfile::tempdir().unwrap();
+        let default = data.path().join("index/default");
+        std::fs::create_dir_all(data.path().join("user_data")).unwrap();
+        std::fs::create_dir(default.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(folder, &default).unwrap();
+        let error = migrate_at_startup(data.path(), "default")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            owned_by_another_user(&default, owner, data.path())
+        );
     }
 
     /// What `axum::serve` gave us for free, asserted rather than assumed now

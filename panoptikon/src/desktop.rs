@@ -34,7 +34,7 @@ impl RootLock {
                     runtime.display()
                 )
             })
-            .map_err(|err| crate::ownership::explain(err, &root))?;
+            .map_err(|err| crate::ownership::explain(err, &root, std::slice::from_ref(&root)))?;
         let path = runtime.join("server.lock");
         let file = OpenOptions::new()
             .create(true)
@@ -43,7 +43,9 @@ impl RootLock {
             .write(true)
             .open(&path)
             .with_context(|| format!("failed to open root lock '{}'", path.display()))
-            .map_err(|err| crate::ownership::explain(err, &runtime))?;
+            .map_err(|err| {
+                crate::ownership::explain(err, &runtime, &[runtime.clone(), path.clone()])
+            })?;
         if let Err(error) = file.try_lock_exclusive() {
             bail!(
                 "Panoptikon Server root '{}' is already owned by another process (lock '{}'): {error}. Stop the other Server or Panoptikon Desktop instance before using this root.",
@@ -74,6 +76,31 @@ mod tests {
         assert!(error.contains(&root.display().to_string()), "{error}");
         drop(first);
         RootLock::acquire(root).unwrap();
+    }
+
+    /// A root, then only its `runtime/`, that another user owns: both
+    /// failures name the folder and its owner above the original error.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_another_user_owns_is_named() {
+        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        let Some((folder, owner)) = foreign_folder(false) else {
+            return;
+        };
+        let error = RootLock::acquire(folder.to_path_buf()).err().unwrap();
+        let expected = owned_by_another_user(folder, owner, folder);
+        assert!(format!("{error:#}").starts_with(&expected), "{error:#}");
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        std::os::unix::fs::symlink(folder, &runtime).unwrap();
+        let error = RootLock::acquire(temp.path().to_path_buf()).err().unwrap();
+        let expected = owned_by_another_user(&runtime, owner, &runtime);
+        assert!(format!("{error:#}").starts_with(&expected), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("failed to open root lock"),
+            "{error:#}"
+        );
     }
 
     /// The Desktop marker is process-global diagnostics state and can be
