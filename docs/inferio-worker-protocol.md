@@ -1481,8 +1481,9 @@ either way, so a trim never races a batch.
   (`process_tree::first_oom_victim`), and processes the worker starts inherit
   it. If a batch outgrows RAM despite the ledger, the kernel kills the worker
   and not another program on the host; the death settles the window as
-  `WorkerDied`, a memory negative on the CPU device, and the job re-queues
-  the items. The write is best effort.
+  `WorkerDied`, the job re-queues the items, and the model's batches on that
+  device are capped at half the batch that died until the server restarts
+  (design doc, "Host RAM on the CPU device"). The write is best effort.
 - `load` deadline is long (weights + dep imports; config, default 600 s).
 - **A load blocks nothing but itself.** The orchestrator holds one load
   lock *per model*, not per host: a predict to a model that is already

@@ -519,7 +519,8 @@ carrying a footnote forever, and the footnote is the whole complaint.
   OOM is a process kill, not a catchable exception, so the CPU device
   ships with a default `cap_fraction = 0.75` rather than relying on
   margin alone. Overridable like any GPU. It also keeps a reserve of a
-  tenth of RAM (2 to 16 GiB) that no setting lowers, the worker's clamp
+  tenth of RAM (at most 16 GiB; at least 2 GiB, or a quarter of RAM under
+  8 GiB) that no setting lowers, the worker's clamp
   keeps the same reserve, and on Linux workers are the kernel's first
   out-of-memory victim (docs/batch-calibration-design.md, "Host RAM on the
   CPU device").

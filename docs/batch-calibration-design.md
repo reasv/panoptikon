@@ -1042,15 +1042,19 @@ not reserving at all.
 
 Running out of RAM is not an error a worker can catch: the kernel kills a
 process, and on a host without swap it does so at once. The CPU device
-therefore differs from a GPU in five ways.
+therefore differs from a GPU in six ways.
 
-- **Reserve.** `reserve = max(clamp(total / 10, 2 GiB, 16 GiB),
-  ceil(external × margin))`, with the margin unset or configured: a margin
-  can raise the reserve, never lower it. `/health` reports
-  `reserve_rule = "ram_floor"` when the floor is what applies. It is 2 GiB
-  up to 20 GB of RAM, 3.2 GiB at 32, 12.8 GiB at 128 and 16 GiB from 160 up.
+- **Reserve.** `reserve = max(floor, ceil(external × margin))` with
+  `floor = clamp(total / 10, min(2 GiB, total / 4), 16 GiB)`, with the margin
+  unset or configured: a margin can raise the reserve, never lower it.
+  `/health` reports `reserve_rule = "ram_floor"` when the floor is what
+  applies. It is 1 GiB on a 4 GiB host, 2 GiB from 8 to 20, 3.2 GiB at 32,
+  12.8 GiB at 128 and 16 GiB from 160 up. Under 8 GiB it is a quarter of RAM,
+  because 2 GiB would leave a 4 GB host no priced batch at all.
   It scales with the machine because what it covers does: the kernel's
-  watermarks, slab, and other processes' short-lived growth. The cap
+  watermarks, slab, and other processes' short-lived growth. So on this
+  device `margin = 0` and `cap_fraction = 1.0` do not mean "all of RAM": the
+  floor is still kept. The cap
   (`cap_fraction`, 0.75) limits how much of an idle machine we take; it does
   nothing once other processes hold more than a quarter of RAM, and there
   the reserve is the only margin. A load is refused against the room with no
@@ -1081,12 +1085,35 @@ therefore differs from a GPU in five ways.
   with `oom_score_adj = 1000`. If a batch outgrows RAM despite all of the
   above (a cost that varies with the input, a co-tenant that grew faster
   than a batch runs), the kernel kills the worker and not another program.
-  The death settles as `WorkerDied`, which on the CPU device deflates the
-  replica and halves the anchor, and the job re-queues the items.
+  The death settles as `WorkerDied` and the job re-queues the items.
+- **A death caps the batch.** A death halves the anchor on a unified-memory
+  device, but the next replica is admitted for twice the anchor, which is
+  the batch that died; deflation is lost with the replica. So a worker that
+  stops answering with a granted window in flight (killed by the kernel or
+  by anyone but the gateway, or crashed) caps its (model, device) at half
+  that window's unit budget, at least one unit. The cap holds for the life
+  of the server process, halves again at each further death, and stops the
+  ramp like a shape ceiling; `/health` shows it as `death_cap_units`. It
+  applies on every unified-memory device (the CPU device, MPS, an APU) and to
+  a replica on a private-memory GPU whose window had host RAM booked. That
+  GPU death is still no memory negative: its anchor and ramp are untouched.
+  A window the gateway tore down itself (a cancel) and the death of an idle
+  replica cap nothing. A model that cannot run one item is still condemned
+  as before.
 
 The reserve and the free reading apply to every replica whose host RAM is
 booked on the CPU device, GPU replicas included (next section), and to the
 CPU device on Windows and macOS. The MPS device keeps the GPU rule.
+
+Known limits:
+- A Linux unified-memory GPU (an APU) clamps its unclaimed GTT by the same
+  slab-free RAM reading, but keeps the GPU reserve. Its RAM enters inside
+  the free reading (`min(GTT free, RAM)`), so a RAM floor taken off the
+  device's limit would also withhold GTT that RAM is not short for.
+- Windows refuses an allocation at the commit limit (RAM plus pagefile),
+  whatever is physically free. Free RAM there is `ullAvailPhys` alone, so
+  with a small pagefile a batch can fail to allocate while the reserve is
+  intact; nothing is killed.
 
 ### RAM ceiling for GPU models
 
@@ -1364,7 +1391,8 @@ is a synthetic memory negative on unified-memory devices, and a replica with
 no window in flight can say nothing honest about a batch size. On Linux a
 worker is spawned as the kernel's first out-of-memory victim
 (`oom_score_adj = 1000`), so a host that runs out of RAM takes this path
-rather than losing another program.
+rather than losing another program, and the death caps the model's batch
+("Host RAM on the CPU device").
 
 A fatal failure settles as `WorkerDied` only when the worker actually stopped
 answering; a torn-down stream the dispatcher itself caused by dropping a
@@ -2245,7 +2273,7 @@ So the config's `margin` is an **option**, and absence is a distinct state:
 reserve = ceil(external × margin)                          # margin configured
 reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
 reserve = 1024 MiB                                         # unset, CUDA GPU that spills
-reserve = max(reserve, clamp(total / 10, 2 GiB, 16 GiB))   # the CPU device, always
+reserve = max(reserve, clamp(total / 10, min(2 GiB, total / 4), 16 GiB))  # the CPU device, always
 limit   = min(total × cap_fraction, total − external − reserve)
 ```
 
