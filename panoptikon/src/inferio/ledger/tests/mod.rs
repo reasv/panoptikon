@@ -739,6 +739,7 @@ mod memory_fit;
 mod oom;
 mod pre_fit_share;
 mod profiles;
+mod ram_budget;
 mod ramp;
 mod registration;
 mod shape_ceiling;

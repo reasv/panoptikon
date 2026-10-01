@@ -912,12 +912,12 @@ fn a_configured_ceiling_overrides_the_cpu_default() {
         cap_fraction: Some(1.0),
         knee_max_bucket_dispersion: None,
     });
+    assert_eq!(section_wide.health()[0].cap_fraction, Some(1.0));
     assert_eq!(
-        section_wide.health()[0].cap_fraction,
-        Some(1.0),
-        "a user who asked for the whole machine gets the whole machine"
+        section_wide.health()[0].limit_mb,
+        CPU_RAM_MB - CPU_RAM_MB / 10,
+        "the whole machine but its RAM reserve, which no setting lowers"
     );
-    assert_eq!(section_wide.health()[0].limit_mb, CPU_RAM_MB);
 }
 
 /// On a CPU host the join is the single-GPU fallback, cross-checked against
@@ -1134,6 +1134,11 @@ fn a_death_mid_window_deflates_only_a_unified_device() {
         let worker = &ledger.health()[0].workers[0];
         assert_eq!(worker.deflation, deflation, "{label}");
         assert_eq!(worker.max_units_measured, anchor, "{label}");
+        assert_eq!(
+            worker.death_cap_units.is_some(),
+            deflation == 1,
+            "{label}: capped exactly where the death is a negative"
+        );
         assert_eq!(
             ledger
                 .calibration_state("g/a", gpu)
@@ -1916,4 +1921,42 @@ fn a_window_under_pressure_at_either_end_earns_no_step() {
             "{at_grant:?} at the grant, {at_settle:?} at the settle"
         );
     }
+}
+
+/// The cap a death left and the cap paging left bound the batch together,
+/// the smaller ruling, and each ends on its own terms. A worker that dies
+/// while the Mac pages sets the death cap like any other death; the paging
+/// cap lifts once the batch has grown back, the death cap stays.
+#[test]
+fn a_death_cap_and_a_paging_cap_hold_the_smaller_batch() {
+    let (ledger, handle, admission) = ramped_mac_replica();
+    paging_windows(&ledger, &handle, &admission, 2);
+    let paged = pressure_cap(&ledger).expect("capped by the paging windows");
+    assert_eq!(paged.units, 8);
+
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(token.grant().unit_budget, 8);
+    token.finish(WindowOutcome::WorkerDied);
+    assert_eq!(
+        pressure_cap(&ledger),
+        Some(paged),
+        "a death leaves it alone"
+    );
+    drop(admission);
+
+    // The model is reloaded while the Mac still pages.
+    let handle = loaded_mps(Some(MAC_TOTAL_MB));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    let worker = |ledger: &Arc<VramLedger>| ledger.health().swap_remove(0).workers.swap_remove(0);
+    assert_eq!(worker(&ledger).death_cap_units, Some(4));
+    assert_eq!(worker(&ledger).unit_budget, 4, "the smaller of 4 and 8");
+
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
+    assert_eq!(ramp_windows(&handle, &admission, 4), [4, 4, 4, 4]);
+    assert_eq!(pressure_cap(&ledger), None, "back at what is admitted");
+    assert_eq!(worker(&ledger).death_cap_units, Some(4), "until restart");
 }

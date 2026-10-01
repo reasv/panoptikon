@@ -84,7 +84,8 @@ fn ramped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
 }
 
 impl VramLedger {
-    /// [`admitted_units`] under `knee`, capped at the size a paging episode
+    /// [`admitted_units`] under `knee` and the batch ceiling
+    /// ([`Self::batch_ceiling_locked`]), capped at the size a paging episode
     /// left ([`PressureCap`]).
     pub(super) fn budget_locked(
         state: &LedgerState,
@@ -95,7 +96,7 @@ impl VramLedger {
             entry,
             Self::anchor_locked(state, entry),
             knee,
-            Self::shape_ceiling_locked(state, entry),
+            Self::batch_ceiling_locked(state, entry),
         );
         cal_locked(state, entry)
             .and_then(|cal| cal.pressure_cap)
@@ -127,7 +128,7 @@ impl VramLedger {
             entry,
             Self::anchor_locked(state, entry),
             Self::knee_locked(state, entry),
-            Self::shape_ceiling_locked(state, entry),
+            Self::batch_ceiling_locked(state, entry),
         );
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let Some(cal) = state.calibration.get_mut(&key) else {

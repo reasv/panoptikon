@@ -156,14 +156,14 @@ impl VramLedger {
         let headroom = self.overdraft_with_margin_locked(state, cpu::DEVICE_KEY, margin);
         let credit = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
         let room = (headroom + i128::from(credit)).max(0) as f64;
-        let mut units = ((room - cost.fixed_mb) / cost.mb_per_unit).floor().max(1.0) as u64;
+        let mut units = cost.units_within(room);
         // An item-capped window keeps the seed's unit budget; a one-size
         // cost prices no batch past twice the size it was measured at.
         if Self::item_cap_locked(state, entry).is_some() {
             units = units.min(entry.seed_units.max(1));
         }
         if !cost.fitted {
-            units = units.min(cost.measured_units.saturating_mul(RATCHET_FACTOR));
+            units = units.min(cost.fitted_reach());
         }
         Some(RamCeiling {
             units,
@@ -242,23 +242,35 @@ impl VramLedger {
     /// The reserve withheld on top of external usage, and its rule:
     /// `ceil(external × margin)`, capped at [`DEFAULT_RESERVE_CAP_MB`] only
     /// when the user set no margin for this GPU, and then exactly that cap on
-    /// a CUDA GPU that spills to system RAM. A margin of 0 (the refusal room)
-    /// reserves nothing. See docs/batch-calibration-design.md, "The reserve,
-    /// and why an unset margin is not the same as `margin = 0.10`".
+    /// a CUDA GPU that spills to system RAM. A margin of 0 reserves nothing.
+    /// On the CPU device the reserve is never below [`cpu::ram_reserve_mb`],
+    /// whatever the margin. See docs/batch-calibration-design.md, "The
+    /// reserve, and why an unset margin is not the same as `margin = 0.10`".
     pub(super) fn reserve_locked(
         &self,
+        state: &LedgerState,
         gpu: &str,
         external: u64,
         margin: f64,
     ) -> (u64, &'static str) {
         let budget = self.budgets.for_gpu(gpu);
         let raw = ((external as f64) * margin.max(0.0)).ceil().max(0.0) as u64;
-        if !budget.reserve_is_capped() {
+        let (reserve, rule) = if !budget.reserve_is_capped() {
             (raw, RESERVE_RULE_USER_MARGIN)
         } else if self.budgets.spills_to_ram && gpu != cpu::DEVICE_KEY && margin > 0.0 {
             (DEFAULT_RESERVE_CAP_MB, RESERVE_RULE_FLAT_DEFAULT)
         } else {
             (raw.min(DEFAULT_RESERVE_CAP_MB), RESERVE_RULE_CAPPED_DEFAULT)
+        };
+        let floor = state
+            .gpus
+            .get(gpu)
+            .filter(|_| gpu == cpu::DEVICE_KEY)
+            .map_or(0, |device| cpu::ram_reserve_mb(device.total_mb));
+        if reserve < floor {
+            (floor, RESERVE_RULE_RAM_FLOOR)
+        } else {
+            (reserve, rule)
         }
     }
 
@@ -266,23 +278,23 @@ impl VramLedger {
     /// ([`Self::effective_margin_locked`]).
     fn limit_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
         let external = Self::external_locked(state, gpu).unwrap_or(0);
-        self.limit_over_external_locked(state, gpu, margin, external)
+        // Only external usage is margin-inflated; our residents are measured.
+        let (reserve, _) = self.reserve_locked(state, gpu, external, margin);
+        self.limit_over_locked(state, gpu, external, reserve)
     }
 
-    /// [`Self::limit_with_margin_locked`] against a given external figure.
-    fn limit_over_external_locked(
+    /// The limit over a given external figure and reserve.
+    fn limit_over_locked(
         &self,
         state: &LedgerState,
         gpu: &str,
-        margin: f64,
         external: u64,
+        reserve: u64,
     ) -> u64 {
         let Some(gpu_ledger) = state.gpus.get(gpu) else {
             return 0;
         };
         let total = gpu_ledger.total_mb;
-        // Only external usage is margin-inflated; our residents are measured.
-        let (reserve, _) = self.reserve_locked(gpu, external, margin);
         // The room is in `external`'s domain (`hw.memsize` on Metal); `total`
         // stays the allocator's ceiling over it.
         let room = Self::ram_domain_locked(state, gpu_ledger).unwrap_or(total);
@@ -302,18 +314,20 @@ impl VramLedger {
         limit
     }
 
-    /// The room a load is refused against, with no reserve (margin 0): what
-    /// the card has left over other processes, or on a unified-memory device
-    /// its whole capacity, since other processes' RAM there is transient.
+    /// The room a load is refused against, with no reserve: what the card
+    /// has left over other processes, or on a unified-memory device its whole
+    /// capacity, since other processes' RAM there is transient.
     pub(super) fn refusal_room_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
-        if state
+        let unified = state
             .gpus
             .get(gpu)
-            .is_some_and(|gpu| gpu.unified_ram_mb.is_some())
-        {
-            return self.limit_over_external_locked(state, gpu, 0.0, 0);
-        }
-        self.limit_with_margin_locked(state, gpu, 0.0)
+            .is_some_and(|gpu| gpu.unified_ram_mb.is_some());
+        let external = if unified {
+            0
+        } else {
+            Self::external_locked(state, gpu).unwrap_or(0)
+        };
+        self.limit_over_locked(state, gpu, external, 0)
     }
 
     pub(super) fn headroom_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
@@ -376,10 +390,9 @@ impl VramLedger {
             .filter(|knee| *knee > 0)
     }
 
-    /// The [`ShapeCeiling`] in force for this replica, if it matches its
-    /// canvas and cost epoch ([`shape_ceiling_for`]).
-    pub(super) fn shape_ceiling_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
-        shape_ceiling_for(cal_locked(state, entry), entry)
+    /// The batch ceiling in force for this replica ([`batch_ceiling_for`]).
+    pub(super) fn batch_ceiling_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
+        batch_ceiling_for(cal_locked(state, entry), entry)
     }
 
     pub(super) fn fit_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<FitSnapshot> {

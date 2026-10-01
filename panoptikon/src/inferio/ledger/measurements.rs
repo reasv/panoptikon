@@ -37,6 +37,10 @@ fn push_fit_sample(ring: &mut VecDeque<FitSample>, sample: FitSample) {
 /// beyond the first batch's. Both bound the cost only where it is the same
 /// for every input, so a one-size cost prices only item-capped windows. From
 /// two sizes the slope does not depend on what the first batch kept.
+///
+/// A fit from small batches can read part of the per-unit cost as fixed, so a
+/// batch past [`RamCost::fitted_reach`] books the whole growth per unit of
+/// the same batches instead.
 pub(super) fn ram_cost(
     samples: &[FitSample],
     first_units: u64,
@@ -54,9 +58,12 @@ pub(super) fn ram_cost(
         .filter(|units| *units > 0)?;
     let fit = theil_sen(&samples);
     let fixed_mb = fit.map_or(0.0, |fit| fit.intercept_mb.max(0.0));
-    let per_unit = samples
-        .iter()
-        .filter(|sample| sample.units.saturating_mul(RATCHET_FACTOR) >= largest)
+    let near_largest = || {
+        samples
+            .iter()
+            .filter(|sample| sample.units.saturating_mul(RATCHET_FACTOR) >= largest)
+    };
+    let per_unit = near_largest()
         .map(|sample| {
             let over = sample.delta_mb as f64 - fixed_mb;
             let per_unit = over / sample.units as f64;
@@ -68,9 +75,14 @@ pub(super) fn ram_cost(
             }
         })
         .fold(0.0, f64::max);
+    let mb_per_unit = per_unit.max(fit.map_or(0.0, |fit| fit.slope_mb_per_unit));
+    let whole_per_unit = near_largest()
+        .map(|sample| sample.delta_mb as f64 / sample.units as f64)
+        .fold(0.0, f64::max);
     Some(RamCost {
         fixed_mb,
-        mb_per_unit: per_unit.max(fit.map_or(0.0, |fit| fit.slope_mb_per_unit)),
+        mb_per_unit,
+        whole_mb_per_unit: whole_per_unit.max(mb_per_unit),
         fitted: fit.is_some(),
         measured_units: largest,
     })
@@ -304,7 +316,9 @@ impl VramLedger {
             state.remembered_bases.insert(key.clone(), Some(base));
         }
         if reserved_at_load.is_none() {
-            reserved_at_load = load.as_ref().and_then(|report| report.reserved_at_load_mb);
+            reserved_at_load = load
+                .as_ref()
+                .and_then(|report| pool_at_load_mb(&gpu, report));
             if let Some(entry) = state.workers.get_mut(&worker) {
                 entry.reserved_at_load_mb = reserved_at_load;
             }
@@ -434,9 +448,15 @@ impl VramLedger {
             }
             // This replica's pool as the batch left it, never its peak: a peak
             // never falls back, so `external` would decay under a real hog.
-            if let Some(pool) = measurement
-                .reserved_after_mb
-                .or(measurement.peak_reserved_mb)
+            // On the CPU device that is the resident set after the batch.
+            let pool = if gpu == cpu::DEVICE_KEY {
+                measurement.rss_after_mb
+            } else {
+                measurement
+                    .reserved_after_mb
+                    .or(measurement.peak_reserved_mb)
+            };
+            if let Some(pool) = pool
                 && let Some(entry) = state.workers.get_mut(&worker)
                 && entry
                     .reserved_seen_at
@@ -662,7 +682,7 @@ impl VramLedger {
         }
         // The response-level reading last: it is taken after the final batch.
         if let Some(stamped) = memory {
-            if let Some(reserved) = stamped.value.reserved_mb
+            if let Some(reserved) = sample_pool_mb(&gpu, &stamped.value)
                 && let Some(entry) = state.workers.get_mut(&worker)
             {
                 entry.reserved_mb = Some(reserved);

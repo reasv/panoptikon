@@ -443,8 +443,8 @@ fn the_reserve_is_capped_only_under_an_unset_margin() {
 
 /// Where a full CUDA GPU spills to system RAM, an unset margin reserves the
 /// cap itself, whatever other processes use. A margin the user wrote, for all
-/// GPUs or one, still applies uncapped; the CPU device keeps the capped
-/// default; the refusal room (margin 0) still reserves nothing.
+/// GPUs or one, still applies uncapped; the CPU device keeps its own floor;
+/// a margin of 0 reserves nothing on a GPU.
 #[test]
 fn a_spilling_gpu_reserves_the_cap_under_an_unset_margin() {
     let spilling = |budgets: VramBudgets| VramBudgets {
@@ -494,8 +494,8 @@ fn a_spilling_gpu_reserves_the_cap_under_an_unset_margin() {
             spilling(VramBudget::default().into()),
             super::cpu::DEVICE_KEY,
             4_000,
-            400,
-            RESERVE_RULE_CAPPED_DEFAULT,
+            6_553,
+            RESERVE_RULE_RAM_FLOOR,
         ),
         (
             "a GPU that fails the allocation instead",
@@ -508,15 +508,17 @@ fn a_spilling_gpu_reserves_the_cap_under_an_unset_margin() {
     ] {
         let ledger = VramLedger::for_test(&devices, budgets);
         let margin = ledger.budgets.for_gpu(device).margin_in_force();
+        let state = ledger.lock();
         assert_eq!(
-            ledger.reserve_locked(device, external, margin),
+            ledger.reserve_locked(&state, device, external, margin),
             (reserve, rule),
             "{label}"
         );
+        let floor = if device == GPU { 0 } else { reserve };
         assert_eq!(
-            ledger.reserve_locked(device, external, 0.0).0,
-            0,
-            "{label}: the refusal room"
+            ledger.reserve_locked(&state, device, external, 0.0).0,
+            floor,
+            "{label}: a margin of 0"
         );
     }
 

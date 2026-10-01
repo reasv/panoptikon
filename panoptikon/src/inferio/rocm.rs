@@ -48,7 +48,8 @@ pub(super) struct SysfsRoots {
     pub pci_devices: PathBuf,
     /// DRM nodes; `renderD<minor>` is the per-GPU render node.
     pub dev_dri: PathBuf,
-    /// `MemTotal` for an APU's identity, `MemAvailable` for its GTT clamp.
+    /// `MemTotal` for an APU's identity; `MemAvailable` and `SReclaimable`
+    /// for its GTT clamp.
     pub meminfo: PathBuf,
 }
 
@@ -191,8 +192,9 @@ pub(super) fn build(
 /// high; the ledger's margin covers that.
 ///
 /// A unified GPU's total is carve-out plus GTT, and its free is
-/// `(vram_total − vram_used) + min(gtt_total − gtt_used, MemAvailable)`,
-/// because unclaimed GTT is backed by RAM that may not be free.
+/// `(vram_total − vram_used) + min(gtt_total − gtt_used, deliverable RAM)`
+/// ([`ram_deliverable_mb`]), because unclaimed GTT is backed by RAM that may
+/// not be free.
 pub(super) fn query_memory(
     pci_devices: &Path,
     meminfo: &Path,
@@ -220,7 +222,7 @@ pub(super) fn query_memory(
         let gtt_free_mb = gtt_total_mb.saturating_sub(read_mb(&dir.join("mem_info_gtt_used"))?);
         let available_mb = match ram_available_mb {
             Some(mb) => mb,
-            None => *ram_available_mb.insert(meminfo_mb(meminfo, "MemAvailable")?),
+            None => *ram_available_mb.insert(ram_deliverable_mb(meminfo)?),
         };
         out.push(GpuMemory {
             uuid: gpu.key.clone(),
@@ -516,6 +518,14 @@ fn unified_facts(
         // the name stable when the BIOS setting changes.
         ram_mb: mem_total_mb + vram_total_mb,
     })
+}
+
+/// RAM the kernel could deliver now, in MiB: `MemAvailable` less
+/// `SReclaimable`, slab it counts as available but may not free before it
+/// kills a process. `None` without a `MemAvailable` row.
+pub(super) fn ram_deliverable_mb(meminfo: &Path) -> Option<u64> {
+    let available = meminfo_mb(meminfo, "MemAvailable")?;
+    Some(available.saturating_sub(meminfo_mb(meminfo, "SReclaimable").unwrap_or(0)))
 }
 
 /// One `/proc/meminfo` row in whole MiB, or `None`. Rows are
@@ -1326,6 +1336,13 @@ mod tests {
             Some((512, 256)),
             "the same GPU read as discrete never consults the GTT files"
         );
+        // 2 GiB of that RAM is reclaimable slab, which is not deliverable.
+        let slab = host(8 * 1024 * 1024);
+        let mut rows = fs::read_to_string(&slab.roots.meminfo).unwrap();
+        rows.push_str("SReclaimable:    2097152 kB\n");
+        fs::write(&slab.roots.meminfo, rows).unwrap();
+        assert_eq!(read_from(&slab, apu(true)), Some((budget, 256 + 6 * 1024)));
+        assert_eq!(ram_deliverable_mb(&slab.roots.meminfo), Some(6 * 1024));
         // Plenty of RAM: the GTT term is the driver's own figure again.
         let roomy = host(100 * 1024 * 1024);
         let seen = read_from(&roomy, apu(true));
