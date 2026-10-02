@@ -11,8 +11,9 @@ pub(super) fn persistable_anchor(cal: &ModelCalibration) -> u64 {
 
 impl VramLedger {
     /// Prime a (model, GPU)'s calibration from a matched profile. A profile
-    /// confers the fit always; the anchor (as a seeded claim) when it carries a
-    /// fit; the sample ring only when local; `local_samples` only when local
+    /// confers the fit always; the anchor (as a seeded claim) and the working
+    /// size when it carries a fit; the sample ring only when local;
+    /// `local_samples` only when local
     /// with the exact torch string. Runs once per (model, GPU) per run: the
     /// first attempt sets the flag even without a match, so a reload cannot
     /// duplicate the ring.
@@ -46,13 +47,11 @@ impl VramLedger {
         };
         let cal = state.calibration.entry(key.clone()).or_default();
         cal.seeded = true;
-        // Never overwrite a knee this machine fitted.
+        // Never overwrite a working size this machine measured. Like the
+        // anchor, a stored one is ignored without a fit: it is the size the
+        // run opens at, and nothing could price it.
         if !cal.knee_is_local {
-            cal.knee_units = seed.knee_units;
-            cal.knee_fitted_units = seed.knee_units;
-            cal.knee_is_local = false;
-            // Expiry progress survives a restart (zero unless local).
-            cal.knee_clean_windows = seed.knee_clean_windows;
+            cal.knee_units = seed.knee_units.filter(|_| seed.slope_mb_per_unit > 0.0);
         }
         if adopt_fit {
             cal.fit = Some(FitSnapshot {
@@ -159,18 +158,14 @@ impl VramLedger {
         }
         let previously_persisted = cal.persisted;
         let fit_version = cal.fit.map(|fit| fit.version).unwrap_or(0);
-        // Only a locally fitted knee is written, as fitted (not widened).
-        let knee = cal.knee_fitted_units.filter(|_| cal.knee_is_local);
-        let knee_withdrawn = cal.knee_withdrawn;
+        // Only a working size measured here is written.
+        let knee = cal.knee_units.filter(|_| cal.knee_is_local);
         let current = (persistable_anchor(cal), fit_version, knee);
-        if !knee_withdrawn
-            && cal.persisted.is_some_and(|persisted| {
-                persisted.1 == current.1 && persisted.0 >= current.0 && persisted.2 == current.2
-            })
-        {
+        if cal.persisted.is_some_and(|persisted| {
+            persisted.1 == current.1 && persisted.0 >= current.0 && persisted.2 == current.2
+        }) {
             return None;
         }
-        cal.knee_withdrawn = false;
         // The persisted anchor only moves forward; halvings stay runtime-only.
         let max_units_measured = cal
             .persisted
@@ -208,11 +203,10 @@ impl VramLedger {
             residual_mb: fit.map(|fit| fit.residual_mb).unwrap_or(0.0),
             samples: fit.map(|fit| fit.samples).unwrap_or(0),
             knee_units: knee,
-            knee_withdrawn,
+            knee_withdrawn: false,
             max_units_measured,
             local_samples: cal.local_samples,
-            // Rides along; never triggers a write on its own.
-            knee_clean_windows: cal.knee_clean_windows,
+            knee_clean_windows: 0,
             ring: cal.samples.iter().copied().collect(),
         })
     }

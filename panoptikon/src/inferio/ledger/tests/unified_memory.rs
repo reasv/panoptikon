@@ -1434,12 +1434,12 @@ async fn a_load_on_the_cpu_device_of_a_mac_counts_on_the_mps_device() {
     assert_eq!(held.grant().mb, headroom / 2);
 }
 
-/// With MPS sampled peaks, no batch reads warm off `peak_reserved`, and an
-/// empty ring would let the ramp double to the memory ceiling. Read off the
-/// **post-batch** pool, the ring fills and the ramp holds at a rung it
-/// measured.
+/// With MPS sampled peaks, no batch reads warm off `peak_reserved`, and
+/// nothing would measure a rate. Read off the **post-batch** pool, the ring
+/// fills: wd-vit's rate is no better at 128 units than at 64, and the job
+/// stays at 64.
 #[test]
-fn a_long_job_of_sampled_mps_windows_holds_at_a_rung_it_measured() {
+fn a_long_job_of_sampled_mps_windows_stays_at_the_size_that_measured_best() {
     let (ledger, handle, admission) = ramping_from_seed(64);
     let mut budgets = Vec::new();
     for _ in 0..1_200 {
@@ -1448,31 +1448,19 @@ fn a_long_job_of_sampled_mps_windows_holds_at_a_rung_it_measured() {
     let worker = &ledger.health()[0].workers[0];
     assert!(
         worker.throughput_samples > 0,
-        "the sampler's peak no longer disqualifies every batch"
+        "the sampler's peak does not disqualify every batch"
     );
+    assert_eq!(worker.knee_units, Some(64));
     assert_eq!(
-        worker.knee_units,
-        Some(511),
-        "the ring certifies a knee off wd-vit's decline past 256"
-    );
-    assert_eq!(
-        (budgets[0], budgets[3], budgets.iter().copied().max()),
-        (64, 512, Some(512)),
-        "the ramp walked four rungs and the curve stopped it, against the \
-         nine doublings to 19 100 an empty ring never brakes: {:?}",
+        (budgets[0], budgets[2], budgets.iter().copied().max()),
+        (64, 128, Some(128)),
+        "one size above was tried, and no more: {:?}",
         &budgets[..12]
     );
-    let held = *budgets.last().expect("windows");
-    assert_eq!(held, 255, "and settled below the top rung it measured");
-    assert!(
-        held <= worker.max_units_measured,
-        "{held} is a rung that ran (measured up to {})",
-        worker.max_units_measured
-    );
+    assert_eq!(*budgets.last().expect("windows"), 64);
 }
 
-/// Three warm windows ahead of the same job change nothing once the ring
-/// fills; with it empty they would pin the budget at an unmeasured 512.
+/// Three warm windows ahead of the same job change nothing.
 #[test]
 fn three_warm_windows_do_not_decide_the_budget_for_the_whole_job() {
     let (ledger, handle, admission) = ramping_from_seed(64);
@@ -1484,14 +1472,9 @@ fn three_warm_windows_do_not_decide_the_budget_for_the_whole_job() {
         budgets.push(mps_sampled_window(&handle, &admission, &WDVIT_M3_MAX));
     }
     let worker = &ledger.health()[0].workers[0];
-    let held = *budgets.last().expect("windows");
-    assert_eq!(worker.knee_units, Some(255), "a knee either way");
-    assert_eq!(
-        held, 255,
-        "the same rung the job reaches without them, against the 512 \
-         `held_units` pinned when nothing behind them measured anything"
-    );
-    assert!(held <= worker.max_units_measured);
+    assert_eq!(worker.knee_units, Some(64));
+    assert_eq!(*budgets.last().expect("windows"), 64);
+    assert!(budgets.iter().all(|units| *units <= 128));
 }
 /// The **ceiling** half of `limit = min(recommended_max, memsize - external -
 /// reserve)`, swept: wherever more RAM is free than Metal will hand out, the
@@ -1638,10 +1621,10 @@ fn ramped_mac_replica() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("registers");
     push_ram(&handle, MAC_TOTAL_MB, 90_000, 0, 0);
-    let ramped: Vec<u64> = (0..5)
+    let ramped: Vec<u64> = (0..6)
         .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
         .collect();
-    assert_eq!(ramped, [4, 8, 16, 32, 64]);
+    assert_eq!(ramped, [4, 4, 8, 16, 32, 64]);
     (ledger, handle, admission)
 }
 
@@ -1893,9 +1876,10 @@ fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
     assert_eq!(ramp_figures(&ledger).3, 3);
 }
 
-/// At warning with nothing being paged out the replica keeps the size it
-/// had: no growth, no ramp step, no knee sample. A squeeze there is not
-/// kept once its cause is gone. Growth resumes when the pressure ends.
+/// At warning with nothing being paged out the replica keeps its working
+/// size: the trial of the next one is put off, and there is no growth and
+/// no throughput sample. A squeeze there is not kept once its cause is
+/// gone. The trial is taken up again after the pressure ends.
 #[test]
 fn at_warning_without_paging_the_batch_size_is_held() {
     let (ledger, handle, admission) = ramped_mac_replica();
@@ -1904,7 +1888,7 @@ fn at_warning_without_paging_the_batch_size_is_held() {
     let held: Vec<u64> = (0..3)
         .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
         .collect();
-    assert_eq!(held, [128, 128, 128], "the budget in force, and no more");
+    assert_eq!(held, [128, 64, 64], "the trial under way is put off");
     let (step_during, _, samples_during, _) = ramp_figures(&ledger);
     assert_eq!(step_during, step);
     assert_eq!(samples_during, samples);
@@ -1923,10 +1907,15 @@ fn at_warning_without_paging_the_batch_size_is_held() {
         None,
         "a squeeze, not a paging episode"
     );
-    assert_eq!(ramp_windows(&handle, &admission, 1), [128]);
+    assert_eq!(ramp_windows(&handle, &admission, 1), [64]);
 
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
-    assert_eq!(ramp_windows(&handle, &admission, 2), [128, 256]);
+    let after = ramp_windows(&handle, &admission, RETEST_WINDOWS as usize + 3);
+    assert_eq!(
+        after[..RETEST_WINDOWS as usize],
+        [64; RETEST_WINDOWS as usize]
+    );
+    assert_eq!(after[RETEST_WINDOWS as usize..], [128, 256, 512]);
 }
 
 /// Pressure at either end of a window marks it: at the grant only, or at the

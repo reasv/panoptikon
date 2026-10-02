@@ -35,7 +35,9 @@ impl VramLedger {
                         let anchor = cal.map(|cal| cal.max_units_measured).unwrap_or(0);
                         let knee = cal.and_then(|cal| cal.knee_units).filter(|knee| *knee > 0);
                         let shape_ceiling = shape_ceiling_for(cal, entry);
-                        let held = entry.hold_reported();
+                        // A trial earned nothing and the next is not on yet.
+                        let held =
+                            cal.is_some_and(|cal| cal.failed_trials > 0 && cal.trial.is_none());
                         LedgerWorkerHealth {
                             inference_id: entry.inference_id.clone(),
                             footprint_mb: entry.footprint_mb(),
@@ -54,13 +56,13 @@ impl VramLedger {
                             grants_mb: entry.grants_mb(),
                             pending_requests: entry.pending_requests,
                             seed_units: entry.seed_units,
-                            ramp_step: entry.ramp_step,
+                            ramp_step: Self::ramp_step_locked(state, entry),
                             deflation: entry.deflation,
                             clean_windows: entry.clean_windows,
-                            unit_budget: Self::budget_locked(state, entry, knee),
+                            unit_budget: Self::budget_locked(state, entry),
                             ramp_held: held,
-                            held_units: held.then_some(entry.held_units).flatten(),
-                            held_certified: held && entry.held_certified,
+                            held_units: knee.filter(|_| held),
+                            held_certified: held && cal.is_some_and(|cal| cal.knee_is_local),
                             max_units_measured: anchor,
                             knee_units: knee,
                             shape_ceiling_units: shape_ceiling,
@@ -212,32 +214,33 @@ pub struct LedgerWorkerHealth {
     /// Demand signal behind the contention split.
     pub pending_requests: usize,
     pub seed_units: u64,
-    /// Doublings earned by clean windows.
+    /// Doublings of the working batch size over the seed.
     pub ramp_step: u32,
     /// Halvings currently applied by OOM / throughput-collapse deflation.
     pub deflation: u32,
     /// Consecutive clean windows since the last negative sample.
     pub clean_windows: u32,
-    /// The ramp+ratchet-bounded unit budget as of this snapshot.
+    /// The unit budget as of this snapshot: the batch size under the ratchet.
     pub unit_budget: u64,
-    /// The ramp is held (reported once a window ran at its budget), and the
-    /// rung it is held at.
+    /// The last trial of a larger batch size earned nothing and the next is
+    /// not on yet, and the size held meanwhile.
     pub ramp_held: bool,
     pub held_units: Option<u64>,
-    /// Whether the knee ring certified the held rung; `false` when not held.
+    /// Whether the held size's rate was measured here; `false` when not held.
     pub held_certified: bool,
     /// Ratchet anchor: largest locally measured clean priced batch.
     pub max_units_measured: u64,
-    /// Throughput knee: the largest batch size admitted whatever memory allows.
+    /// The working batch size: the largest that measured faster than the size
+    /// below it, or the size this replica opened at.
     pub knee_units: Option<u64>,
-    /// Whether the knee was fitted here rather than seeded from a profile.
+    /// Whether it was measured here rather than seeded from a profile.
     pub knee_is_local: bool,
     /// Shape ceiling from `index_limit` clamps: caps `unit_budget`; runtime-only.
     pub shape_ceiling_units: Option<u64>,
     /// Half the batch a replica of this model was running here when its
     /// process died mid-window: caps `unit_budget` until the server restarts.
     pub death_cap_units: Option<u64>,
-    /// Samples in the knee ring (all occupancies); runtime-only.
+    /// Throughput observations held (all occupancies); runtime-only.
     pub throughput_samples: usize,
     /// Local fit samples, including restored ones; the margin widens below
     /// `LOCAL_CONFIRMATION_SAMPLES`.

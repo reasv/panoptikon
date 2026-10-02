@@ -363,7 +363,6 @@ impl VramLedger {
             budget_floor.filter(|_| window.is_some_and(|charge| knee_admits_window(&charge)));
         // A clean priced batch of this window ran at its budget.
         let mut ran_full = false;
-        let mut left_pool_grown = false;
         // A window the queue sized is no evidence for the ramp's next step;
         // its batches still feed the knee ring.
         let queue_bound = window.is_none_or(|charge| charge.queue_bound);
@@ -620,11 +619,7 @@ impl VramLedger {
                     units,
                     units_per_sec: units as f64 * 1000.0 / duration_ms,
                     occupants,
-                    // Both stamped below from the calibration.
-                    seq: 0,
-                    anchor: 0,
-                    warmup: warmup_window,
-                    warmup_tail: !warmup_window && ran_batches <= KNEE_WARMUP_BATCHES,
+                    warmup: warmup_window || ran_batches <= KNEE_WARMUP_BATCHES,
                 });
             }
             // Every clean priced batch is a fit sample of the envelope
@@ -640,9 +635,6 @@ impl VramLedger {
                 let full = budget_floor
                     .is_some_and(|floor| units >= floor || measurement.next_over_budget);
                 ran_full |= full;
-                if full {
-                    left_pool_grown = high_water && measurement.reserved_after_mb.is_some();
-                }
             }
             // Pool-over-allocated ratio, only where the pool grew and the delta
             // reaches [`POOL_MARGIN_MIN_DELTA_MB`].
@@ -879,12 +871,7 @@ impl VramLedger {
         {
             cal.max_units_measured_here = anchor;
         }
-        // Stamp each sample with its sequence and the anchor in force, for
-        // [`fit_knee`]'s post-widening guard.
-        for mut sample in throughput {
-            sample.seq = cal.throughput_seq;
-            sample.anchor = cal.max_units_measured;
-            cal.throughput_seq = cal.throughput_seq.saturating_add(1);
+        for sample in throughput {
             cal.throughput.push_back(sample);
             while cal.throughput.len() > KNEE_RING {
                 cal.throughput.pop_front();
@@ -900,7 +887,6 @@ impl VramLedger {
             at_budget: !queue_bound && !ram_bound && !pressure && ran_full,
             filled: !queue_bound && !ram_bound && ran_full,
             throughput_samples,
-            left_pool_grown,
             oom: saw_oom,
             throughput_collapse: saw_collapse,
             spill: saw_spill,

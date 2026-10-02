@@ -126,6 +126,7 @@ fn a_pre_fit_replica_joining_busy_fitted_ones_leaves_them_room_to_grow() {
             let series = (1..=6u64).map(|k| measurement(k * 4, 0, 400 * k * 4));
             handle.lock().unwrap().record_measurements(series.collect());
             clean_window(&admission);
+            ledger.set_knee_for_test(&format!("g/fitted{index}"), GPU, 32);
             (handle, admission)
         })
         .collect();
@@ -282,6 +283,7 @@ fn measured(headroom: u64, batches: &[(u64, u64)]) -> (Arc<VramLedger>, Admissio
         .unwrap()
         .record_measurements(batches.collect());
     token.finish(WindowOutcome::Responded { oom: None });
+    measured.earn_next_size();
     (ledger, measured, neighbour)
 }
 
@@ -339,6 +341,7 @@ fn no_batch_is_priced_under_a_measured_batch_of_at_most_its_size() {
         // The pool is released after the window.
         push_memory(&handle, 5560, 0);
         token.finish(WindowOutcome::Responded { oom: None });
+        measured.earn_next_size();
 
         let held = window(&neighbour);
         assert_eq!(held.grant().mb, 2780);

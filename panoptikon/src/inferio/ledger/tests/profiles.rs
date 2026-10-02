@@ -1,11 +1,12 @@
 //! Stored profiles: what a seed confers, and what is written back.
 use super::*;
 
-/// A **shipped** profile confers its anchor exactly as a local one does: the
-/// first window opens at the ramp floor it implies, growth is capped at
-/// `RATCHET_FACTOR x` it, and it confers no local confirmation or sample ring.
+/// A **shipped** profile confers its anchor exactly as a local one does:
+/// growth is capped at `RATCHET_FACTOR x` it, and it confers no local
+/// confirmation or sample ring. Without a working size the run still opens
+/// at the seed: an anchor is no batch size to open at.
 #[test]
-fn a_shipped_profiles_anchor_floors_the_ramp_and_caps_growth() {
+fn a_shipped_profiles_anchor_caps_growth_and_does_not_open_the_run() {
     let profiles = Arc::new(FakeProfiles {
         seed: Some(ProfileSeed {
             base_mb: 1000,
@@ -51,8 +52,8 @@ fn a_shipped_profiles_anchor_floors_the_ramp_and_caps_growth() {
     );
     assert_eq!(
         measured_window(&handle, &admission, 512),
-        512,
-        "the first window opens at the ramp floor for 512, not at the seed"
+        4,
+        "the first window opens at the seed"
     );
     // A window whose content was small: the measured range does not extend,
     // so the ceiling stays where the seeded anchor put it.
@@ -75,7 +76,7 @@ fn a_seeded_anchor_is_never_written_back_as_this_machines_own() {
             slope_mb_per_unit: 10.0,
             residual_mb: 0.0,
             samples: 20,
-            knee_units: None,
+            knee_units: Some(512),
             local: false,
             fit_is_local: false,
             exact_torch: true,
@@ -92,7 +93,7 @@ fn a_seeded_anchor_is_never_written_back_as_this_machines_own() {
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
     push_memory(&handle, 90_000, 0);
-    // A window granted at the seeded anchor whose *content* was 8 units:
+    // A window granted at the seeded working size whose *content* was 8 units:
     // local evidence never reaches 512, so the anchor stays a claim.
     measured_window(&handle, &admission, 8);
     assert_eq!(ledger.health()[0].workers[0].max_units_measured, 512);
@@ -152,10 +153,10 @@ fn a_host_that_cannot_reach_a_conferred_anchor_records_what_it_ran() {
     );
 }
 
-/// On the next start that figure is adopted, floors the ramp at the largest
-/// step at or below it, and stays seeded until a clean batch here reaches it.
+/// On the next start that figure is adopted and stays seeded until a clean
+/// batch here reaches it; the row's working size opens the run.
 #[test]
-fn a_locally_recorded_anchor_floors_the_next_starts_ramp() {
+fn a_locally_recorded_working_size_opens_the_next_start() {
     let profiles = Arc::new(FakeProfiles {
         seed: Some(seeded_anchor(295, true)),
         ..FakeProfiles::default()
@@ -175,8 +176,8 @@ fn a_locally_recorded_anchor_floors_the_next_starts_ramp() {
     let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
     assert_eq!(
         token.grant().unit_budget,
-        256,
-        "and the first window opens at the step it implies"
+        295,
+        "and the first window opens at the stored working size"
     );
 }
 
@@ -457,10 +458,10 @@ fn a_second_card_of_the_same_architecture_adopts_the_anchor_as_seeded() {
     );
 }
 
-/// A conferred anchor floors the ramp's **exponent**, rounded down; the
-/// ratchet ceiling above it is unchanged.
+/// A stored working size opens the run at exactly that size, and the
+/// ratchet ceiling above the anchor is unchanged.
 #[test]
-fn a_conferred_anchor_never_admits_a_window_wider_than_itself() {
+fn a_stored_working_size_opens_the_run_at_that_size() {
     let seeded = |anchor: u64| {
         let profiles = Arc::new(FakeProfiles {
             seed: Some(seeded_anchor(anchor, false)),
@@ -476,38 +477,29 @@ fn a_conferred_anchor_never_admits_a_window_wider_than_itself() {
         (ledger, handle, admission)
     };
     let (_ledger, handle, admission) = seeded(3072);
-    assert_eq!(
-        measured_window(&handle, &admission, 2048),
-        2048,
-        "64 << 5, not 64 << 6: never wider than the anchor itself"
-    );
-    // And the ceiling above it is unchanged: the clean window earns the
-    // ramp its next step, still inside RATCHET_FACTOR x 3072.
+    assert_eq!(measured_window(&handle, &admission, 3072), 3072);
+    // A size that earns the next one runs RATCHET_FACTOR x the anchor.
     let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-    assert_eq!(token.grant().unit_budget, 4096);
+    assert_eq!(token.grant().unit_budget, 6144);
     drop(token);
 
     let (_ledger, _handle, admission) = seeded(768);
     let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-    assert_eq!(
-        token.grant().unit_budget,
-        512,
-        "and a conferred 768 opens at 512, not 1024"
-    );
+    assert_eq!(token.grant().unit_budget, 768);
 }
 
 /// A profile measured on a **different SKU of the same architecture** prices
-/// this card's windows and floors its ramp, but the budget is still bounded by
+/// this card's windows and opens its run, but the budget is still bounded by
 /// this card's live free memory.
 #[test]
-fn a_profile_from_another_sku_of_this_architecture_prices_and_floors_it() {
+fn a_profile_from_another_sku_of_this_architecture_prices_and_opens_it() {
     let profiles = Arc::new(FakeProfiles {
         seed: Some(ProfileSeed {
             base_mb: 1000,
             slope_mb_per_unit: 10.0,
             residual_mb: 0.0,
             samples: 20,
-            knee_units: None,
+            knee_units: Some(4096),
             // Measured on a 32 GB card of this architecture; this host's
             // card holds 12 GB. Not local: it is not this machine's own.
             local: false,
@@ -587,8 +579,9 @@ fn a_worker_naming_another_architecture_is_reported_once_per_card() {
     );
 }
 
-/// A **local** profile resumes the measured range: the anchor floors the ramp
-/// and the sample ring comes back, so the ramp is not paid again per restart.
+/// A **local** profile resumes the measured range: the working size opens
+/// the run and the sample ring comes back, so neither is paid again per
+/// restart.
 #[test]
 fn a_local_profile_resumes_the_measured_range() {
     let ring: Vec<FitSample> = (1..=6)
@@ -603,7 +596,7 @@ fn a_local_profile_resumes_the_measured_range() {
             slope_mb_per_unit: 10.0,
             residual_mb: 0.0,
             samples: 6,
-            knee_units: None,
+            knee_units: Some(64),
             local: true,
             fit_is_local: true,
             exact_torch: true,
@@ -633,7 +626,7 @@ fn a_local_profile_resumes_the_measured_range() {
     assert_eq!(
         token.grant().unit_budget,
         64,
-        "resumes at the measured range instead of re-ramping from the seed"
+        "resumes at the stored working size instead of the seed"
     );
 }
 

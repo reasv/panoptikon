@@ -93,7 +93,7 @@ fn death_cap(ledger: &Arc<VramLedger>) -> Option<u64> {
 
 /// A worker that dies whenever its batch reaches 32 units dies once: the
 /// model is then held at half that batch, where without the cap the next
-/// replica ramps back to 32 and dies again, window after window.
+/// replica runs 32 again and dies again, window after window.
 #[test]
 fn a_death_mid_window_caps_the_model_at_half_the_batch_that_died() {
     const FATAL: u64 = 32;
@@ -114,6 +114,7 @@ fn a_death_mid_window_caps_the_model_at_half_the_batch_that_died() {
                 10 * units + 100,
             )]);
             token.finish(WindowOutcome::Responded { oom: None });
+            admission.earn_next_size();
             continue;
         }
         deaths += 1;
@@ -123,8 +124,8 @@ fn a_death_mid_window_caps_the_model_at_half_the_batch_that_died() {
         replica = cpu_replica(&ledger);
     }
     assert_eq!(deaths, 1, "{sizes:?}");
-    assert_eq!(sizes[..6], [4, 8, 16, 32, 8, 16], "{sizes:?}");
-    assert!(sizes[6..].iter().all(|units| *units == 16), "{sizes:?}");
+    assert_eq!(sizes[..4], [4, 8, 16, 32], "{sizes:?}");
+    assert!(sizes[4..].iter().all(|units| *units == 16), "{sizes:?}");
     assert_eq!(ledger.health()[0].workers[0].unit_budget, 16);
 
     // A shape ceiling under the cap binds in its place: the smaller rules.
@@ -192,7 +193,8 @@ fn repeated_deaths_halve_the_cap_down_to_one_unit() {
         assert_eq!(cap, (units / 2).max(1));
         caps.push(cap);
     }
-    assert_eq!(caps, [16, 8, 4, 2, 1, 1, 1]);
+    // The first of them runs the 64 units the last was about to try.
+    assert_eq!(caps, [32, 16, 8, 4, 2, 1, 1]);
 }
 
 /// A window the queue sized says nothing about the batch the model can run:
@@ -231,6 +233,7 @@ fn a_death_in_a_window_the_queue_sized_sets_no_cap() {
             let batch = measurement(full, 0, 100 + full / per_mb);
             handle.lock().unwrap().record_measurements(vec![batch]);
             token.finish(WindowOutcome::Responded { oom: None });
+            admission.earn_next_size();
         }
         assert_eq!(full, cost.seed_units.map_or(0, u64::from) << 6);
 
@@ -1022,7 +1025,6 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
         squeezed: false,
         room_bound: false,
         peak_occupants: 0,
-        knee_bound: false,
         ample_headroom: true,
         queue_bound: false,
         byte_bound: false,
@@ -1116,7 +1118,6 @@ fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
         squeezed: false,
         room_bound: false,
         peak_occupants: 0,
-        knee_bound: false,
         ample_headroom: true,
         queue_bound: false,
         byte_bound: false,
@@ -1497,6 +1498,9 @@ fn room_window(
         handle.lock().unwrap().record_measurements(vec![batch]);
     }
     token.finish(outcome);
+    if outcome == CLEAN {
+        admission.earn_next_size();
+    }
     (grant.unit_budget, grant.mb, grant.squeezed)
 }
 
@@ -1729,6 +1733,7 @@ fn out_of_memory_windows_raise_the_pool_margin_three_times_at_most() {
         };
         wide.lock().unwrap().record_measurements(vec![batch]);
         token.finish(CLEAN);
+        admission.earn_next_size();
     }
     room(&ledger, &wide, 1_000);
     assert_eq!(room_window(&wide, &admission, OUT_OF_MEMORY).0, 52);

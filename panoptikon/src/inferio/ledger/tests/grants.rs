@@ -751,6 +751,7 @@ fn a_grant_and_the_pool_it_grew_are_charged_once() {
     handle.lock().unwrap().record_measurements(series);
     push_memory(&handle, 90_000, 2400);
     clean_window(&admission);
+    admission.earn_next_size();
     let worker = &ledger.health()[0].workers[0];
     assert_eq!(worker.reserved_mb, Some(2400));
     assert_eq!(worker.footprint_mb, 3400, "1000 base + 2400 pool growth");
@@ -782,6 +783,7 @@ fn a_small_card_does_not_collapse_to_a_zero_share() {
     // free = 6144 - 1200 base - 2400 pool = 2544, so external is 0.
     push_memory(&handle, 2544, 2400);
     clean_window(&admission);
+    admission.earn_next_size();
     assert_eq!(ledger.health()[0].external_mb, 0);
     let first = admission.request_grant(24, None, 1, 0).unwrap();
     assert_eq!(first.grant().mb, 2400);

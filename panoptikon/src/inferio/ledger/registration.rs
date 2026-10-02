@@ -749,14 +749,7 @@ impl VramLedger {
                 reserved_seen_at: None,
                 grants: HashMap::new(),
                 pending_requests: 0,
-                ramp_step: 0,
-                ramp_held: false,
-                held_units: None,
-                held_certified: false,
                 oom_at_floor: floor_strikes,
-                windows_queue_bound: 0,
-                hold_announced: false,
-                hold_reprobe_windows: 0,
                 deflation: 0,
                 deflation_repaid_at: None,
                 clean_windows: 0,
@@ -778,7 +771,6 @@ impl VramLedger {
                 ram_base_mb: ram_at_load_mb,
                 ram_mb: None,
                 ram_bound: false,
-                awaited_sample_bucket: None,
                 ram_started: false,
                 item_cap: ram_at_load_mb.map(|_| 1),
             },
@@ -915,6 +907,25 @@ impl Admission {
         let state = self.ledger.lock();
         let entry = state.workers.get(&self.worker)?;
         VramLedger::item_cap_locked(&state, entry)
+    }
+
+    /// Stand in for a rate that rises with every doubling: the working size
+    /// becomes twice the largest batch measured (at least the seed), as
+    /// trials that each earned their size would leave it.
+    #[cfg(test)]
+    pub(super) fn earn_next_size(&self) {
+        let mut state = self.ledger.lock();
+        let Some(entry) = state.workers.get(&self.worker) else {
+            return;
+        };
+        let (seed, key) = (
+            entry.seed_units.max(1),
+            (entry.inference_id.clone(), entry.gpu.clone()),
+        );
+        let cal = state.calibration.entry(key).or_default();
+        cal.knee_units = Some(seed.max(cal.max_units_measured.saturating_mul(RATCHET_FACTOR)));
+        cal.trial = None;
+        cal.grew_from = None;
     }
 
     /// [`Self::request_grant_byte_bound`] with `byte_bound = false`.

@@ -149,7 +149,7 @@ impl VramLedger {
     }
 
     /// Ingest every worker's telemetry with no window, so nothing reaches the
-    /// ramp or the knee ring.
+    /// throughput ring.
     #[cfg(test)]
     pub(super) fn ingest_all_for_test(&self) {
         let mut state = self.lock();
@@ -159,7 +159,7 @@ impl VramLedger {
         }
     }
 
-    /// Install a local knee without fitting one.
+    /// Install a working size as measured here.
     #[cfg(test)]
     pub(super) fn set_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {
         let mut state = self.lock();
@@ -168,88 +168,34 @@ impl VramLedger {
             .entry((inference_id.to_owned(), gpu.to_owned()))
             .or_default();
         cal.knee_units = Some(knee);
-        cal.knee_fitted_units = Some(knee);
         cal.knee_is_local = true;
+        cal.trial = None;
+        cal.grew_from = None;
     }
 
-    /// Install a seeded (not local) knee.
+    /// Observations in the ring that may decide a batch size.
     #[cfg(test)]
-    pub(super) fn set_seeded_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {
-        let mut state = self.lock();
-        let cal = state
-            .calibration
-            .entry((inference_id.to_owned(), gpu.to_owned()))
-            .or_default();
-        cal.knee_units = Some(knee);
-        cal.knee_fitted_units = Some(knee);
-        cal.knee_is_local = false;
-    }
-
-    /// Push sole-occupancy samples straight into the knee ring, `each` per
-    /// `(units, units/sec)` point.
-    #[cfg(test)]
-    pub(super) fn seed_throughput_ring_for_test(
-        &self,
-        inference_id: &str,
-        gpu: &str,
-        curve: &[(u64, f64)],
-        each: usize,
-    ) {
-        let mut state = self.lock();
-        let cal = state
-            .calibration
-            .entry((inference_id.to_owned(), gpu.to_owned()))
-            .or_default();
-        // Stamped as a real ingest would, with the anchor raised to the widest
-        // size seeded.
-        let anchor = curve
-            .iter()
-            .map(|(units, _)| *units)
-            .max()
-            .unwrap_or(0)
-            .max(cal.max_units_measured);
-        cal.max_units_measured = anchor;
-        for (units, units_per_sec) in curve {
-            for _ in 0..each {
-                cal.throughput.push_back(ThroughputSample {
-                    units: *units,
-                    units_per_sec: *units_per_sec,
-                    occupants: 0,
-                    seq: cal.throughput_seq,
-                    anchor,
-                    warmup: false,
-                    warmup_tail: false,
-                });
-                cal.throughput_seq += 1;
-                while cal.throughput.len() > KNEE_RING {
-                    cal.throughput.pop_front();
-                }
-            }
-        }
-    }
-
-    /// The runtime-only historical peak the knee threshold is anchored to.
-    #[cfg(test)]
-    pub(super) fn knee_best_for_test(&self, inference_id: &str, gpu: &str) -> Option<(u32, f64)> {
+    pub(super) fn deciding_samples_for_test(&self, inference_id: &str, gpu: &str) -> usize {
         self.lock()
             .calibration
             .get(&(inference_id.to_owned(), gpu.to_owned()))
-            .and_then(|cal| cal.knee_best)
-    }
-
-    /// The knee's clean-window count and widened bucket.
-    #[cfg(test)]
-    pub(super) fn knee_expiry_for_test(&self, inference_id: &str, gpu: &str) -> (u32, Option<u32>) {
-        self.lock()
-            .calibration
-            .get(&(inference_id.to_owned(), gpu.to_owned()))
-            .map(|cal| {
-                (
-                    cal.knee_clean_windows,
-                    cal.knee_widened.map(|widening| widening.bucket),
-                )
+            .map_or(0, |cal| {
+                cal.throughput
+                    .iter()
+                    .filter(|sample| sample.decides())
+                    .count()
             })
-            .unwrap_or((0, None))
+    }
+
+    /// The gain rule's state: `(trial windows, windows before the next
+    /// trial, trials in a row that earned nothing)`.
+    #[cfg(test)]
+    pub(super) fn trial_for_test(&self, inference_id: &str, gpu: &str) -> (Option<u32>, u32, u32) {
+        self.lock()
+            .calibration
+            .get(&(inference_id.to_owned(), gpu.to_owned()))
+            .map(|cal| (cal.trial, cal.retest_after, cal.failed_trials))
+            .unwrap_or((None, 0, 0))
     }
 
     /// The stored shape ceiling, unfiltered (unlike `/health`).

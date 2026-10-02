@@ -337,15 +337,15 @@ fn post_fit_units_derive_from_mb_via_the_slope() {
         .collect();
     handle.lock().unwrap().record_measurements(series);
     clean_window(&admission);
+    ledger.set_knee_for_test("g/a", GPU, 64);
     let fit = ledger.health()[0].workers[0]
         .fit
         .as_ref()
         .map(|fit| fit.slope_mb_per_unit)
         .expect("fitted");
     assert!((fit - 10.0).abs() < 1e-6, "slope {fit}");
-    // The anchor is 48 units, so the ramp's exponent is at 4 (32 <= 48) and
-    // its next step is 64 — under the ratchet ceiling of 96, and reserved at
-    // 64 * 10 = 640, not the whole share.
+    // The anchor is 48 units and the working size 64, under the ratchet
+    // ceiling of 96: reserved at 64 * 10 = 640, not the whole share.
     let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
     assert_eq!(token.grant().unit_budget, 64);
     assert_eq!(token.grant().mb, 640);
@@ -416,6 +416,7 @@ fn fitted_with_a_fixed_part(
         let batch = measurement(units, 0, fixed_mb + per_unit_mb * units);
         handle.lock().unwrap().record_measurements(vec![batch]);
         token.finish(WindowOutcome::Responded { oom: None });
+        admission.earn_next_size();
     }
     (handle, admission)
 }
@@ -531,6 +532,7 @@ fn the_cpu_device_charges_the_fixed_part_only_when_it_is_not_resident() {
             };
             handle.lock().unwrap().record_measurements(vec![batch]);
             token.finish(WindowOutcome::Responded { oom: None });
+            admission.earn_next_size();
         }
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         let grant = *token.grant();

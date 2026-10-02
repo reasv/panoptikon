@@ -17,9 +17,8 @@ use super::oom::{
     OOM_SOURCE_ERROR_FRAME, OOM_SOURCE_MARKER, OOM_SOURCE_MESSAGE_PATTERN, OOM_SOURCE_TYPED,
     OOM_SOURCE_UNCLASSIFIED, OomTrust,
 };
-use super::ramp::{ramp_still_gains, ring_certifies_reached};
+use super::ramp::{quiet_rate, relative_mad};
 use super::test_hooks::CalibrationState;
-use super::throughput_knee::{fit_knee, flat_above, relative_mad};
 
 const GPU: &str = "GPU-aaaa";
 /// The profile keyspace every test replica reports: one architecture, so
@@ -235,7 +234,7 @@ fn seeded_anchor(anchor: u64, local: bool) -> ProfileSeed {
         slope_mb_per_unit: 10.0,
         residual_mb: 0.0,
         samples: 20,
-        knee_units: None,
+        knee_units: Some(anchor),
         local,
         fit_is_local: local,
         exact_torch: true,
@@ -246,8 +245,9 @@ fn seeded_anchor(anchor: u64, local: bool) -> ProfileSeed {
     }
 }
 
-/// A clean window that reports one pool-growing batch of `units`, and the unit
-/// budget it was granted.
+/// A clean window that reports one pool-growing batch of `units`, of a model
+/// whose rate rises with every doubling ([`Admission::earn_next_size`]).
+/// Returns the unit budget it was granted.
 fn measured_window(handle: &TelemetryHandle, admission: &Admission, units: u64) -> u64 {
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
@@ -258,6 +258,7 @@ fn measured_window(handle: &TelemetryHandle, admission: &Admission, units: u64) 
         .unwrap()
         .record_measurements(vec![measurement(units, 0, 10 * units + 100)]);
     token.finish(WindowOutcome::Responded { oom: None });
+    admission.earn_next_size();
     granted
 }
 
@@ -523,10 +524,7 @@ fn rate(units: u64, units_per_sec: f64, count: usize) -> Vec<ThroughputSample> {
             units,
             units_per_sec,
             occupants: 0,
-            seq: 0,
-            anchor: 0,
             warmup: false,
-            warmup_tail: false,
         };
         count
     ]
@@ -546,23 +544,19 @@ fn warm_batch(units: u64, units_per_sec: f64) -> BatchMeasurement {
 }
 
 /// One observation as the ledger recorded it: `(units, units/sec, the
-/// ratchet anchor at the time, the replica's window index)`.
-type Recorded = (u64, f64, u64, u64);
+/// replica's window index)`.
+type Recorded = (u64, f64, u64);
 
-/// A recorded series as [`fit_knee`] receives it — numbered in order, and
-/// with the replica's first window marked warm-up.
-fn recorded(series: &[Recorded]) -> Vec<ThroughputSample> {
+/// A recorded series as the ring holds it, with the replica's first window
+/// marked warm-up.
+fn recorded(series: &[Recorded]) -> VecDeque<ThroughputSample> {
     series
         .iter()
-        .enumerate()
-        .map(|(index, (units, rate_, anchor, window))| ThroughputSample {
+        .map(|(units, rate_, window)| ThroughputSample {
             units: *units,
             units_per_sec: *rate_,
             occupants: 0,
-            seq: index as u64,
-            anchor: *anchor,
             warmup: *window == 0,
-            warmup_tail: false,
         })
         .collect()
 }
