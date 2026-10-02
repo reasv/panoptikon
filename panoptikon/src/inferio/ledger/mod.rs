@@ -189,6 +189,11 @@ pub const KNEE_WARMUP_BATCHES: u64 = WINDOW_DEPTH_MULTIPLIER;
 /// shallow one gives one, so [`MIN_KNEE_BUCKET_SAMPLES`] can take three.
 pub const TRIAL_WINDOWS: u32 = 2 * MIN_KNEE_BUCKET_SAMPLES as u32;
 
+/// Observations of its own after which a size a trial earned must still beat
+/// the size it grew from, or it is given up. A trial is judged on as few as
+/// [`MIN_KNEE_BUCKET_SAMPLES`], which noise can carry past the band.
+pub const CONFIRM_SAMPLES: usize = 12;
+
 /// Windows at the working size after a trial that earned nothing before the
 /// next one, doubled by each further such trial [`RETEST_MAX_DOUBLINGS`]
 /// times at most: 12, 24, … 384.
@@ -1075,7 +1080,8 @@ struct ModelCalibration {
     failed_trials: u32,
     /// The working size's rate at the last verdict.
     settled_rate: Option<f64>,
-    /// The size the working size grew from, and its rate then.
+    /// The size the working size grew from and its rate then, until the
+    /// working size has [`CONFIRM_SAMPLES`] of its own.
     grew_from: Option<(u64, f64)>,
     /// `(anchor, fit version, local knee)` as last written; a change triggers a
     /// write.

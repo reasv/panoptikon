@@ -77,9 +77,11 @@ opening:  W = the stored knee_units (a row with a fit); otherwise the size of
           the first window that ran at its budget with memory to spare
 
 after each clean window:
-  W grew from a size whose rate W no longer beats by the band -> back to it
+  W has CONFIRM_SAMPLES (12) samples of its own and no longer beats the rate
+  of the size it grew from by the band                 -> back to that size
   trial on:
     at and above known:  above * KNEE_RATIO > at  -> W = largest size sampled,
+                                                     its samples alone are kept,
                                                      and the next trial at once
                          else                     -> end the trial
     else, a window granted more than W:
@@ -110,10 +112,11 @@ a window that failed (out of memory, collapse, death) ends a trial too
   after 12, 24, 48 … 384 windows at the working size, and at once when the
   working size's own rate moves by more than the band (the inputs changed).
   A flat model pays one or two trial windows in a few hundred.
-- **A size keeps its place only while it beats the one it grew from.** A
-  trial is judged on as few as two observations. Once the new working size
-  has more of them and no longer beats the old one's rate, the replica goes
-  back.
+- **An earned size is confirmed once.** A trial is judged on as few as two
+  observations, which noise can carry past the band. When the new working
+  size has `CONFIRM_SAMPLES` (12) of its own and no longer beats the old
+  one's rate, the replica goes back. Through ±10 % noise a flat rate then
+  ends one size up in 2 jobs of 60, and none goes further.
 - **The store holds the size that earned its place**: `knee_units = W` once
   this machine measured it. A restart opens at `W`, tries `2 W` once and
   returns; nothing walks. `max_units_measured` is still the ratchet's anchor

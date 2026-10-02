@@ -1027,9 +1027,10 @@ fn a_working_size_whose_rate_moved_is_tried_again_at_once() {
     );
 }
 
-/// A flat rate read through ±10 % noise, 60 jobs of 400 windows: where a
-/// trial's two observations read a gain past the band, the size is given
-/// up again once it has more of them. Every job ends at the seed.
+/// A flat rate read through ±10 % noise, 60 jobs of 400 windows. Where a
+/// trial's two observations read a gain past the band, the size is given up
+/// again once it has [`CONFIRM_SAMPLES`] of them, unless the seed's own rate
+/// was read low from its first two: 2 jobs end one size up, none further.
 #[test]
 fn a_flat_noisy_rate_does_not_walk() {
     let state = std::cell::Cell::new(0x9E37_79B9_7F4A_7C15u64);
@@ -1050,7 +1051,9 @@ fn a_flat_noisy_rate_does_not_walk() {
         }
         ended.push(ledger.health()[0].workers[0].knee_units.expect("measured"));
     }
-    assert_eq!(ended, [64; 60]);
+    let grown = ended.iter().filter(|units| **units > 64).count();
+    assert_eq!(grown, 2, "{ended:?}");
+    assert!(ended.iter().all(|units| *units <= 128), "{ended:?}");
 }
 
 /// Windows the queue sized neither set the working size nor count towards
@@ -1123,6 +1126,34 @@ fn a_trial_that_runs_out_of_memory_is_over() {
     assert_eq!(ledger.trial_for_test("g/a", GPU), (None, RETEST_WINDOWS, 1));
     let worker = &ledger.health()[0].workers[0];
     assert_eq!((worker.knee_units, worker.unit_budget), (Some(64), 32));
+    // Deflated windows do not count towards the next trial.
+    for _ in 0..2 {
+        assert_eq!(
+            window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0),
+            32
+        );
+    }
+    assert_eq!(ledger.trial_for_test("g/a", GPU), (None, RETEST_WINDOWS, 1));
+}
+
+/// A trial whose two observations read 1.18x the seed's rate earns the size.
+/// Its rate then reads lower than it did, which tries the next size once
+/// more; once it has [`CONFIRM_SAMPLES`] observations of its own, at the
+/// seed's rate, it is given up.
+#[test]
+fn a_size_earned_on_a_high_reading_is_given_up_once_measured_more() {
+    let (ledger, handle, admission) = ramping_from_seed(64);
+    let budgets: Vec<u64> = (0..12)
+        .map(|window| {
+            let rate = move |_| if window == 2 { 26.0 } else { 22.0 };
+            window_leaving_warm(&handle, &admission, |_| 2, rate)
+        })
+        .collect();
+    assert_eq!(
+        budgets,
+        [64, 64, 128, 256, 128, 128, 256, 128, 128, 128, 64, 64]
+    );
+    assert_eq!(ledger.health()[0].workers[0].knee_units, Some(64));
 }
 
 /// The working size and the cadence belong to the (model, device): a

@@ -38,19 +38,33 @@ pub(super) fn admitted_units(
     (bounded >> entry.deflation.min(63)).max(1)
 }
 
-/// Median units/sec of the samples that may decide a batch size (sole
-/// occupant, not warm-up) with `above < units <= up_to`. `None` with fewer
-/// than [`MIN_KNEE_BUCKET_SAMPLES`] of them, or when their relative MAD
-/// exceeds `band`: something outside the ledger was moving the rate.
+/// The samples that may decide a batch size (sole occupant, not warm-up)
+/// with `above < units <= up_to`.
+fn deciding(
+    samples: &VecDeque<ThroughputSample>,
+    above: u64,
+    up_to: u64,
+) -> impl Iterator<Item = &ThroughputSample> {
+    samples
+        .iter()
+        .filter(move |sample| sample.decides() && sample.units > above && sample.units <= up_to)
+}
+
+/// How many such samples the ring holds.
+fn sampled(samples: &VecDeque<ThroughputSample>, above: u64, up_to: u64) -> usize {
+    deciding(samples, above, up_to).count()
+}
+
+/// Their median units/sec. `None` with fewer than
+/// [`MIN_KNEE_BUCKET_SAMPLES`] of them, or when their relative MAD exceeds
+/// `band`: something outside the ledger was moving the rate.
 pub(super) fn quiet_rate(
     samples: &VecDeque<ThroughputSample>,
     above: u64,
     up_to: u64,
     band: f64,
 ) -> Option<f64> {
-    let mut rates: Vec<f64> = samples
-        .iter()
-        .filter(|sample| sample.decides() && sample.units > above && sample.units <= up_to)
+    let mut rates: Vec<f64> = deciding(samples, above, up_to)
         .map(|sample| sample.units_per_sec)
         .collect();
     if rates.len() < MIN_KNEE_BUCKET_SAMPLES || relative_mad(&mut rates)? > band {
@@ -206,8 +220,8 @@ impl VramLedger {
     /// The working size is set by the first window that ran at its budget
     /// with memory to spare.
     /// A trial of the next size is kept when its median rate beats the
-    /// working size's by more than [`KNEE_RATIO`], and for as long as it
-    /// still does once it is the working size. A trial ends when the rate
+    /// working size's by more than [`KNEE_RATIO`], and still does once it
+    /// has [`CONFIRM_SAMPLES`] observations of its own. A trial ends when the rate
     /// does not, when [`TRIAL_WINDOWS`] trial windows gave no verdict, when
     /// another replica ran beside it or memory was under pressure, or when
     /// the window `failed`. With no
@@ -250,25 +264,28 @@ impl VramLedger {
         let quiet = charge.peak_occupants == 0 && charge.pressure == mps::MemoryPressure::Normal;
         // Measured here, so it may be persisted.
         cal.knee_is_local |= at.is_some();
-        // A size keeps its place only while it beats the one it grew from:
-        // the few observations a trial is judged on can read too high.
+        // The few observations a trial is judged on can read too high: with
+        // [`CONFIRM_SAMPLES`] of its own, the size must still beat the one
+        // it grew from.
         if let (Some(at), Some((smaller, rate))) = (at, cal.grew_from)
-            && at * KNEE_RATIO <= rate
+            && sampled(&cal.throughput, working / 2, working) >= CONFIRM_SAMPLES
         {
-            cal.knee_units = Some(smaller);
             cal.grew_from = None;
-            end_trial(cal, smaller, Some(rate));
-            tracing::info!(
-                model = %key.0,
-                gpu = %key.1,
-                units = smaller,
-                units_per_sec = rate,
-                larger_units_per_sec = at,
-                retest_after_windows = cal.retest_after,
-                "a larger batch size no longer measures faster; back to the \
-                 size it grew from"
-            );
-            return;
+            if at * KNEE_RATIO <= rate {
+                cal.knee_units = Some(smaller);
+                end_trial(cal, smaller, Some(rate));
+                tracing::info!(
+                    model = %key.0,
+                    gpu = %key.1,
+                    units = smaller,
+                    units_per_sec = rate,
+                    larger_units_per_sec = at,
+                    retest_after_windows = cal.retest_after,
+                    "a larger batch size did not stay faster once measured \
+                     more often; back to the size it grew from"
+                );
+                return;
+            }
         }
         let Some(windows) = cal.trial else {
             let Some(at) = at.filter(|_| at_budget && quiet && !deflated) else {
@@ -280,7 +297,6 @@ impl VramLedger {
             if moved {
                 cal.failed_trials = 0;
                 cal.retest_after = 0;
-                cal.grew_from = None;
             }
             cal.retest_after = cal.retest_after.saturating_sub(1);
             if cal.retest_after == 0 {
@@ -290,13 +306,13 @@ impl VramLedger {
         };
         match (at, above) {
             (Some(at), Some(above)) if above * KNEE_RATIO > at => {
-                let earned = cal
-                    .throughput
-                    .iter()
-                    .filter(|sample| sample.decides())
+                let earned = deciding(&cal.throughput, working, u64::MAX)
                     .map(|sample| sample.units)
                     .max()
                     .unwrap_or(working);
+                // A step the room cut short is less than a doubling: the
+                // old size's samples would count as the new one's.
+                cal.throughput.retain(|sample| sample.units > working);
                 cal.knee_units = Some(earned);
                 cal.grew_from = Some((working, at));
                 cal.trial = Some(0);
