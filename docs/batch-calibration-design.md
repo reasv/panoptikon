@@ -76,11 +76,14 @@ above = the same for units > W            # only a trial puts samples there
 opening:  W = the stored knee_units (a row with a fit); otherwise the size of
           the first window that ran at its budget with memory to spare
 
+gains:    rate * KNEE_RATIO ^ d > the smaller size's rate, d the doublings
+          between the two sizes (1, or less when the room cut the step)
+
 after each clean window:
-  W has CONFIRM_SAMPLES (12) samples of its own and no longer beats the rate
-  of the size it grew from by the band                 -> back to that size
+  W has CONFIRM_SAMPLES (12) samples of its own and no longer gains on the
+  rate of the size it grew from                         -> back to that size
   trial on:
-    at and above known:  above * KNEE_RATIO > at  -> W = largest size sampled,
+    at and above known:  above gains on at        -> W = largest size sampled,
                                                      its samples alone are kept,
                                                      and the next trial at once
                          else                     -> end the trial
@@ -97,12 +100,14 @@ a window that failed (out of memory, collapse, death) ends a trial too
 ```
 
 - **A gain is `KNEE_RATIO`.** Rates within 10 % of each other are a plateau,
-  so a larger size is kept when it is more than 1.11× faster. A rate rising
-  1.44× or 1.14× per doubling earns every doubling; one rising 1.05× never
-  leaves the size it opened at, where the old ramp walked it to the room.
-  That is the rule: each doubling doubles the memory for a gain the ledger
-  cannot tell from none. The price is on curves with a soft bend: a model
-  10 % faster at twice the size stays at the smaller one.
+  so twice the size is kept when it is more than 1.11× faster. A step the
+  room cuts short is held to its share of that: 128 → 191 units is 0.58 of
+  a doubling and must gain 1.06×. A rate rising 1.44× or 1.14× per doubling
+  earns every step; one rising 1.05× never leaves the size it opened at,
+  where the old ramp walked it to the room. That is the rule: each doubling
+  doubles the memory for a gain the ledger cannot tell from none. The price
+  is on curves with a soft bend: a model 10 % faster at twice the size
+  stays at the smaller one.
 - **No evidence is not growth.** Too few samples, a pool that grows with
   every batch, a first window that is all warm-up: the size is measured
   again, a trial for at most `TRIAL_WINDOWS` windows, and then counts as not
@@ -127,8 +132,7 @@ a window that failed (out of memory, collapse, death) ends a trial too
 - **Rising rates.** One window more than before at the opening size (it must
   be measured before the next can be compared with it), then one window per
   doubling. A caller that keeps a batch and a half in flight takes three per
-  size. A last step the room cuts short is a trial of that size, kept if it
-  gains more than the band.
+  size.
 - A replica under the host-RAM item cap opens at one item, so every size it
   runs is earned: a tagger bound by CPU preprocessing (8, 14, 21, 22.5
   items/s at 1, 2, 4, 8 units) stays at 4.

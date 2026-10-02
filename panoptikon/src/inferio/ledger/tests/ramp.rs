@@ -887,15 +887,15 @@ fn a_flat_rate_stays_at_its_size_and_retries_ever_less_often() {
 }
 
 /// A larger size is kept only when its rate beats the working size's by
-/// more than the band, 1.11x: on a 16 GB card, 82 MiB a unit, a rate
-/// rising 1.41x a doubling grows to the 191 units that fit; 1.14x keeps
-/// each doubling but not the last step the room cuts short (1.08x); 1.05x
-/// never leaves the seed; a rate that stops rising at 128 stops there.
+/// more than the band, 1.11x a doubling. On a 16 GB card, 82 MiB a unit: a
+/// rate rising 1.41x or 1.14x a doubling grows to the 191 units that fit,
+/// the last step (0.58 of a doubling) held to its share of the band, 1.06x;
+/// 1.05x never leaves the seed; a rate that stops rising at 128 stops there.
 #[test]
 fn a_size_is_kept_only_on_a_gain_past_the_band() {
     let cases: [(Rate, &[u64], u64); 5] = [
         (|units| (units as f64).sqrt(), &[64, 64, 128, 191], 191),
-        (|units| (units as f64).powf(0.19), &[64, 64, 128, 191], 128),
+        (|units| (units as f64).powf(0.19), &[64, 64, 128, 191], 191),
         (|units| (units as f64).powf(0.07), &[64, 64, 128], 64),
         (|_| 22.0, &[64, 64, 128], 64),
         (|units| units.min(128) as f64, &[64, 64, 128, 191], 128),
@@ -913,8 +913,7 @@ fn a_size_is_kept_only_on_a_gain_past_the_band() {
 }
 
 /// With room, a rate that rises takes one window per doubling after the
-/// one that measures the seed's size, and keeps a last step the room cuts
-/// short only if that step gains more than the band.
+/// one that measures the seed's size, up to what the room holds.
 #[test]
 fn a_rising_rate_takes_a_window_per_doubling() {
     let (ledger, handle, admission) = ramping_from_seed(64);
@@ -925,9 +924,8 @@ fn a_rising_rate_takes_a_window_per_doubling() {
         budgets[..11],
         [64, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 19090]
     );
-    // 19 090 units are 1.08x the rate of 16 384.
-    assert!(budgets[11..].iter().all(|units| *units == 16384));
-    assert_eq!(ledger.health()[0].workers[0].knee_units, Some(16384));
+    assert!(budgets[11..].iter().all(|units| *units == 19090));
+    assert_eq!(ledger.health()[0].workers[0].knee_units, Some(19090));
 }
 
 /// A caller that keeps a batch and a half in flight gives one observation

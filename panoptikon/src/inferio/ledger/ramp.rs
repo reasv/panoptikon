@@ -97,6 +97,16 @@ pub(super) fn median(values: &mut [f64]) -> Option<f64> {
     })
 }
 
+/// Whether `rate` at `units` beats `smaller_rate` at `smaller` by more than
+/// the plateau band. [`KNEE_RATIO`] is the band for a doubling; a step the
+/// room cut short is held to its share of it.
+fn gains(rate: f64, units: u64, smaller_rate: f64, smaller: u64) -> bool {
+    let doublings = (units as f64 / smaller.max(1) as f64)
+        .log2()
+        .clamp(0.0, 1.0);
+    rate * KNEE_RATIO.powf(doublings) > smaller_rate
+}
+
 /// End a trial that did not earn the larger size its place: its samples go,
 /// and the next trial waits [`RETEST_WINDOWS`] windows at the working size,
 /// doubled by each trial in a row that ended this way. `rate` is the working
@@ -271,7 +281,7 @@ impl VramLedger {
             && sampled(&cal.throughput, working / 2, working) >= CONFIRM_SAMPLES
         {
             cal.grew_from = None;
-            if at * KNEE_RATIO <= rate {
+            if !gains(at, working, rate, smaller) {
                 cal.knee_units = Some(smaller);
                 end_trial(cal, smaller, Some(rate));
                 tracing::info!(
@@ -304,12 +314,12 @@ impl VramLedger {
             }
             return;
         };
+        let earned = deciding(&cal.throughput, working, u64::MAX)
+            .map(|sample| sample.units)
+            .max()
+            .unwrap_or(working);
         match (at, above) {
-            (Some(at), Some(above)) if above * KNEE_RATIO > at => {
-                let earned = deciding(&cal.throughput, working, u64::MAX)
-                    .map(|sample| sample.units)
-                    .max()
-                    .unwrap_or(working);
+            (Some(at), Some(above)) if gains(above, earned, at, working) => {
                 // A step the room cut short is less than a doubling: the
                 // old size's samples would count as the new one's.
                 cal.throughput.retain(|sample| sample.units > working);
