@@ -1997,6 +1997,15 @@ fn a_blocked_step_is_asked_for_again_until_it_fails_or_is_granted() {
     let after = run(&mut replica, fits_191, 8);
     assert!(after.iter().all(|units| *units <= 64), "{after:?}");
 
+    // Nor is a size asked past once the replica has stepped down from it:
+    // with a rate flat from 32 units the size ends at 32, and 64 ran.
+    let flat_from_32 = |units: u64| (units.min(32) as f64).sqrt();
+    let mut replica = OneBatch::on_a_card_of(fits_191);
+    let budgets: Vec<u64> = (0..8)
+        .map(|_| replica.window(fits_70, full, flat_from_32, Pool::Kept, None))
+        .collect();
+    assert_eq!(budgets, [64, 64, 70, 32, 16, 32, 32, 32]);
+
     // A step blocked one doubling past a size that ran is not asked for
     // again: 128 units ran and gained nothing, 256 do not fit.
     let fits_130 = 130 * OneBatch::PER_UNIT_MB;

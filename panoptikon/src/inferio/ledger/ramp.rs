@@ -662,6 +662,8 @@ impl VramLedger {
                     working = smaller;
                     cal.knee_units = Some(smaller);
                     cal.knee_is_local = true;
+                    // Memory granted the size it steps down from.
+                    cal.room_cut = false;
                     trial.moved = true;
                     trial.windows = 0;
                     waited = false;
