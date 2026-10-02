@@ -17,7 +17,7 @@ use super::oom::{
     OOM_SOURCE_ERROR_FRAME, OOM_SOURCE_MARKER, OOM_SOURCE_MESSAGE_PATTERN, OOM_SOURCE_TYPED,
     OOM_SOURCE_UNCLASSIFIED, OomTrust,
 };
-use super::ramp::{faster, quiet_rate, relative_mad};
+use super::ramp::{faster, placed, quiet_rate, relative_mad};
 use super::test_hooks::CalibrationState;
 
 const GPU: &str = "GPU-aaaa";

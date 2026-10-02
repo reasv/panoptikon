@@ -109,6 +109,19 @@ fn ladder(samples: &[(u64, f64)], working: u64, limit: u64) -> Vec<(u64, Vec<f64
     sizes
 }
 
+/// [`ladder`] up to the size `trial` is measuring. A step memory cuts is the
+/// size it grants now, not a larger one it granted before.
+fn observed(samples: &[(u64, f64)], working: u64, trial: &Trial) -> Vec<(u64, Vec<f64>)> {
+    let asked = trial.up.unwrap_or(working);
+    let below = asked / 2;
+    let mut sizes = ladder(samples, working, asked);
+    if trial.granted < asked && trial.granted as f64 * KNEE_RATIO > below as f64 {
+        sizes.retain(|(size, _)| *size <= below);
+        sizes.push((trial.granted, rates_at(samples, trial.granted, below)));
+    }
+    sizes
+}
+
 /// The median of `rates`. `None` with fewer than
 /// [`MIN_KNEE_BUCKET_SAMPLES`] of them, or when their relative MAD exceeds
 /// `band`: something outside the ledger was moving the rate.
@@ -203,7 +216,12 @@ enum Over {
 /// from `working` up to the fastest of `sizes`, that is not shown slower
 /// than the fastest by the band. `Err` is the size to observe next, while a
 /// comparison is undecided and the trial has not `waited` its windows out.
-fn placed(sizes: &[(u64, Vec<f64>)], working: u64, band: f64, waited: bool) -> Result<u64, u64> {
+pub(super) fn placed(
+    sizes: &[(u64, Vec<f64>)],
+    working: u64,
+    band: f64,
+    waited: bool,
+) -> Result<u64, u64> {
     let Some((best, best_rates, _)) = sizes
         .iter()
         .filter_map(|(size, rates)| Some((*size, rates, quiet_rate(rates, band)?)))
@@ -376,8 +394,8 @@ impl VramLedger {
             if let Some(mut trial) = cal.trial {
                 let mut samples = comparable(&cal.throughput);
                 samples.retain(|(units, _)| !failed || *units < charge.unit_budget);
-                if let Some(asked) = trial.up {
-                    let sizes = ladder(&samples, working, asked);
+                if trial.up.is_some() {
+                    let sizes = observed(&samples, working, &trial);
                     Self::keep_earned(cal, &key, &mut trial, &sizes, band, true);
                     cal.trial = Some(trial);
                 }
@@ -462,8 +480,6 @@ impl VramLedger {
     ) -> Option<u64> {
         let working = cal.knee_units.unwrap_or(0);
         let earned = match placed(sizes, working, band, waited) {
-            // Memory cut the last step: the size is what it granted.
-            Ok(size) if Some(size) == trial.up => size.min(trial.granted),
             Ok(size) => size,
             Err(next) => return Some(next),
         };
@@ -511,13 +527,7 @@ impl VramLedger {
             let below = asked / 2;
             // Memory granted nothing above `below`.
             let mut blocked = false;
-            let mut sizes = ladder(samples, working, asked);
-            // A step memory cuts is the size it grants now, not a larger
-            // one it granted before.
-            if trial.granted < asked && trial.granted as f64 * KNEE_RATIO > below as f64 {
-                sizes.retain(|(size, _)| *size <= below);
-                sizes.push((trial.granted, rates_at(samples, trial.granted, below)));
-            }
+            let sizes = observed(samples, working, trial);
             let (top, top_rates) = sizes.last().expect("the working size");
             if (*top as f64) * KNEE_RATIO <= below as f64 {
                 // Nothing observed above `below` yet.

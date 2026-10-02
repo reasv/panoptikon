@@ -926,6 +926,19 @@ fn a_comparison_takes_twelve_observations_a_side_or_a_clear_difference() {
     assert_eq!(faster(&[60.0, 140.0], &[244.0, 245.0], step, band), None);
 }
 
+/// Where a trial's sizes put the working size: the smallest not shown slower
+/// than the fastest by the band, never one that has no rate.
+#[test]
+fn a_size_with_no_rate_is_never_the_working_size() {
+    let band = KNEE_MAX_BUCKET_DISPERSION;
+    let sizes = |middle: Vec<f64>| vec![(64, vec![8.0; 3]), (128, middle), (256, vec![16.0; 3])];
+    for waited in [false, true] {
+        assert_eq!(placed(&sizes(vec![11.3]), 64, band, waited), Ok(256));
+        assert_eq!(placed(&sizes(vec![4.0, 30.0]), 64, band, waited), Ok(256));
+        assert_eq!(placed(&sizes(vec![15.0; 3]), 64, band, waited), Ok(128));
+    }
+}
+
 /// A rate that stops rising at the seed's size. The first trial runs one
 /// window at twice the size and one at half, and leaves the size in place;
 /// the next come after 12, 24, 48 … and then every 384 windows at it.
@@ -1349,10 +1362,13 @@ fn a_trial_ends_at_a_window_that_fails() {
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
         assert_eq!(aborted.grant().unit_budget, 256);
-        handle
-            .lock()
-            .unwrap()
-            .record_measurements(vec![warm_batch(256, 16.0); 2]);
+        handle.lock().unwrap().record_measurements(vec![
+            BatchMeasurement {
+                duration_ms: Some(256.0 * 1000.0 / 16.0),
+                ..measurement(256, 2660, 2660)
+            };
+            2
+        ]);
         aborted.finish(WindowOutcome::Aborted);
         assert_eq!(ledger.trial_for_test("g/a", GPU), (Some(256), 0, 0));
         let token = admission
