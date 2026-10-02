@@ -110,6 +110,13 @@ pub struct CalibrationProfile {
     pub knee_trials_failed: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub knee_retest_after: u32,
+    /// What a batch size trial had measured when its run ended, as parallel
+    /// arrays: a batch of `knee_rate_units[i]` units ran at `knee_rates[i]`
+    /// units a second. The next start goes on from them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub knee_rate_units: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub knee_rates: Vec<f64>,
     /// The fit sample ring as parallel arrays: `sample_units[i]` units
     /// allocated `sample_delta_mb[i]` MiB over `allocated_at_load`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -166,6 +173,8 @@ impl CalibrationProfile {
         self.local_samples = 0;
         self.knee_trials_failed = 0;
         self.knee_retest_after = 0;
+        self.knee_rate_units.clear();
+        self.knee_rates.clear();
         self.sample_units.clear();
         self.sample_delta_mb.clear();
     }
@@ -294,6 +303,9 @@ pub struct ProfileSeed {
     pub knee_units: Option<u64>,
     /// Zero unless `local`.
     pub knee_trials: TrialCadence,
+    /// An unfinished trial's observations, `(units, units/sec)`. Empty
+    /// unless `local`.
+    pub knee_rates: Vec<(u64, f64)>,
     /// True only for an entry from the local store.
     pub local: bool,
     /// Whether the fit fields came from a local entry; differs from `local`
@@ -331,6 +343,9 @@ pub struct ProfileUpdate {
     /// `None` leaves the stored working size as it is.
     pub knee_units: Option<u64>,
     pub knee_trials: TrialCadence,
+    /// An unfinished trial's observations, `(units, units/sec)`; replaces
+    /// the stored ones.
+    pub knee_rates: Vec<(u64, f64)>,
     pub max_units_measured: u64,
     pub local_samples: u32,
     pub ring: Vec<FitSample>,
@@ -645,6 +660,8 @@ impl CalibrationStore {
                 knee_units: update.knee_units,
                 knee_trials_failed: update.knee_trials.failed,
                 knee_retest_after: update.knee_trials.retest_after,
+                knee_rate_units: update.knee_rates.iter().map(|(units, _)| *units).collect(),
+                knee_rates: update.knee_rates.iter().map(|(_, rate)| *rate).collect(),
                 samples: update.samples.min(u32::MAX as usize) as u32,
                 residual_mb: update.residual_mb,
                 measured_at: now_rfc3339(),
@@ -865,6 +882,13 @@ impl CalibrationProfiles for CalibrationStore {
                 }
             } else {
                 TrialCadence::default()
+            },
+            knee_rates: if best.local {
+                let profile = &best.profile;
+                let rates = profile.knee_rates.iter().copied();
+                profile.knee_rate_units.iter().copied().zip(rates).collect()
+            } else {
+                Vec::new()
             },
             local: best.local,
             fit_is_local: donor.is_some_and(|donor| donor.local),
@@ -1207,6 +1231,7 @@ mod tests {
             samples: 38,
             knee_units: None,
             knee_trials: Default::default(),
+            knee_rates: Vec::new(),
             max_units_measured: 1024,
             local_samples: 12,
             ring: (1..=4).map(|k| sample(k * 8)).collect(),
@@ -2290,7 +2315,8 @@ sample_delta_mb = [80, 160]
 
     /// The working size is read back by the next run and, like the anchor,
     /// travels when the same file is imported as a shipped baseline. The wait
-    /// for the next trial is read back too, and stays local.
+    /// for the next trial and an unfinished trial's observations are read
+    /// back too, and stay local.
     #[test]
     fn the_working_size_round_trips_and_travels_into_a_baseline() {
         let root = tempfile::tempdir().unwrap();
@@ -2299,14 +2325,17 @@ sample_delta_mb = [80, 160]
             failed: 3,
             retest_after: 84,
         };
+        let knee_rates = vec![(15, 41.5), (30, 43.25), (15, 40.0)];
         store.record(ProfileUpdate {
             knee_units: Some(15),
             knee_trials,
+            knee_rates: knee_rates.clone(),
             ..update("clip/vit", "fp16", 0.79)
         });
         let seed = lookup(&store, "clip/vit").expect("the entry matches its own key");
         assert!(seed.local);
         assert_eq!((seed.knee_units, seed.knee_trials), (Some(15), knee_trials));
+        assert_eq!(seed.knee_rates, knee_rates);
 
         let mut profile = store.local_entries().remove(0);
         profile.strip_local_authority();
@@ -2315,6 +2344,15 @@ sample_delta_mb = [80, 160]
             (profile.knee_trials_failed, profile.knee_retest_after),
             (0, 0)
         );
+        assert!(profile.knee_rate_units.is_empty() && profile.knee_rates.is_empty());
+
+        // The next update replaces the trial's observations: none are left.
+        store.record(ProfileUpdate {
+            knee_units: Some(15),
+            ..update("clip/vit", "fp16", 0.79)
+        });
+        let seed = lookup(&store, "clip/vit").expect("still there");
+        assert!(seed.knee_rates.is_empty());
         assert_eq!(profile.max_units_measured, 1024, "the anchor travels too");
     }
 

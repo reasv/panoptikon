@@ -411,6 +411,7 @@ fn a_shape_ceiling_never_survives_a_restart() {
             samples: last.samples,
             knee_units: last.knee_units,
             knee_trials: last.knee_trials,
+            knee_rates: Vec::new(),
             local: true,
             fit_is_local: true,
             exact_torch: true,

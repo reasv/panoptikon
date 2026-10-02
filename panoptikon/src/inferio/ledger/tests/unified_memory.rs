@@ -1897,7 +1897,8 @@ fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
 /// At warning with nothing being paged out the replica keeps its working
 /// size: the trial of the next one is put off, and there is no growth and
 /// no throughput sample. A squeeze there is not kept once its cause is
-/// gone. The trial is taken up again after the pressure ends.
+/// gone. The trial is taken up again after the pressure ends, within two
+/// doublings of the working size.
 #[test]
 fn at_warning_without_paging_the_batch_size_is_held() {
     let (ledger, handle, admission) = ramped_mac_replica();
@@ -1938,7 +1939,7 @@ fn at_warning_without_paging_the_batch_size_is_held() {
         after[..RETEST_WINDOWS as usize],
         [64; RETEST_WINDOWS as usize]
     );
-    assert_eq!(after[RETEST_WINDOWS as usize..], [128, 256, 512]);
+    assert_eq!(after[RETEST_WINDOWS as usize..], [128, 256, 256]);
 }
 
 /// Pressure at either end of a window marks it: at the grant only, or at the

@@ -92,6 +92,7 @@ impl VramLedger {
             cal.anchor_measured_here = false;
         }
         if seed.local {
+            cal.unfinished = seed.knee_rates;
             for sample in seed.ring {
                 cal.samples.push_back(sample);
                 while cal.samples.len() > FIT_RING {
@@ -124,8 +125,9 @@ impl VramLedger {
         );
     }
 
-    /// The write policy, once per settled window: an update when the anchor
-    /// advanced, or the fit, the working size or the trial cadence changed.
+    /// The write policy, once per settled window and when the queue runs dry:
+    /// an update when the anchor advanced, or the fit, the working size, the
+    /// trial cadence or an unfinished trial's observations changed.
     /// Requires known `arch`, `torch`, `dtype` and `base_mb`, and
     /// `local_samples > 0`. The fit fields are empty until a local fit exists.
     pub(super) fn pending_update_locked(
@@ -184,12 +186,14 @@ impl VramLedger {
         let knee = cal.knee_units.filter(|_| cal.knee_is_local);
         let cadence = stored_cadence(cal);
         let anchor = persistable_anchor(cal);
+        let unfinished = std::mem::take(&mut cal.store_due);
         if before.is_some_and(|before| {
             before.fit_version == fit_version
                 && before.anchor >= anchor
                 && (knee.is_none() || before.knee == knee)
                 && before.cadence == cadence
-        }) {
+        }) && !unfinished
+        {
             return None;
         }
         // The persisted anchor only moves forward; halvings stay runtime-only.
@@ -205,6 +209,7 @@ impl VramLedger {
             Some(before) if before.fit_version != fit_version => "fit_changed",
             Some(before) if knee.is_some() && before.knee != knee => "knee_changed",
             Some(before) if before.cadence != cadence => "trial_cadence",
+            Some(before) if before.anchor >= anchor => "trial_unfinished",
             Some(_) => "anchor_advanced",
             None if fit_version > 0 => "fit_changed",
             None => "anchor_advanced",
@@ -237,6 +242,7 @@ impl VramLedger {
                 failed: cadence.0,
                 retest_after: cadence.1,
             },
+            knee_rates: cal.unfinished.clone(),
             max_units_measured,
             local_samples: cal.local_samples,
             ring: cal.samples.iter().copied().collect(),

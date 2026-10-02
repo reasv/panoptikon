@@ -2343,6 +2343,7 @@ metadata.cost.unit = "none"
             samples: 38,
             knee_units: Some(512),
             knee_trials: Default::default(),
+            knee_rates: Vec::new(),
             max_units_measured: 1024,
             local_samples: 12,
             ring: Vec::new(),

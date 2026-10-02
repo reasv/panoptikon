@@ -117,7 +117,10 @@ fn observed(samples: &[(u64, f64)], working: u64, trial: &Trial) -> Vec<(u64, Ve
     let mut sizes = ladder(samples, working, asked);
     if trial.granted < asked && trial.granted as f64 * SAME_SIZE_RATIO > below as f64 {
         sizes.retain(|(size, _)| *size <= below);
-        sizes.push((trial.granted, rates_at(samples, trial.granted, below)));
+        // A look-ahead memory cut is not measured.
+        if !trial.looks_ahead {
+            sizes.push((trial.granted, rates_at(samples, trial.granted, below)));
+        }
     }
     sizes
 }
@@ -223,16 +226,17 @@ fn fastest(sizes: &[(u64, Vec<f64>)], band: f64) -> Option<usize> {
 }
 
 /// Where the sizes a trial measured put the working size: the smallest size,
-/// from `working` up to the fastest of `sizes`, that is not shown slower
-/// than the fastest by the band. `working` itself is left only when it is
-/// clearly slower ([`clearly_faster`]). `Err` is the size to observe next,
-/// while a comparison is undecided and the trial has not `waited` its windows
-/// out.
+/// from `working` up to the fastest of `sizes`, that is not clearly slower
+/// than the fastest by the band ([`clearly_faster`]); `working` itself is
+/// left only on `confirm` observations a side. `Err` is the size to observe
+/// next, while a comparison is undecided on fewer than `enough` observations
+/// a side.
 pub(super) fn placed(
     sizes: &[(u64, Vec<f64>)],
     working: u64,
     band: f64,
-    waited: bool,
+    enough: usize,
+    confirm: usize,
 ) -> Result<u64, u64> {
     let Some((best, best_rates)) = fastest(sizes, band).map(|index| &sizes[index]) else {
         return Ok(working);
@@ -240,16 +244,14 @@ pub(super) fn placed(
     let best = *best;
     for (size, rates) in sizes.iter().filter(|(size, _)| *size < best) {
         let within = share(1.0 / KNEE_RATIO, *size, best);
-        let slower = if *size == working {
-            clearly_faster(rates, best_rates, within, band, CLEAR_ERRORS)
-        } else {
-            faster(rates, best_rates, within, band)
-        };
+        let observed = rates.len().min(best_rates.len());
+        let slower = clearly_faster(rates, best_rates, within, band, CLEAR_ERRORS)
+            .filter(|slower| !slower || *size != working || observed >= confirm);
         match slower {
             Some(true) => {}
             // A size with no rate cannot become the working size.
             None if *size != working && quiet_rate(rates, band).is_none() => {}
-            None if !waited => {
+            None if observed < enough => {
                 return Err(if rates.len() < best_rates.len() {
                     *size
                 } else {
@@ -279,6 +281,15 @@ impl VramLedger {
             None if cal.room_cut && cal.throughput.iter().any(ran) => working.saturating_mul(2),
             None => working,
         }
+    }
+
+    /// The working size, while a trial asks for its look-ahead: the doubling
+    /// past one that showed no gain. Memory that cannot grant it in full
+    /// grants the working size instead, and the look-ahead is not measured.
+    pub(super) fn look_ahead_from_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
+        let cal = cal_locked(state, entry)?;
+        let ahead = |trial: &Trial| trial.looks_ahead && trial.up == Some(trial.run);
+        cal.trial.filter(ahead).and(cal.knee_units)
     }
 
     /// [`admitted_units`] for [`Self::size_locked`] under the batch ceiling
@@ -370,13 +381,13 @@ impl VramLedger {
     /// measured gain".
     ///
     /// The working size is set by the first window that ran at its budget
-    /// with memory to spare. After `retest_after` windows at it a trial
-    /// measures the sizes next to it ([`Self::trial_step`]) and moves it to
-    /// the smallest size whose rate is within [`KNEE_RATIO`] of the best
-    /// measured. A trial that leaves it in place doubles the wait; one that
-    /// moves it resets the wait. Either way the size is then the stored
-    /// size. A window that `failed` ends a trial; one under memory pressure
-    /// puts it off.
+    /// with memory to spare, once past a cold start. After `retest_after`
+    /// windows at it a trial measures the sizes next to it
+    /// ([`Self::trial_step`]) and moves it to the smallest size whose rate
+    /// is within [`KNEE_RATIO`] of the best measured. A trial that leaves it
+    /// in place doubles the wait; one that moves it resets the wait. Either
+    /// way the size is then the stored size. A window that `failed` ends a
+    /// trial; one under memory pressure puts it off.
     pub(super) fn note_gain_locked(
         &self,
         state: &mut LedgerState,
@@ -390,13 +401,18 @@ impl VramLedger {
         };
         let band = self.budgets.for_gpu(&entry.gpu).knee_dispersion_in_force();
         let deflated = entry.deflation > 0;
+        // With a host-RAM side a cold replica works up to the size asked
+        // under the item cap and the ratchet.
+        let working_up = entry.has_ram_side()
+            && (charge.item_cap.is_some() || charge.unit_budget < charge.size_asked);
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let Some(cal) = state.calibration.get_mut(&key) else {
             return;
         };
         let Some(working) = cal.knee_units.filter(|units| *units > 0) else {
-            // A window memory cut is not the size this replica opens at.
-            if at_budget && !failed && !charge.squeezed && !charge.ram_bound {
+            // The size this replica opens at: not one memory cut, nor one
+            // on the way up from a cold start.
+            if at_budget && !failed && !charge.squeezed && !charge.ram_bound && !working_up {
                 cal.knee_units = Some(charge.unit_budget);
             }
             return;
@@ -418,7 +434,8 @@ impl VramLedger {
         if !at_budget {
             return;
         }
-        let samples = comparable(&cal.throughput);
+        let mut samples = comparable(&cal.throughput);
+        let starts = cal.trial.is_none();
         let mut trial = match cal.trial {
             Some(trial) => Trial {
                 windows: trial.windows + 1,
@@ -432,34 +449,23 @@ impl VramLedger {
                 cal.room_cut = false;
                 cal.failed_trials = 0;
                 cal.retest_after = 0;
-                Trial::start(working)
+                Trial::start(working, true)
             }
             None => {
                 let own = rates_at(&samples, working, working / 2);
                 if quiet_rate(&own, band).is_none() {
                     return;
                 }
-                // The working size's own rate moved: what the ring holds was
-                // measured on other inputs.
-                if own.len() >= 2 * CONFIRM_SAMPLES {
-                    let (old, new) = (&own[..CONFIRM_SAMPLES], &own[own.len() - CONFIRM_SAMPLES..]);
-                    let moved = |from, to| {
-                        clearly_faster(from, to, 1.0 / KNEE_RATIO, band, CLEAR_ERRORS) == Some(true)
-                    };
-                    if moved(old, new) || moved(new, old) {
-                        let stale = cal.throughput.len().saturating_sub(CONFIRM_SAMPLES);
-                        cal.throughput.drain(..stale);
-                        cal.failed_trials = 0;
-                        cal.retest_after = 0;
-                    }
-                }
                 cal.retest_after = cal.retest_after.saturating_sub(1);
                 if cal.retest_after > 0 {
                     return;
                 }
-                Trial::start(working)
+                Trial::start(working, !cal.knee_is_local)
             }
         };
+        if starts && Self::resume(cal, &samples, working, band) {
+            samples = comparable(&cal.throughput);
+        }
         trial.largest = trial.largest.max(charge.unit_budget);
         // This window asked for the size the trial is measuring.
         let asked_up = trial.up == Some(charge.size_asked);
@@ -490,6 +496,69 @@ impl VramLedger {
         }
     }
 
+    /// The queue ran dry with `worker` free: its run ended, or its caller fell
+    /// behind. A trial that is on goes on when work returns; what it has
+    /// measured is kept for the store, so that a restart goes on with it,
+    /// and the pool it grew is released, [`TRIM_DEBOUNCE`] apart at most.
+    /// Returns whether a trial is on.
+    pub(super) fn note_queue_dry_locked(state: &mut LedgerState, worker: WorkerId) -> bool {
+        let Some(entry) = state.workers.get(&worker) else {
+            return false;
+        };
+        let debounced = entry
+            .last_trim_at
+            .is_none_or(|at| at.elapsed() >= TRIM_DEBOUNCE);
+        let key = (entry.inference_id.clone(), entry.gpu.clone());
+        let Some(cal) = state.calibration.get_mut(&key) else {
+            return false;
+        };
+        let Some(trial) = cal.trial else {
+            return false;
+        };
+        let samples = comparable(&cal.throughput);
+        if cal.unfinished != samples {
+            cal.unfinished = samples;
+            cal.store_due = true;
+        }
+        let working = cal.knee_units.unwrap_or(0);
+        if debounced && trial.largest as f64 * SAME_SIZE_RATIO > working as f64 {
+            Self::flag_trial_trim_locked(state, worker);
+        }
+        true
+    }
+
+    /// Take a starting trial up where the last run's was when its queue ran
+    /// dry: put what that one had measured before `samples`, this run's.
+    /// Only if the working size has a rate again and that has not moved
+    /// since, the same inputs; otherwise the stored observations are
+    /// dropped. Returns whether the trial goes on from them.
+    fn resume(cal: &mut ModelCalibration, samples: &[(u64, f64)], working: u64, band: f64) -> bool {
+        if cal.unfinished.is_empty() {
+            return false;
+        }
+        let then = rates_at(&cal.unfinished, working, working / 2);
+        let now = rates_at(samples, working, working / 2);
+        let moved =
+            |from, to| clearly_faster(from, to, 1.0 / KNEE_RATIO, band, CLEAR_ERRORS) == Some(true);
+        if quiet_rate(&now, band).is_none() || moved(&then, &now) || moved(&now, &then) {
+            cal.unfinished.clear();
+            cal.store_due = true;
+            return false;
+        }
+        for (units, units_per_sec) in cal.unfinished.iter().rev() {
+            cal.throughput.push_front(ThroughputSample {
+                units: *units,
+                units_per_sec: *units_per_sec,
+                occupants: 0,
+                grew_pool: None,
+                warmup: false,
+            });
+        }
+        let over = cal.throughput.len().saturating_sub(KNEE_RING);
+        cal.throughput.drain(..over);
+        true
+    }
+
     /// Move the working size up to where the `sizes` a trial measured put it
     /// ([`placed`]). Returns the size to observe next when that is undecided.
     fn keep_earned(
@@ -498,10 +567,15 @@ impl VramLedger {
         trial: &mut Trial,
         sizes: &[(u64, Vec<f64>)],
         band: f64,
-        waited: bool,
+        enough: usize,
     ) -> Option<u64> {
         let working = cal.knee_units.unwrap_or(0);
-        let earned = match placed(sizes, working, band, waited) {
+        // A size a trial here placed is left on CONFIRM_SAMPLES a side.
+        let confirm = match trial.opening {
+            true => MIN_KNEE_BUCKET_SAMPLES,
+            false => CONFIRM_SAMPLES,
+        };
+        let earned = match placed(sizes, working, band, enough, confirm) {
             Ok(size) => size,
             Err(next) => return Some(next),
         };
@@ -526,16 +600,18 @@ impl VramLedger {
     /// Upward, the trial doubles the size while the last doubling was
     /// [`TRIAL_STEP`] faster and memory granted it in full, and once past a
     /// doubling that was not: the next has to be clearly faster, by that
-    /// step a doubling, than the last size that gained. After each gain, and
-    /// when the climb is over, the working size moves to the smallest size,
-    /// from itself up to the fastest measured, that is not shown slower than
-    /// the fastest by the band ([`placed`]). If it has not moved, the trial
-    /// turns to half the working size, and moves there while that is clearly
-    /// within the band of the fastest ([`HOLD_ERRORS`]).
+    /// step a doubling, than the last size that gained; memory that cuts
+    /// that one ends the climb. It stays within two doublings of the working
+    /// size. After each gain, and when the climb is over, the working size
+    /// moves to the smallest size, from itself up to the fastest measured,
+    /// that is not clearly slower than the fastest by the band ([`placed`]).
+    /// If it has not moved, the trial turns to half the working size, and
+    /// moves there while that is clearly within the band of the fastest
+    /// ([`HOLD_ERRORS`]).
     ///
     /// A comparison the observations cannot decide sends the next window to
-    /// the side with fewer of them; after [`TRIAL_WINDOWS`] windows without
-    /// a verdict it counts as not shown.
+    /// the side with fewer of them; on [`TRIAL_SAMPLES`] a side, or after
+    /// [`TRIAL_WINDOWS`] windows without a verdict, it counts as not shown.
     fn trial_step(
         cal: &mut ModelCalibration,
         key: &(String, String),
@@ -547,7 +623,12 @@ impl VramLedger {
         let Some(mut working) = cal.knee_units else {
             return Step::Over;
         };
-        let mut waited = trial.windows >= TRIAL_WINDOWS;
+        // The observations a side from which an undecided comparison counts
+        // as not shown: any, once its windows are out.
+        let mut enough = match trial.windows >= TRIAL_WINDOWS {
+            true => 0,
+            false => TRIAL_SAMPLES,
+        };
         while let Some(asked) = trial.up {
             let under = asked / 2;
             // The size `asked` has to gain on: the last that gained.
@@ -556,10 +637,13 @@ impl VramLedger {
             let mut blocked = false;
             let sizes = observed(samples, working, trial);
             let (top, top_rates) = sizes.last().expect("the working size");
-            let gains = if (*top as f64) * SAME_SIZE_RATIO <= under as f64 {
+            let gains = if trial.looks_ahead && trial.granted < asked {
+                // Memory cut the look-ahead: the climb is over.
+                Some(false)
+            } else if (*top as f64) * SAME_SIZE_RATIO <= under as f64 {
                 // Nothing observed above `under` yet.
                 let cut = asked_up && trial.granted as f64 * SAME_SIZE_RATIO <= under as f64;
-                if !cut && !waited {
+                if !cut && enough > 0 {
                     return Step::Run(asked);
                 }
                 blocked = cut;
@@ -578,7 +662,7 @@ impl VramLedger {
                     faster(&lower_rates, top_rates, step, band)
                 };
                 match verdict {
-                    None if !waited => {
+                    None if lower_rates.len().min(top_rates.len()) < enough => {
                         return Step::Run(if lower_rates.len() < top_rates.len() {
                             gained
                         } else {
@@ -588,28 +672,30 @@ impl VramLedger {
                     verdict => verdict,
                 }
             };
+            if gains == Some(true) {
+                // What is measured so far may place the working size higher
+                // already.
+                Self::keep_earned(cal, key, trial, &sizes, band, 0);
+                working = cal.knee_units.unwrap_or(working);
+            }
             // The next doubling: after a gain, and once past a doubling that
-            // was shown to have none.
+            // was shown to have none; never past two doublings above the
+            // working size.
             if let Some(gains) = gains
                 && trial.granted >= asked
                 && (gains || !trial.looks_ahead)
+                && asked / 2 <= working
             {
-                if gains {
-                    // What is measured so far may place the working size
-                    // higher already.
-                    Self::keep_earned(cal, key, trial, &sizes, band, true);
-                    working = cal.knee_units.unwrap_or(working);
-                }
                 trial.looks_ahead = !gains;
                 trial.up = Some(asked.saturating_mul(2));
                 trial.granted = u64::MAX;
                 asked_up = false;
                 trial.windows = 0;
-                waited = false;
+                enough = TRIAL_SAMPLES;
                 continue;
             }
             // The climb is over: place the working size.
-            if let Some(size) = Self::keep_earned(cal, key, trial, &sizes, band, waited) {
+            if let Some(size) = Self::keep_earned(cal, key, trial, &sizes, band, enough) {
                 return Step::Run(size);
             }
             cal.room_cut = blocked && cal.knee_units == Some(under);
@@ -622,7 +708,7 @@ impl VramLedger {
             };
             trial.up = None;
             trial.windows = 0;
-            waited = false;
+            enough = TRIAL_SAMPLES;
         }
         loop {
             let smaller = working / 2;
@@ -657,9 +743,9 @@ impl VramLedger {
                     cal.room_cut = false;
                     trial.moved = true;
                     trial.windows = 0;
-                    waited = false;
+                    enough = TRIAL_SAMPLES;
                 }
-                None if !waited => {
+                None if smaller_rates.len().min(best_rates.len()) < enough => {
                     return Step::Run(if smaller_rates.len() <= best_rates.len() {
                         smaller
                     } else {
@@ -692,9 +778,12 @@ impl VramLedger {
             cal.failed_trials = cal.failed_trials.saturating_add(1);
             cal.knee_is_local |= over == Over::Judged;
         }
-        // The next trial measures the sizes next to the working size afresh.
+        // The next trial measures the sizes next to the working size afresh,
+        // and a restart has nothing to go on with.
         cal.throughput
             .retain(|sample| is_size(sample.units, working, working / 2));
+        cal.store_due |= !cal.unfinished.is_empty();
+        cal.unfinished.clear();
         tracing::info!(
             model = %key.0,
             gpu = %key.1,

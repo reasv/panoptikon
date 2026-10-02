@@ -655,10 +655,23 @@ pub(crate) async fn run_dispatcher(
             let inference_id = ctx.inference_id.clone();
             in_flight.spawn(async move { run_batch(&inference_id, replica, window, plan).await });
         }
-        // An idle model stops counting as hungry to its neighbours.
-        for replica in &free {
-            if let Some(admission) = &replica.admission {
+        // An idle model stops counting as hungry to its neighbours, and a
+        // batch size trial does not keep its pool through an empty queue.
+        let mut index = 0;
+        while index < free.len() {
+            let trim = free[index].admission.as_ref().is_some_and(|admission| {
                 admission.note_demand(queue.len());
+                admission.take_trial_trim()
+            });
+            if trim {
+                let replica = free.swap_remove(index);
+                ctx.stats.replicas_free.store(free.len(), Relaxed);
+                let inference_id = ctx.inference_id.clone();
+                in_flight.spawn(async move {
+                    run_trim(&inference_id, TRIM_TRIGGER_TRIAL, replica).await
+                });
+            } else {
+                index += 1;
             }
         }
 
@@ -2350,6 +2363,45 @@ mod tests {
             "taken at the first window's return"
         );
         assert_eq!(harness.stats.total_batches.load(Relaxed), 2);
+        harness.shutdown().await;
+    }
+
+    /// A release that comes due with the queue empty, a run that ended
+    /// inside a batch size trial, runs on the free replica, which keeps
+    /// serving.
+    #[tokio::test]
+    async fn a_trial_trim_due_on_an_empty_queue_runs_on_the_free_replica() {
+        let harness = one_replica(32_768, "echo_test", item_cost(4)).await;
+        harness
+            .ledger
+            .trial_trim_for_test(harness.worker_id, Some(true));
+        // Any message wakes the dispatcher; this one is for no replica.
+        harness
+            .tx
+            .send(DispatchMsg::Trim {
+                worker: harness.worker_id.wrapping_add(9999),
+                trigger: "idle",
+            })
+            .expect("queued");
+        let trimmed = async {
+            while harness
+                .ledger
+                .last_trim_for_test(harness.worker_id)
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        timeout(Duration::from_secs(30), trimmed)
+            .await
+            .expect("the free replica was trimmed");
+        let input = WorkerInput {
+            data: Some(json!("after")),
+            file: None,
+        };
+        let outputs = harness.predict(vec![input], None).await.expect("served");
+        assert_eq!(outputs[0], WorkerOutput::Json(json!({"echo": "after"})));
+        assert_eq!(harness.stats.total_batches.load(Relaxed), 1);
         harness.shutdown().await;
     }
 

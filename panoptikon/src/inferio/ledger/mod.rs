@@ -193,7 +193,8 @@ pub const KNEE_WARMUP_BATCHES: u64 = WINDOW_DEPTH_MULTIPLIER;
 
 /// Observations of each of two batch sizes with which their median rates
 /// are compared as they stand. With fewer, only a difference of more than
-/// [`CLEAR_ERRORS`] standard errors decides.
+/// [`CLEAR_ERRORS`] standard errors decides. Also the observations a side
+/// with which a working size a trial here placed is left for a larger one.
 pub const CONFIRM_SAMPLES: usize = 12;
 
 /// Standard errors of the difference between two sizes' rates that decide a
@@ -202,15 +203,19 @@ pub const CLEAR_ERRORS: f64 = 4.0;
 
 /// Standard errors by which a smaller size must be inside the band, on
 /// [`CONFIRM_SAMPLES`] observations a side, for the working size to move
-/// down to it. A move up takes [`CLEAR_ERRORS`] whatever the count, so a
-/// size at the band's edge is not left and returned to as the observations
-/// scatter. Also the gain that carries a trial on past a doubling without
-/// one.
+/// down to it. A move up takes [`CLEAR_ERRORS`], so a size at the band's
+/// edge is not left and returned to as the observations scatter. Also the
+/// gain that carries a trial on past a doubling without one.
 pub const HOLD_ERRORS: f64 = 1.0;
 
 /// The gain of one doubling for which a trial goes on to the next: below
 /// it the rate has stopped rising.
 pub const TRIAL_STEP: f64 = 1.015;
+
+/// Observations of each of two batch sizes with which a comparison that is
+/// still undecided counts as not shown. They may come from more than one
+/// run: a run that ends inside a trial stores them.
+pub const TRIAL_SAMPLES: usize = 4 * CONFIRM_SAMPLES;
 
 /// Windows a trial may run without a verdict before the comparison counts as
 /// not shown: one observation a window on each side reaches
@@ -472,10 +477,10 @@ impl ThroughputSample {
     }
 
     /// What its rate depends on besides the batch size: whether another
-    /// replica ran beside it, and what the batch did to the pool. Only
+    /// replica ran beside it, and whether the batch grew the pool. Only
     /// observations with the same conditions are compared.
-    fn conditions(&self) -> (bool, Option<bool>) {
-        (self.occupants > 0, self.grew_pool)
+    fn conditions(&self) -> (bool, bool) {
+        (self.occupants > 0, self.grew_pool == Some(true))
     }
 }
 
@@ -503,11 +508,14 @@ struct Trial {
     /// The fastest size measured and the size below it, once the trial has
     /// turned to the smaller size.
     best: (u64, u64),
+    /// It started from a size no trial here had placed, or one memory had
+    /// held the replica at: a clear difference moves it, on any count.
+    opening: bool,
 }
 
 impl Trial {
     /// A trial of twice `working`.
-    fn start(working: u64) -> Self {
+    fn start(working: u64, opening: bool) -> Self {
         Self {
             up: Some(working.saturating_mul(2)),
             run: working.saturating_mul(2),
@@ -517,6 +525,7 @@ impl Trial {
             largest: working,
             looks_ahead: false,
             best: (working, working / 2),
+            opening,
         }
     }
 }
@@ -1177,6 +1186,11 @@ struct ModelCalibration {
     retest_after: u32,
     /// Trials in a row that left the working size in place.
     failed_trials: u32,
+    /// What a trial the queue ran dry in had measured, as `(units,
+    /// units/sec)`: what the store holds for a restart to go on with.
+    unfinished: Vec<(u64, f64)>,
+    /// `unfinished` changed since the store was last told.
+    store_due: bool,
     /// Memory granted the last trial nothing above the working size: the
     /// replica keeps asking for twice that size, and the first window
     /// granted a larger one starts a trial. Seeded for a stored working

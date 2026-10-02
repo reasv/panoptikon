@@ -316,6 +316,7 @@ fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
                 samples: 0,
                 knee_units: None,
                 knee_trials: Default::default(),
+                knee_rates: Vec::new(),
                 local: true,
                 fit_is_local: false,
                 exact_torch: true,

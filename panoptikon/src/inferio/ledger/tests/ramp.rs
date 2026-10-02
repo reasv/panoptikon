@@ -966,17 +966,21 @@ fn a_comparison_takes_twelve_observations_a_side_or_a_clear_difference() {
     assert_eq!(faster(&[60.0, 140.0], &[244.0, 245.0], step, band), None);
 }
 
-/// Where a trial's sizes put the working size: the smallest not shown slower
-/// than the fastest by the band, never one that has no rate.
+/// Where a trial's sizes put the working size: the smallest not clearly
+/// slower than the fastest by the band, never one that has no rate. A size
+/// a trial placed is left only on twelve observations a side.
 #[test]
 fn a_size_with_no_rate_is_never_the_working_size() {
     let band = KNEE_MAX_BUCKET_DISPERSION;
     let sizes = |middle: Vec<f64>| vec![(64, vec![8.0; 3]), (128, middle), (256, vec![16.0; 3])];
-    for waited in [false, true] {
-        assert_eq!(placed(&sizes(vec![11.3]), 64, band, waited), Ok(256));
-        assert_eq!(placed(&sizes(vec![4.0, 30.0]), 64, band, waited), Ok(256));
-        assert_eq!(placed(&sizes(vec![15.5; 3]), 64, band, waited), Ok(128));
+    for enough in [usize::MAX, 0] {
+        let placed = |middle, confirm| placed(&sizes(middle), 64, band, enough, confirm);
+        assert_eq!(placed(vec![11.3], MIN_KNEE_BUCKET_SAMPLES), Ok(256));
+        assert_eq!(placed(vec![4.0, 30.0], MIN_KNEE_BUCKET_SAMPLES), Ok(256));
+        assert_eq!(placed(vec![15.5; 3], MIN_KNEE_BUCKET_SAMPLES), Ok(128));
     }
+    let placed = |enough| placed(&sizes(vec![15.5; 3]), 64, band, enough, CONFIRM_SAMPLES);
+    assert_eq!((placed(usize::MAX), placed(0)), (Err(256), Ok(64)));
 }
 
 /// A rate that stops rising at the seed's size. The first trial runs one
@@ -1037,15 +1041,15 @@ fn the_working_size_is_the_smallest_within_the_band_of_the_best() {
             &[64, 64, 128, 191, 32],
             64,
         ),
-        // Flat from 8 units: 128 does not gain, nor does the room one
-        // doubling past it, and the size steps down to 8.
+        // Flat from 8 units: 128 does not gain, the 256 one doubling past
+        // it do not fit and are not run, and the size steps down to 8.
         (
             |units| units.min(8) as f64,
-            &[64, 64, 128, 191, 32, 16, 8, 4],
+            &[64, 64, 128, 64, 32, 16, 8, 4],
             8,
         ),
         // Flat: down to one unit.
-        (|_| 22.0, &[64, 64, 128, 191, 32, 16, 8, 4, 2, 1], 1),
+        (|_| 22.0, &[64, 64, 128, 64, 32, 16, 8, 4, 2, 1], 1),
         // Rising to 128 and flat above.
         (|units| units.min(128) as f64, &[64, 64, 128, 191], 128),
     ];
@@ -1268,40 +1272,33 @@ fn a_noisy_rate_does_not_walk() {
     }
 }
 
-/// A working size whose own rate moves by more than the band (the inputs
-/// changed) is tried again at once, and the cadence starts over: here the
-/// rate halves at window 200, where the next trial was due at window 389.
-/// A rate that moves by 3 %, inside the band, changes nothing.
+/// A working size whose own rate moves, here to half at window 200, is not
+/// tried again for that: the next trial comes when its wait is over.
 #[test]
-fn a_working_size_whose_rate_moved_is_tried_again_at_once() {
-    let run = |moved: f64| {
-        let (ledger, handle, admission) = ramping_from_seed(64);
-        let budgets: Vec<u64> = (0..210)
-            .map(|window| {
-                let rate = move |units: u64| match window >= 200 {
-                    true => flat_from_64(units) * moved,
-                    false => flat_from_64(units),
-                };
-                window_leaving_warm(&handle, &admission, |_| 2, rate)
-            })
-            .collect();
-        (budgets, ledger.trial_for_test("g/a", GPU))
-    };
-    let (budgets, trial) = run(0.5);
-    assert_eq!(budgets[200..], [64, 64, 64, 64, 128, 256, 32, 64, 64, 64]);
-    assert_eq!(trial, (None, RETEST_WINDOWS - 3, 1));
-    let (budgets, trial) = run(0.97);
+fn a_rate_that_moves_at_the_working_size_leaves_the_wait_alone() {
+    let (ledger, handle, admission) = ramping_from_seed(64);
+    let budgets: Vec<u64> = (0..210)
+        .map(|window| {
+            let rate = move |units: u64| match window >= 200 {
+                true => flat_from_64(units) * 0.5,
+                false => flat_from_64(units),
+            };
+            window_leaving_warm(&handle, &admission, |_| 2, rate)
+        })
+        .collect();
     assert_eq!(budgets[200..], [64; 10]);
-    assert_eq!(trial, (None, 192 - 13, 5));
+    assert_eq!(ledger.trial_for_test("g/a", GPU), (None, 192 - 13, 5));
 }
 
 /// A rate that starts to rise above the working size while the size's own
 /// rate stays put is found by the next trial on the cadence: rising from
-/// window 20, found by the trial at window 44.
+/// window 20, found by the trial at window 44. A size a trial left in place
+/// is left for a larger one on twelve observations a side: 256 units run
+/// until they have them, and the trial goes on from there.
 #[test]
 fn a_rate_that_starts_to_rise_later_is_found_by_the_next_trial() {
     let (ledger, handle, admission) = ramping_from_seed(64);
-    let budgets: Vec<u64> = (0..56)
+    let budgets: Vec<u64> = (0..90)
         .map(|window| {
             let rate = move |units: u64| match window >= 20 && units > 64 {
                 true => (units as f64).sqrt(),
@@ -1310,7 +1307,8 @@ fn a_rate_that_starts_to_rise_later_is_found_by_the_next_trial() {
             window_leaving_warm(&handle, &admission, |_| 2, rate)
         })
         .collect();
-    assert_eq!(budgets[44..48], [128, 256, 512, 1024]);
+    assert_eq!(budgets[44..47], [128, 256, 256]);
+    assert_eq!(budgets[50..53], [256, 512, 1024]);
     // A trial that moved the size resets the cadence: the next one that
     // leaves it in place waits 12 windows, not 48.
     assert_eq!(ledger.health()[0].workers[0].knee_units, Some(19090));
@@ -1576,7 +1574,7 @@ fn local_store(root: &std::path::Path) -> Arc<CalibrationStore> {
 }
 
 /// One process start over `store`: `windows` windows of a replica seeded 64
-/// at `rate`. Returns their budgets.
+/// at `rate`, and the queue running dry after them. Returns their budgets.
 fn process_start(store: &Arc<CalibrationStore>, windows: usize, rate: Rate) -> Vec<u64> {
     let ledger = VramLedger::for_test_with(
         &[(GPU, "TEST 9000", 200_000)],
@@ -1588,9 +1586,63 @@ fn process_start(store: &Arc<CalibrationStore>, windows: usize, rate: Rate) -> V
         .register_worker("g/a", item_cost(64), &handle, None)
         .expect("registers");
     push_memory(&handle, 190_000, 1000);
-    (0..windows)
+    let budgets = (0..windows)
         .map(|_| window_leaving_warm(&handle, &admission, |_| 2, rate))
-        .collect()
+        .collect();
+    // The run is over: the queue is dry.
+    admission.note_demand(0);
+    budgets
+}
+
+/// A rate 5 % higher from 128 units up, a fifth lower under 64, each
+/// observation 0.9, 1.0 or 1.1 times it in turn: 128 units are told from 64
+/// by twelve observations a side, and never clearly.
+fn scattered(units: u64) -> f64 {
+    thread_local!(static SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+    let turn = SEEN.with(|seen| seen.replace(seen.get() + 1) % 3);
+    let rate = match units {
+        0..=63 => 0.8,
+        64..=127 => 1.0,
+        _ => 1.05,
+    };
+    rate * (0.9 + 0.1 * f64::from(turn))
+}
+
+/// A run that ends inside a trial: the queue runs dry. What the trial had
+/// measured is stored, and the next start goes on with it: three more
+/// windows at 128 units, not six. The comparison of 64 units with the
+/// fastest size stays undecided until it has [`TRIAL_SAMPLES`] a side, in
+/// the sixth start; then half the size runs once, the size is left in place
+/// and stored with the trial that left it there.
+#[test]
+fn a_trial_is_carried_over_the_end_of_a_run_until_it_has_its_observations() {
+    let root = tempfile::tempdir().unwrap();
+    let store = local_store(root.path());
+    let row = || store.lookup(&item_query("g/a")).expect("stored");
+    let start = |windows| process_start(&store, windows, scattered);
+    assert_eq!(start(6), [64, 64, 128, 128, 64, 128]);
+    assert_eq!(row().knee_units, None);
+    assert!(!row().knee_rates.is_empty());
+
+    let budgets = start(12);
+    assert_eq!(first_reached(&budgets)[1..], [(128, 3), (256, 9)]);
+    let mut starts = 2;
+    let mut budgets = Vec::new();
+    while row().knee_units.is_none() {
+        assert!(!row().knee_rates.is_empty());
+        budgets = start(12);
+        starts += 1;
+    }
+    assert_eq!(starts, 6);
+    assert_eq!(budgets[4..], [256, 64, 32, 64, 64, 64, 64, 64]);
+    assert_eq!(
+        (
+            row().knee_units,
+            row().knee_trials.failed,
+            row().knee_rates.len()
+        ),
+        (Some(64), 1, 0)
+    );
 }
 
 /// Process starts over one store. The first start's trial leaves 64 units
@@ -1635,9 +1687,11 @@ fn a_stored_size_that_is_too_large_steps_down() {
         [256, 512, 256, 1024, 128, 64, 32]
     );
     assert_eq!(stored(), Some(32), "stored while the trial goes on");
+    // The start goes on from what the last had measured: 64 and 128 units
+    // are not run again.
     assert_eq!(
         process_start(&store, 11, flat),
-        [32, 32, 64, 128, 16, 8, 4, 2, 1, 1, 1]
+        [32, 32, 16, 8, 4, 2, 1, 1, 1, 1, 1]
     );
     assert_eq!(stored(), Some(1));
 }
@@ -1669,6 +1723,31 @@ fn a_trial_that_ran_a_larger_size_asks_the_pool_back() {
         assert!(!admission.take_trial_trim());
         assert!(ledger.take_pending_trims().is_empty());
     }
+}
+
+/// A queue that runs dry inside a trial that ran a larger size asks the pool
+/// back as the end of a trial does, and the trial is still on for when work
+/// returns. Not within [`TRIM_DEBOUNCE`] of a release, nor while work is
+/// queued.
+#[test]
+fn a_queue_that_runs_dry_inside_a_trial_asks_the_pool_back() {
+    let (ledger, handle, admission) = ramping_from_seed(64);
+    push_memory(&handle, 190_000, 1_000);
+    let budgets: Vec<u64> = (0..3)
+        .map(|_| window_leaving_warm(&handle, &admission, |_| 2, flat_from_64))
+        .collect();
+    assert_eq!(budgets, [64, 64, 128]);
+    let trial = ledger.trial_for_test("g/a", GPU);
+    assert_eq!(trial.0, Some(256));
+    admission.note_demand(5);
+    assert!(!admission.take_trial_trim());
+    admission.note_demand(0);
+    assert!(admission.take_trial_trim());
+    assert_eq!(ledger.trial_for_test("g/a", GPU), trial);
+
+    admission.note_trim_declined();
+    admission.note_demand(0);
+    assert!(!admission.take_trial_trim(), "a release just answered");
 }
 
 /// A window of three batches at ten units a second, out for its batches'
@@ -1772,11 +1851,11 @@ fn a_trial_looks_one_doubling_past_one_that_does_not_gain() {
             &[64, 64, 128, 256, 32, 64],
             64,
         ),
-        // 4 % is over it, and inside the band: the trial goes on, the size
-        // stays.
+        // 4 % is over it, and inside the band: the size stays, and the
+        // trial within two doublings of it.
         (
             |units| [5.0, 10.0, 10.4][usize::from(units >= 64) + usize::from(units >= 256)],
-            &[64, 64, 128, 256, 512, 1024, 32, 64],
+            &[64, 64, 128, 256, 32, 64],
             64,
         ),
     ];
@@ -1791,11 +1870,11 @@ fn a_trial_looks_one_doubling_past_one_that_does_not_gain() {
 }
 
 /// The working size is left only on a clear difference. Up: a larger size
-/// 7 % faster on twelve scattered observations a side does not move it,
-/// though the same medians place a size the replica is not at. Down: half
-/// the size, 4 % slower on scattered observations, is inside the band by
-/// the medians and the size stays; as fast, it is clearly inside and the
-/// size moves.
+/// 7 % faster on twelve scattered observations a side does not move it, nor
+/// is a size the replica is not at passed over on those. Down: half the
+/// size, 4 % slower on scattered observations, is inside the band by the
+/// medians and the size stays; as fast, it is clearly inside and the size
+/// moves.
 #[test]
 fn the_working_size_is_left_only_on_a_clear_difference() {
     let band = KNEE_MAX_BUCKET_DISPERSION;
@@ -1809,11 +1888,14 @@ fn the_working_size_is_left_only_on_a_clear_difference() {
         (64, scattered(100.0)),
         (128, scattered(107.0)),
     ];
-    assert_eq!(placed(&sizes[1..], 64, band, true), Ok(64));
-    assert_eq!(placed(&sizes[1..], 64, band, false), Err(128));
-    assert_eq!(placed(&sizes, 32, band, true), Ok(128));
+    assert_eq!(placed(&sizes[1..], 64, band, 0, CONFIRM_SAMPLES), Ok(64));
+    assert_eq!(
+        placed(&sizes[1..], 64, band, usize::MAX, CONFIRM_SAMPLES),
+        Err(128)
+    );
+    assert_eq!(placed(&sizes, 32, band, 0, CONFIRM_SAMPLES), Ok(64));
     let quiet = [(64, vec![100.0; 12]), (128, vec![107.0; 12])];
-    assert_eq!(placed(&quiet, 64, band, true), Ok(128));
+    assert_eq!(placed(&quiet, 64, band, 0, CONFIRM_SAMPLES), Ok(128));
 
     for (half, settled) in [(0.96, 64), (1.0, 32)] {
         let (ledger, handle, admission) = ramping_from_seed(64);
@@ -1932,7 +2014,9 @@ fn a_step_down_starts_the_wait_over() {
 
 /// Each doubling of a trial has [`TRIAL_WINDOWS`] windows of its own. With
 /// one observation a window, scattered so that only twelve a side decide,
-/// the first doubling takes 23 windows and the second 13.
+/// the first doubling takes 23 windows and the second, which has no rate to
+/// wait for at the working size, 14. The trial stays within two doublings
+/// of the working size and turns to comparing 256 units with it.
 #[test]
 fn each_doubling_has_its_own_windows_to_be_decided_in() {
     let seen = std::cell::RefCell::new(std::collections::HashMap::<u64, u32>::new());
@@ -1945,10 +2029,9 @@ fn each_doubling_has_its_own_windows_to_be_decided_in() {
         (units as f64).powf(0.0704) * (0.9 + 0.2 * f64::from(*count % 12) / 11.0)
     };
     let (budgets, _) = one_batch_windows(60_000, 45, a_batch_and_a_half, rate, Pool::Kept);
-    assert_eq!(
-        first_reached(&budgets)[1..],
-        [(128, 5), (256, 28), (512, 41)]
-    );
+    assert_eq!(first_reached(&budgets)[1..], [(128, 5), (256, 28)]);
+    assert_eq!(budgets[27..41], [256; 14]);
+    assert_eq!(budgets[41], 64);
 }
 
 /// Batches of whole 3-unit items fill a budget of 64 units with 63, and the
@@ -2003,8 +2086,9 @@ fn a_blocked_step_is_asked_for_again_until_it_fails_or_is_granted() {
         (None, RETEST_WINDOWS - 2, 1)
     );
     assert!(!replica.admission.take_trial_trim());
-    // The room returns: a trial at once, and its count starts over.
-    assert_eq!(run(&mut replica, fits_191, 4), [128, 191, 32, 64]);
+    // The room returns: a trial at once, and its count starts over. The
+    // 256 past the 128 that gained nothing do not fit and are not run.
+    assert_eq!(run(&mut replica, fits_191, 4), [128, 64, 32, 64]);
     assert_eq!(
         replica.ledger.trial_for_test("g/a", GPU),
         (None, RETEST_WINDOWS - 1, 1)
@@ -2034,6 +2118,6 @@ fn a_blocked_step_is_asked_for_again_until_it_fails_or_is_granted() {
     let mut replica = OneBatch::on_a_card_of(fits_191);
     assert_eq!(
         run(&mut replica, fits_130, 8),
-        [64, 64, 128, 130, 32, 64, 64, 64]
+        [64, 64, 128, 64, 32, 64, 64, 64]
     );
 }

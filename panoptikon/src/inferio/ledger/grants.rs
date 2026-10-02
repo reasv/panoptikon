@@ -181,6 +181,17 @@ impl VramLedger {
                     mb = price.cost_mb(units);
                 }
             }
+            // A trial's look-ahead is run in full or not at all.
+            if units < wanted
+                && (squeezed || ram_bound)
+                && let Some(working) = Self::look_ahead_from_locked(&state, entry)
+                && working < units
+            {
+                units = working;
+                if let Some(price) = price {
+                    mb = price.cost_mb(units);
+                }
+            }
             let ram_cost = ram.and_then(|ram| ram.cost);
             let ram_mb = ram_cost.map_or(0, |cost| cost.booking_mb(units));
             let ram_mb_per_unit = ram_cost.map(|cost| cost.mb_per_unit);

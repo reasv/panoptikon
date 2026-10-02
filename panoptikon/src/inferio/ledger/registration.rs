@@ -982,11 +982,23 @@ impl Admission {
         self.ledger.fit_to_send(self.worker)
     }
 
-    /// Update the demand signal (0 when the queue drains).
+    /// Update the demand signal of this replica, which is free: 0 when the
+    /// queue drained, which a batch size trial is told
+    /// ([`VramLedger::note_queue_dry_locked`]).
     pub fn note_demand(&self, pending: usize) {
-        let mut state = self.ledger.lock();
-        if let Some(entry) = state.workers.get_mut(&self.worker) {
-            entry.pending_requests = pending;
+        let update = {
+            let mut state = self.ledger.lock();
+            if let Some(entry) = state.workers.get_mut(&self.worker) {
+                entry.pending_requests = pending;
+            }
+            let dry = pending == 0 && VramLedger::note_queue_dry_locked(&mut state, self.worker);
+            let stored = dry && self.ledger.profiles.is_some();
+            stored
+                .then(|| VramLedger::pending_update_locked(&mut state, self.worker))
+                .flatten()
+        };
+        if let (Some(update), Some(profiles)) = (update, self.ledger.profiles.as_ref()) {
+            profiles.record(update);
         }
     }
 }
