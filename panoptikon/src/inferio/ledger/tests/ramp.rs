@@ -1110,20 +1110,24 @@ fn a_cut_size_is_the_fastest_by_its_own_batches() {
 
 /// A look-ahead that does not fit is not run and not asked for again: the
 /// trial goes on comparing the sizes it did run. On a card for 191 units a
-/// rate that is the same at every size, read through scatter, leaves 128
-/// units undecided against 64 after the look-ahead, and they run in turn.
+/// rate that is the same at every size, read through the same scatter at
+/// each, shows no gain at 128 units on twelve observations a side; the 256
+/// past them are asked for once and run as 64; then 128 units, not clearly
+/// within the band of 64, run in turn with them.
 #[test]
 fn a_look_ahead_that_does_not_fit_is_not_asked_for_again() {
     let fits_191 = 191 * OneBatch::PER_UNIT_MB;
-    let batches = std::cell::Cell::new(0u32);
-    let rate = |_| {
-        batches.set(batches.get() + 1);
-        10.0 * (0.9 + 0.1 * f64::from(batches.get() % 3))
+    let seen = std::cell::RefCell::new(std::collections::HashMap::<u64, u32>::new());
+    let rate = |units: u64| {
+        let mut seen = seen.borrow_mut();
+        let count = seen.entry(units).or_insert(0);
+        *count += 1;
+        10.0 * (0.9 + 0.1 * f64::from(*count % 3))
     };
-    let (budgets, kept) = one_batch_windows(fits_191, 30, |capped| capped * 3, rate, Pool::Kept);
+    let (budgets, kept) = one_batch_windows(fits_191, 16, |capped| capped * 3, rate, Pool::Kept);
     assert_eq!(budgets[..3], [64, 64, 128]);
-    // The window that asked for 256 units ran 64; no second one follows it.
-    assert!(budgets[2..].windows(2).all(|pair| pair != [64, 64]));
+    // The eleventh window asked for 256 units and ran 64.
+    assert_eq!(budgets[9..], [128, 64, 128, 128, 128, 128, 64]);
     assert_eq!(kept, Some(64));
 }
 
