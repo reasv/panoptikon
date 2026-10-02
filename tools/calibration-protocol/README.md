@@ -829,7 +829,7 @@ that ramps at all leaves it far behind (an S2 leg: 8 → 1024).
 
 **A working size a trial left in place is not a stall.** The seed is a
 starting guess, not a floor: the batch size is the smallest whose rate is
-within 10 % of the best a trial measured, so a model that gains nothing from
+within 5 % of the best a trial measured, so a model that gains nothing from
 larger batches ends *under* its seed on purpose and stays there, trying the
 sizes next to it every so often. A model whose `knee_units` `/health` marks
 `knee_is_local` is therefore never counted as "never left the seed"; the
@@ -839,8 +839,8 @@ withholds its `REQUEST_UNIT_BUDGET` note for the same models.
 
 **A size no trial has left in place is a stall.** `knee_units` alone is not
 evidence: it is set the moment a replica opens, and it may come from a shipped
-profile. `knee_is_local` is false for both, and for a size a trial has just
-moved up to; a leg that ends that way at its seed has measured nothing and is
+profile. `knee_is_local` is false for both; a leg that ends that way at its
+seed has measured nothing and is
 named as "never left the seed". `utilization` reads the same flag: only a size
 a trial left in place lowers its denominator from the probe boundary to the
 largest batch that ran.

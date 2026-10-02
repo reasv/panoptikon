@@ -551,13 +551,14 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
     `calibration_learned`, so they agree.
 
     The working size is read here because a budget can be *deliberately* low:
-    it is the smallest size whose rate is within 10 % of the best a trial
+    it is the smallest size whose rate is within 5 % of the best a trial
     measured, and a worker at it tries the sizes next to it every so often.
     Without it those samples look exactly like a batch size that never left
     the seed.
 
     Only a working size `/health` marks `knee_is_local` counts: a trial on
-    this machine measured the sizes next to it and left it in place. The size
+    this machine measured the sizes next to it and moved to it or left it in
+    place. The size
     a replica merely opened at, or one seeded from a shipped profile, is "not
     measured yet", which is a leg that learned nothing.
     """
@@ -1340,7 +1341,7 @@ def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
     size trial is over` lines with `moved=false`, the `knee_units` of every
     `/health` sample marked `knee_is_local` (the only one a leg that *resumed*
     a stored size has), and the local store's own `knee_units`, which is
-    written only for such a size. The rung is the settle lines'
+    written only for a size a trial placed. The rung is the settle lines'
     `max_units_measured` -- the largest batch that ran -- with the store's
     copy of that field as the fallback.
     """
@@ -1933,7 +1934,7 @@ def check_calibration_learned(ctx: Context) -> Verdict:
 
     **A working size a trial left in place is learning.** The seed is a
     starting guess, not a floor: the batch size is the smallest whose rate is
-    within 10 % of the best measured, so a model that gains nothing from
+    within 5 % of the best measured, so a model that gains nothing from
     larger batches ends *under* its seed on purpose. A worker deliberately
     running at 3-7 units would otherwise read "peak unit_budget never left
     the seed (seed 64, peak 64)" and FAIL for doing exactly the right thing.
