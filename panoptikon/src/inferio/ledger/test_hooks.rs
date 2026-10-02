@@ -159,6 +159,20 @@ impl VramLedger {
         }
     }
 
+    /// Set or read a replica's pending release after a batch size trial
+    /// ([`Admission::take_trial_trim`]).
+    #[cfg(test)]
+    pub(in crate::inferio) fn trial_trim_for_test(&self, worker: u64, set: Option<bool>) -> bool {
+        let mut state = self.lock();
+        let Some(entry) = state.workers.get_mut(&worker) else {
+            return false;
+        };
+        if let Some(due) = set {
+            entry.trial_trim_due = due;
+        }
+        entry.trial_trim_due
+    }
+
     /// Install a working size as measured here.
     #[cfg(test)]
     pub(super) fn set_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {

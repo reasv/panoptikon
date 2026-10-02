@@ -762,6 +762,7 @@ impl VramLedger {
                 alloc_retries_last_window: None,
                 alloc_retries_total: None,
                 idle_release_gave_nothing: false,
+                trial_trim_due: false,
                 pool_releases: None,
                 last_release_mb: None,
                 last_release_ms: None,
@@ -878,6 +879,16 @@ impl Admission {
             .workers
             .get(&self.worker)
             .map(|entry| entry.gpu.clone())
+    }
+
+    /// Whether a batch size trial left this replica's pool to release; the
+    /// answer is given once.
+    pub fn take_trial_trim(&self) -> bool {
+        let mut state = self.ledger.lock();
+        state
+            .workers
+            .get_mut(&self.worker)
+            .is_some_and(|entry| std::mem::take(&mut entry.trial_trim_due))
     }
 
     /// Record a `trim` answer ([`VramLedger::note_trimmed`]).

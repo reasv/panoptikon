@@ -9031,7 +9031,7 @@
           },
           "knee_is_local": {
             "type": "boolean",
-            "description": "A trial on this machine measured the sizes next to `knee_units` and\nleft it in place, in this run or the one that stored it. `false` for\na size seeded from a shipped profile, one this replica opened at, and\none a trial has just moved."
+            "description": "A trial on this machine measured the sizes next to `knee_units` and\nleft it in place or stepped down to it, in this run or the one that\nstored it. `false` for a size seeded from a shipped profile, one this\nreplica opened at, and one a trial has just moved up to."
           },
           "knee_units": {
             "type": [

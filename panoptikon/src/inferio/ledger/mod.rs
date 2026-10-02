@@ -270,7 +270,7 @@ const TRIM_TRIGGER_SQUEEZED: &str = "squeezed";
 const TRIM_TRIGGER_IDLE: &str = "idle";
 const TRIM_TRIGGER_ALLOC_RETRIES: &str = "alloc_retries";
 const TRIM_TRIGGER_PRESSURE: &str = "memory_pressure";
-const TRIM_TRIGGER_TRIAL: &str = "trial_over";
+pub(in crate::inferio) const TRIM_TRIGGER_TRIAL: &str = "trial_over";
 
 /// A measurement's `regrow_after` for a release the host asked for (the
 /// worker's own is `shrink`); only these reach `/health`.
@@ -721,6 +721,10 @@ struct WorkerEntry {
     /// The last release freed nothing: idle trims are off until another window
     /// settles.
     idle_release_gave_nothing: bool,
+    /// A batch size trial left the pool larger than the working size needs:
+    /// the dispatcher releases it when this replica's window returns
+    /// ([`Admission::take_trial_trim`]).
+    trial_trim_due: bool,
     /// Trim replies that freed memory (`released_mb > 0`); `None` until a reply
     /// carried the figure.
     pool_releases: Option<u64>,
@@ -1138,7 +1142,8 @@ struct ModelCalibration {
     /// or one a profile seeded (a working size can only shrink a grant).
     /// `None` until a window ran at its budget.
     knee_units: Option<u64>,
-    /// A trial on this machine left it in place; only then is it persisted.
+    /// A trial on this machine left it in place, or stepped down to it;
+    /// only then is it persisted.
     knee_is_local: bool,
     /// The trial in progress. Runtime-only, like `room_cut`.
     trial: Option<Trial>,

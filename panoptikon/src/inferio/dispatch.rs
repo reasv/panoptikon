@@ -29,8 +29,8 @@ use tokio::time::timeout;
 
 use super::cost::{CostAggregation, CostDimension, CostUnit};
 use super::ledger::{
-    Admission, ErrorFrameOom, FitSnapshot, Grant, GrantToken, WINDOW_DEPTH_MULTIPLIER,
-    WindowOutcome, message_oom_tier,
+    Admission, ErrorFrameOom, FitSnapshot, Grant, GrantToken, TRIM_TRIGGER_TRIAL,
+    WINDOW_DEPTH_MULTIPLIER, WindowOutcome, message_oom_tier,
 };
 use super::manager::ModelManager;
 use super::slot_error::Unattempted;
@@ -672,10 +672,23 @@ pub(crate) async fn run_dispatcher(
             Some(finished) = in_flight.join_next(), if !in_flight.is_empty() => {
                 match finished {
                     Ok((replica, BatchOutcome::Continue)) => {
-                        free.push(replica);
                         ctx.stats.in_flight_windows.fetch_sub(1, Relaxed);
-                        ctx.stats.replicas_free.store(free.len(), Relaxed);
                         refill_deadline = Some(tokio::time::Instant::now() + WINDOW_SETTLE_MAX);
+                        // A batch size trial left a pool the batches no
+                        // longer need: release it before the next window.
+                        let trim = replica
+                            .admission
+                            .as_ref()
+                            .is_some_and(Admission::take_trial_trim);
+                        if trim {
+                            let inference_id = ctx.inference_id.clone();
+                            in_flight.spawn(async move {
+                                run_trim(&inference_id, TRIM_TRIGGER_TRIAL, replica).await
+                            });
+                        } else {
+                            free.push(replica);
+                            ctx.stats.replicas_free.store(free.len(), Relaxed);
+                        }
                     }
                     Ok((replica, BatchOutcome::Trimmed)) => {
                         free.push(replica);
@@ -2309,6 +2322,36 @@ mod tests {
             );
             harness.shutdown().await;
         }
+    }
+
+    /// A release a batch size trial left pending runs when the replica's
+    /// window returns, with work queued or not, and the replica keeps
+    /// serving.
+    #[tokio::test]
+    async fn a_trial_trim_runs_when_the_window_returns() {
+        let harness = one_replica(32_768, "echo_test", item_cost(4)).await;
+        harness
+            .ledger
+            .trial_trim_for_test(harness.worker_id, Some(true));
+        for text in ["before", "after"] {
+            let outputs = harness
+                .predict(
+                    vec![WorkerInput {
+                        data: Some(json!(text)),
+                        file: None,
+                    }],
+                    None,
+                )
+                .await
+                .expect("served");
+            assert_eq!(outputs[0], WorkerOutput::Json(json!({"echo": text})));
+        }
+        assert!(
+            !harness.ledger.trial_trim_for_test(harness.worker_id, None),
+            "taken at the first window's return"
+        );
+        assert_eq!(harness.stats.total_batches.load(Relaxed), 2);
+        harness.shutdown().await;
     }
 
     /// A *busy* replica is not trimmed: the one-request-at-a-time protocol has

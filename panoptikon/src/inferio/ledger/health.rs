@@ -222,9 +222,9 @@ pub struct LedgerWorkerHealth {
     /// measured the sizes next to it.
     pub knee_units: Option<u64>,
     /// A trial on this machine measured the sizes next to `knee_units` and
-    /// left it in place, in this run or the one that stored it. `false` for
-    /// a size seeded from a shipped profile, one this replica opened at, and
-    /// one a trial has just moved.
+    /// left it in place or stepped down to it, in this run or the one that
+    /// stored it. `false` for a size seeded from a shipped profile, one this
+    /// replica opened at, and one a trial has just moved up to.
     pub knee_is_local: bool,
     /// The batch size the trial in progress runs next; absent between trials.
     pub trial_units: Option<u64>,

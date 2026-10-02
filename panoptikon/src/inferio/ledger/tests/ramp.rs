@@ -1556,14 +1556,14 @@ fn a_stored_size_that_is_too_large_steps_down() {
     assert_eq!(stored(), Some(1));
 }
 
-/// A trial that ran a larger size than the one it leaves asks the replica to
-/// release its pool; one that moved up to the largest size it ran does not.
+/// A trial that ran a larger size than the one it leaves marks the replica's
+/// pool for release at its next window boundary, once; one that moved up to
+/// the largest size it ran does not.
 #[test]
 fn a_trial_that_ran_a_larger_size_asks_the_pool_back() {
-    for (rate, windows, asked) in [
-        (flat_from_64 as Rate, 4, true),
-        (|units| units as f64, 12, false),
-    ] {
+    let cases: [(Rate, usize, bool); 2] =
+        [(flat_from_64, 4, true), (|units| units as f64, 12, false)];
+    for (rate, windows, asked) in cases {
         let (ledger, handle, admission) = ramping_from_seed(64);
         for _ in 0..windows {
             window_leaving_warm(&handle, &admission, |_| 2, rate);
@@ -1573,8 +1573,8 @@ fn a_trial_that_ran_a_larger_size_asks_the_pool_back() {
             None,
             "the trial is over"
         );
-        let trims = ledger.take_pending_trims();
-        assert_eq!(trims.len(), usize::from(asked));
-        assert!(trims.iter().all(|trim| trim.trigger == TRIM_TRIGGER_TRIAL));
+        assert_eq!(admission.take_trial_trim(), asked);
+        assert!(!admission.take_trial_trim());
+        assert!(ledger.take_pending_trims().is_empty());
     }
 }
