@@ -1678,27 +1678,33 @@ const CPU_BOUND: [(u64, f64); 6] = [
 
 /// A cold load of a model whose rate stops rising at 8 units, on an idle
 /// 16 GB card. From the single item the trial doubles while the last
-/// doubling gained 3 %, up to 16 units, and the working size is 4, the
-/// smallest within 10 % of the rate at 8. Later trials run 8, 16 and 2 and
-/// leave it there, far from the 191 units the card holds. The store gets
-/// the largest size it ran and the working size.
+/// doubling gained 1.5 %, and once past the one that did not, up to 32
+/// units, and the working size is 8, the smallest within 5 % of the best
+/// rate. Later trials run 16, 32 and 4 and leave it there, far from the 191
+/// units the card holds. The store gets the largest size it ran and the
+/// working size.
 #[test]
 fn a_cold_load_grows_from_one_item_while_the_rate_gains() {
     let ran = ColdRun::beside(15_700).run(50, |units| ladder_rate(&CPU_BOUND, units));
-    assert_eq!(ran.units[..7], [1, 2, 2, 4, 8, 16, 4]);
+    assert_eq!(
+        ran.units[..8],
+        [1, 2, 2, 4, 8, 16, 32, 8],
+        "{:?}",
+        ran.units
+    );
     let trials: Vec<usize> = (7..ran.units.len())
-        .filter(|window| ran.units[*window] != 4)
+        .filter(|window| ran.units[*window] != 8)
         .collect();
-    assert_eq!(trials, [18, 19, 20, 33, 34, 35], "{:?}", ran.units);
-    assert_eq!(ran.units[18..21], [8, 16, 2]);
-    assert_eq!(ran.knee, Some(4));
-    assert_eq!(ran.stored, Some((16, Some(4))));
+    assert_eq!(trials, [19, 20, 21, 34, 35, 36], "{:?}", ran.units);
+    assert_eq!(ran.units[19..22], [16, 32, 4]);
+    assert_eq!(ran.knee, Some(8));
+    assert_eq!(ran.stored, Some((32, Some(8))));
 }
 
 /// The same load with a rate that rises 1.41x per doubling grows to what
 /// the card holds, and no batch runs out of memory at the fitted price. The
-/// size is stored once the next trial, a window at half of it, has left it
-/// in place.
+/// size is stored as it is reached; the next trial, a window at half of it,
+/// leaves it in place.
 #[test]
 fn a_cold_load_whose_rate_keeps_rising_grows_to_the_room() {
     let ran = ColdRun::beside(15_700).run(26, |units| (units as f64).sqrt());
@@ -1759,8 +1765,9 @@ fn one_measured_size_does_not_hold_a_small_room_at_one_unit() {
 /// A run resumed from a store row that an earlier build wrote without a
 /// working size (largest size 179, on the same card) opens at the seed once
 /// the item cap ends, not at the anchor or the room. 128 units measure no
-/// faster than 64, and the size steps down to 4 units, the smallest within
-/// 10 % of the best rate; the row is stored with that.
+/// faster than 64, nor do the 191 the card holds, and the size steps down
+/// to 8 units, the smallest within 5 % of the best rate; the row is stored
+/// with that.
 #[test]
 fn a_stored_anchor_without_a_working_size_opens_at_the_seed() {
     let stored = ProfileSeed {
@@ -1774,9 +1781,9 @@ fn a_stored_anchor_without_a_working_size_opens_at_the_seed() {
         ..ColdRun::beside(15_700)
     };
     let ran = resumed.run(22, |units| ladder_rate(&CPU_BOUND, units));
-    assert_eq!(ran.units[..10], [1, 2, 4, 64, 64, 128, 32, 16, 8, 2]);
-    assert!(ran.units[10..].iter().all(|units| *units == 4));
-    assert_eq!(ran.stored, Some((128, Some(4))));
+    assert_eq!(ran.units[..10], [1, 2, 4, 64, 64, 128, 191, 32, 16, 8]);
+    assert!(ran.units[10..].iter().all(|units| *units == 8));
+    assert_eq!(ran.stored, Some((191, Some(8))));
 }
 
 /// A replica whose batches never grow host RAM still learns its GPU side:

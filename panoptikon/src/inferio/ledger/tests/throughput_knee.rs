@@ -532,10 +532,10 @@ fn a_measured_working_size_caps_the_grant_and_is_persisted() {
         .register_worker("g/a", item_cost(64), &handle, None)
         .unwrap();
     push_memory(&handle, 90_000, 1000);
-    let budgets: Vec<u64> = (0..5)
+    let budgets: Vec<u64> = (0..6)
         .map(|_| window_at_the_rate(&handle, &admission, |units| units.min(64) as f64))
         .collect();
-    assert_eq!(budgets, [64, 64, 128, 32, 64]);
+    assert_eq!(budgets, [64, 64, 128, 256, 32, 64]);
 
     let worker = &ledger.health()[0].workers[0];
     assert_eq!(worker.knee_units, Some(64));
@@ -550,7 +550,7 @@ fn a_measured_working_size_caps_the_grant_and_is_persisted() {
     let last = profiles.updates.lock().unwrap().last().cloned().unwrap();
     assert_eq!(
         (last.knee_units, last.max_units_measured),
-        (Some(64), 128),
+        (Some(64), 256),
         "the size a trial left in place, beside the largest that ran"
     );
 
@@ -708,13 +708,13 @@ fn a_persisted_knee_seeds_the_next_run() {
         .unwrap();
     push_memory(&handle, 90_000, 1000);
     // The rate doubles with the batch up to 16 units and gains nothing past.
-    // The first trial moves the size to 16; the next leaves it there, and
-    // it is stored.
-    let budgets: Vec<u64> = (0..20)
+    // The first trial moves the size to 16, and it is stored; the next
+    // leaves it there.
+    let budgets: Vec<u64> = (0..22)
         .map(|_| window_at_the_rate(&handle, &admission, |units| units.min(16) as f64))
         .collect();
-    assert_eq!(budgets[..6], [4, 4, 8, 16, 32, 16]);
-    assert_eq!(budgets[17..], [32, 8, 16]);
+    assert_eq!(budgets[..7], [4, 4, 8, 16, 32, 64, 16]);
+    assert_eq!(budgets[18..], [32, 64, 8, 16]);
     assert_eq!(ledger.health()[0].workers[0].knee_units, Some(16));
 
     let seed = store
@@ -824,7 +824,7 @@ fn a_late_seed_never_overwrites_a_locally_fitted_knee() {
         .register_worker("g/a", item_cost(64), &handle, None)
         .unwrap();
     push_memory(&handle, 90_000, 1000);
-    for _ in 0..4 {
+    for _ in 0..5 {
         window_at_the_rate(&handle, &admission, |units| units.min(64) as f64);
     }
     assert_eq!(ledger.health()[0].workers[0].knee_units, Some(64));

@@ -63,10 +63,13 @@ impl VramLedger {
         // place by a trial here, and the wait for the next trial carries on.
         if !cal.knee_is_local {
             cal.knee_units = seed.knee_units.filter(|_| seed.slope_mb_per_unit > 0.0);
-            if seed.local && cal.knee_units.is_some() {
+            if let Some(knee) = cal.knee_units.filter(|_| seed.local) {
                 cal.knee_is_local = true;
                 cal.failed_trials = seed.knee_trials.failed;
                 cal.retest_after = seed.knee_trials.retest_after;
+                // No larger size was ever measured here: memory, or the end
+                // of the run, cut the climb at this one.
+                cal.room_cut = seed.max_units_measured as f64 * SAME_SIZE_RATIO <= knee as f64;
             }
         }
         if adopt_fit {
@@ -176,8 +179,8 @@ impl VramLedger {
         }
         let before = cal.persisted;
         let fit_version = cal.fit.map(|fit| fit.version).unwrap_or(0);
-        // Only a working size a trial here left in place is written; `None`
-        // leaves the stored one as it is.
+        // Only a working size a trial here measured is written; `None` leaves
+        // the stored one as it is.
         let knee = cal.knee_units.filter(|_| cal.knee_is_local);
         let cadence = stored_cadence(cal);
         let anchor = persistable_anchor(cal);

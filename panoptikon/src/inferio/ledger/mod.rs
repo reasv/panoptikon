@@ -168,7 +168,11 @@ pub const MIN_FIT_SAMPLES: usize = 3;
 /// The plateau band: a batch size whose rate is at least this fraction of the
 /// best rate measured is as good as the best, and the working size is the
 /// smallest such size.
-pub const KNEE_RATIO: f64 = 0.9;
+pub const KNEE_RATIO: f64 = 0.95;
+
+/// A batch counts as one of a batch size when that size is at least this
+/// fraction of it: up to 1.11x larger is the same size.
+pub const SAME_SIZE_RATIO: f64 = 0.9;
 
 /// Observations of one batch size the gain rule needs to read its rate: the
 /// fewest a dispersion can be computed from.
@@ -196,9 +200,17 @@ pub const CONFIRM_SAMPLES: usize = 12;
 /// comparison on fewer than [`CONFIRM_SAMPLES`] observations a side.
 pub const CLEAR_ERRORS: f64 = 4.0;
 
+/// Standard errors by which a smaller size must be inside the band, on
+/// [`CONFIRM_SAMPLES`] observations a side, for the working size to move
+/// down to it. A move up takes [`CLEAR_ERRORS`] whatever the count, so a
+/// size at the band's edge is not left and returned to as the observations
+/// scatter. Also the gain that carries a trial on past a doubling without
+/// one.
+pub const HOLD_ERRORS: f64 = 1.0;
+
 /// The gain of one doubling for which a trial goes on to the next: below
 /// it the rate has stopped rising.
-pub const TRIAL_STEP: f64 = 1.03;
+pub const TRIAL_STEP: f64 = 1.015;
 
 /// Windows a trial may run without a verdict before the comparison counts as
 /// not shown: one observation a window on each side reaches
@@ -485,6 +497,12 @@ struct Trial {
     moved: bool,
     /// The largest size it was granted, for the trim that follows.
     largest: u64,
+    /// The doubling below `up` showed no gain: `up` has to gain on the size
+    /// two doublings below it, or the climb is over.
+    looks_ahead: bool,
+    /// The fastest size measured and the size below it, once the trial has
+    /// turned to the smaller size.
+    best: (u64, u64),
 }
 
 impl Trial {
@@ -497,6 +515,8 @@ impl Trial {
             windows: 0,
             moved: false,
             largest: working,
+            looks_ahead: false,
+            best: (working, working / 2),
         }
     }
 }
@@ -1147,10 +1167,10 @@ struct ModelCalibration {
     /// or one a profile seeded (a working size can only shrink a grant).
     /// `None` until a window ran at its budget.
     knee_units: Option<u64>,
-    /// A trial on this machine left it in place, or stepped down to it;
-    /// only then is it persisted.
+    /// A trial on this machine moved to it or left it in place; only then
+    /// is it persisted.
     knee_is_local: bool,
-    /// The trial in progress. Runtime-only, like `room_cut`.
+    /// The trial in progress. Runtime-only.
     trial: Option<Trial>,
     /// Windows at the working size still to run before the next trial.
     /// Persisted with `failed_trials`, so a restart continues the wait.
@@ -1159,7 +1179,8 @@ struct ModelCalibration {
     failed_trials: u32,
     /// Memory granted the last trial nothing above the working size: the
     /// replica keeps asking for twice that size, and the first window
-    /// granted a larger one starts a trial.
+    /// granted a larger one starts a trial. Seeded for a stored working
+    /// size that is the largest size this machine has measured.
     room_cut: bool,
     /// What the store was last told; a change triggers a write.
     persisted: Option<Persisted>,

@@ -9031,7 +9031,7 @@
           },
           "knee_is_local": {
             "type": "boolean",
-            "description": "A trial on this machine measured the sizes next to `knee_units` and\nleft it in place or stepped down to it, in this run or the one that\nstored it. `false` for a size seeded from a shipped profile, one this\nreplica opened at, and one a trial has just moved up to."
+            "description": "A trial on this machine measured the sizes next to `knee_units` and\nmoved to it or left it in place, in this run or the one that stored\nit. `false` for a size seeded from a shipped profile and one this\nreplica opened at."
           },
           "knee_units": {
             "type": [
@@ -9039,7 +9039,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The working batch size: the smallest whose rate measured within 10 %\nof the best, or the size this replica opened at until a trial has\nmeasured the sizes next to it.",
+            "description": "The working batch size: the smallest whose rate measured within 5 %\nof the best, or the size this replica opened at until a trial has\nmeasured the sizes next to it.",
             "minimum": 0
           },
           "last_regrow_batch_ms": {

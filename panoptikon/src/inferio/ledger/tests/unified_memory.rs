@@ -1440,8 +1440,8 @@ async fn a_load_on_the_cpu_device_of_a_mac_counts_on_the_mps_device() {
 
 /// With MPS sampled peaks, no batch reads warm off `peak_reserved`. Read off
 /// the **post-batch** pool, the ring's warm batches are told from the ones
-/// that grew it: wd-vit's rate is no better at 128 units than at 64, and
-/// within 10 % of its best down to 2 units, where the job ends.
+/// that grew it: wd-vit's rate is no better at 128 units than at 64, nor at
+/// 256, and within 5 % of its best down to 4 units, where the job ends.
 #[test]
 fn a_long_job_of_sampled_mps_windows_ends_at_the_smallest_size_near_its_best_rate() {
     let (ledger, handle, admission) = ramping_from_seed(64);
@@ -1454,14 +1454,14 @@ fn a_long_job_of_sampled_mps_windows_ends_at_the_smallest_size_near_its_best_rat
         worker.throughput_samples > 0,
         "the sampler's peak does not disqualify every batch"
     );
-    assert_eq!(worker.knee_units, Some(2));
+    assert_eq!(worker.knee_units, Some(4));
     assert_eq!(
         (budgets[0], budgets[2], budgets.iter().copied().max()),
-        (64, 128, Some(128)),
-        "one size above was tried, and no more: {:?}",
+        (64, 128, Some(256)),
+        "one size above was tried, one doubling past it, and no more: {:?}",
         &budgets[..12]
     );
-    assert_eq!(*budgets.last().expect("windows"), 2);
+    assert_eq!(*budgets.last().expect("windows"), 4);
 }
 
 /// Three warm windows ahead of the same job change nothing.
@@ -1476,9 +1476,9 @@ fn three_warm_windows_do_not_decide_the_budget_for_the_whole_job() {
         budgets.push(mps_sampled_window(&handle, &admission, &WDVIT_M3_MAX));
     }
     let worker = &ledger.health()[0].workers[0];
-    assert_eq!(worker.knee_units, Some(2));
-    assert_eq!(*budgets.last().expect("windows"), 2);
-    assert!(budgets.iter().all(|units| *units <= 128));
+    assert_eq!(worker.knee_units, Some(4));
+    assert_eq!(*budgets.last().expect("windows"), 4);
+    assert!(budgets.iter().all(|units| *units <= 256));
 }
 /// The **ceiling** half of `limit = min(recommended_max, memsize - external -
 /// reserve)`, swept: wherever more RAM is free than Metal will hand out, the
