@@ -437,7 +437,9 @@ pub struct FitSample {
     pub delta_mb: u64,
 }
 
-/// One throughput observation, in units/sec (not items/sec). Runtime-only.
+/// One throughput observation: a batch's units per second of its window's
+/// time from grant to settle, the time outside the batches shared out by
+/// batch time (units, not items). Runtime-only.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ThroughputSample {
     units: u64,
@@ -547,6 +549,9 @@ struct GrantCharge {
     /// The batch size the gain rule asked for this window
     /// ([`VramLedger::size_locked`]), before anything cut it.
     size_asked: u64,
+    /// When the grant was issued: a throughput sample is charged its share
+    /// of the time from here to the settle.
+    granted_at: Instant,
     /// Memory held this window back ([`Grant::squeezed`]).
     squeezed: bool,
     /// The fitted price cut this window's batch to the device's room: not

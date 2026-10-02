@@ -238,6 +238,7 @@ impl VramLedger {
                     requests: window_requests,
                     unit_budget,
                     size_asked,
+                    granted_at: Instant::now(),
                     squeezed,
                     room_bound,
                     peak_occupants: 0,
@@ -622,6 +623,20 @@ pub struct GrantToken {
 impl GrantToken {
     pub fn grant(&self) -> &Grant {
         &self.grant
+    }
+
+    /// Make the grant `ms` older, as if its window had been out that long.
+    #[cfg(test)]
+    pub(super) fn age_for_test(&self, ms: f64) {
+        let mut state = self.ledger.lock();
+        let charge = state
+            .workers
+            .get_mut(&self.worker)
+            .and_then(|entry| entry.grants.get_mut(&self.grant_id));
+        if let Some(charge) = charge {
+            let age = Duration::from_secs_f64(ms / 1000.0);
+            charge.granted_at = charge.granted_at.checked_sub(age).expect("a recent boot");
+        }
     }
 
     /// Release the grant and record the window's outcome. `Some` when this

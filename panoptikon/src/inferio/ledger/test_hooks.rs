@@ -173,6 +173,21 @@ impl VramLedger {
         entry.trial_trim_due
     }
 
+    /// The throughput ring as `(units, units/sec)`.
+    #[cfg(test)]
+    pub(super) fn throughput_for_test(&self, inference_id: &str, gpu: &str) -> Vec<(u64, f64)> {
+        self.lock()
+            .calibration
+            .get(&(inference_id.to_owned(), gpu.to_owned()))
+            .map(|cal| {
+                cal.throughput
+                    .iter()
+                    .map(|sample| (sample.units, sample.units_per_sec))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Install a working size as measured here.
     #[cfg(test)]
     pub(super) fn set_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {

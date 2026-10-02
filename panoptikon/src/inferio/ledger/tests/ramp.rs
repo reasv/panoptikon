@@ -1594,3 +1594,32 @@ fn a_trial_that_ran_a_larger_size_asks_the_pool_back() {
         assert!(ledger.take_pending_trims().is_empty());
     }
 }
+
+/// The rate is units per second of the window, from its grant to its
+/// settle. Each batch is charged the time outside the batches in proportion
+/// to its own: in a window out twice as long as its batches ran, 64 units in
+/// 100 ms count as 64 units in 200 ms, and in 300 ms as in 600 ms.
+#[test]
+fn the_rate_counts_the_windows_time_outside_its_batches() {
+    let (ledger, handle, admission) = ramping_from_seed(64);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let batch = |duration_ms| BatchMeasurement {
+        duration_ms: Some(duration_ms),
+        ..measurement(64, 740, 740)
+    };
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![batch(100.0), batch(300.0)]);
+    token.age_for_test(800.0);
+    token.finish(WindowOutcome::Responded { oom: None });
+    let rates: Vec<f64> = ledger
+        .throughput_for_test("g/a", GPU)
+        .iter()
+        .map(|(_, rate)| *rate)
+        .collect();
+    assert!((310.0..=320.0).contains(&rates[0]), "{rates:?}");
+    assert!((rates[0] / rates[1] - 3.0).abs() < 1e-9, "{rates:?}");
+}

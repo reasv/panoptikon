@@ -417,6 +417,16 @@ impl VramLedger {
         // corroborated by its memory figures.
         let mut clipped_collapses = 0usize;
         let mut uncorroborated_collapses = 0usize;
+        // The window's time from grant to settle over the time its batches
+        // ran, at least 1: each batch is charged its share of the rest.
+        let batch_ms: f64 = samples
+            .iter()
+            .filter_map(|sample| sample.measurement.duration_ms)
+            .sum();
+        let wall_ratio = window
+            .map(|charge| charge.granted_at.elapsed().as_secs_f64() * 1000.0 / batch_ms)
+            .filter(|ratio| ratio.is_finite())
+            .map_or(1.0, |ratio| ratio.max(1.0));
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
@@ -616,7 +626,7 @@ impl VramLedger {
             {
                 throughput.push(ThroughputSample {
                     units,
-                    units_per_sec: units as f64 * 1000.0 / duration_ms,
+                    units_per_sec: units as f64 * 1000.0 / (duration_ms * wall_ratio),
                     occupants,
                     grew_pool,
                     warmup: warmup_window || ran_batches <= KNEE_WARMUP_BATCHES,
