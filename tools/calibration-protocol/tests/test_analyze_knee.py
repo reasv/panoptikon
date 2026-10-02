@@ -1,16 +1,16 @@
-"""`calibration_learned`: a plateau knee is something learned, not nothing.
+"""`calibration_learned`: a working size a trial left in place is something
+learned, not nothing.
 
 The check reads "peak `unit_budget` no higher than the first recorded" as
-"nothing was learned". That is right for a ramp that never started and wrong
-for a model that ends *below* its seed on purpose: rule 4 stops the ramp where
-throughput stops improving, so a knee under the seed is the brake working, and
-the worker then holds there, re-testing the plateau every so many clean
-windows.
+"nothing was learned". That is right for a batch size that never left the
+seed and wrong for a model that ends *below* its seed on purpose: the batch
+size is the smallest whose rate is within 10 % of the best a trial measured,
+and the worker stays there, trying the sizes next to it every so often.
 
-The case below, with measured numbers: seed 64, knee first learned at 3 and
-widened up to 15, budget running as low as 2 — which would read `NOTHING WAS
-LEARNED: peak unit_budget never left the seed (seed 64, peak 64)` while the
-ledger was doing exactly the right thing.
+The case below: seed 64, a size first left in place at 3 and later at 7 and
+15, budget running as low as 3 — which would read `NOTHING WAS LEARNED: peak
+unit_budget never left the seed (seed 64, peak 64)` while the ledger was
+doing exactly the right thing.
 
 Run with the managed interpreter:
 
@@ -43,17 +43,15 @@ MODEL = "tags/wd-vit-tagger-v3"
 STORE = {"profile": [{"inference_id": MODEL}]}
 
 
-def _context(series, after=STORE, learning=True, held=None,
-             certified=False):
-    """`series` is a list of `(unit_budget, knee_units)` health samples."""
+def _context(series, after=STORE, learning=True, local=True):
+    """`series` is a list of `(unit_budget, knee_units)` health samples;
+    `local` is what `/health` says of every `knee_units` among them."""
     samples = [
         {"kind": "sample", "t_wall": 100.0 + index,
          "health": {"ok": True, "workers": [
              {"inference_id": MODEL, "unit_budget": budget,
               "knee_units": knee, "fit_samples": 10,
-              "ramp_held": held is not None,
-              "held_units": held,
-              "held_certified": held is not None and certified}]}}
+              "knee_is_local": local and knee is not None}]}}
         for index, (budget, knee) in enumerate(series)
     ]
     args = argparse.Namespace(worker_pattern="inferio", join_tolerance=1.0,
@@ -64,27 +62,27 @@ def _context(series, after=STORE, learning=True, held=None,
                            probes=[])
 
 
-# The S4a-mps shape: the seed, then the brake, then the widening probes.
+# The seed, then the size trials left in place.
 BRAKED = ([(64, None), (32, None), (16, None), (8, None)]
           + [(3, 3)] * 12 + [(7, 7)] * 4 + [(3, 3)] * 12 + [(15, 15)] * 3)
 
 
-def test_a_budget_held_at_its_knee_is_learning():
+def test_a_budget_at_a_size_a_trial_left_in_place_is_learning():
     verdict = analyze.check_calibration_learned(_context(BRAKED))
     assert verdict.verdict == "PASS"
     assert "NOTHING WAS LEARNED" not in verdict.detail
-    assert "held at a learned plateau knee" in verdict.detail
+    assert "at a working size a trial left in place" in verdict.detail
 
 
 def test_the_detail_says_what_it_was_holding_at():
     verdict = analyze.check_calibration_learned(_context(BRAKED))
     assert "seed 64" in verdict.detail
-    assert "knee first learned at 3" in verdict.detail
-    assert "widened 2 time(s) up to 15" in verdict.detail
+    assert "first left in place at 3" in verdict.detail
+    assert "moved 3 time(s), at most 15" in verdict.detail
     assert "ran as low as 3" in verdict.detail
     row = verdict.numbers["models"][MODEL]
     assert (row["first"], row["peak"], row["low"]) == (64, 64, 3)
-    assert (row["knee_first"], row["knee"], row["knee_widenings"]) == (3, 15, 2)
+    assert (row["knee_first"], row["knee"], row["knee_moves"]) == (3, 15, 3)
 
 
 def test_a_ramp_that_never_started_still_fails():
@@ -114,11 +112,11 @@ def test_a_ramp_that_did_climb_is_unaffected():
     climbed = [(4, None), (8, None), (16, None), (32, None), (96, None)]
     verdict = analyze.check_calibration_learned(_context(climbed))
     assert verdict.verdict == "PASS"
-    assert "held at a learned plateau knee" not in verdict.detail
+    assert "at a working size a trial left in place" not in verdict.detail
 
 
-def test_ramp_progress_does_not_blame_the_unit_budget_for_a_knee_at_the_seed():
-    """A model braked at 64 is not the REQUEST_UNIT_BUDGET symptom."""
+def test_ramp_progress_does_not_blame_the_unit_budget_for_a_size_left_at_the_seed():
+    """A model a trial left at 64 is not the REQUEST_UNIT_BUDGET symptom."""
     braked_at_64 = [(64, 64)] * 10
     verdict = analyze.check_ramp_progress(_context(braked_at_64))
     assert "REQUEST_UNIT_BUDGET" not in verdict.detail
@@ -128,42 +126,25 @@ def test_ramp_progress_does_not_blame_the_unit_budget_for_a_knee_at_the_seed():
     assert "REQUEST_UNIT_BUDGET" in plain.detail
 
 
-# --- the throughput brake, with no knee anywhere -----------------------------
+# --- a working size no trial has left in place --------------------------------
 #
-# `ramp_held` is a knee's statement made before any knee fits -- but only when
-# `held_certified` says the ring measured that rung. A hold it cannot certify
-# is the opposite statement: nothing was measured there. S2-text-loadgen is the
-# shape (peak `unit_budget` never left the seed, the brake engaged, no knee),
-# and it went green the moment the brake engaged for anything at all.
+# `knee_units` is set the moment a replica opens and may come from a shipped
+# profile; only `knee_is_local` says a trial measured the sizes next to it. A
+# leg that sits at its seed without that has measured nothing.
 
 
-def test_a_budget_held_at_a_certified_rung_is_learning():
+def test_a_size_no_trial_left_in_place_learned_nothing():
     verdict = analyze.check_calibration_learned(
-        _context([(64, None)] * 20, held=64, certified=True))
-    assert verdict.verdict == "PASS"
-    assert "NOTHING WAS LEARNED" not in verdict.detail
-    assert "held by the throughput brake at a rung the ring certified" \
-        in verdict.detail
-    assert "held at 64 for 20 sample(s)" in verdict.detail
-    row = verdict.numbers["models"][MODEL]
-    assert (row["held"], row["held_units"], row["held_certified"]) \
-        == (20, 64, 20)
-
-
-def test_a_budget_held_at_an_uncertified_rung_learned_nothing():
-    """The text-loadgen shape: the brake engaged, and the ring never
-    certified the rung it engaged at, so the leg measured nothing."""
-    verdict = analyze.check_calibration_learned(
-        _context([(64, None)] * 20, held=64))
+        _context([(64, 64)] * 20, local=False))
     assert verdict.verdict == "FAIL"
     assert "peak unit_budget never left the seed" in verdict.detail
-    assert "a rung the ring never certified" in verdict.detail
-    row = verdict.numbers["models"][MODEL]
-    assert (row["held"], row["held_certified"]) == (20, 0)
+    assert verdict.numbers["models"][MODEL]["knee"] == 0
+    # …and it earns the REQUEST_UNIT_BUDGET note again.
+    plain = analyze.check_ramp_progress(_context([(64, 64)] * 10, local=False))
+    assert "REQUEST_UNIT_BUDGET" in plain.detail
 
 
-def test_an_unheld_ramp_that_never_started_still_fails():
-    """The same series with the brake off: nothing was holding it back."""
+def test_a_ramp_that_never_started_fails_without_any_working_size():
     verdict = analyze.check_calibration_learned(_context([(64, None)] * 20))
     assert verdict.verdict == "FAIL"
     assert "peak unit_budget never left the seed" in verdict.detail

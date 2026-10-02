@@ -547,18 +547,19 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
                                             Dict[str, int],
                                             Dict[str, Dict[str, int]]]:
     """Per-model `unit_budget` over time, the best `fit_samples` seen, and the
-    plateau knee and throughput hold beside it: one source for `ramp_progress`
-    and `calibration_learned`, so they agree.
+    working batch size beside it: one source for `ramp_progress` and
+    `calibration_learned`, so they agree.
 
-    The knee is read here because a budget can be *deliberately* low: rule 4
-    stops the ramp where throughput stops improving, and a worker held at its
-    knee then probes above it every so often to check the plateau is still
-    there. Without the knee those samples look exactly like a ramp that never
-    started.
+    The working size is read here because a budget can be *deliberately* low:
+    it is the smallest size whose rate is within 10 % of the best a trial
+    measured, and a worker at it tries the sizes next to it every so often.
+    Without it those samples look exactly like a batch size that never left
+    the seed.
 
-    `ramp_held` / `held_units` are the same statement without a knee, but only
-    when `held_certified` says the ring measured the rung: an uncertified hold
-    is "not measured yet", which is a leg that learned nothing.
+    Only a working size `/health` marks `knee_is_local` counts: a trial on
+    this machine measured the sizes next to it and left it in place. The size
+    a replica merely opened at, or one seeded from a shipped profile, is "not
+    measured yet", which is a leg that learned nothing.
     """
     series: Dict[str, List[int]] = {}
     fits: Dict[str, int] = {}
@@ -571,25 +572,15 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
             if worker.get("fit_samples"):
                 fits[key] = max(fits.get(key, 0), int(worker["fit_samples"]))
             row = knees.setdefault(key, {"knee": 0, "knee_first": 0,
-                                         "knee_widenings": 0, "held": 0,
-                                         "held_units": 0, "held_certified": 0,
-                                         "_last": 0})
-            if worker.get("ramp_held"):
-                row["held"] += 1
-                row["held_units"] = max(row["held_units"],
-                                        int(worker.get("held_units") or 0))
-                if worker.get("held_certified"):
-                    row["held_certified"] += 1
-            knee = int(worker.get("knee_units") or 0)
+                                         "knee_moves": 0, "_last": 0})
+            knee = (int(worker.get("knee_units") or 0)
+                    if worker.get("knee_is_local") else 0)
             if knee:
                 if not row["knee_first"]:
                     row["knee_first"] = knee
-                # The knee moving up is the widening probe having succeeded:
-                # after N clean windows the worker retests the plateau, and a
-                # knee that keeps moving is a brake being re-tested, not a
-                # ramp that stopped.
-                if knee > row["_last"] and row["_last"]:
-                    row["knee_widenings"] += 1
+                # A later trial moved it, up or down.
+                if knee != row["_last"] and row["_last"]:
+                    row["knee_moves"] += 1
                 row["knee"] = max(row["knee"], knee)
                 row["_last"] = knee
     for row in knees.values():
@@ -604,11 +595,7 @@ def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
                 "low": min(values), "fit_samples": fits.get(model, 0),
                 "knee": knees.get(model, {}).get("knee", 0),
                 "knee_first": knees.get(model, {}).get("knee_first", 0),
-                "knee_widenings": knees.get(model, {}).get("knee_widenings", 0),
-                "held": knees.get(model, {}).get("held", 0),
-                "held_units": knees.get(model, {}).get("held_units", 0),
-                "held_certified": knees.get(model, {}).get("held_certified",
-                                                           0)}
+                "knee_moves": knees.get(model, {}).get("knee_moves", 0)}
         for model, values in series.items()
     }
 
@@ -1346,30 +1333,31 @@ def check_idle_liveness(ctx: Context) -> Verdict:
 
 
 def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
-    """Per model with a knee in force: the knee, and the rung it held at.
+    """Per model whose working size a trial left in place: that size, and the
+    largest size it ran.
 
-    Three signals, because a leg carries only some of them: the log's `fitted
-    a throughput knee` lines, the `knee_units` every `/health` sample
-    publishes (the only one a leg that *resumed* a knee from the store has),
-    and the store's own `knee_units`. The rung is the settle lines'
-    `max_units_measured` -- how far the ramp was allowed to grow before the
-    brake -- with the store's copy of that field as the fallback.
+    Three signals, because a leg carries only some of them: the log's `a batch
+    size trial is over` lines with `moved=false`, the `knee_units` of every
+    `/health` sample marked `knee_is_local` (the only one a leg that *resumed*
+    a stored size has), and the local store's own `knee_units`, which is
+    written only for such a size. The rung is the settle lines'
+    `max_units_measured` -- the largest batch that ran -- with the store's
+    copy of that field as the fallback.
     """
     rows: Dict[str, Dict[str, int]] = {}
 
     def row(model: str) -> Dict[str, int]:
         return rows.setdefault(model, {"knee": 0, "knee_named": 0, "rung": 0})
 
-    # `log_matching`, not `log_events`: the parsed message is the whole
-    # sentence up to the first `k=`, of which this is the opening clause.
-    for event in ctx.log_matching("fitted a throughput knee"):
+    for event in ctx.log_matching("a batch size trial is over"):
         fields = event["fields"]
-        model, knee = fields.get("model"), fields.get("knee_units")
-        if model is None or not isinstance(knee, (int, float)):
+        model, knee = fields.get("model"), fields.get("units")
+        if (model is None or not isinstance(knee, (int, float))
+                or fields.get("moved") not in (False, "false")):
             continue
         entry = row(str(model))
         entry["knee"] = max(entry["knee"], int(knee))
-        entry["knee_named"] = max(entry["knee_named"], int(knee))
+        entry["knee_named"] = int(knee)
     _, _, knees = _budget_series(ctx)
     for model, knee_row in knees.items():
         if knee_row["knee"]:
@@ -1380,8 +1368,8 @@ def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
         if isinstance(knee, (int, float)) and knee:
             entry = row(model)
             entry["knee"] = max(entry["knee"], int(knee))
-            # The store's figure is the knee that survived the leg, so it is
-            # the one the detail names when the fitted lines disagree.
+            # The store's figure is the size the leg ended on, so it is the
+            # one the detail names when the trial lines disagree.
             entry["knee_named"] = int(knee)
         if isinstance(rung, (int, float)) and model in rows:
             rows[model]["rung"] = int(rung)
@@ -1397,8 +1385,8 @@ def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
 
 def check_utilization(ctx: Context) -> Verdict:
     """The largest unit budget a grant actually carried, vs the probe's OOM
-    boundary -- or, where a throughput knee held the ramp, vs the rung it was
-    held at.
+    boundary -- or, where a trial left the working size in place, vs the
+    largest size it ran.
 
     The published `unit_budget` in `/health` is what the ledger offers, not
     what it admitted: S4a published 512 while every window ran 1 unit, so the
@@ -1407,14 +1395,16 @@ def check_utilization(ctx: Context) -> Verdict:
     scored; healthrec's published figure is the fallback for a recording with
     no grant lines, and the detail says when it was used.
 
-    **A knee is the intended stop.** Rule 4 grows a batch only while
-    throughput pays, so a ramp stopped by a fitted knee never approaches the
-    probe's OOM boundary and scored 0.06-0.12 against it -- a FAIL for
-    obeying the design (`calibration_learned` already reads the knee as
-    learning). Where a knee is in force the denominator is what the ledger
-    was *allowed* to reach: the rung the settle lines measured, or the knee's
-    own cap when no rung was recorded, and never above the probe boundary. A
-    leg with no knee is scored exactly as before.
+    **A working size a trial left in place is the intended stop.** A batch
+    grows only while its rate does, so a model that gains nothing past a few
+    units never approaches the probe's OOM boundary and would score
+    0.06-0.12 against it -- a FAIL for obeying the design. Where a trial
+    measured the sizes next to the working size and left it in place
+    (`_knee_holds`), the denominator is what the ledger actually tried: the
+    largest batch the settle lines measured, or the working size itself when
+    none was recorded, and never above the probe boundary. A leg whose batch
+    size no trial has left in place -- one stuck at the size it opened at
+    included -- is scored against the probe boundary.
 
     Same split as `slope_accuracy`: "no worker was ever admitted" is a result,
     "no probe boundary was passed" a harness omission."""
@@ -1909,14 +1899,14 @@ def check_hog_tracking(ctx: Context) -> Verdict:
 
 
 def check_ramp_progress(ctx: Context) -> Verdict:
-    """The ramp must actually move: ramp_step / unit_budget over time."""
+    """The batch size must actually move: `unit_budget` over time."""
     if not ctx.health_samples:
         return Verdict("ramp_progress", "SKIP", "no healthrec.jsonl")
     rows = _budget_rows(ctx)
     if not rows:
         return Verdict("ramp_progress", "SKIP", "no workers in any health sample")
-    # A model held at its knee can sit at the seed forever and be right, so
-    # it is not a candidate for the note below.
+    # A model whose working size a trial left at the seed can sit there
+    # forever and be right, so it is not a candidate for the note below.
     stalled_at_64 = [model for model, row in rows.items()
                      if row["peak"] == 64 and not row["knee"]]
     detail = "; ".join(
@@ -1941,22 +1931,14 @@ def check_calibration_learned(ctx: Context) -> Verdict:
     == 0` for some model, no `[[profile]]` in `calibration.after.toml`, a peak
     `unit_budget` no higher than the first recorded. See the README's "Checks".
 
-    **A knee is learning.** The seed is a starting guess, not a floor: rule 4
-    stops the ramp where throughput stops improving, so a model whose knee is
-    below its seed ends *under* the seed on purpose, and holding there while
-    probing above it every so many clean windows is the brake working: a
-    worker deliberately running at 3-7 units with a knee of 3 would otherwise
-    read "peak unit_budget never left the seed (seed 64, peak 64)" and FAIL
-    for doing exactly the right thing. A model with a knee is therefore never
-    counted as stuck, and the detail says what it
-    was holding at instead.
-
-    **So is a hold the ring certified.** `ramp_held` with `held_certified` is
-    the same statement before any knee fits: the rung is the top of a measured
-    plateau, and the brake holds the budget there rather than doubling away
-    from it. A hold the ring *cannot* certify says the opposite -- nothing was
-    measured at that rung -- so it never clears `stuck`, and the detail says
-    which of the two this was.
+    **A working size a trial left in place is learning.** The seed is a
+    starting guess, not a floor: the batch size is the smallest whose rate is
+    within 10 % of the best measured, so a model that gains nothing from
+    larger batches ends *under* its seed on purpose. A worker deliberately
+    running at 3-7 units would otherwise read "peak unit_budget never left
+    the seed (seed 64, peak 64)" and FAIL for doing exactly the right thing.
+    Only a size `/health` marks `knee_is_local` counts: the size a replica
+    opened at, with no trial to show for it, is still "stuck".
     """
     learning = _declared_learning(ctx)
     profiles = (ctx.after or {}).get("profile") or []
@@ -1976,39 +1958,23 @@ def check_calibration_learned(ctx: Context) -> Verdict:
             reasons.append("fit samples == 0 for " + ", ".join(no_fit))
         stuck = sorted(f"{model} (seed {rows[model]['first']}, peak "
                        f"{rows[model]['peak']})"
-                       + (f" [the throughput brake held it at "
-                          f"{rows[model]['held_units'] or rows[model]['peak']} "
-                          f"for {rows[model]['held']} sample(s), a rung the "
-                          f"ring never certified: nothing was measured there]"
-                          if rows[model]["held"] else "")
                        for model in rows
                        if rows[model]["peak"] <= rows[model]["first"]
-                       and not rows[model]["knee"]
-                       and not rows[model]["held_certified"])
+                       and not rows[model]["knee"])
         if stuck:
             reasons.append("peak unit_budget never left the seed for "
                            + ", ".join(stuck))
         braked = sorted(
-            f"{model} (seed {rows[model]['first']}, knee first learned at "
-            f"{rows[model]['knee_first']}, widened "
-            f"{rows[model]['knee_widenings']} time(s) up to "
+            f"{model} (seed {rows[model]['first']}, first left in place at "
+            f"{rows[model]['knee_first']}, moved "
+            f"{rows[model]['knee_moves']} time(s), at most "
             f"{rows[model]['knee']}, ran as low as {rows[model]['low']})"
             for model in rows
             if rows[model]["knee"] and
             rows[model]["peak"] <= rows[model]["first"])
         if braked:
-            notes.append("held at a learned plateau knee: "
+            notes.append("at a working size a trial left in place: "
                          + ", ".join(braked))
-        gated = sorted(
-            f"{model} (seed {rows[model]['first']}, held at "
-            f"{rows[model]['held_units'] or rows[model]['peak']} for "
-            f"{rows[model]['held']} sample(s))"
-            for model in rows
-            if rows[model]["held_certified"] and not rows[model]["knee"]
-            and rows[model]["peak"] <= rows[model]["first"])
-        if gated:
-            notes.append("held by the throughput brake at a rung the ring "
-                         "certified: " + ", ".join(gated))
     if ctx.after is None:
         reasons.append("no calibration.after.toml in the scenario directory")
     elif not profiles:
