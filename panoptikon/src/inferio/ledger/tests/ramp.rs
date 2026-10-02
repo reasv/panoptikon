@@ -1098,6 +1098,42 @@ fn a_flat_noisy_rate_does_not_walk() {
     assert!(ended.iter().all(|units| *units <= 128), "{ended:?}");
 }
 
+/// A job's first window holds one item while the scanner fills, and the
+/// ratchet admits twice the largest batch run: the first window at its
+/// budget is 2 units, whatever the seed, and every size from there is
+/// earned. A rate flat at every size stays at 2 units and tries 4 six times
+/// in 380 windows. CLIP on an M3 Max (113 items/s at 8 units, 125 at 16:
+/// 1.107x) stays at 8.
+#[test]
+fn a_job_opens_small_after_a_queue_sized_first_window_and_earns_from_there() {
+    // (seed, rate, the first windows, the size kept, later trials)
+    let clip: Rate = |units| ladder_rate(&CLIP_M3_MAX, units);
+    let cases: [(u32, Rate, &[u64], u64, usize); 2] = [
+        (16, |_| 6.5, &[1, 2, 2, 4, 2, 2], 2, 5),
+        (64, clip, &[1, 2, 2, 4, 8, 16, 8, 8], 8, 4),
+    ];
+    for (seed, rate, opening, settled, later) in cases {
+        let (ledger, handle, admission) = ramping_from_seed(seed);
+        let mut budgets = vec![queued_window_leaving_warm(
+            &handle,
+            &admission,
+            1,
+            |_| 2,
+            rate,
+        )];
+        budgets.extend((0..380).map(|_| window_leaving_warm(&handle, &admission, |_| 2, rate)));
+        assert_eq!(budgets[..opening.len()], *opening);
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            Some(settled),
+            "seed {seed}"
+        );
+        let trials = windows_off(&budgets[opening.len()..], settled);
+        assert_eq!(trials.len(), later, "seed {seed}: {trials:?}");
+        assert!(budgets.iter().all(|units| *units <= 2 * settled));
+    }
+}
+
 /// Windows the queue sized neither set the working size nor count towards
 /// a trial or the wait for the next one, and a trial waits through them.
 #[test]
