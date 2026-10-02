@@ -33,7 +33,7 @@ table's status column and the registry's `metadata.cost` comments, both of
 which now cite the code. Step 3 (auto everywhere with the number as a cap,
 plus the stamped one-time config migration) is implemented. Step 4's
 throughput half is implemented: the batch size moves only on rates measured
-orchestrator-side in units/sec, and the size a trial left in place is
+orchestrator-side in units/sec, and each size a trial placed is
 persisted through the existing store write path — see "Batch size: growing
 only on a measured gain" below. The
 shipped-baseline *directory* has been wired since 1c but no actual baselines
@@ -52,7 +52,7 @@ and unified-memory pools are covered too — the admission key (`device_key`,
 
 The rule (2026-10-02): do not waste memory, but use as much of the hardware
 as makes a batch faster. **The working batch size is the smallest size whose
-rate is within 10 % of the best rate measured**, and it moves only on
+rate is within 5 % of the best rate measured**, and it moves only on
 measurements: never because a larger size was merely no slower, and never
 because a timer ran out. The earlier machinery (a ramp that doubled until a
 gate stopped it, a hold, a knee fitted over the whole curve, and a knee that
@@ -68,7 +68,8 @@ cap, the ratchet at `RATCHET_FACTOR ×` the anchor, shape ceiling, death and
 pressure caps, deflation).
 
 ```text
-rate(s)   = median units/sec of the comparable observations of size s
+rate(s)   = median of the comparable observations of size s, each a batch's
+            units per second of its window, from grant to settle
             (unknown with fewer than 2, or a relative MAD over the device's band)
 d(a, b)   = the doublings between two sizes, 1 at most
 
@@ -78,43 +79,75 @@ faster(lo, hi, f): is rate(hi) > f × rate(lo)?
                                                         CLEAR_ERRORS (4) standard errors
     undecided -> the next window runs the side with fewer observations;
                  after TRIAL_WINDOWS (24) windows it counts as not shown
+clear(lo, hi, f, n): the same question, decided only by a difference of more
+    than n standard errors, whatever the count
 
 opening:  W = the stored knee_units (a row with a fit), with the wait stored
           beside it; otherwise the first window that ran at its budget with
-          memory to spare, and a trial at once
+          memory to spare, and a trial at once.
+          A stored W that is the largest size this machine has measured is
+          asked past (2W) once W has run, as while memory grants nothing above
 
 after `wait` full windows at W, a trial:
-  up:    T = 2W, 4W, … while faster(T/2, T, TRIAL_STEP ^ d) and memory granted T
-         in full; a size memory cut is the size it granted
-         best = the fastest size from W to T
-         W'   = the smallest size from W up to best that is not shown slower
-                than the band: not faster(s, best, (1 / KNEE_RATIO) ^ d)
-         W' > W -> W = W', and the trial is over
+  up:    G = W, the last size that gained; T = 2G
+         faster(G, T, TRIAL_STEP per doubling) and memory granted T in full
+                -> G = T, T = 2T
+         shown not faster, for the first time since a gain, T granted in full
+                -> T = 2T: one doubling of look-ahead. It goes on only if
+                   clear(G, T, TRIAL_STEP per doubling, HOLD_ERRORS) at twelve
+                   observations a side
+         otherwise the climb is over; a size memory cut is the size it granted
+         after each gain and at the end, W is placed:
+           best = the fastest size from W to T
+           W stays unless clear(W, best, (1 / KNEE_RATIO) ^ d, CLEAR_ERRORS)
+           else W = the smallest size above it that is not shown slower than
+                the band: not faster(s, best, (1 / KNEE_RATIO) ^ d)
   down:  (when the up half moved nothing)  D = W / 2
-         faster(D, best, (1 / KNEE_RATIO) ^ d) is shown false -> W = D, again
+         D is clearly inside the band of best [clear(D, best, (1 / KNEE_RATIO) ^ d,
+         HOLD_ERRORS (1) at twelve a side, CLEAR_ERRORS under) is false]
+                -> W = D, again
   over:  W moved  -> wait = RETEST_WINDOWS (12), failed = 0
-         W stayed -> W is confirmed; wait = 12 << failed (384 at most); failed += 1
+         W stayed -> wait = 12 << failed (384 at most); failed += 1
          the observations of the other sizes are dropped, and a pool larger
          than W needs is released when the replica's window returns
 ```
 
-- **The band is `KNEE_RATIO`.** Rates within 10 % of the best are a plateau,
+- **The rate is end to end.** A batch's observation is its units over its
+  share of the window's time, from the ledger issuing the grant to settling
+  it: `units × 1000 / (duration_ms × wall_ms / Σ duration_ms)`. The time
+  outside the batches (pricing, the round trip, the clamp, the frames
+  between batches) is paid per window and per batch, so it weighs most on
+  small batches. A model whose batches are no faster at any size therefore
+  stops stepping down where that time is inside the band: at 6.5 ms a window
+  and 1 ms a batch, 2 units at 22 items/s, 8 at 100, 16 at 300, and 1 unit
+  only for a model as slow as 6.5 items/s.
+- **The band is `KNEE_RATIO`.** Rates within 5 % of the best are a plateau,
   and `W` is its smallest size. A trial doubles on while the last doubling
-  gained `TRIAL_STEP` (3 %), so a curve with a soft bend is followed to
-  where it flattens before `W` is placed: a rate rising 1.05× a doubling ends
-  within 8 % of its best rate instead of at the size it opened at. A step
-  memory cuts short is held to its share of both thresholds: 128 → 191 units
-  is 0.58 of a doubling and must be 1.06× faster to be kept. A size less
-  than 1.11× the one below it is the same size.
+  gained `TRIAL_STEP` (1.5 %), so a curve with a soft bend is followed to
+  where it flattens before `W` is placed. A step memory cuts short is held
+  to its share of both thresholds: 128 → 191 units is 0.58 of a doubling and
+  must be 1.03× faster to be kept. A size less than 1.11× the one below it
+  is the same size (`SAME_SIZE_RATIO`), and a step the ratchet, not memory,
+  trimmed to a full batch of the size asked ran that size.
+- **One doubling of look-ahead.** Some curves dip or stay flat for one
+  doubling and rise beyond it. A doubling shown to gain nothing is passed
+  once; the size beyond it has to be clearly faster than the last size that
+  gained, by the step for both doublings. Two in a row end the climb, and so
+  does a doubling that could not be measured in its windows.
 - **Down as well as up.** A model that opens larger than it needs (a full
   queue at the seed, a stored size, a shipped one) steps down while half the
-  size is within the band of the best rate the trial measured. A rate flat
-  at every size ends at one unit.
+  size is within the band of the fastest size the trial measured; that size
+  is kept through the steps, so the size cannot walk down pair by pair.
 - **A verdict needs evidence that survives noise.** Two sizes are compared on
   twelve observations each, or on fewer when their difference is more than
   four standard errors of both sides' scatter, so a model 1.44× faster per
   doubling still takes one window per doubling and a noisy flat one waits.
-  The observations of both sizes are kept until the trial is over.
+- **`W` is left only on a clear difference.** Up, whatever the count, the
+  best size must be faster than the band by four standard errors; down, at
+  twelve a side, half the size must be inside the band by one. A size at the
+  band's edge is therefore not left and returned to as the observations
+  scatter. Moving up is the harder of the two because a move up that noise
+  made costs memory until a later trial undoes it.
 - **No evidence is not a move.** A comparison that stays undecided for
   `TRIAL_WINDOWS` windows counts as not shown, and `W` stays.
 - **Nothing is permanent.** A trial that left `W` in place is repeated after
@@ -124,41 +157,50 @@ after `wait` full windows at W, a trial:
   are dropped and a trial starts at once: the inputs changed.
 - **The pool follows the size.** A trial that ran a larger size than the one
   it leaves marks the replica, and the dispatcher sends it a `trim`
-  (`trial_over`) when its window returns, before the next one. The other
-  trims go to idle replicas and are declined by a busy one; this one is for
-  a replica in the middle of a job. A pool under `TRIM_SLACK_MB` is left.
+  (`trial_over`) when its window returns, before the next one, with work
+  queued or not. The other trims go to idle replicas and are declined by a
+  busy one. A pool under `TRIM_SLACK_MB` is left.
 - **Memory decides what a trial may run.** When memory grants nothing above
   `W`, the up half is skipped and the replica keeps asking for `2 W`, which
   costs nothing; the first window granted a larger size starts a trial at
   once. A window that runs out of memory, collapses, or whose worker dies
-  ends the trial; one under memory pressure puts it off for 12 windows.
-  Either way `W` keeps what the trial had measured below that window's size.
-- **The store holds a confirmed size.** `knee_units` is written when a trial
-  has left `W` in place, and at once when a trial moves it *down*; a size a
-  trial has just moved up is not written until the next one leaves it there.
-  The wait is stored beside it (`knee_trials_failed`, `knee_retest_after` in
-  whole twelves, rounded down), so a restart carries the wait on instead of
-  starting a trial. `max_units_measured` is still the ratchet's anchor (the
-  largest clean batch run) and does not say where a run opens. A row with an
-  anchor and no `knee_units` opens at the seed.
+  ends the trial and the asking; one under memory pressure puts the trial
+  off for 12 windows. Either way `W` keeps what the trial had measured below
+  that window's size.
+- **The store holds every size a trial placed.** `knee_units` is written as
+  soon as a trial moves `W`, up or down, during the climb as well, and when
+  a trial leaves an opening size in place; the wait is stored beside it
+  (`knee_trials_failed`, `knee_retest_after` in whole twelves, rounded
+  down). A restart carries the wait on, and a run that ended inside a trial
+  left no wait, so the next goes on with the trial from the size reached.
+  `max_units_measured` is still the ratchet's anchor (the largest clean
+  batch run). When it is no larger than the stored `W`, nothing above `W`
+  was measured here: memory, or the end of the run, cut the climb, and the
+  room may differ now. The replica then runs `W` once and asks for `2 W`,
+  as it does within a process, so a larger room is found in its second
+  window. A row with an anchor and no `knee_units` opens at the seed.
 - **Rising rates.** One window more than before at the opening size (it must
   be measured before the next can be compared with it), then one window per
   doubling, and one window at half the size twelve windows later. A caller
   that keeps a batch and a half in flight takes three per size.
 - `/health`: `knee_units` is `W`; `knee_is_local` says a trial on this machine
-  left it in place or stepped down to it (in this run or the one that stored
-  it); `trial_units` is the size a trial runs next; `retest_after_windows`
-  the wait.
+  moved to it or left it in place (in this run or the one that stored it);
+  `trial_units` is the size a trial runs next; `retest_after_windows` the
+  wait.
 
-What the rule cannot see: the rate is the worker's batch rate, so time spent
-between windows is not in it; a rate that is flat for a doubling and rises
-beyond it is not followed; a rate scattered past the device's band has no
-value, and the size stays where it is.
+What the rule cannot see: the dispatcher's time between a settle and the
+next grant is not in the rate; a rate that is flat for two doublings or more
+and rises beyond them is not followed; a rate scattered past the device's
+band has no value, and the size stays where it is. What it costs under heavy
+noise: a trial's climb passes the 1.5 % step by chance, so a model whose
+observations scatter by 15–20 % runs trial windows at several times `W`
+until the trials have backed off.
 
 ### Batch size: what counts as a measurement
 
 The ring holds the last `KNEE_RING` (128) throughput observations per (model,
-device), in units/sec. What may enter it, and what is compared with what:
+device), in units per second of the window. What may enter it, and what is
+compared with what:
 
 - **Full batches.** A batch must carry `FULL_BATCH_RATIO` (80 %) of its
   window's granted budget, or be one the next item would have pushed past it
@@ -184,7 +226,7 @@ device), in units/sec. What may enter it, and what is compared with what:
   itself.
 - **No rate out of scattered evidence.** A size's rate is known only from at
   least two observations whose relative MAD (`MAD / median`) is within
-  `KNEE_MAX_BUCKET_DISPERSION`, 0.20: twice the 10 % band, and between the
+  `KNEE_MAX_BUCKET_DISPERSION`, 0.20: four times the 5 % band, and between the
   0.003–0.05 quiet GPUs measure and the 0.9 of three models contending for
   one. The CPU device ships 0.35 (a quiet CPU host measures 0.13–0.20); both
   are overridden by `knee_max_bucket_dispersion` in `[inference_local.vram]`.
@@ -2242,7 +2284,7 @@ slope_mb_per_unit = 0.79               # marginal cost in MiB per unit, fitted
                                        # allocated_at_load; see Measurement)
 knee_units        = 512                # optional: the working batch size, the
                                        # smallest whose rate measured within
-                                       # 10 % of the best; a run opens here
+                                       # 5 % of the best; a run opens here
 samples           = 38
 residual_mb       = 96                 # fit scatter → confidence / safety margin
 measured_at       = "2026-07-30T00:00:00Z"
