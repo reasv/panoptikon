@@ -116,10 +116,10 @@ in ways the one-line statement is not:
   never against the surviving ring's alone. Without both this and the
   full-budget rule, each refit lands lower than the last and the cap walks
   itself down to a single unit, absorbingly.
-- **Enforced on the unit side.** `slope × knee_units` and a `min` on admitted
-  units are the same constraint post-fit and the unit-side one also binds
-  pre-fit; the same equivalence gives the contention appetite as `slope ×
-  min(anchor, knee)`.
+- **Enforced on the unit side.** The price of `knee_units` and a `min` on
+  admitted units are the same constraint post-fit and the unit-side one also
+  binds pre-fit; the same equivalence gives the contention appetite as the
+  price of `min(anchor, knee)` units.
 - **A profile's knee may be seeded from a shipped baseline** (unlike the
   ratchet anchor): it can only ever make a grant smaller. It is never written
   back out under our own generator stamp, and never overwrites a knee this
@@ -253,8 +253,8 @@ anything — the knee is withdrawn outright.
 - *At the knee* means the knee was the binding constraint **and** the window
   carried enough work to reach it. A window short of work, or held down by the
   ramp or the ratchet, says nothing about the cap.
-- *With room to spare* means `headroom ≥ RATCHET_FACTOR × slope × min(anchor,
-  knee)` and the window was not squeezed — exactly what the widened budget
+- *With room to spare* means `headroom ≥ price(RATCHET_FACTOR × min(anchor,
+  knee))` and the window was not squeezed — exactly what the widened budget
   would cost. Re-widening into a full GPU would be a squeeze, not a probe.
 - A **negative** window resets the counter. A model that just ran out of
   memory is not a model asking to be let out.
@@ -494,6 +494,15 @@ waiting for work rather than for the brake, so its hold caps admission as ever
 but is not reported — a textembed job published `ramp_held` with
 `held_certified = false` for 421 of 427 samples of a job whose every window was
 granted `RATCHET_FACTOR ×` the anchor.
+
+A window can also run at its budget and leave the ring empty: its one full
+batch grew the pool (so it is no warm batch) and the rest of the window was
+too short to count, which is what a caller that keeps a batch and a half in
+flight produces at every doubling. The gate would read that as a restart and
+step. So after such a window, if the worker reports the pool still held, the
+same size runs once more: that batch is warm, the ring gets its sample and
+the gate has something to compare. Once per log2 size; a second window that
+still gives nothing steps as before, so nothing holds on this alone.
 
 **And a doubling is earned only by a window that ran at its budget.** The
 exponent is a claim about the *next* rung, so the window paying for it has to
@@ -932,8 +941,8 @@ remedy.
 
 For an index-masked instance already in production, admission therefore turns
 **on** at the next load of each card: that card's row enters the ledger with
-nvidia-smi's total, takes the default reserve — `capped_default`, or
-`flat_default` on a spill host, since the operator wrote no `margin` for a
+nvidia-smi's total, takes the default reserve — `capped_default` or
+`gpu_floor`, or `flat_default` on a spill host, since the operator wrote no `margin` for a
 UUID they could not see — and the next grant is the first one bounded by a budget. Nothing is
 retroactive: no window already dispatched is re-priced and no profile is
 back-filled, and the UUID an operator needs to write a per-GPU override comes
@@ -1228,26 +1237,36 @@ booked centrally on the CPU device. It is never a throughput signal.
   replica's first window after load is a single item, measured before any
   larger batch runs: the dispatcher puts one request in the window, the grant
   caps each batch at one item whatever the cost unit, and nothing is booked.
-  Its batches feed the RAM samples only (no GPU fit sample, anchor, knee
-  sample, ramp step or warm-up count), so the next window is sized as the
-  replica's first would have been, from the seed or the profile's anchor.
-  What that item keeps is start-up and gives no sample, so the cost stays
-  unknown, and further windows stay item-capped (one batch deep, seen by the
-  RAM samples only) with the cap doubling after each window whose batch
-  filled it: 2, 4, …; a short window leaves it. They book nothing until a
+  The item cap only limits the batch. To the GPU side an item-capped window
+  is a window of that size, as a queue-sized one is: it feeds the fit, the
+  knee ring (the first window is warm-up, as always), the anchor and the
+  ramp. So a cold load without a profile doubles from the single item, each
+  window at most twice the largest size run (1, 2, 4, 8, 16, …), which is
+  where a model whose rate stops rising early gets its knee: a tagger bound
+  by CPU preprocessing is held at 7 units, where starting at its seed of 64
+  it doubled to the edge of a 16 GB card before the ring had three sizes.
+  And beside another process that leaves 2 GB of a card, the sizes run
+  give the fit before a batch could pass the room. The single-item window
+  is one batch deep; any other capped window holds at most
+  `WINDOW_DEPTH_MULTIPLIER` batches of the cap, whatever the ramp's budget
+  (under a stored anchor it would otherwise run hundreds of two-item
+  batches).
+  What that item keeps is start-up and gives no RAM sample, so the cost stays
+  unknown, and further windows stay item-capped with the cap doubling after
+  each window whose batch filled it: 2, 4, …; a short window leaves it.
+  They book nothing until a
   batch larger than the first grows RAM, then book at that one-size estimate
   until a second size gives the slope, when capping ends. So a one-size
   estimate that is wrong for costlier inputs costs at most one capped batch.
   The cost lives as long as the process, so a reload books from it at once,
   plus the start-up its first batch will add; of what that batch keeps, up to
-  the start-up measured before joins its load level. The cap stops doubling
-  at a `seed_units` batch (in items, from the largest units per item run so
-  far), and it never ends by count. Once as many doublings as capped windows
-  ran would hold a seed batch, capped windows also feed the GPU side, as
-  windows host RAM held back (fit samples and anchor, no ramp step or knee
-  sample), so a model whose batches never grow RAM, or only ever get one
-  item, still gets its fit and anchor. No window runs unbooked beyond twice
-  the largest batch already run, and never beyond one seed batch. A request
+  the start-up measured before joins its load level. The cap never ends by
+  count; it ends once a filled doubling would hold a `seed_units` batch (in
+  items, from the largest units per item run so far), where the unit budget
+  bounds the batch as for any replica. A model only ever sent single items
+  stays capped, which changes nothing: its windows are one-item windows.
+  No window runs unbooked beyond twice the largest batch
+  already run, and never beyond one seed batch. A request
   of several items still runs whole in its window, at the cap per batch; for
   a count-priced model the cap is the unit budget too.
 - **What a capped window changes.** The grant reads `squeezed` for the
@@ -1256,7 +1275,9 @@ booked centrally on the CPU device. It is never a throughput signal.
   `max_units_measured_here` nor knee expiry, and records no negative. Its
   batches still feed the GPU fit and the anchor, since they ran clean. Below
   the ceiling nothing differs; at it, growth stops as at the edge of a full
-  card and resumes from the same ramp position when RAM frees up.
+  card and resumes from the same ramp position when RAM frees up. The item
+  cap of a cold start is not this ceiling: `ram_ceiling_binding` is set only
+  when the RAM ceiling itself is below the batch the GPU side asked for.
 - **Not covered.** CPU-device replicas (RSS is their device memory);
   unified devices (MPS, APUs), whose GPU memory is RAM priced on their own
   row but whose host-side buffers (decode, preprocessing) this ceiling does
@@ -1456,15 +1477,16 @@ limit     = min(total × cap_fraction,           # server lever, default off
                 total − external × (1 + margin)) # desktop lever, default on
 headroom  = limit − Σ charge(residents) − Σ load_reservations  # may go negative
 room(w)   = headroom + max(0, growth(w) − Σ grants(w))  # w's own pool is free
+price(u)  = pool margin × (max(0, intercept) + slope × u)
 grant     = min(min(headroom share of w + own pool of w, room(w)),
-                ramp step, slope × knee_units,
-                slope × shape_ceiling_units,
+                ramp step, price(knee_units),
+                price(shape_ceiling_units),
                 priced content of the window itself)
 ```
 
-The `slope × knee_units` term is written on the MB side here and enforced
+The `price(knee_units)` term is written on the MB side here and enforced
 on the **unit** side in the implementation (`admitted_units`): post-fit the
-two are the same constraint, since a grant's MB figure is `units × slope`,
+two are the same constraint, since a grant's MB figure is `price(units)`,
 and the unit-side form needs no fit to be in force — so a knee still binds
 on a model that has not been fitted yet. The `shape_ceiling_units` term is
 the same shape and is enforced in the same place ("Shape ceiling: the third
@@ -1487,7 +1509,8 @@ execute at this corpus's shapes.
   approximation.
 - **A grant is dual-denominated**: an MB reservation (the ledger
   currency) and a unit budget (the packing currency). Post-fit the unit
-  budget derives from the MB side via the slope; pre-fit there is no
+  budget derives from the MB side via the price (the largest batch whose
+  `price` the share covers); pre-fit there is no
   slope, so the unit budget is the ramp value (`seed_units × 2^k`) and
   the MB side is the contention share held while that step is measured —
   the whole headroom for a replica alone on its device, a part of it
@@ -1721,8 +1744,8 @@ execute at this corpus's shapes.
 - **Contention policy** when several models are hungry at once: demand
   first (queue depth; an idle model consumes no new grants, though it
   holds its pool until trimmed — see Reactive shrink), then split by
-  calibrated appetite `slope × knee_units` — implemented as `slope ×
-  min(ratchet anchor, knee, limit / slope)`, the same unit-side equivalence
+  calibrated appetite `price(knee_units)` — implemented as `price(min(ratchet
+  anchor, knee, the units the limit affords))`, the same unit-side equivalence
   as the grant term above, so neither a knee-capped worker nor one holding a
   bigger card's seeded anchor can claim a share of the GPU sized for a batch
   it will never be admitted for — falling back to `base`
@@ -1734,7 +1757,7 @@ execute at this corpus's shapes.
 
   **A pre-fit reservation beside other replicas.** The split above only
   sees replicas that are asking at the same instant. Post-fit that is enough:
-  a lone requester reserves `units × slope` and leaves the rest. Pre-fit the
+  a lone requester reserves `price(units)` and leaves the rest. Pre-fit the
   share *is* the reservation, so a lone requester reserved the whole headroom
   and the next replica to ask — idle a moment earlier, in a window, or still
   loading — got `mb = 0` and one unit until that window settled (measured on
@@ -1808,15 +1831,23 @@ execute at this corpus's shapes.
     replica already holds, since the batch reuses its pool and the memory it
     kept is charged to it already.
   - *The batch is cut to what the grant covers* when the headroom cannot
-    supply the price and another replica holds a reservation on the device or
-    on the one sharing its RAM (a GPU replica's host RAM booking is one; an
-    unpriced one-unit window is not). A batch priced within what the
-    replica already holds is never cut: it allocates nothing new. A cut
-    window is squeezed, so the dispatcher sizes it to the cut budget. A
-    replica asking while nobody holds a reservation keeps the full ramp
-    value, as it does alone, so a card that is merely full sets no new
-    one-unit trap; and one unit is still the floor, so a replica left with
-    no headroom runs one unpriced unit, as before.
+    supply the price and either another replica holds a reservation on the
+    device or on the one sharing its RAM (a GPU replica's host RAM booking
+    is one; an unpriced one-unit window is not), or two sizes of this model
+    have measured its price here. The second applies alone on the device
+    too: a pre-fit batch the room does not cover at the measured rise would
+    only run out of memory. With one size measured a further unit is priced
+    at the design figure, which is no ground to cut on: a model far under
+    its design cost in a small room would be cut to the one unit it
+    measured, and never measure a second. A batch priced
+    within what the replica already holds is never cut: it allocates
+    nothing new. A cut window is squeezed, so the dispatcher sizes it to
+    the cut budget. A replica that has measured fewer than two sizes,
+    asking while nobody holds a reservation, keeps the full ramp value, so
+    a card that
+    is merely full sets no new one-unit trap; and one unit is still the
+    floor, so a replica left with no headroom runs one unpriced unit, as
+    before.
   - *A cut batch varies its size until three are measured.* A cut size
     depends only on the headroom and the pools, which do not move while the
     replicas stay busy, so the same size would run in every window and the
@@ -1852,9 +1883,9 @@ execute at this corpus's shapes.
   about what the lone ramp was exposed to before this rule, which ran 8, 16,
   32 units against the whole headroom and passed it on its own at the second
   or third window on every one of these small devices; the rule is inside
-  the headroom where that was not. After the fit a grant is `units × slope`,
-  which does not contain memory a first batch kept either; that is the
-  fitted price's own limit, unchanged here.
+  the headroom where that was not. After the fit a grant prices the fit's
+  intercept too ("The price covers the intercept", below), which holds
+  memory a first batch kept once every sample carries it.
 
   `room` — what the one-item out-of-memory rule and the ramp's
   ample-headroom test read — is not cut. The worker's clamp needs no change:
@@ -1974,8 +2005,9 @@ Worker, per batch within its window:
   currency, regressing `peak_allocated − allocated_at_load` against
   batch units with a **free intercept**: `base` is process-level driver
   currency the allocator never saw, so forcing the fit through it (or
-  through zero) would bias the slope low — admission uses the slope; the
-  intercept is diagnostic only. Reserved was the original basis and is
+  through zero) would bias the slope low. Admission prices the whole line
+  ("The price covers the intercept", below).
+  Reserved was the original basis and is
   wrong three ways: the caching allocator
   never returns blocks, so only pool-growing batches carried information
   and a warm steady state fed the fit nothing; the reserved/allocated
@@ -2021,9 +2053,35 @@ Worker, per batch within its window:
   is the median absolute residual about that line. The residual and the
   sample count are kept as confidence; the residual is what widens the
   effective margin ("Fit confidence widens margins automatically", above).
+- **The price covers the intercept.** The intercept is allocated memory a
+  batch costs whatever its size: buffers the first batch creates and keeps,
+  or a stage that runs once per batch. It was first left out of the price
+  when the fit was still made on the pool (`peak_reserved −
+  reserved_at_load`), where the intercept was mostly allocator rounding,
+  and the rule was carried over unchanged when the fit moved to allocated
+  memory, where it is real: 8–10 MiB for most shipped models, 33 MiB for
+  wd-vit on a 16 GB AMD card, 380–390 MiB for the docTR pipelines (8 MiB
+  per item). Priced by slope alone, a grant cut to the room was short by
+  the intercept times the pool margin, and on a card with no other tenant
+  nothing else covers that: the 33 MiB put a 181-unit batch 4 MiB over the
+  card. A model with 800 MiB fixed and 82 MiB per unit was granted 26 units
+  in a room that holds 16.
+  - A negative intercept prices as 0, so a grant is never below
+    `slope × units`.
+  - The intercept is measured over the level at load, so it counts memory
+    the replica keeps after its first batch. On a GPU that memory is in the
+    pool the grant is netted against. On the CPU device nothing is netted,
+    so there the fixed part is priced only beyond the resident growth the
+    replica already holds (taken off before the pool margin).
+  - The store does not hold the intercept. A local profile's sample ring
+    restores it at seeding; a shipped profile has no ring, so its grants
+    are priced by slope alone until this device has fitted (three sizes).
+  - The worker's clamp gets the fixed part with the grant (`fixed_mb`,
+    protocol doc "Memory grants") and scales only the per-unit part.
 - **The pool margin bridges the two currencies.** A grant is denominated
   in what the driver sees, so its MB figure is
-  `ceil(slope × units × margin)`. The margin is the reserved/allocated
+  `ceil((max(0, intercept) + slope × units) × margin)`.
+  The margin is the reserved/allocated
   ratio **this process** has observed for this (model, GPU), taken from
   the pool-growing batch with the most units in the ring and clamped to
   [1.0, 2.0] on CUDA and ROCm and to [1.0, **4.0**] on MPS — the ceiling
@@ -2038,6 +2096,36 @@ Worker, per batch within its window:
   persisted**, because the ratio is exactly the quantity measured not to
   reproduce across runs — clamped, it is a bounded safety multiplier,
   not a property of the model. `/health` reports it as `pool_margin`.
+  **An out-of-memory window at the room's limit raises it.** The ratio is
+  one observation, and the same batch needs more pool when the pool was
+  last shaped by another batch size (wd-vit: 1.056 in an emptied pool,
+  1.067–1.085 in a reused one). So when a window whose batch the fitted
+  price cut to the device's room runs out of memory, the margin of that
+  (model, device) is multiplied by 1.1 (`OOM_MARGIN_STEP`), at most three
+  times (`OOM_MARGIN_MAX_STEPS`, ×1.331) and still inside the allocator's
+  ceiling. The same room then buys a batch a tenth smaller, and a larger
+  room a proportionally larger one.
+  - It is kept until the server restarts and applies to every replica of
+    the model on that device, so a later job does not repeat the failure.
+    Deflation, which halves the ramp value and is repaid after three clean
+    windows, would otherwise return to the same size (the room, not the
+    ramp, had set it). It is never repaid: a clean window at the smaller
+    size says nothing about the larger one.
+  - Nothing is raised by a failure the price did not size: a pre-fit
+    window; one the queue, the ramp, host RAM or an item cap sized; a share
+    of the room beside another replica that is asking; a one-unit window;
+    a window while macOS is paging (the pressure cap holds the batch
+    there); an aborted window; a worker death; a spill or a collapse.
+    Deflation alone answers those. A Mac at warning with nothing paged out
+    does raise it: nothing else there stops the same failure returning
+    every time deflation is repaid.
+  - Three steps cover the measured spread of the ratio (3–5 % at large
+    batches) several times over; a fourth failure has another cause.
+  - Known limits. Another process's usage jumping during a room-sized
+    window fails it in the same way and raises the margin too. The raise
+    is not persisted (the store has no field for it, and its profiles are
+    keyed by architecture, not by card), so each server start can see one
+    such failure per (model, device).
   The pool is not released per window to make the margin smaller: that
   release measured as a fixed 1–35 ms per window (20–60 % of a fast
   window, 4–9 % at the largest batches) for a 5–17 % lower peak pool, so
@@ -2161,7 +2249,10 @@ Worker, per batch within its window:
   moved) and deflates that worker's grants; N consecutive clean windows
   restore them — deflation must be recoverable, or one external spike
   degrades a worker until respawn. Deflation is runtime state,
-  deliberately not persisted across restarts. It may shrink a worker below its
+  deliberately not persisted across restarts. When the room, not the ramp,
+  had sized the failed window, halving the ramp value changes nothing, so
+  that failure also raises the pool margin ("The pool margin bridges the
+  two currencies", above). It may shrink a worker below its
   seed, down to a single unit: the seed is where the ramp *starts*, not a promise
   to a worker that just OOMed; the real floor is at pack time (a batch is never
   smaller than one item).
@@ -2438,6 +2529,7 @@ So the config's `margin` is an **option**, and absence is a distinct state:
 ```
 reserve = ceil(external × margin)                          # margin configured
 reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
+reserve = max(reserve, min(1024 MiB, 3 % of total))        # unset, any GPU but Apple's
 reserve = 1024 MiB                                         # unset, CUDA GPU that spills
 reserve = max(reserve, clamp(total / 10, min(2 GiB, total / 4), 16 GiB))  # the CPU device, always
 limit   = min(total × cap_fraction, total − external − reserve)
@@ -2459,6 +2551,29 @@ limit   = min(total × cap_fraction, total − external − reserve)
   re-reads live free memory before every batch, is what actually catches a
   bigger move.
 
+- On a GPU other than Apple's the unset reserve is **at least 3 % of the
+  card, at most 1 GiB** (`reserve_rule = gpu_floor`). A tenth of other usage
+  is nothing on a card nobody else uses (17 MiB beside a 165 MiB desktop),
+  and a model with no throughput knee below the card's size is then granted
+  the card to the last MiB. What a batch needs there varies by a few percent
+  with the allocator pool's history ("The pool margin bridges the two
+  currencies"), and the device itself takes memory outside the allocator
+  after the first batches (144–244 MiB measured on HIP), which is only
+  booked once a later free reading shows it.
+  - It costs a model that the room cuts at most 3 % of its batch (245 MiB of
+    an 8 GB card, 491 of 16 GB, 737 of 24 GB, 1024 from 34 GB up), and a
+    model held by its knee nothing.
+  - Once other processes hold 30 % of the card, a tenth of their usage is the
+    larger figure and nothing changes. A flat 1 GiB would take 15–47 % of the
+    room left on an 8 GB card shared with a 2–6 GB tenant.
+  - Not on the CPU device (its own floor, below) and not on Apple Silicon,
+    whose limit is counted in RAM, where other usage is never small, and
+    which has the memory-pressure rules.
+  - A GPU carved out of host RAM on Linux (an APU) has the floor like a
+    discrete card. That is by reasoning, not measurement: with RAM to
+    spare its other usage reads small and a batch is granted to the last
+    MiB of what the driver will deliver, where the allocation fails.
+  - A margin written in the config is applied as written, 0 included.
 - On a host where a full CUDA GPU spills to system RAM instead of failing
   the allocation (the Windows display driver: native Windows, or `/dev/dxg`
   under WSL2 and Docker Desktop), the unset reserve is the 1 GiB cap itself,
@@ -2483,7 +2598,7 @@ user's stated rule ("at most 1 GB is ever withheld") and the widening was
 never the main protection — the ramp and the extrapolation ratchet both count
 local samples only, and neither is affected. And `/health` reports the reserve
 actually applied (`reserve_mb`) and which rule produced it (`reserve_rule`:
-`user_margin` | `capped_default` | `flat_default` | `ram_floor`), as does
+`user_margin` | `capped_default` | `gpu_floor` | `flat_default` | `ram_floor`), as does
 every `issued a memory grant` log line, so which arithmetic a GPU is under is never a guess.
 
 ## Calibration store
@@ -2598,8 +2713,9 @@ bound what a conferred number can do:
   even the machine's own store may hold a number its 96 GB card measured and
   its 12 GB card is now reading. Only a clean priced batch **this GPU ran**,
   in a window that did not fail, makes it measured here.
-- **The appetite is clamped by the card.** The contention weight is `slope ×
-  min(anchor, knee, limit / slope)`: a share sized for a batch this card cannot
+- **The appetite is clamped by the card.** The contention weight is
+  `price(min(anchor, knee, the units the limit affords))`: a share sized
+  for a batch this card cannot
   run is not an appetite, and taking it would come out of the neighbour's
   slice.
 

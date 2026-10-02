@@ -778,10 +778,9 @@ impl VramLedger {
                 ram_base_mb: ram_at_load_mb,
                 ram_mb: None,
                 ram_bound: false,
+                awaited_sample_bucket: None,
                 ram_started: false,
                 item_cap: ram_at_load_mb.map(|_| 1),
-                item_capped_windows: 0,
-                capped_windows_feed_gpu: false,
             },
         );
         drop(state);
@@ -908,6 +907,14 @@ impl Admission {
     /// Items the next window may hold ([`VramLedger::window_item_bound`]).
     pub fn window_item_bound(&self) -> usize {
         self.ledger.window_item_bound(self.worker)
+    }
+
+    /// The item cap in force ([`VramLedger::item_cap_locked`]).
+    #[cfg(test)]
+    pub(super) fn item_cap(&self) -> Option<u32> {
+        let state = self.ledger.lock();
+        let entry = state.workers.get(&self.worker)?;
+        VramLedger::item_cap_locked(&state, entry)
     }
 
     /// [`Self::request_grant_byte_bound`] with `byte_bound = false`.

@@ -1449,6 +1449,22 @@ def unreturnable_split_mb() -> int | None:
         return None
 
 
+# Allocated MiB when the first load finished; None until then.
+_allocated_at_load_mb: int | None = None
+
+
+def held_since_load_mb() -> int:
+    """MiB allocated now above the level at load: what earlier batches left
+    allocated. 0 on a RAM-priced worker, or when either figure is unknown.
+    """
+    if _ram_currency() or _allocated_at_load_mb is None:
+        return 0
+    _, allocated = pool_stats_mb()
+    if allocated is None:
+        return 0
+    return max(0, allocated - _allocated_at_load_mb)
+
+
 def releasable_pool_mb() -> int | None:
     """Pool this process holds that a batch can spend without a new device
     allocation: `reserved - allocated`. None on a RAM-priced worker, where
@@ -1978,6 +1994,9 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
         payload["reserved_at_load_mb"] = reserved
     if allocated is not None:
         payload["allocated_at_load_mb"] = allocated
+        global _allocated_at_load_mb
+        if _allocated_at_load_mb is None:
+            _allocated_at_load_mb = allocated
     dtype, dtype_method = resolved_dtype(instance)
     # The unstated sentinel is only useful with a footprint to key.
     if dtype != DTYPE_UNSTATED or "base_mb" in payload:

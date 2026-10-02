@@ -2407,3 +2407,136 @@ fn a_squeezed_window_earns_a_step_the_card_then_refuses_to_honour() {
         "the card still prices every ask: {granted:?} for {asked:?} MiB"
     );
 }
+
+/// What a worker reports of its pool around a batch.
+#[derive(Clone, Copy)]
+enum Pool {
+    /// Kept after the batch, as a GPU allocator does.
+    Kept,
+    /// Grown by each window's batch and released before the next.
+    Released,
+    /// No pool figures.
+    Unreported,
+}
+
+/// A replica with a seed of 64 and no profile, 82 MiB per unit, on a card
+/// with `room_mb` for its batches, whose windows hold `queued` units: one
+/// batch at the budget and a remainder too short to count, as when the
+/// caller keeps fewer items in flight than the ramp's window. Returns each
+/// window's unit budget and whether the ramp is held after the last; a batch
+/// that needs more than the room panics.
+fn one_batch_windows(
+    room_mb: u64,
+    windows: usize,
+    queued: impl Fn(u64) -> u64,
+    rate: impl Fn(u64) -> f64,
+    pool: Pool,
+) -> (Vec<u64>, bool) {
+    const PER_UNIT_MB: u64 = 82;
+    let ledger = ledger(1000 + room_mb, no_margin());
+    let handle = loaded(Some(1000), Some(0));
+    let admission = ledger
+        .register_worker("g/a", item_cost(64), &handle, None)
+        .expect("registers");
+    let mut held = 0;
+    let mut budgets = Vec::new();
+    for _ in 0..windows {
+        ledger.record_free_for_test(GPU, room_mb - held);
+        let capped = admission.window_target_units() / WINDOW_DEPTH_MULTIPLIER;
+        let queue = queued(capped);
+        let token = admission.request_grant(queue, None, 1, 0).expect("granted");
+        let units = token.grant().unit_budget;
+        assert!(PER_UNIT_MB * units <= room_mb, "{units} units: {budgets:?}");
+        let batch = |units: u64, held: &mut u64| {
+            let need = PER_UNIT_MB * units;
+            let before = match pool {
+                Pool::Released => 0,
+                _ => *held,
+            };
+            *held = before.max(need);
+            let reserved = !matches!(pool, Pool::Unreported);
+            BatchMeasurement {
+                reserved_before_mb: reserved.then_some(before),
+                reserved_after_mb: reserved.then_some(*held),
+                peak_reserved_mb: reserved.then_some(*held),
+                allocated_before_mb: Some(0),
+                peak_allocated_mb: Some(need),
+                duration_ms: Some(units as f64 * 1000.0 / rate(units)),
+                ..measurement(units, 0, need)
+            }
+        };
+        let full_batches = (queue / units).max(1);
+        let mut batches: Vec<BatchMeasurement> =
+            (0..full_batches).map(|_| batch(units, &mut held)).collect();
+        batches.push(batch(units / 2, &mut held));
+        if matches!(pool, Pool::Released) {
+            held = 0;
+        }
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(WindowOutcome::Responded { oom: None });
+        budgets.push(units);
+    }
+    let held = ledger.health()[0].workers[0].ramp_held;
+    (budgets, held)
+}
+
+/// A window's unit queue of one batch and a half at the budget.
+fn a_batch_and_a_half(capped: u64) -> u64 {
+    capped * 3 / 2
+}
+
+/// A flat rate through one-batch windows: each window's one full batch grows
+/// the pool, so it gives the knee ring nothing, and the gate used to step on
+/// that as on a restart, to the 191 units the card holds. Now the size runs
+/// once more with the pool warm, the ring gets its samples, and the gate
+/// holds at 128, where the rate is no better than at 64.
+#[test]
+fn a_window_that_gave_no_knee_sample_runs_once_more_before_the_ramp_steps() {
+    let (budgets, held) = one_batch_windows(15_700, 9, a_batch_and_a_half, |_| 22.0, Pool::Kept);
+    assert_eq!(budgets, [64, 64, 64, 128, 128, 128, 128, 128, 128]);
+    assert!(held);
+}
+
+/// A rate that keeps rising still ramps to what the card holds.
+#[test]
+fn a_rising_rate_reaches_the_room_through_one_batch_windows() {
+    let rising = |units| ladder_rate(&MINILM_M3_MAX, units);
+    let (budgets, _) = one_batch_windows(15_700, 8, a_batch_and_a_half, rising, Pool::Kept);
+    assert_eq!(budgets, [64, 64, 64, 128, 128, 128, 191, 191]);
+
+    // 100 units fill a smaller card: the same log2 size as 64, which ran its
+    // one more window, so 100 does not run another for want of a sample.
+    let (budgets, held) = one_batch_windows(8_200, 4, |capped| capped, rising, Pool::Kept);
+    assert_eq!(budgets, [64, 64, 64, 100]);
+    assert!(!held);
+}
+
+/// The extra window is one per size: a worker whose pool is gone again by
+/// the next window never gives a sample and ramps a window later per rung;
+/// one that reports no pool figures ramps as before.
+#[test]
+fn a_worker_that_never_gives_a_knee_sample_still_ramps() {
+    let (released, _) = one_batch_windows(15_700, 6, a_batch_and_a_half, |_| 22.0, Pool::Released);
+    assert_eq!(released, [64, 64, 128, 128, 191, 191]);
+    let (unreported, _) =
+        one_batch_windows(150_000, 4, a_batch_and_a_half, |_| 22.0, Pool::Unreported);
+    assert_eq!(unreported, [64, 128, 256, 512]);
+}
+
+/// A queue-sized window is no evidence either way: it waits for nothing, and
+/// the next full window is twice the largest size run. That one, below the
+/// seed, runs once more at its own size, not at twice it.
+#[test]
+fn a_queue_sized_window_does_not_wait_for_a_knee_sample() {
+    let window = std::cell::Cell::new(0);
+    let queued = |capped: u64| {
+        window.set(window.get() + 1);
+        if window.get() == 1 {
+            8
+        } else {
+            a_batch_and_a_half(capped)
+        }
+    };
+    let (budgets, _) = one_batch_windows(15_700, 3, queued, |_| 22.0, Pool::Kept);
+    assert_eq!(budgets, [8, 16, 16]);
+}

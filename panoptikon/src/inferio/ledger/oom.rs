@@ -184,6 +184,47 @@ impl VramLedger {
         );
     }
 
+    /// A window of more than one unit that the device's room sized
+    /// ([`GrantCharge::room_bound`]) ran out of memory: its batch needed more
+    /// than its price. The (model, device)'s pool margin is raised by
+    /// [`OOM_MARGIN_STEP`], at most [`OOM_MARGIN_MAX_STEPS`] times, so the
+    /// same room buys a smaller batch from now on, for every replica of the
+    /// model here. Not while macOS is paging, which leaves any batch too
+    /// little room.
+    pub(super) fn raise_pool_margin_locked(
+        state: &mut LedgerState,
+        worker: WorkerId,
+        charge: GrantCharge,
+    ) {
+        if !charge.room_bound || charge.unit_budget <= 1 || charge.pressure.paging() {
+            return;
+        }
+        let Some(entry) = state.workers.get(&worker) else {
+            return;
+        };
+        let key = (entry.inference_id.clone(), entry.gpu.clone());
+        let before = Self::pool_margin_locked(state, entry);
+        let cal = state.calibration.entry(key.clone()).or_default();
+        if cal.oom_margin_steps >= OOM_MARGIN_MAX_STEPS {
+            return;
+        }
+        cal.oom_margin_steps += 1;
+        let after = state
+            .workers
+            .get(&worker)
+            .map_or(before, |entry| Self::pool_margin_locked(state, entry));
+        tracing::info!(
+            model = %key.0,
+            gpu = %key.1,
+            failed_at_units = charge.unit_budget,
+            room_mb = charge.room,
+            pool_margin_before = before,
+            pool_margin = after,
+            "a window sized by this device's room ran out of memory; raised \
+             this model's pool margin here until the server restarts"
+        );
+    }
+
     /// A replica whose process died holding a granted window (`charge`).
     ///
     /// Where the death may be a host RAM kill ([`death_may_be_ram`]), the

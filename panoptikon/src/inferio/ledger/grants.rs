@@ -45,15 +45,22 @@ impl VramLedger {
             .max(1)
     }
 
-    /// Items the dispatcher may put in one window: one batch at the item cap
-    /// ([`Self::item_cap_locked`]), else no bound.
+    /// Items the dispatcher may put in one window. Under an item cap
+    /// ([`Self::item_cap_locked`]) that is [`WINDOW_DEPTH_MULTIPLIER`]
+    /// batches of it, whatever the ramp's budget, and one item while the cap
+    /// is one, the replica's first window; else no bound.
     pub(super) fn window_item_bound(&self, worker: WorkerId) -> usize {
         let state = self.lock();
-        state
+        let cap = state
             .workers
             .get(&worker)
-            .and_then(|entry| Self::item_cap_locked(&state, entry))
-            .map_or(usize::MAX, |cap| cap as usize)
+            .and_then(|entry| Self::item_cap_locked(&state, entry));
+        match cap {
+            None => usize::MAX,
+            Some(1) => 1,
+            Some(cap) => usize::try_from(u64::from(cap).saturating_mul(WINDOW_DEPTH_MULTIPLIER))
+                .unwrap_or(usize::MAX),
+        }
     }
 
     /// Reserve headroom for one window and hand back the grant.
@@ -90,11 +97,21 @@ impl VramLedger {
         };
         let signed_headroom = self.overdraft_with_margin_locked(&state, &gpu, margin);
         let headroom = signed_headroom.max(0) as u64;
-        // The ramp value, and what of it the window's content asks for.
-        let (capped, wanted) = {
+        // The ramp value, and what of it the window's content asks for. An
+        // item cap (the user's included) limits the content like a short
+        // queue: for a count-priced model it is a unit count.
+        let (capped, wanted, item_cap) = {
             let entry = state.workers.get(&worker)?;
             let capped = Self::budget_locked(&state, entry, Self::knee_locked(&state, entry));
-            (capped, capped.min(window_units.max(1)).max(1))
+            let item_cap = Self::item_cap_locked(&state, entry)
+                .map(|cap| user_cap_items.map_or(cap, |user| cap.min(user)));
+            let content = match item_cap {
+                Some(cap) if entry.aggregation == CostAggregation::Count => {
+                    window_units.min(u64::from(cap))
+                }
+                _ => window_units,
+            };
+            (capped, capped.min(content.max(1)).max(1), item_cap)
         };
         let share = self.share_locked(&state, worker, signed_headroom, wanted);
         let (
@@ -111,28 +128,27 @@ impl VramLedger {
             ram_mb,
             ram_bound,
             ram_mb_per_unit,
-            item_cap,
-            ram_only,
+            fixed_mb,
         ) = {
             let entry = state.workers.get(&worker)?;
-            let slope = Self::grant_slope_locked(&state, entry);
+            let price = Self::grant_price_locked(&state, entry);
             // The knee decided this window's size: it bit (compared with the
             // shape ceiling still applied) and the work in hand reached it.
             let knee_bound =
                 capped < Self::budget_locked(&state, entry, None) && wanted >= capped && capped > 0;
-            // Room for `RATCHET_FACTOR` × the appetite, measured against the
-            // requester's own room (its pool included).
-            let ample_headroom = (share.room as f64)
-                >= self.appetite_mb_locked(&state, entry) * RATCHET_FACTOR as f64;
+            // Room for a batch `RATCHET_FACTOR` × the appetite's, measured
+            // against the requester's own room (its pool included).
+            let ample_headroom =
+                (share.room as f64) >= self.appetite_mb_locked(&state, entry, RATCHET_FACTOR);
             let mut units = wanted;
             let mut mb = share.mb;
             // Memory, not the ramp, ratchet or queue, held this window back.
-            let squeezed = if let Some(slope) = slope {
+            let squeezed = if let Some(price) = price {
                 // Post-fit the unit budget is what the share affords.
-                let affordable = ((share.mb as f64) / slope).floor().max(1.0) as u64;
+                let affordable = price.units(share.mb).max(1);
                 let squeezed = affordable < wanted;
                 units = units.min(affordable).max(1);
-                mb = ((units as f64) * slope).ceil() as u64;
+                mb = price.cost_mb(units);
                 squeezed
             } else {
                 // Pre-fit the ramp value is the unit budget; with no share at
@@ -140,15 +156,19 @@ impl VramLedger {
                 if share.mb == 0 {
                     units = 1;
                 }
-                // Beside another replica's reservation, at most the batch
-                // that the share and what the replica holds cover at its
-                // pre-fit price.
+                // Beside another replica's reservation, or once two sizes of
+                // this model measured its price here, at most the batch that
+                // the share and what the replica holds cover at its pre-fit
+                // price.
                 let within = share
                     .mb
                     .saturating_add(entry.growth_in_use_mb())
                     .max(entry.pool_growth_mb());
-                let covered = Self::pre_fit_price_locked(&state, entry).units(within, units);
-                let cut = covered < units && Self::neighbour_reserved_locked(&state, worker);
+                let price = Self::pre_fit_price_locked(&state, entry);
+                let covered = price.units(within, units);
+                let cut = covered < units
+                    && (price.has_measured_rise()
+                        || Self::neighbour_reserved_locked(&state, worker));
                 if cut {
                     units = Self::cut_size_locked(&state, entry, covered);
                 }
@@ -162,26 +182,10 @@ impl VramLedger {
             let ram_bound = ram.is_some_and(|ram| ram.units < units);
             if let Some(ram) = ram.filter(|_| ram_bound) {
                 units = ram.units;
-                if let Some(slope) = slope {
-                    mb = ((units as f64) * slope).ceil() as u64;
+                if let Some(price) = price {
+                    mb = price.cost_mb(units);
                 }
             }
-            // An item-capped window bounds batches in items, the user's cap
-            // included; for a count-priced model that is its unit budget too.
-            let item_cap = Self::item_cap_locked(&state, entry)
-                .map(|cap| user_cap_items.map_or(cap, |user| cap.min(user)));
-            if let Some(cap) = item_cap.map(u64::from).filter(|cap| *cap < units)
-                && entry.aggregation == CostAggregation::Count
-            {
-                units = cap;
-                if let Some(slope) = slope {
-                    mb = ((units as f64) * slope).ceil() as u64;
-                }
-            }
-            // Until the GPU side learns from them, an item-capped window is
-            // not a RAM bound to it; after, the cap holds it back as one.
-            let ram_only = item_cap.is_some() && !entry.capped_windows_feed_gpu;
-            let ram_bound = !ram_only && (ram_bound || item_cap.is_some());
             let ram_cost = ram.and_then(|ram| ram.cost);
             let ram_mb = ram_cost.map_or(0, |cost| cost.booking_mb(units));
             let ram_mb_per_unit = ram_cost.map(|cost| cost.mb_per_unit);
@@ -203,8 +207,7 @@ impl VramLedger {
                 ram_mb,
                 ram_bound,
                 ram_mb_per_unit,
-                item_cap,
-                ram_only,
+                price.map_or(0, |price| price.fixed_mb as u64),
             )
         };
         // At least one unit, or the queue stalls; the MB side has no floor.
@@ -217,6 +220,14 @@ impl VramLedger {
             let busy_holder = starved.then(|| Self::largest_free_pool_locked(&state, &gpu, worker));
             Self::flag_trims_locked(&mut state, &gpu, worker, starved, busy_holder.flatten());
         }
+        // The room itself, through the fitted price, set this batch's size.
+        let room_bound = squeezed
+            && share.mb == share.room
+            && state
+                .workers
+                .get(&worker)
+                .and_then(|entry| Self::grant_price_locked(&state, entry))
+                .is_some_and(|price| unit_budget == price.units(share.mb).max(1));
         // What the booking may take out of free host RAM: the replica reuses
         // the growth it already holds.
         let ram_new_mb = state.workers.get(&worker).map_or(0, |entry| {
@@ -237,6 +248,7 @@ impl VramLedger {
                     requests: window_requests,
                     unit_budget,
                     squeezed,
+                    room_bound,
                     peak_occupants: 0,
                     knee_bound,
                     ample_headroom,
@@ -246,7 +258,6 @@ impl VramLedger {
                     ram_bound,
                     pressure,
                     item_cap,
-                    ram_only,
                 },
             );
         if let Some(entry) = state.workers.get_mut(&worker) {
@@ -327,6 +338,7 @@ impl VramLedger {
                 canvas_pixels,
                 max_tokens,
                 squeezed: squeezed || ram_bound,
+                fixed_mb: fixed_mb.min(mb),
                 ram_mb: ram_new_mb,
                 ram_reserve_mb,
             },
@@ -464,13 +476,7 @@ impl VramLedger {
             WindowOutcome::Responded { oom } => oom,
             _ => None,
         };
-        // A clean RAM-only window leaves the ramp and the knee as they were.
-        let clean_ram_only = charge.is_some_and(|charge| charge.ram_only)
-            && matches!(outcome, WindowOutcome::Responded { oom: None })
-            && !ingested.negative;
-        if let WindowOutcome::Responded { oom } = outcome
-            && !clean_ram_only
-        {
+        if let WindowOutcome::Responded { oom } = outcome {
             let negative = ingested.negative || oom.is_some();
             responded_negative = negative;
             // Read after the ingest, which may move both.
@@ -485,7 +491,12 @@ impl VramLedger {
             // under it and be spent at once when it is withdrawn.
             let gate = self.ramp_gate_locked(&state, worker, anchor);
             let knee_binds = Self::knee_binds_locked(&state, worker);
-            let may_grow = gate.gains && !knee_binds;
+            // A step the ring cannot judge waits one window for a sample.
+            let awaits_sample = gate.gains
+                && !knee_binds
+                && !negative
+                && Self::awaits_knee_sample_locked(&mut state, worker, charge, &ingested);
+            let may_grow = gate.gains && !knee_binds && !awaits_sample;
             // An uncertified hold (no knee in force, anchor > 0) is held at the
             // largest batch this GPU ran, else the seed; never at the conferred
             // anchor. See docs/batch-calibration-design.md, "Throughput knee:
@@ -506,8 +517,11 @@ impl VramLedger {
             } else {
                 seed_units
             };
-            let hold_rung =
-                (anchor > 0 && !gate.gains && !gate.certified && !knee_binds).then_some(rung);
+            let hold_rung = if awaits_sample {
+                charge.map(|charge| charge.unit_budget)
+            } else {
+                (anchor > 0 && !gate.gains && !gate.certified && !knee_binds).then_some(rung)
+            };
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
                     entry.note_negative_sample(anchor);
@@ -534,7 +548,9 @@ impl VramLedger {
                 Self::note_pressure_size_locked(&mut state, worker, charge, filled);
             }
             Self::reprobe_hold_locked(&mut state, worker, charge, negative);
-            Self::log_ramp_hold_locked(&mut state, worker, gate, knee_binds);
+            if !awaits_sample {
+                Self::log_ramp_hold_locked(&mut state, worker, gate, knee_binds);
+            }
             knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
         }
         let died = matches!(outcome, WindowOutcome::WorkerDied);
@@ -545,6 +561,12 @@ impl VramLedger {
         // death path already halved it.
         if death.is_none() && (frame_oom.is_some() || ingested.oom || died) {
             Self::lower_seeded_anchor_locked(&mut state, worker);
+        }
+        // An out-of-memory window the room sized was priced too low.
+        if let Some(charge) =
+            charge.filter(|_| responded_negative && (frame_oom.is_some() || ingested.oom))
+        {
+            Self::raise_pool_margin_locked(&mut state, worker, charge);
         }
         // A one-item OOM with less room than one item costs; see
         // [`OOM_WINDOWS_AT_FLOOR`].
@@ -648,6 +670,8 @@ pub struct Grant {
     /// Memory (the GPU's or host RAM), not the ramp, ratchet or queue, held
     /// this window back.
     pub squeezed: bool,
+    /// The part of `mb` a batch costs whatever its size; 0 pre-fit.
+    pub fixed_mb: u64,
     /// Host RAM a GPU replica's window may add to its resident set: its
     /// booking on the CPU device less the growth it already holds; 0 if none.
     pub ram_mb: u64,

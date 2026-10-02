@@ -211,6 +211,7 @@ def isolated(torch_module=None):
                 clear=False,
             ),
             mock.patch.dict(memory._logged, {}, clear=False),
+            mock.patch.object(memory, "_allocated_at_load_mb", None),
         ):
             for key in memory._logged:
                 memory._logged[key] = False
@@ -301,6 +302,13 @@ def test_load_that_initializes_cuda_is_still_measured() -> None:
         cuda.initialized = True
         cuda.allocate(1024, reserved_mb=1200)
         report = memory.finish_load(before, object())
+        # What a batch leaves allocated is held over that level, which a
+        # second load report does not move.
+        assert memory.held_since_load_mb() == 0
+        cuda.allocate(32)
+        assert memory.held_since_load_mb() == 32
+        memory.finish_load(memory.begin_load(), object())
+        assert memory.held_since_load_mb() == 32
     assert report["base_mb"] == 1024 + memory.CONTEXT_ESTIMATE_MB
     assert report["base_method"] == "alloc_delta"
     assert report["reserved_at_load_mb"] == 1200
@@ -3335,6 +3343,6 @@ def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:
             40 * 1024, 128 * 1024, 40 * 1024,
         )
     source = inspect.getsource(packing.run_window)
-    clamp = source.index("clamp_to_live_memory(budget, grant_mb,")
+    clamp = source.index("live = clamp_to_live_memory(")
     begin = source.index("state = memory.begin_batch()")
     assert clamp < begin, "the counter read is outside the timed section"

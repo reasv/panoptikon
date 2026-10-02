@@ -555,6 +555,9 @@ expressed no opinion, so the orchestrator applies its own default fraction
 *and* caps the resulting reserve at 1 GiB, which stops the margin making the
 last few gigabytes of a busy GPU unusable; a margin written in the file is
 honoured verbatim and uncapped, because it is a statement about your machine.
+Except on a Mac, the default reserve is also at least 3 % of the GPU (at most
+1 GiB): with little else on the card a tenth of other usage is a few MiB, and
+batches sized to fill the card would run at its physical limit.
 Where a full NVIDIA GPU spills to system RAM instead of failing (Windows, WSL2,
 Docker Desktop), the default reserve on each CUDA GPU is that 1 GiB flat: the
 last gigabyte buys no throughput, and a spill makes inference several times

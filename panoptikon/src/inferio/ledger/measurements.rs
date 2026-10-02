@@ -363,6 +363,7 @@ impl VramLedger {
             budget_floor.filter(|_| window.is_some_and(|charge| knee_admits_window(&charge)));
         // A clean priced batch of this window ran at its budget.
         let mut ran_full = false;
+        let mut left_pool_grown = false;
         // A window the queue sized is no evidence for the ramp's next step;
         // its batches still feed the knee ring.
         let queue_bound = window.is_none_or(|charge| charge.queue_bound);
@@ -374,7 +375,6 @@ impl VramLedger {
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
         let pressure = window.is_some_and(|charge| charge.pressure != mps::MemoryPressure::Normal);
         let item_capped = window.is_some_and(|charge| charge.item_cap.is_some());
-        let ram_only = window.is_some_and(|charge| charge.ram_only);
         // The largest units per item an item-capped batch ran, if one ran,
         // and whether a batch filled the cap.
         let mut item_units: Option<u64> = None;
@@ -580,11 +580,6 @@ impl VramLedger {
                     .and_then(|charge| charge.item_cap)
                     .is_some_and(|cap| measurement.items.unwrap_or(0) >= u64::from(cap));
             }
-            // A RAM-only window feeds the RAM cost alone: to the GPU side the
-            // next window is this replica's first.
-            if ram_only {
-                continue;
-            }
             // A memory-clamped batch still counts as uncut.
             if !clipped {
                 ran_wider_uncut = ran_wider_uncut.max(units.unwrap_or(0));
@@ -642,8 +637,12 @@ impl VramLedger {
                     delta_mb: peak.saturating_sub(at_load),
                 });
                 anchor = anchor.max(units);
-                ran_full |= budget_floor
+                let full = budget_floor
                     .is_some_and(|floor| units >= floor || measurement.next_over_budget);
+                ran_full |= full;
+                if full {
+                    left_pool_grown = high_water && measurement.reserved_after_mb.is_some();
+                }
             }
             // Pool-over-allocated ratio, only where the pool grew and the delta
             // reaches [`POOL_MARGIN_MIN_DELTA_MB`].
@@ -766,27 +765,17 @@ impl VramLedger {
         }
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.fit_watermark = new_watermark;
-            if !ram_only {
-                entry.settled_windows = entry.settled_windows.saturating_add(1);
-            }
+            entry.settled_windows = entry.settled_windows.saturating_add(1);
             entry.ran_batches = ran_batches;
-            // Doubled after a batch that filled it, up to a seed batch. Once
-            // as many doublings as capped windows ran would hold one, capped
-            // windows feed the GPU side too, so it learns even from a model
-            // sent one item at a time.
-            if let Some(item_units) = item_units {
-                entry.item_capped_windows = entry.item_capped_windows.saturating_add(1);
+            // Doubled after a batch that filled it. It ends once it would
+            // hold a seed batch: from there the unit budget bounds the batch
+            // as it does for any replica.
+            if let Some(item_units) = item_units.filter(|_| filled_cap) {
                 let seed_items = entry.seed_units.div_ceil(item_units.max(1));
-                if let Some(cap) = entry.item_cap
-                    && filled_cap
-                    && u64::from(cap) < seed_items
-                {
-                    entry.item_cap = Some(cap.saturating_mul(2));
-                }
-                let doubled = 1u64
-                    .checked_shl(entry.item_capped_windows)
-                    .unwrap_or(u64::MAX);
-                entry.capped_windows_feed_gpu |= doubled >= seed_items;
+                entry.item_cap = entry
+                    .item_cap
+                    .map(|cap| cap.saturating_mul(2))
+                    .filter(|cap| u64::from(*cap) < seed_items);
             }
             // A window reporting zero retries is kept: the starvation trigger
             // tells it apart from no report.
@@ -911,6 +900,7 @@ impl VramLedger {
             at_budget: !queue_bound && !ram_bound && !pressure && ran_full,
             filled: !queue_bound && !ram_bound && ran_full,
             throughput_samples,
+            left_pool_grown,
             oom: saw_oom,
             throughput_collapse: saw_collapse,
             spill: saw_spill,
@@ -993,6 +983,16 @@ pub(super) fn robust_fit(samples: &[FitSample]) -> Option<FitSnapshot> {
     theil_sen(samples)
 }
 
+/// The intercept of the line of `slope` through `samples`: the median of
+/// `delta − slope × units`. `None` without samples.
+pub(super) fn intercept_at(samples: &[FitSample], slope: f64) -> Option<f64> {
+    let mut intercepts: Vec<f64> = samples
+        .iter()
+        .map(|sample| sample.delta_mb as f64 - slope * sample.units as f64)
+        .collect();
+    median(&mut intercepts)
+}
+
 /// [`robust_fit`] from any two distinct unit counts on.
 fn theil_sen(samples: &[FitSample]) -> Option<FitSnapshot> {
     let mut slopes: Vec<f64> = Vec::new();
@@ -1009,11 +1009,7 @@ fn theil_sen(samples: &[FitSample]) -> Option<FitSnapshot> {
     if !slope.is_finite() || slope <= 0.0 {
         return None;
     }
-    let mut intercepts: Vec<f64> = samples
-        .iter()
-        .map(|sample| sample.delta_mb as f64 - slope * sample.units as f64)
-        .collect();
-    let intercept = median(&mut intercepts)?;
+    let intercept = intercept_at(samples, slope)?;
     let mut residuals: Vec<f64> = samples
         .iter()
         .map(|sample| (sample.delta_mb as f64 - (intercept + slope * sample.units as f64)).abs())

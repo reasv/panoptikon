@@ -57,8 +57,9 @@ impl VramLedger {
         if adopt_fit {
             cal.fit = Some(FitSnapshot {
                 slope_mb_per_unit: seed.slope_mb_per_unit,
-                // Not stored; admission uses only the slope.
-                intercept_mb: 0.0,
+                // Not stored: read off the local ring, 0 without one.
+                intercept_mb: measurements::intercept_at(&seed.ring, seed.slope_mb_per_unit)
+                    .unwrap_or(0.0),
                 residual_mb: seed.residual_mb,
                 samples: seed.samples,
                 version,

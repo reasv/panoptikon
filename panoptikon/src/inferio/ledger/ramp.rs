@@ -299,6 +299,30 @@ impl VramLedger {
         );
     }
 
+    /// Whether the ramp runs one more window at this size before stepping:
+    /// a window at its budget gave the knee ring no sample because its last
+    /// full batch grew the pool, and the pool is still held, so the gate
+    /// would step on no evidence where the next window's batch runs warm.
+    /// Once per log2 size: a second window without a sample steps as before.
+    pub(super) fn awaits_knee_sample_locked(
+        state: &mut LedgerState,
+        worker: WorkerId,
+        charge: Option<GrantCharge>,
+        ingested: &Ingested,
+    ) -> bool {
+        let unsampled =
+            ingested.at_budget && ingested.throughput_samples == 0 && ingested.left_pool_grown;
+        let (Some(charge), Some(entry)) =
+            (charge.filter(|_| unsampled), state.workers.get_mut(&worker))
+        else {
+            return false;
+        };
+        let bucket = Some(size_bucket(charge.unit_budget));
+        let waited = entry.awaited_sample_bucket == bucket;
+        entry.awaited_sample_bucket = bucket;
+        !waited
+    }
+
     /// Whether a seeded or fitted knee is in force for this (model, GPU).
     pub(super) fn knee_binds_locked(state: &LedgerState, worker: WorkerId) -> bool {
         state

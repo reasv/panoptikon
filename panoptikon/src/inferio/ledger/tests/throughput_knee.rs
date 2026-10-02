@@ -1065,6 +1065,7 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         requests: 1,
         unit_budget: 64,
         squeezed: false,
+        room_bound: false,
         peak_occupants: 0,
         knee_bound: false,
         ample_headroom: true,
@@ -1074,7 +1075,6 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         ram_bound: false,
         pressure: mps::MemoryPressure::Normal,
         item_cap: None,
-        ram_only: false,
     };
     assert!(knee_admits_window(&honest));
     assert!(

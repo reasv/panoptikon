@@ -32,11 +32,21 @@ fn host_with_ram(
     profiles: Option<Arc<FakeProfiles>>,
     ram_mb: u64,
 ) -> Arc<VramLedger> {
+    host_with_cards(cards, 200_000, profiles, ram_mb)
+}
+
+/// [`host`] with cards of `card_mb` and `ram_mb` of host RAM.
+fn host_with_cards(
+    cards: &[&str],
+    card_mb: u64,
+    profiles: Option<Arc<FakeProfiles>>,
+    ram_mb: u64,
+) -> Arc<VramLedger> {
     let inventory = GpuInventory::known(
         cards
             .iter()
             .enumerate()
-            .map(|(index, uuid)| nvidia(index as u32, uuid, "TEST 9000", 200_000))
+            .map(|(index, uuid)| nvidia(index as u32, uuid, "TEST 9000", card_mb))
             .collect(),
     )
     .with_cpu(ram_mb, crate::inferio::cpu::MemRoots::default());
@@ -89,7 +99,37 @@ fn gpu_replica(
 ) -> (TelemetryHandle, Admission) {
     let (handle, admission) = cold_gpu_replica(ledger, model, gpu, item_cost(seed));
     measure_ram_cost(&handle, &admission, 0, RAM_PER_UNIT_MB);
+    forget_gpu_side(ledger, model, gpu);
     (handle, admission)
+}
+
+/// Drops what a replica's windows so far taught the GPU side (fit, anchor,
+/// knee ring, ramp), so a test of host RAM starts its ramp at the seed.
+fn forget_gpu_side(ledger: &Arc<VramLedger>, model: &str, gpu: &str) {
+    let mut state = ledger.lock();
+    let ram = state
+        .calibration
+        .remove(&(model.to_owned(), gpu.to_owned()))
+        .expect("measured");
+    state.calibration.insert(
+        (model.to_owned(), gpu.to_owned()),
+        ModelCalibration {
+            seeded: ram.seeded,
+            ram_samples: ram.ram_samples,
+            ram_cost: ram.ram_cost,
+            ram_startup_mb: ram.ram_startup_mb,
+            ram_first_units: ram.ram_first_units,
+            ..ModelCalibration::default()
+        },
+    );
+    for entry in state.workers.values_mut() {
+        if entry.inference_id == model && entry.gpu == gpu {
+            entry.ramp_step = 0;
+            entry.clean_windows = 0;
+            entry.settled_windows = 0;
+            entry.ran_batches = 0;
+        }
+    }
 }
 
 /// A cold replica's item-capped windows, one item, then two, then four (as
@@ -103,8 +143,8 @@ fn measure_ram_cost(
     per_unit_mb: u64,
 ) {
     single_item_window(handle, admission, 1, fixed_mb + per_unit_mb);
-    while admission.window_item_bound() != usize::MAX {
-        let items = admission.window_item_bound() as u64;
+    while item_bound(admission) != usize::MAX {
+        let items = item_bound(admission) as u64;
         let token = admission.request_grant(items, None, 1, 0).expect("granted");
         assert_eq!(token.grant().user_cap_items, Some(items as u32));
         handle.lock().unwrap().record_measurements(vec![ram_batch(
@@ -114,6 +154,11 @@ fn measure_ram_cost(
         )]);
         token.finish(WindowOutcome::Responded { oom: None });
     }
+}
+
+/// The items per batch the replica is capped at; `usize::MAX` if uncapped.
+fn item_bound(admission: &Admission) -> usize {
+    admission.item_cap().map_or(usize::MAX, |cap| cap as usize)
 }
 
 /// A single-item window of `units`: one batch of one item that grows the
@@ -240,10 +285,9 @@ fn window_counts(ledger: &Arc<VramLedger>) -> (u64, u32, u64) {
     )
 }
 
-/// With RAM to spare, a replica that books it is granted, after the two
-/// item-capped windows that measure its cost, exactly what one on a host
-/// without a CPU device is, window after window: those windows left the
-/// ramp, the knee and the anchor as they were.
+/// With RAM to spare and its cost measured, a replica that books it is
+/// granted exactly what one on a host without a CPU device is, window after
+/// window, from the same GPU-side state.
 #[test]
 fn plentiful_host_ram_changes_no_grant() {
     let base = ledger(200_000, no_margin());
@@ -256,6 +300,7 @@ fn plentiful_host_ram_changes_no_grant() {
     let (handle, admission) = cold_gpu_replica(&ledger, "g/plenty", GPU, item_cost(8));
     cpu_free_to_book(&ledger, 45_000);
     measure_ram_cost(&handle, &admission, 0, RAM_PER_UNIT_MB);
+    forget_gpu_side(&ledger, "g/plenty", GPU);
 
     for window in 0..10 {
         let (booked, unbooked) = (row(&ledger, "g/plenty"), row(&base, "g/plenty"));
@@ -309,7 +354,7 @@ fn host_ram_caps_a_gpu_replica_without_moving_its_ramp() {
         for _ in 0..3 {
             let grant = ram_window(&handle, &admission);
             assert_eq!(grant.unit_budget, 300);
-            assert_eq!(grant.mb, 3_000, "the GPU reserves only what 300 units need");
+            assert_eq!(grant.mb, 3_100, "the GPU reserves only what 300 units need");
             assert!(grant.squeezed, "memory held it back");
         }
     });
@@ -657,7 +702,7 @@ fn a_death_in_a_booked_item_capped_window_caps() {
     )]);
     token.finish(WindowOutcome::Responded { oom: None });
 
-    assert_eq!(admission.window_item_bound(), 4);
+    assert_eq!(item_bound(&admission), 4);
     let token = admission.request_grant(4, None, 1, 0).expect("granted");
     assert_eq!(token.grant().user_cap_items, Some(4));
     assert!(row(&ledger, "g/capped").ram_booked_mb > 0);
@@ -819,6 +864,7 @@ fn a_cost_measured_at_small_batches_does_not_stall_the_ramp() {
     let ledger = host(&[GPU], None);
     let (handle, admission) = cold_gpu_replica(&ledger, "g/far", GPU, item_cost(64));
     measure_ram_cost(&handle, &admission, FIXED, RAM_PER_UNIT_MB);
+    forget_gpu_side(&ledger, "g/far", GPU);
     // 3 000 MiB to book: 280 units at 200 MiB + 10 per unit.
     cpu_free_to_book(&ledger, 3_000);
     let mut sizes = Vec::new();
@@ -1088,7 +1134,7 @@ fn the_item_cap_doubles_until_a_batch_grows_host_ram() {
     ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
     let mut caps = Vec::new();
     for grows in [false, false, false, true] {
-        let items = admission.window_item_bound();
+        let items = item_bound(&admission);
         let token = admission.request_grant(64, Some(3), 1, 0).expect("granted");
         let grant = *token.grant();
         assert_eq!(
@@ -1113,10 +1159,10 @@ fn the_item_cap_doubles_until_a_batch_grows_host_ram() {
     assert_eq!(caps, [(1, 1), (2, 2), (4, 3), (8, 3)]);
     // One size measured: the cap goes on, now booked and at most twice that
     // size, until a second size.
-    assert_eq!(admission.window_item_bound(), 16);
+    assert_eq!(item_bound(&admission), 16);
     let capped = ram_window(&handle, &admission);
     assert_eq!((capped.unit_budget, capped.user_cap_items), (6, Some(16)));
-    assert_eq!(admission.window_item_bound(), usize::MAX);
+    assert_eq!(item_bound(&admission), usize::MAX);
     let next = ram_window(&handle, &admission);
     assert_eq!((next.unit_budget, next.user_cap_items), (1_024, None));
     assert_eq!(row(&ledger, "g/ungrown").max_units_measured, 1_024);
@@ -1138,7 +1184,7 @@ fn the_first_window_after_load_is_a_single_item() {
     ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
     let before = row(&ledger, "g/first");
 
-    assert_eq!(admission.window_item_bound(), 1);
+    assert_eq!(item_bound(&admission), 1);
     // One request of 64 items with a batch cap of 64: batches of one, its GPU
     // reservation the seed's.
     let token = admission
@@ -1163,7 +1209,19 @@ fn the_first_window_after_load_is_a_single_item() {
     let after = row(&ledger, "g/first");
     assert_eq!(after.ram_mb_per_unit, None, "start-up is no cost");
 
-    assert_eq!(admission.window_item_bound(), 2);
+    assert_eq!(item_bound(&admission), 2);
+    assert_eq!(
+        admission.window_item_bound(),
+        6,
+        "three batches of two, not three of the anchor's 1 024 units"
+    );
+    // A window that holds less than the cap is sized by what it holds.
+    let short = admission.request_grant(1, None, 1, 0).expect("granted");
+    assert_eq!(
+        (short.grant().unit_budget, short.grant().user_cap_items),
+        (1, Some(2))
+    );
+    drop(short);
     let token = admission.request_grant(64, None, 1, 0).expect("granted");
     assert_eq!(token.grant().user_cap_items, Some(2));
     assert_eq!(row(&ledger, "g/first").ram_booked_mb, 0);
@@ -1180,6 +1238,7 @@ fn the_first_window_after_load_is_a_single_item() {
     assert_eq!(after.ram_mb_per_unit, Some(2.0 * RAM_PER_UNIT_MB as f64));
 
     // One size measured: the next is item-capped still, now booked.
+    assert_eq!(admission.window_item_bound(), 12);
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
@@ -1191,6 +1250,7 @@ fn the_first_window_after_load_is_a_single_item() {
     drop(token);
     let third = ram_window_kept(&handle, &admission, INIT);
     assert_eq!(third.unit_budget, 4);
+    assert_eq!(admission.window_item_bound(), usize::MAX);
     let fourth = ram_window_kept(&handle, &admission, INIT);
     assert_eq!(fourth.unit_budget, 1_024, "the ramp's own size");
     assert_eq!(
@@ -1397,7 +1457,7 @@ fn a_reload_books_the_start_up_its_first_batch_adds() {
         token.finish(WindowOutcome::Responded { oom: None });
     }
     // Two sizes: 100 MiB fixed, 10 per unit.
-    assert_eq!(admission.window_item_bound(), usize::MAX);
+    assert_eq!(item_bound(&admission), usize::MAX);
     drop(admission);
 
     let (handle, admission) = cold_gpu_replica(&ledger, "g/restart", GPU, item_cost(8));
@@ -1476,8 +1536,8 @@ fn a_pixel_priced_single_item_window_is_one_image() {
     assert_eq!(grant.unit_budget, IMAGE);
     assert!(grant.mb > 0, "the GPU side reserves for the image");
 
-    // Two such images fill the seed: after one that grew no RAM the cap is a
-    // seed batch, and the GPU side learns from it.
+    // Two such images fill the seed: after one that grew no RAM the cap
+    // would hold a seed batch, and ends.
     let (handle, admission) = cold_gpu_replica(&ledger, "g/pixels-flat", GPU, cost);
     let token = admission.request_grant(IMAGE, None, 1, 0).expect("granted");
     handle
@@ -1488,56 +1548,225 @@ fn a_pixel_priced_single_item_window_is_one_image() {
             ..ram_batch(IMAGE, RSS_AT_LOAD_MB, RSS_AT_LOAD_MB)
         }]);
     token.finish(WindowOutcome::Responded { oom: None });
-    assert_eq!(admission.window_item_bound(), 2);
-    assert!(
-        ledger.lock().workers.values().any(|entry| {
-            entry.inference_id == "g/pixels-flat" && entry.capped_windows_feed_gpu
-        })
-    );
-
-    // Measured at one size, an item-capped window keeps the seed's unit
-    // budget where a profile lets the ramp start higher: 3 Mpx, not twice the
-    // 2 Mpx it was measured at.
-    let seeded = CostDimension {
-        seed_units: Some(3_000_000),
-        ..cost
-    };
-    let profiles = Arc::new(FakeProfiles {
-        seed: Some(ProfileSeed {
-            slope_mb_per_unit: 0.001,
-            ..seeded_anchor(64_000_000, true)
-        }),
-        ..FakeProfiles::default()
-    });
-    let ledger = host(&[GPU], Some(profiles));
-    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
-    let (handle, admission) = cold_gpu_replica(&ledger, "g/pixels-seed", GPU, seeded);
-    for images in [1, 2] {
-        let token = admission
-            .request_grant(IMAGE * images, None, 1, 0)
-            .expect("granted");
-        handle
-            .lock()
-            .unwrap()
-            .record_measurements(vec![BatchMeasurement {
-                items: Some(images),
-                ..ram_batch(IMAGE * images, RSS_AT_LOAD_MB + 100, RSS_AT_LOAD_MB)
-            }]);
-        token.finish(WindowOutcome::Responded { oom: None });
-    }
-    let token = admission
-        .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
-    assert_eq!(
-        (token.grant().unit_budget, token.grant().user_cap_items),
-        (3_000_000, Some(4))
-    );
+    assert_eq!(item_bound(&admission), usize::MAX);
 }
 
-/// A replica whose batches never grow host RAM stays item-capped, its cap
-/// doubling to a seed batch. Once as many doublings as capped windows ran
-/// would hold a seed batch its GPU side learns from them: anchor, fit samples
-/// and, from three sizes, a fit. Nothing is booked.
+/// A cold replica with a RAM side, alone on a card with `room_mb` for its
+/// batches: wd-vit on an AMD card unless changed (base 554 MiB, seed 64,
+/// 82 MiB per unit).
+struct ColdRun {
+    room_mb: u64,
+    seed: u32,
+    /// GPU MiB a batch allocates per unit; the pool is kept.
+    per_unit_mb: u64,
+    /// GPU MiB only the replica's first batch allocates.
+    first_only_mb: u64,
+    profile: Option<ProfileSeed>,
+}
+
+impl ColdRun {
+    fn beside(room_mb: u64) -> Self {
+        Self {
+            room_mb,
+            seed: 64,
+            per_unit_mb: 82,
+            first_only_mb: 0,
+            profile: None,
+        }
+    }
+
+    /// `windows` windows under a full queue, at `rate(units)` units/s. Host
+    /// RAM is plentiful and handed back after each batch. The single-item
+    /// window holds one batch, the others [`WINDOW_DEPTH_MULTIPLIER`]. A
+    /// batch that needs more than the room is out of memory: it panics.
+    fn run(self, windows: usize, rate: impl Fn(u64) -> f64) -> Ran {
+        const BASE_MB: u64 = 554;
+        let profiles = Arc::new(FakeProfiles {
+            seed: self.profile,
+            ..FakeProfiles::default()
+        });
+        let ledger = host_with_cards(
+            &[GPU],
+            BASE_MB + self.room_mb,
+            Some(Arc::clone(&profiles)),
+            CPU_RAM_MB,
+        );
+        let handle = with_rss(loaded_on(GPU, Some(BASE_MB), Some(0)));
+        let admission = ledger
+            .register_worker("g/cold", item_cost(self.seed), &handle, Some(GPU))
+            .expect("admitted on its card");
+        cpu_free_to_book(&ledger, 45_000);
+        let mut pool = 0;
+        let mut first_only = self.first_only_mb;
+        let mut ran = Vec::new();
+        for window in 0..windows {
+            ledger.record_free_for_test(GPU, self.room_mb - pool);
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            let grant = *token.grant();
+            assert!(
+                !row(&ledger, "g/cold").ram_ceiling_binding,
+                "window {window}: host RAM is plentiful"
+            );
+            let units = grant
+                .unit_budget
+                .min(grant.user_cap_items.map_or(u64::MAX, u64::from));
+            let batches = match grant.user_cap_items {
+                Some(1) => 1,
+                _ => WINDOW_DEPTH_MULTIPLIER,
+            };
+            let measurements = (0..batches)
+                .map(|_| {
+                    let need = self.per_unit_mb * units + std::mem::take(&mut first_only);
+                    assert!(
+                        need <= self.room_mb,
+                        "window {window}: {units} units need {need} MiB, out of memory: {ran:?}"
+                    );
+                    let before = pool;
+                    pool = pool.max(need);
+                    BatchMeasurement {
+                        reserved_before_mb: Some(before),
+                        reserved_after_mb: Some(pool),
+                        allocated_before_mb: Some(0),
+                        peak_allocated_mb: Some(need),
+                        peak_rss_mb: Some(RSS_AT_LOAD_MB + RAM_PER_UNIT_MB * units),
+                        rss_after_mb: Some(RSS_AT_LOAD_MB),
+                        duration_ms: Some(units as f64 * 1000.0 / rate(units)),
+                        ..measurement(units, 0, pool)
+                    }
+                })
+                .collect();
+            handle.lock().unwrap().record_measurements(measurements);
+            token.finish(WindowOutcome::Responded { oom: None });
+            ran.push(units);
+        }
+        let health = row(&ledger, "g/cold");
+        assert_eq!(health.deflation, 0);
+        let stored = profiles.updates.lock().unwrap().last().cloned();
+        Ran {
+            units: ran,
+            knee: health.knee_units,
+            stored: stored.map(|row| (row.max_units_measured, row.knee_units)),
+        }
+    }
+}
+
+/// What a [`ColdRun`] did: each window's units, the knee in force at the
+/// end, and the last store row's `(largest size run here, knee)`.
+struct Ran {
+    units: Vec<u64>,
+    knee: Option<u64>,
+    stored: Option<(u64, Option<u64>)>,
+}
+
+/// Items per second of a model bound by CPU preprocessing: flat from 8 units.
+const CPU_BOUND: [(u64, f64); 6] = [
+    (1, 8.0),
+    (2, 14.0),
+    (4, 21.0),
+    (8, 22.5),
+    (16, 22.3),
+    (512, 21.0),
+];
+
+/// A cold load of a model whose rate stops rising at 8 units, on an idle
+/// 16 GB card: the batch doubles from the single item (twice the largest
+/// size run), every window feeds the knee ring, and the knee holds it at 7
+/// (15 on a re-test), far from the 191 units the card holds. The store gets
+/// the largest size it ran and the knee.
+#[test]
+fn a_cold_load_doubles_from_one_item_and_is_held_by_the_knee() {
+    let ran = ColdRun::beside(15_700).run(40, |units| ladder_rate(&CPU_BOUND, units));
+    assert_eq!(ran.units[..8], [1, 2, 4, 8, 16, 32, 32, 32]);
+    assert!(
+        ran.units[8..].iter().all(|units| [7, 15].contains(units)),
+        "{:?}",
+        ran.units
+    );
+    assert_eq!(ran.knee, Some(7));
+    assert_eq!(ran.stored, Some((32, Some(7))));
+}
+
+/// The same load with a rate that keeps rising ramps to what the card holds,
+/// and no batch runs out of memory at the fitted price.
+#[test]
+fn a_cold_load_whose_rate_keeps_rising_ramps_to_the_room() {
+    let ran = ColdRun::beside(15_700).run(14, |units| ladder_rate(&RISING, units));
+    assert_eq!(ran.units[..9], [1, 2, 4, 8, 16, 32, 64, 128, 191]);
+    assert!(ran.units[9..].iter().all(|units| *units == 191));
+}
+
+/// Beside another process that holds most of the card, no batch is larger
+/// than the room covers: 26 units in 2 186 MiB where the seed's 64 need
+/// 5 248, and in 295 MiB three units, cut at the price the first two sizes
+/// measured, where four need 328.
+#[test]
+fn a_cold_load_beside_a_full_card_stays_inside_its_room() {
+    let rising = |units| ladder_rate(&RISING, units);
+    let ran = ColdRun::beside(2_186).run(8, rising);
+    assert_eq!(ran.units, [1, 2, 4, 8, 16, 26, 26, 26]);
+    let ran = ColdRun::beside(295).run(6, rising);
+    assert_eq!(ran.units, [1, 2, 3, 3, 3, 3]);
+}
+
+/// One measured size prices a further unit at the registry's design figure
+/// (256 MiB at a seed of 8), which is no ground to cut a batch on: a model
+/// of 5 MiB per unit in a 300 MiB room ramps to the 60 units that fit, not
+/// held at one. A store row holding that one sample does not hold the next
+/// run either.
+#[test]
+fn one_measured_size_does_not_hold_a_small_room_at_one_unit() {
+    let rising = |units| ladder_rate(&RISING, units);
+    let small = |profile| ColdRun {
+        seed: 8,
+        per_unit_mb: 5,
+        profile,
+        ..ColdRun::beside(300)
+    };
+    let ran = small(None).run(8, rising);
+    assert_eq!(ran.units, [1, 2, 4, 8, 16, 32, 60, 60]);
+    let one_sample = ProfileSeed {
+        slope_mb_per_unit: 0.0,
+        samples: 1,
+        max_units_measured: 1,
+        local_samples: 1,
+        ring: vec![FitSample {
+            units: 1,
+            delta_mb: 5,
+        }],
+        ..seeded_anchor(1, true)
+    };
+    let ran = small(Some(one_sample)).run(8, rising);
+    assert_eq!(ran.units, [1, 2, 4, 8, 16, 32, 60, 60]);
+}
+
+/// A run resumed from a store row that an earlier build wrote without a
+/// knee (largest size 179, on the same card): the anchor opens the ramp at
+/// the seed and the room, past the sizes where the knee is, until the ring
+/// fits it; the row is then stored with the knee, which holds the next run.
+#[test]
+fn a_stored_anchor_without_a_knee_is_held_once_the_knee_is_fitted() {
+    let stored = ProfileSeed {
+        base_mb: 554,
+        slope_mb_per_unit: 81.7,
+        ..seeded_anchor(179, true)
+    };
+    let resumed = ColdRun {
+        profile: Some(stored),
+        ..ColdRun::beside(15_700)
+    };
+    let ran = resumed.run(40, |units| ladder_rate(&CPU_BOUND, units));
+    assert_eq!(ran.units[..7], [1, 2, 4, 64, 191, 191, 191]);
+    assert!(ran.units[7..].iter().all(|units| [7, 15].contains(units)));
+    let (largest, knee) = ran.stored.expect("stored");
+    assert_eq!((largest, knee), (191, Some(7)));
+}
+
+/// A replica whose batches never grow host RAM still learns its GPU side:
+/// its item-capped windows are fit samples, three sizes of them a fit. The
+/// cap ends once filled doublings would hold a seed batch; from there its
+/// batches set the anchor as any replica's do. Nothing is booked.
 #[test]
 fn a_replica_that_never_grows_host_ram_still_learns_its_gpu_side() {
     let ledger = host(&[GPU], None);
@@ -1545,7 +1774,7 @@ fn a_replica_that_never_grows_host_ram_still_learns_its_gpu_side() {
     ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
     let mut bounds = Vec::new();
     for window_units in [64, 64, 64, 64, 4, 2] {
-        bounds.push(admission.window_item_bound());
+        bounds.push(item_bound(&admission));
         let token = admission
             .request_grant(window_units, None, 1, 0)
             .expect("granted");
@@ -1560,20 +1789,20 @@ fn a_replica_that_never_grows_host_ram_still_learns_its_gpu_side() {
         )]);
         token.finish(WindowOutcome::Responded { oom: None });
     }
-    assert_eq!(bounds, [1, 2, 4, 8, 8, 8]);
+    assert_eq!(bounds[..4], [1, 2, 4, usize::MAX]);
     let state = ledger.calibration_state("g/flat", GPU).expect("calibrated");
     assert_eq!(state.max_units_measured, 8, "the seed batch it ran");
-    assert_eq!(state.samples.len(), 3, "sizes 8, 4 and 2");
+    assert_eq!(state.samples.len(), 4, "sizes 1, 2, 4 and 8");
     assert!(state.fit.is_some());
     let flat = row(&ledger, "g/flat");
     assert_eq!((flat.ram_mb_per_unit, flat.ram_booked_mb), (None, 0));
 
-    // Sent one item at a time the cap never fills, yet the GPU side learns as
-    // soon.
+    // Sent one item at a time the cap never fills: each window is a
+    // one-unit window to the GPU side.
     let (handle, admission) = cold_gpu_replica(&ledger, "g/single", GPU, item_cost(8));
     let mut bounds = Vec::new();
     for _ in 0..4 {
-        bounds.push(admission.window_item_bound());
+        bounds.push(item_bound(&admission));
         let token = admission.request_grant(1, None, 1, 0).expect("granted");
         handle.lock().unwrap().record_measurements(vec![ram_batch(
             1,
@@ -1586,7 +1815,7 @@ fn a_replica_that_never_grows_host_ram_still_learns_its_gpu_side() {
     let single = ledger
         .calibration_state("g/single", GPU)
         .expect("calibrated");
-    assert_eq!(single.max_units_measured, 1, "the fourth window's item");
+    assert_eq!((single.max_units_measured, single.samples.len()), (1, 1));
 }
 
 /// The RAM cost belongs to the (model, GPU) and outlives the replica: a
@@ -1600,7 +1829,7 @@ fn a_reload_runs_a_single_item_window_only_while_the_cost_is_unknown() {
     measure_ram_cost(&handle, &admission, 0, RAM_PER_UNIT_MB);
     drop(admission);
     let (_handle, admission) = cold_gpu_replica(&ledger, "g/reload", GPU, item_cost(8));
-    assert_eq!(admission.window_item_bound(), usize::MAX);
+    assert_eq!(item_bound(&admission), usize::MAX);
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
@@ -1614,10 +1843,10 @@ fn a_reload_runs_a_single_item_window_only_while_the_cost_is_unknown() {
 
     let (handle, admission) = cold_gpu_replica(&ledger, "g/unknown", GPU, item_cost(8));
     single_item_window(&handle, &admission, 1, 0);
-    assert_eq!(admission.window_item_bound(), 2);
+    assert_eq!(item_bound(&admission), 2);
     drop(admission);
     let (_handle, admission) = cold_gpu_replica(&ledger, "g/unknown", GPU, item_cost(8));
-    assert_eq!(admission.window_item_bound(), 1);
+    assert_eq!(item_bound(&admission), 1);
 }
 
 /// An out-of-memory in the single-item window, from a batch or from the
@@ -1644,7 +1873,7 @@ fn a_single_item_window_out_of_memory_deflates() {
         }]);
     token.finish(WindowOutcome::Responded { oom: None });
     assert_eq!(row(&ledger, "g/oom").deflation, 1);
-    assert_eq!(admission.window_item_bound(), 1);
+    assert_eq!(item_bound(&admission), 1);
 
     // An out-of-memory the error frame reported, its batch clean.
     let token = admission.request_grant(1, None, 1, 0).expect("granted");
@@ -1684,5 +1913,57 @@ fn only_a_private_memory_gpu_replica_books_host_ram() {
         .expect("admitted");
     for (ledger, model) in [(&mixed, "g/cpu"), (&mac, "g/mps"), (&bare, "g/bare")] {
         assert_eq!(row(ledger, model).ram_resident_mb, None, "{model}");
+    }
+}
+
+/// An item-capped window of a fitted model is priced with the fixed part
+/// like any other: one unit at the default pool margin, 1.25 × (100 + 10).
+#[test]
+fn an_item_capped_window_is_priced_with_the_fixed_part() {
+    let ring = [4u64, 8, 16].map(|units| FitSample {
+        units,
+        delta_mb: 100 + 10 * units,
+    });
+    let profiles = Arc::new(FakeProfiles {
+        seed: Some(ProfileSeed {
+            ring: ring.to_vec(),
+            ..seeded_anchor(16, true)
+        }),
+        ..FakeProfiles::default()
+    });
+    let ledger = host(&[GPU], Some(profiles));
+    let (_handle, admission) = cold_gpu_replica(&ledger, "g/a", GPU, item_cost(4));
+    let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+    let grant = *token.grant();
+    assert_eq!(
+        (grant.user_cap_items, grant.unit_budget, grant.mb),
+        (Some(1), 1, 138)
+    );
+}
+
+/// A window the GPU's room cut and host RAM then cut further was sized by
+/// host RAM: its failure leaves the pool margin. With RAM to spare the room
+/// sizes it, and its failure raises the margin.
+#[test]
+fn an_out_of_memory_window_host_ram_sized_leaves_the_pool_margin() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/a", GPU, 3);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    for _ in 0..7 {
+        ram_window(&handle, &admission);
+    }
+    // The card has room for 100 units of the 384 asked: 100 + 100 × 10 MiB.
+    push_memory(&handle, 100, 1000);
+    ledger.ingest_all_for_test();
+    for (ram_to_book, units, raised) in [(500, 50, 0), (45_000, 100, 1)] {
+        cpu_free_to_book(&ledger, ram_to_book);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().unit_budget, units);
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Marker),
+        });
+        assert_eq!(margin_steps(&ledger, "g/a", GPU), raised);
     }
 }
