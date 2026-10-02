@@ -928,6 +928,29 @@ fn a_rising_rate_takes_a_window_per_doubling() {
     assert_eq!(ledger.health()[0].workers[0].knee_units, Some(19090));
 }
 
+/// A step the room cuts short, earned after many windows at the working
+/// size: the new size's rate is read from its own observations, not from
+/// the old size's, which lie within a doubling of it.
+#[test]
+fn a_cut_step_is_judged_on_its_own_samples() {
+    let batches = std::cell::Cell::new(0usize);
+    // Flat past 128 units for the first 40 batches, rising throughout after.
+    let rate = |units: u64| {
+        batches.set(batches.get() + 1);
+        let gaining = if batches.get() <= 40 {
+            units.min(128)
+        } else {
+            units
+        };
+        (gaining as f64).sqrt()
+    };
+    let (budgets, held) = one_batch_windows(15_700, 24, |capped| capped * 3, rate, Pool::Kept);
+    assert_eq!(budgets[..4], [64, 64, 128, 191]);
+    assert_eq!(budgets[4..16], [128; 12]);
+    assert_eq!(budgets[16..], [191; 8]);
+    assert!(!held);
+}
+
 /// A caller that keeps a batch and a half in flight gives one observation
 /// a window, and none in a window whose batch grew the pool: four windows
 /// at the seed, three at each size after it.
@@ -1000,6 +1023,27 @@ fn a_rate_that_starts_to_rise_later_is_found_by_the_next_trial() {
     }
 }
 
+/// A gain resets the cadence: after two trials that earned nothing and two
+/// that earned a size, the next that earns nothing is tried again after
+/// [`RETEST_WINDOWS`], not four times that.
+#[test]
+fn a_gain_resets_the_cadence() {
+    let (ledger, handle, admission) = ramping_from_seed(64);
+    for window in 0..44 {
+        // Flat for 20 windows, then rising up to 256 units.
+        let rate = move |units: u64| match window >= 20 {
+            true => (units.min(256) as f64).sqrt(),
+            false => 8.0,
+        };
+        window_leaving_warm(&handle, &admission, |_| 2, rate);
+    }
+    assert_eq!(ledger.health()[0].workers[0].knee_units, Some(256));
+    assert_eq!(
+        ledger.trial_for_test("g/a", GPU),
+        (None, RETEST_WINDOWS - 1, 1)
+    );
+}
+
 /// A working size whose own rate moves by more than the band (the inputs
 /// changed) is re-tested at once, not when the cadence comes round: flat
 /// until window 200, where the next trial is due at 379, then half the rate
@@ -1055,7 +1099,7 @@ fn a_flat_noisy_rate_does_not_walk() {
 }
 
 /// Windows the queue sized neither set the working size nor count towards
-/// a trial, and a trial waits through them.
+/// a trial or the wait for the next one, and a trial waits through them.
 #[test]
 fn queue_sized_windows_wait() {
     let (ledger, handle, admission) = ramping_from_seed(64);
@@ -1073,6 +1117,12 @@ fn queue_sized_windows_wait() {
     }
     assert_eq!(ledger.trial_for_test("g/a", GPU), (Some(0), 0, 0));
     assert_eq!(ledger.health()[0].workers[0].unit_budget, 128);
+    // The trial earns nothing; 48 units of work are 64-unit samples too.
+    window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0);
+    for _ in 0..5 {
+        queued_window_leaving_warm(&handle, &admission, 48, |_| 2, |_| 22.0);
+    }
+    assert_eq!(ledger.trial_for_test("g/a", GPU), (None, RETEST_WINDOWS, 1));
 }
 
 /// A trial window that ran beside another replica's measures nothing: the
@@ -1103,6 +1153,16 @@ fn a_trial_beside_another_replica_is_put_off() {
     assert_eq!(
         window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0),
         64
+    );
+    // Nor do windows beside it count towards the next trial.
+    let beside = neighbour.request_grant(4, None, 1, 0).expect("granted");
+    for _ in 0..3 {
+        window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0);
+    }
+    drop(beside);
+    assert_eq!(
+        ledger.trial_for_test("g/a", GPU),
+        (None, RETEST_WINDOWS - 1, 0)
     );
 }
 

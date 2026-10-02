@@ -228,16 +228,15 @@ impl VramLedger {
     /// The gain rule, once per settled window that responded or died.
     ///
     /// The working size is set by the first window that ran at its budget
-    /// with memory to spare.
-    /// A trial of the next size is kept when its median rate beats the
-    /// working size's by more than [`KNEE_RATIO`], and still does once it
-    /// has [`CONFIRM_SAMPLES`] observations of its own. A trial ends when the rate
-    /// does not, when [`TRIAL_WINDOWS`] trial windows gave no verdict, when
-    /// another replica ran beside it or memory was under pressure, or when
-    /// the window `failed`. With no
-    /// trial on, windows at the working size count down to the next one; a
-    /// working-size rate that moved by more than [`KNEE_RATIO`] since the
-    /// last verdict starts it at once.
+    /// with memory to spare. A trial of the next size is kept when its
+    /// median rate gains on the working size's ([`gains`]), and given up
+    /// again if it no longer does once it has [`CONFIRM_SAMPLES`]
+    /// observations of its own. A trial ends when the rate does not gain,
+    /// when [`TRIAL_WINDOWS`] trial windows gave no verdict, when another
+    /// replica ran beside it or memory was under pressure, or when the
+    /// window `failed`. With no trial on, windows at the working size count
+    /// down to the next one; a working-size rate that moved by more than
+    /// [`KNEE_RATIO`] since the last verdict starts it at once.
     pub(super) fn note_gain_locked(
         &self,
         state: &mut LedgerState,
