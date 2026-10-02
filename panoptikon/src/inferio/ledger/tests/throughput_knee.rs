@@ -51,25 +51,36 @@ fn minilms_recorded_size_is_refused_by_the_variance_filter() {
     );
     assert!(dispersion > KNEE_MAX_BUCKET_DISPERSION);
     let ring = recorded(&[(8, pair[0], 1), (8, pair[1], 1)]);
-    assert_eq!(quiet_rate(&ring, 4, 8, KNEE_MAX_BUCKET_DISPERSION), None);
+    assert_eq!(ring_rate(&ring, 8, KNEE_MAX_BUCKET_DISPERSION), None);
 }
 
-/// Observations taken beside another replica decide nothing, however many
-/// there are; nor does a single one.
+/// Observations taken beside another replica, or with a growing pool, are
+/// read apart from the others: a size's rate is that of the conditions most
+/// of the last six observations were taken in. A single one is no rate.
 #[test]
-fn a_contended_series_has_no_rate_to_decide_by() {
+fn a_rate_is_read_from_observations_in_the_same_conditions() {
+    let band = KNEE_MAX_BUCKET_DISPERSION;
     let mut ring = curve(&[(8, 100.0)], 6);
-    assert_eq!(
-        quiet_rate(&ring, 4, 8, KNEE_MAX_BUCKET_DISPERSION),
-        Some(100.0)
-    );
-    assert_eq!(quiet_rate(&ring, 8, 16, KNEE_MAX_BUCKET_DISPERSION), None);
-    for sample in ring.iter_mut() {
-        sample.occupants = 2;
-    }
-    assert_eq!(quiet_rate(&ring, 4, 8, KNEE_MAX_BUCKET_DISPERSION), None);
+    assert_eq!(ring_rate(&ring, 8, band), Some(100.0));
+    assert_eq!(ring_rate(&ring, 16, band), None);
+    let beside = ThroughputSample {
+        units_per_sec: 50.0,
+        occupants: 2,
+        ..ring[0]
+    };
+    ring.extend([beside; 2]);
+    assert_eq!(ring_rate(&ring, 8, band), Some(100.0), "two of six");
+    ring.extend([beside; 2]);
+    assert_eq!(ring_rate(&ring, 8, band), Some(50.0), "four of six");
+    let grew = ThroughputSample {
+        units_per_sec: 20.0,
+        grew_pool: Some(true),
+        ..ring[0]
+    };
+    ring.extend([grew; 4]);
+    assert_eq!(ring_rate(&ring, 8, band), Some(20.0));
     let single = curve(&[(8, 100.0)], 1);
-    assert_eq!(quiet_rate(&single, 4, 8, KNEE_MAX_BUCKET_DISPERSION), None);
+    assert_eq!(ring_rate(&single, 8, band), None);
 }
 
 /// The warm-up rule: a replica's first settled window is no measurement,
@@ -80,10 +91,7 @@ fn the_replicas_first_window_is_no_measurement() {
     // faster at 4 units than it ever is again.
     let series: Vec<Recorded> = [vec![(4, 300.0, 0); 3], vec![(4, 100.0, 1); 3]].concat();
     let ring = recorded(&series);
-    assert_eq!(
-        quiet_rate(&ring, 2, 4, KNEE_MAX_BUCKET_DISPERSION),
-        Some(100.0)
-    );
+    assert_eq!(ring_rate(&ring, 4, KNEE_MAX_BUCKET_DISPERSION), Some(100.0));
     // Unmarked, they disagree with the honest ones by 0.5 and the size has
     // no rate at all.
     let unmarked: VecDeque<ThroughputSample> = ring
@@ -93,10 +101,7 @@ fn the_replicas_first_window_is_no_measurement() {
             ..*sample
         })
         .collect();
-    assert_eq!(
-        quiet_rate(&unmarked, 2, 4, KNEE_MAX_BUCKET_DISPERSION),
-        None
-    );
+    assert_eq!(ring_rate(&unmarked, 4, KNEE_MAX_BUCKET_DISPERSION), None);
 }
 
 /// When a replica's first window is a **single** batch, the runtime's
@@ -137,19 +142,19 @@ fn the_bucket_variance_band_is_the_devices_own() {
     // 0.30: past anything a quiet GPU shows, inside what a quiet CPU does.
     let noisy = curve(&[(8, 70.0), (8, 130.0)], 1);
     assert_eq!(
-        quiet_rate(&noisy, 4, 8, KNEE_MAX_BUCKET_DISPERSION),
+        ring_rate(&noisy, 8, KNEE_MAX_BUCKET_DISPERSION),
         None,
         "the accelerator band refuses it"
     );
     assert_eq!(
-        quiet_rate(&noisy, 4, 8, super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION),
+        ring_rate(&noisy, 8, super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION),
         Some(100.0),
         "the CPU device's band reads it"
     );
     // 0.025 of scatter is inside both.
     let quiet = curve(&[(8, 97.5), (8, 102.5)], 1);
     assert_eq!(
-        quiet_rate(&quiet, 4, 8, KNEE_MAX_BUCKET_DISPERSION),
+        ring_rate(&quiet, 8, KNEE_MAX_BUCKET_DISPERSION),
         Some(100.0)
     );
 }
@@ -224,7 +229,7 @@ fn relative_mad_is_the_robust_dispersion_the_threshold_is_stated_in() {
 /// Which measurements reach the throughput series: warm-pool, priceable,
 /// non-negative ones and nothing else.
 #[test]
-fn only_clean_priceable_warm_batches_reach_the_knee_series() {
+fn only_clean_priceable_batches_reach_the_throughput_ring() {
     let ledger = ledger(100_000, no_margin());
     let handle = loaded(Some(1000), Some(0));
     let admission = ledger
@@ -234,7 +239,8 @@ fn only_clean_priceable_warm_batches_reach_the_knee_series() {
 
     let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
     handle.lock().unwrap().record_measurements(vec![
-        // A pool-growing batch: it pays cudaMalloc for its size.
+        // A pool-growing batch pays cudaMalloc for its size: kept, and
+        // compared only with others that grew the pool.
         measurement(8, 0, 100),
         // An OOM and a WDDM spill: they measure the failure, not the curve.
         BatchMeasurement {
@@ -252,13 +258,13 @@ fn only_clean_priceable_warm_batches_reach_the_knee_series() {
             duration_ms: None,
             ..warm_batch(8, 500.0)
         },
-        // No allocator reading: "the pool did not grow" is only assumed.
+        // No allocator reading: kept apart from the warm ones too.
         BatchMeasurement {
             peak_reserved_mb: None,
             reserved_before_mb: None,
             ..warm_batch(8, 500.0)
         },
-        // Half a reading is no reading either.
+        // Half a reading is no reading.
         BatchMeasurement {
             reserved_before_mb: None,
             ..warm_batch(8, 500.0)
@@ -274,15 +280,20 @@ fn only_clean_priceable_warm_batches_reach_the_knee_series() {
             }),
             ..warm_batch(8, 500.0)
         },
-        // The one that counts.
+        // A warm one.
         warm_batch(8, 500.0),
     ]);
     token.finish(WindowOutcome::Responded { oom: None });
 
+    let pools: Vec<Option<bool>> = ledger.lock().calibration[&("g/a".to_owned(), GPU.to_owned())]
+        .throughput
+        .iter()
+        .map(|sample| sample.grew_pool)
+        .collect();
     assert_eq!(
-        ledger.health()[0].workers[0].throughput_samples,
-        1,
-        "eight of the nine measurements are excluded, each for its own reason"
+        pools,
+        [Some(true), None, None, Some(false)],
+        "five of the nine measurements are excluded, each for its own reason"
     );
 }
 
@@ -357,11 +368,11 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         "a memory-blind grant priced nothing, so its rate describes nothing"
     );
     assert!(
-        !ring_admits_window(&GrantCharge {
+        ring_admits_window(&GrantCharge {
             ram_bound: true,
             ..honest
         }),
-        "host RAM set the size, so its rate says nothing about the GPU's curve"
+        "host RAM cut it as the room does: its batches ran the size it set"
     );
     assert!(
         !ring_admits_window(&GrantCharge {
@@ -372,10 +383,10 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
     );
 }
 
-/// A squeezed window's warm batches reach the throughput ring at the size they ran,
-/// and its pool-growing batch reaches the **cost fit**.
+/// A squeezed window's batches reach the throughput ring at the size they
+/// ran, and its pool-growing batch reaches the **cost fit**.
 #[test]
-fn a_squeezed_windows_batches_reach_the_fit_and_the_knee() {
+fn a_squeezed_windows_batches_reach_the_fit_and_the_ring() {
     // 1 200 MiB of GPU against a 1 100 base: under `SEED_BATCH_FLOOR_MB` of
     // headroom, so squeezed.
     let ledger = ledger(1_200, no_margin());
@@ -395,9 +406,9 @@ fn a_squeezed_windows_batches_reach_the_fit_and_the_knee() {
 
     let worker = &ledger.health()[0].workers[0];
     assert_eq!(
-        worker.throughput_samples, 1,
+        worker.throughput_samples, 2,
         "8 units is what this card could run, and the rate at 8 units is \
-         what the batch measured"
+         what the batches measured"
     );
     assert_eq!(
         worker.max_units_measured, 8,
@@ -430,10 +441,10 @@ fn contended_warm_window(
     held.finish(WindowOutcome::Responded { oom: None });
 }
 
-/// A curve that knees on a quiet GPU fits none when a neighbour held a window
-/// across every one of its windows.
+/// Every observation taken while a neighbour held a window is kept and
+/// tagged with it.
 #[test]
-fn a_neighbours_overlapping_window_keeps_a_curve_out_of_the_knee_fit() {
+fn a_neighbours_overlapping_window_is_tagged_on_every_observation() {
     let ledger = priced_ledger(100_000);
     let handle = loaded(Some(1000), Some(0));
     let neighbour_handle = loaded(Some(1000), Some(0));
@@ -469,14 +480,15 @@ fn a_neighbours_overlapping_window_keeps_a_curve_out_of_the_knee_fit() {
         worker.throughput_samples, 16,
         "every observation is kept and tagged"
     );
-    assert_eq!(
-        worker.knee_units, None,
-        "none of them was measured with the GPU to itself"
+    assert!(
+        ledger.lock().calibration[&("g/a".to_owned(), GPU.to_owned())]
+            .throughput
+            .iter()
+            .all(|sample| sample.occupants == 1)
     );
 }
 
-/// The same windows with the GPU to itself do decide, so the test above is
-/// about the tag and not about the fixture.
+/// The same windows with the GPU to itself carry no tag.
 #[test]
 fn the_same_windows_measured_alone_do_decide() {
     let ledger = priced_ledger(100_000);
@@ -494,9 +506,9 @@ fn the_same_windows_measured_alone_do_decide() {
     );
 }
 
-/// End to end: a rate that gains nothing past the seed leaves the working
-/// size there, it caps the grant, and it travels to the store as local
-/// evidence.
+/// End to end: a rate that rises to the seed's size and no further leaves
+/// the working size there, it caps the grant, and it travels to the store as
+/// local evidence.
 #[test]
 fn a_measured_working_size_caps_the_grant_and_is_persisted() {
     let profiles = Arc::new(FakeProfiles::default());
@@ -506,10 +518,10 @@ fn a_measured_working_size_caps_the_grant_and_is_persisted() {
         .register_worker("g/a", item_cost(64), &handle, None)
         .unwrap();
     push_memory(&handle, 90_000, 1000);
-    let budgets: Vec<u64> = (0..4)
-        .map(|_| window_at_the_rate(&handle, &admission, |_| 100.0))
+    let budgets: Vec<u64> = (0..5)
+        .map(|_| window_at_the_rate(&handle, &admission, |units| units.min(64) as f64))
         .collect();
-    assert_eq!(budgets, [64, 64, 128, 64]);
+    assert_eq!(budgets, [64, 64, 128, 32, 64]);
 
     let worker = &ledger.health()[0].workers[0];
     assert_eq!(worker.knee_units, Some(64));
@@ -525,7 +537,7 @@ fn a_measured_working_size_caps_the_grant_and_is_persisted() {
     assert_eq!(
         (last.knee_units, last.max_units_measured),
         (Some(64), 128),
-        "the size that earned its place, beside the largest that ran"
+        "the size a trial left in place, beside the largest that ran"
     );
 
     // A settle that changes nothing writes nothing more.
@@ -544,6 +556,7 @@ fn deflation_still_halves_below_the_knee() {
             residual_mb: 0.0,
             samples: 20,
             knee_units: Some(16),
+            knee_trials: Default::default(),
             local: false,
             fit_is_local: false,
             exact_torch: true,
@@ -616,6 +629,7 @@ fn a_seeded_knee_is_never_laundered_into_local_provenance() {
             residual_mb: 0.0,
             samples: 20,
             knee_units: Some(16),
+            knee_trials: Default::default(),
             local: false,
             fit_is_local: false,
             exact_torch: true,
@@ -680,10 +694,13 @@ fn a_persisted_knee_seeds_the_next_run() {
         .unwrap();
     push_memory(&handle, 90_000, 1000);
     // The rate doubles with the batch up to 16 units and gains nothing past.
-    let budgets: Vec<u64> = (0..6)
+    // The first trial moves the size to 16; the next leaves it there, and
+    // it is stored.
+    let budgets: Vec<u64> = (0..20)
         .map(|_| window_at_the_rate(&handle, &admission, |units| units.min(16) as f64))
         .collect();
-    assert_eq!(budgets, [4, 4, 8, 16, 32, 16]);
+    assert_eq!(budgets[..6], [4, 4, 8, 16, 32, 16]);
+    assert_eq!(budgets[17..], [32, 8, 16]);
     assert_eq!(ledger.health()[0].workers[0].knee_units, Some(16));
 
     let seed = store
@@ -789,8 +806,8 @@ fn a_late_seed_never_overwrites_a_locally_fitted_knee() {
         .register_worker("g/a", item_cost(64), &handle, None)
         .unwrap();
     push_memory(&handle, 90_000, 1000);
-    for _ in 0..3 {
-        window_at_the_rate(&handle, &admission, |_| 100.0);
+    for _ in 0..4 {
+        window_at_the_rate(&handle, &admission, |units| units.min(64) as f64);
     }
     assert_eq!(ledger.health()[0].workers[0].knee_units, Some(64));
     assert!(ledger.health()[0].workers[0].knee_is_local);
@@ -810,6 +827,7 @@ fn a_late_seed_never_overwrites_a_locally_fitted_knee() {
                 residual_mb: 0.0,
                 samples: 20,
                 knee_units: Some(1),
+                knee_trials: Default::default(),
                 local: false,
                 fit_is_local: false,
                 exact_torch: true,
@@ -851,6 +869,7 @@ fn a_late_seed_never_overwrites_a_locally_fitted_knee() {
                 residual_mb: 0.0,
                 samples: 20,
                 knee_units: Some(16),
+                knee_trials: Default::default(),
                 local: false,
                 fit_is_local: false,
                 exact_torch: true,

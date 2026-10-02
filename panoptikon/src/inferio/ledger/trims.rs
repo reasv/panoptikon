@@ -155,6 +155,30 @@ impl VramLedger {
         );
     }
 
+    /// A trial left `worker`'s pool larger than its working size needs: ask
+    /// it back, unless it is under [`TRIM_SLACK_MB`] or the debounce applies.
+    pub(super) fn flag_trial_trim_locked(state: &mut LedgerState, worker: WorkerId) {
+        let Some(entry) = state.workers.get(&worker) else {
+            return;
+        };
+        if entry.pool_growth_mb() < TRIM_SLACK_MB
+            || entry
+                .last_trim_at
+                .is_some_and(|at| at.elapsed() < TRIM_DEBOUNCE)
+        {
+            return;
+        }
+        let gpu = entry.gpu.clone();
+        let candidate = (worker, entry.inference_id.clone(), entry.pool_growth_mb());
+        Self::queue_trims_locked(
+            state,
+            &gpu,
+            TRIM_TRIGGER_TRIAL,
+            Some(worker),
+            vec![candidate],
+        );
+    }
+
     /// Queue one trim per candidate up to [`MAX_PENDING_TRIMS`], skipping any
     /// already queued. The only place a [`TrimRequest`] is created. The
     /// debounce starts when the replica answers, not here.

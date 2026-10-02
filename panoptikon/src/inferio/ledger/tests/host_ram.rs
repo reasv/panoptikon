@@ -267,15 +267,9 @@ fn cpu_row(ledger: &Arc<VramLedger>) -> GpuBudgetHealth {
         .expect("the CPU device")
 }
 
-/// The ramp, knee and anchor state a RAM ceiling must leave alone.
-fn ramp_state(row: &LedgerWorkerHealth) -> (u32, u32, usize, Option<u64>, bool) {
-    (
-        row.ramp_step,
-        row.deflation,
-        row.throughput_samples,
-        row.knee_units,
-        row.ramp_held,
-    )
+/// The batch size state a RAM ceiling must leave alone.
+fn ramp_state(row: &LedgerWorkerHealth) -> (u32, Option<u64>, Option<u64>) {
+    (row.deflation, row.knee_units, row.trial_units)
 }
 
 /// The one replica's window counters: settled and clean windows, batches run.
@@ -335,9 +329,9 @@ fn plentiful_host_ram_changes_no_grant() {
 }
 
 /// When host RAM gets tight mid-job the next grant is what it holds, like
-/// the edge of a full card: the ramp keeps its place, the throughput ring takes
-/// nothing and nothing deflates. When RAM frees up the ramp resumes where it
-/// stood.
+/// the edge of a full card: the batch size keeps its place, the throughput
+/// ring takes the batches at the size they ran and nothing deflates. When
+/// RAM frees up the batch size resumes where it stood.
 #[test]
 fn host_ram_caps_a_gpu_replica_without_moving_its_ramp() {
     let ledger = host(&[GPU], None);
@@ -372,6 +366,7 @@ fn host_ram_caps_a_gpu_replica_without_moving_its_ramp() {
     let after = row(&ledger, "g/capped");
     assert!(after.ram_ceiling_binding);
     assert_eq!(ramp_state(&after), ramp_state(&before));
+    assert!(after.throughput_samples > before.throughput_samples);
     assert_eq!(after.max_units_measured, 300, "a clean batch it did run");
 
     // Tighter still: the next grant shrinks below the last.
@@ -685,7 +680,7 @@ fn a_gpu_replica_that_dies_with_host_ram_booked_is_capped() {
     assert_eq!(after.death_cap_units, Some(128));
     assert_eq!(after.unit_budget, 128);
     assert_eq!(after.max_units_measured, before.max_units_measured);
-    assert_eq!((after.deflation, after.ramp_step), (0, before.ramp_step));
+    assert_eq!((after.deflation, after.knee_units), (0, before.knee_units));
     for _ in 0..4 {
         assert_eq!(ram_window(&handle, &admission).unit_budget, 128);
     }
@@ -1682,31 +1677,38 @@ const CPU_BOUND: [(u64, f64); 6] = [
 ];
 
 /// A cold load of a model whose rate stops rising at 8 units, on an idle
-/// 16 GB card. From the single item each doubling is kept while it measures
-/// faster by more than the band; 8 units do not beat 4, so it stays at 4
-/// and tries 8 again 12 and then 24 windows later, far from the 191 units
-/// the card holds. The store gets the largest size it ran and the working
-/// size.
+/// 16 GB card. From the single item the trial doubles while the last
+/// doubling gained 3 %, up to 16 units, and the working size is 4, the
+/// smallest within 10 % of the rate at 8. Later trials run 8, 16 and 2 and
+/// leave it there, far from the 191 units the card holds. The store gets
+/// the largest size it ran and the working size.
 #[test]
 fn a_cold_load_grows_from_one_item_while_the_rate_gains() {
     let ran = ColdRun::beside(15_700).run(50, |units| ladder_rate(&CPU_BOUND, units));
-    assert_eq!(ran.units[..6], [1, 2, 2, 4, 8, 4]);
-    let trials: Vec<usize> = (0..ran.units.len())
+    assert_eq!(ran.units[..7], [1, 2, 2, 4, 8, 16, 4]);
+    let trials: Vec<usize> = (7..ran.units.len())
         .filter(|window| ran.units[*window] != 4)
         .collect();
-    assert_eq!(trials, [0, 1, 2, 4, 17, 42], "{:?}", ran.units);
-    assert_eq!((ran.units[17], ran.units[42]), (8, 8));
+    assert_eq!(trials, [18, 19, 20, 33, 34, 35], "{:?}", ran.units);
+    assert_eq!(ran.units[18..21], [8, 16, 2]);
     assert_eq!(ran.knee, Some(4));
-    assert_eq!(ran.stored, Some((8, Some(4))));
+    assert_eq!(ran.stored, Some((16, Some(4))));
 }
 
 /// The same load with a rate that rises 1.41x per doubling grows to what
-/// the card holds, and no batch runs out of memory at the fitted price.
+/// the card holds, and no batch runs out of memory at the fitted price. The
+/// size is stored once the next trial, a window at half of it, has left it
+/// in place.
 #[test]
 fn a_cold_load_whose_rate_keeps_rising_grows_to_the_room() {
-    let ran = ColdRun::beside(15_700).run(14, |units| (units as f64).sqrt());
+    let ran = ColdRun::beside(15_700).run(26, |units| (units as f64).sqrt());
     assert_eq!(ran.units[..10], [1, 2, 2, 4, 8, 16, 32, 64, 128, 191]);
-    assert!(ran.units[10..].iter().all(|units| *units == 191));
+    assert_eq!(ran.units[23], 95);
+    assert!(
+        (10..26)
+            .filter(|window| *window != 23)
+            .all(|window| ran.units[window] == 191)
+    );
     assert_eq!(ran.stored, Some((191, Some(191))));
 }
 
@@ -1757,7 +1759,8 @@ fn one_measured_size_does_not_hold_a_small_room_at_one_unit() {
 /// A run resumed from a store row that an earlier build wrote without a
 /// working size (largest size 179, on the same card) opens at the seed once
 /// the item cap ends, not at the anchor or the room. 128 units measure no
-/// faster than 64, so it stays at 64, and the row is stored with that.
+/// faster than 64, and the size steps down to 4 units, the smallest within
+/// 10 % of the best rate; the row is stored with that.
 #[test]
 fn a_stored_anchor_without_a_working_size_opens_at_the_seed() {
     let stored = ProfileSeed {
@@ -1770,10 +1773,10 @@ fn a_stored_anchor_without_a_working_size_opens_at_the_seed() {
         profile: Some(stored),
         ..ColdRun::beside(15_700)
     };
-    let ran = resumed.run(12, |units| ladder_rate(&CPU_BOUND, units));
-    assert_eq!(ran.units[..7], [1, 2, 4, 64, 64, 128, 64]);
-    assert!(ran.units[7..].iter().all(|units| *units == 64));
-    assert_eq!(ran.stored, Some((128, Some(64))));
+    let ran = resumed.run(22, |units| ladder_rate(&CPU_BOUND, units));
+    assert_eq!(ran.units[..10], [1, 2, 4, 64, 64, 128, 32, 16, 8, 2]);
+    assert!(ran.units[10..].iter().all(|units| *units == 4));
+    assert_eq!(ran.stored, Some((128, Some(4))));
 }
 
 /// A replica whose batches never grow host RAM still learns its GPU side:

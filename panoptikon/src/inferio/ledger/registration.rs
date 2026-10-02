@@ -925,7 +925,6 @@ impl Admission {
         let cal = state.calibration.entry(key).or_default();
         cal.knee_units = Some(seed.max(cal.max_units_measured.saturating_mul(RATCHET_FACTOR)));
         cal.trial = None;
-        cal.grew_from = None;
     }
 
     /// [`Self::request_grant_byte_bound`] with `byte_bound = false`.

@@ -4,11 +4,11 @@
 use super::*;
 
 /// Whether a window's batches may feed the throughput ring: not when it ran
-/// unpriced (`mb == 0`), host RAM set its budget, or it ran under memory
-/// pressure. A squeezed window is admitted; its budget is what the card ran.
-/// Excluded windows still feed the cost fit.
+/// unpriced (`mb == 0`) or under memory pressure. A window the room or host
+/// RAM cut is admitted; its budget is what the device ran. Excluded windows
+/// still feed the cost fit.
 pub(super) fn ring_admits_window(charge: &GrantCharge) -> bool {
-    charge.mb > 0 && !charge.ram_bound && charge.pressure == mps::MemoryPressure::Normal
+    charge.mb > 0 && charge.pressure == mps::MemoryPressure::Normal
 }
 
 /// Add a fit sample to a ring holding at most one per distinct `units`, so a
@@ -370,8 +370,8 @@ impl VramLedger {
         // A window the byte wall closed still counts toward
         // `max_units_measured_here`, but is no window at its budget.
         let byte_bound = window.is_some_and(|charge| charge.byte_bound);
-        // A window host RAM sized counts toward neither, and feeds no
-        // throughput sample; nor does one run under memory pressure.
+        // A window host RAM sized counts toward neither; nor does one run
+        // under memory pressure, which also feeds no throughput sample.
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
         let pressure = window.is_some_and(|charge| charge.pressure != mps::MemoryPressure::Normal);
         let item_capped = window.is_some_and(|charge| charge.item_cap.is_some());
@@ -599,18 +599,16 @@ impl VramLedger {
                 _ => None,
             };
             let high_water = grew_pool == Some(true);
-            let warm = grew_pool == Some(false);
             // Every batch that ran counts toward the warm-up, except negatives
             // and dropped collapses (skipped above).
             ran_batches = ran_batches.saturating_add(1);
-            // Knee samples (units/sec) exclude negatives, unpriced batches,
-            // batches with no allocator reading or a growing pool, batches below
-            // the full-batch floor, and clamped batches. All still feed the fit.
+            // Throughput samples (units/sec) exclude negatives, unpriced
+            // batches, batches below the full-batch floor, and clamped
+            // batches. All still feed the fit.
             if let Some(clamp) = &measurement.clamped {
                 clamps.push(clamp.reason.clone());
             }
-            if warm
-                && measurement.clamped.is_none()
+            if measurement.clamped.is_none()
                 && let (Some(units), Some(duration_ms), Some(full_batch)) =
                     (units, measurement.duration_ms, full_batch)
                 && duration_ms > 0.0
@@ -620,6 +618,7 @@ impl VramLedger {
                     units,
                     units_per_sec: units as f64 * 1000.0 / duration_ms,
                     occupants,
+                    grew_pool,
                     warmup: warmup_window || ran_batches <= KNEE_WARMUP_BATCHES,
                 });
             }
@@ -884,7 +883,7 @@ impl VramLedger {
         Ingested {
             negative,
             fit_samples: fit_sample_count,
-            at_budget: !queue_bound && !ram_bound && !pressure && ran_full,
+            at_budget: !queue_bound && !pressure && ran_full,
             filled: !queue_bound && !ram_bound && ran_full,
             throughput_samples,
             oom: saw_oom,

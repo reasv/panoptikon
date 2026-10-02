@@ -264,13 +264,13 @@ impl VramLedger {
         let issued = state.workers.get(&worker).map(|entry| {
             (
                 entry.inference_id.clone(),
-                Self::ramp_step_locked(&state, entry),
+                Self::knee_locked(&state, entry).unwrap_or(0),
                 entry.deflation,
                 Self::pricing_fit_locked(&state, entry).is_none(),
             )
         });
         drop(state);
-        if let Some((model, ramp_step, deflation, pre_fit)) = issued {
+        if let Some((model, working_units, deflation, pre_fit)) = issued {
             let canvas = canvas_log_field(canvas_pixels);
             tracing::debug!(
                 model = %model,
@@ -285,7 +285,7 @@ impl VramLedger {
                 reserve_mb,
                 reserve_rule,
                 pre_fit,
-                ramp_step,
+                working_units,
                 deflation,
                 squeezed,
                 window_requests,
@@ -534,7 +534,7 @@ impl VramLedger {
             },
             fit_samples: ingested.fit_samples,
             throughput_samples: ingested.throughput_samples,
-            ramp_step: Self::ramp_step_locked(&state, entry),
+            working_units: Self::knee_locked(&state, entry).unwrap_or(0),
             deflation: entry.deflation,
             clean_windows: entry.clean_windows,
             max_units_measured: Self::anchor_locked(&state, entry),

@@ -27,12 +27,13 @@
 //! (model, device) at half that batch ([`VramLedger::note_death_locked`]).
 //!
 //! A worker with no reported base contributes only growth; the rest of its
-//! memory reads as `external`. The batch size grows only on a measured gain
-//! in throughput ([`VramLedger::note_gain_locked`]), and a unit budget never
-//! exceeds [`RATCHET_FACTOR`] × the anchor (the largest clean batch run here,
-//! or claimed by a profile). A matched profile seeds the fit, base and knee
-//! and, if it carries a fit, the anchor as a seeded claim; only a local one
-//! seeds the sample ring. Deflation, trials and grants are never persisted.
+//! memory reads as `external`. The batch size moves only on measured rates
+//! ([`VramLedger::note_gain_locked`]), and a unit budget never exceeds
+//! [`RATCHET_FACTOR`] × the anchor (the largest clean batch run here, or
+//! claimed by a profile). A matched profile seeds the fit, base and working
+//! size and, if it carries a fit, the anchor as a seeded claim; only a local
+//! one seeds the sample ring and the wait for the next trial. Deflation, a
+//! trial in progress and grants are never persisted.
 //! A replica on a GPU with its own memory also books its host RAM on the CPU
 //! device, which caps its grant ([`VramLedger::ram_ceiling_locked`]).
 //!
@@ -52,7 +53,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
+use super::calibration::{
+    CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate, TrialCadence,
+};
 use super::cost::{CostAggregation, CostDimension, CostUnit, SEED_BUDGET_MB};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
 use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle, TrimReply};
@@ -162,9 +165,9 @@ pub const RATCHET_FACTOR: u64 = 2;
 /// Minimum fit samples before a fit is attempted at all.
 pub const MIN_FIT_SAMPLES: usize = 3;
 
-/// A larger batch size earns its place only when the working size's rate is
-/// below this fraction of its own: rates within 10 % of each other are a
-/// plateau.
+/// The plateau band: a batch size whose rate is at least this fraction of the
+/// best rate measured is as good as the best, and the working size is the
+/// smallest such size.
 pub const KNEE_RATIO: f64 = 0.9;
 
 /// Observations of one batch size the gain rule needs to read its rate: the
@@ -184,18 +187,26 @@ pub const KNEE_MAX_BUCKET_DISPERSION: f64 = 0.20;
 /// small batch (ONNX Runtime on the CPU device warms up over several).
 pub const KNEE_WARMUP_BATCHES: u64 = WINDOW_DEPTH_MULTIPLIER;
 
-/// Windows a trial of the next batch size may take to give a verdict. A
-/// window whose only full batch grew the pool gives no observation and a
-/// shallow one gives one, so [`MIN_KNEE_BUCKET_SAMPLES`] can take three.
-pub const TRIAL_WINDOWS: u32 = 2 * MIN_KNEE_BUCKET_SAMPLES as u32;
-
-/// Observations of its own after which a size a trial earned must still beat
-/// the size it grew from, or it is given up. A trial is judged on as few as
-/// [`MIN_KNEE_BUCKET_SAMPLES`], which noise can carry past the band.
+/// Observations of each of two batch sizes with which their median rates
+/// are compared as they stand. With fewer, only a difference of more than
+/// [`CLEAR_ERRORS`] standard errors decides.
 pub const CONFIRM_SAMPLES: usize = 12;
 
-/// Windows at the working size after a trial that earned nothing before the
-/// next one, doubled by each further such trial [`RETEST_MAX_DOUBLINGS`]
+/// Standard errors of the difference between two sizes' rates that decide a
+/// comparison on fewer than [`CONFIRM_SAMPLES`] observations a side.
+pub const CLEAR_ERRORS: f64 = 4.0;
+
+/// The gain of one doubling for which a trial goes on to the next: below
+/// it the rate has stopped rising.
+pub const TRIAL_STEP: f64 = 1.03;
+
+/// Windows a trial may run without a verdict before the comparison counts as
+/// not shown: one observation a window on each side reaches
+/// [`CONFIRM_SAMPLES`].
+pub const TRIAL_WINDOWS: u32 = 2 * CONFIRM_SAMPLES as u32;
+
+/// Windows at the working size after a trial that left it in place before
+/// the next one, doubled by each further such trial [`RETEST_MAX_DOUBLINGS`]
 /// times at most: 12, 24, … 384.
 pub const RETEST_WINDOWS: u32 = 12;
 pub const RETEST_MAX_DOUBLINGS: u32 = 5;
@@ -259,6 +270,7 @@ const TRIM_TRIGGER_SQUEEZED: &str = "squeezed";
 const TRIM_TRIGGER_IDLE: &str = "idle";
 const TRIM_TRIGGER_ALLOC_RETRIES: &str = "alloc_retries";
 const TRIM_TRIGGER_PRESSURE: &str = "memory_pressure";
+const TRIM_TRIGGER_TRIAL: &str = "trial_over";
 
 /// A measurement's `regrow_after` for a release the host asked for (the
 /// worker's own is `shrink`); only these reach `/health`.
@@ -430,8 +442,10 @@ pub struct FitSample {
 struct ThroughputSample {
     units: u64,
     units_per_sec: f64,
-    /// Other replicas with an overlapping window; only 0 may decide a size.
+    /// Other replicas with an overlapping window.
     occupants: u32,
+    /// The batch grew the allocator pool; `None` without pool figures.
+    grew_pool: Option<bool>,
     /// Taken in the replica's first settled window, or within the first
     /// [`KNEE_WARMUP_BATCHES`] it ran.
     warmup: bool,
@@ -440,10 +454,48 @@ struct ThroughputSample {
 impl ThroughputSample {
     /// Whether this observation may decide a batch size.
     fn decides(&self) -> bool {
-        self.occupants == 0
-            && !self.warmup
-            && self.units_per_sec.is_finite()
-            && self.units_per_sec > 0.0
+        !self.warmup && self.units_per_sec.is_finite() && self.units_per_sec > 0.0
+    }
+
+    /// What its rate depends on besides the batch size: whether another
+    /// replica ran beside it, and what the batch did to the pool. Only
+    /// observations with the same conditions are compared.
+    fn conditions(&self) -> (bool, Option<bool>) {
+        (self.occupants > 0, self.grew_pool)
+    }
+}
+
+/// A trial of the batch sizes next to the working size
+/// ([`VramLedger::note_gain_locked`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Trial {
+    /// The larger size being measured, or `None` once the trial has turned
+    /// to the smaller one.
+    up: Option<u64>,
+    /// The size the next window is asked to run.
+    run: u64,
+    /// What memory granted the last window that asked for `up`; until one
+    /// has, the size counts as granted in full.
+    granted: u64,
+    /// Windows since the last verdict.
+    windows: u32,
+    /// The trial moved the working size.
+    moved: bool,
+    /// The largest size it was granted, for the trim that follows.
+    largest: u64,
+}
+
+impl Trial {
+    /// A trial of twice `working`, begun by a window that ran `working`.
+    fn start(working: u64) -> Self {
+        Self {
+            up: Some(working.saturating_mul(2)),
+            run: working,
+            granted: u64::MAX,
+            windows: 0,
+            moved: false,
+            largest: working,
+        }
     }
 }
 
@@ -932,7 +984,8 @@ struct WindowSettled {
     negative_reason: Option<&'static str>,
     fit_samples: usize,
     throughput_samples: usize,
-    ramp_step: u32,
+    /// The working batch size; 0 until one is set.
+    working_units: u64,
     deflation: u32,
     clean_windows: u32,
     max_units_measured: u64,
@@ -957,7 +1010,7 @@ impl WindowSettled {
                 throughput_samples = self.throughput_samples,
                 clamped_samples = self.clamped_samples,
                 clamped = %self.clamped_reason,
-                ramp_step = self.ramp_step,
+                working_units = self.working_units,
                 deflation = self.deflation,
                 clean_windows = self.clean_windows,
                 max_units_measured = self.max_units_measured,
@@ -972,7 +1025,7 @@ impl WindowSettled {
                 throughput_samples = self.throughput_samples,
                 clamped_samples = self.clamped_samples,
                 clamped = %self.clamped_reason,
-                ramp_step = self.ramp_step,
+                working_units = self.working_units,
                 deflation = self.deflation,
                 clean_windows = self.clean_windows,
                 max_units_measured = self.max_units_measured,
@@ -991,12 +1044,12 @@ struct Ingested {
     negative: bool,
     /// Samples that entered the cost fit.
     fit_samples: usize,
-    /// The window ran at its budget: enough work in hand, and a batch
-    /// reached [`FULL_BATCH_RATIO`] of it or had no room for the next item.
-    /// Only such a window counts for the gain rule.
+    /// The window ran at its budget: enough work in hand, no memory
+    /// pressure, and a batch reached [`FULL_BATCH_RATIO`] of it or had no
+    /// room for the next item. Only such a window counts for the gain rule.
     at_budget: bool,
-    /// The same, whatever the memory pressure: the [`PressureCap`] grows on
-    /// these.
+    /// The same whatever the memory pressure, unless host RAM set the
+    /// budget: the [`PressureCap`] grows on these.
     filled: bool,
     /// Samples that entered the throughput ring.
     throughput_samples: usize,
@@ -1032,6 +1085,18 @@ struct PressureCap {
     paging: bool,
 }
 
+/// What the local store holds of a (model, GPU), as far as the write policy
+/// compares it ([`VramLedger::pending_update_locked`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Persisted {
+    anchor: u64,
+    fit_version: u64,
+    /// The stored working size, when this run wrote or read one.
+    knee: Option<u64>,
+    /// `(failed_trials, retest_after)` as [`calibration_store`] rounds them.
+    cadence: (u32, u32),
+}
+
 /// Per-(model, GPU) calibration state: the fit, its samples, the anchor and
 /// the working batch size.
 #[derive(Default)]
@@ -1065,27 +1130,26 @@ struct ModelCalibration {
     local_samples: u32,
     /// Throughput observations; [`KNEE_RING`]-bounded, runtime-only.
     throughput: VecDeque<ThroughputSample>,
-    /// The working batch size: the largest that earned its place here
-    /// ([`VramLedger::note_gain_locked`]), or one a profile seeded (a knee can
-    /// only shrink a grant). `None` until a window ran at its budget.
+    /// The working batch size: the smallest whose rate is within
+    /// [`KNEE_RATIO`] of the best measured ([`VramLedger::note_gain_locked`]),
+    /// or one a profile seeded (a working size can only shrink a grant).
+    /// `None` until a window ran at its budget.
     knee_units: Option<u64>,
-    /// Measured here, so it may be persisted.
+    /// A trial on this machine left it in place; only then is it persisted.
     knee_is_local: bool,
-    /// A trial of twice the working size is on: the windows it has run
-    /// without a verdict. Runtime-only, like the three below.
-    trial: Option<u32>,
+    /// The trial in progress. Runtime-only, like `room_cut`.
+    trial: Option<Trial>,
     /// Windows at the working size still to run before the next trial.
+    /// Persisted with `failed_trials`, so a restart continues the wait.
     retest_after: u32,
-    /// Trials in a row that earned nothing.
+    /// Trials in a row that left the working size in place.
     failed_trials: u32,
-    /// The working size's rate at the last verdict.
-    settled_rate: Option<f64>,
-    /// The size the working size grew from and its rate then, until the
-    /// working size has [`CONFIRM_SAMPLES`] of its own.
-    grew_from: Option<(u64, f64)>,
-    /// `(anchor, fit version, local knee)` as last written; a change triggers a
-    /// write.
-    persisted: Option<(u64, u64, Option<u64>)>,
+    /// Memory granted the last trial nothing above the working size: the
+    /// replica keeps asking for twice that size, and the first window
+    /// granted a larger one starts a trial.
+    room_cut: bool,
+    /// What the store was last told; a change triggers a write.
+    persisted: Option<Persisted>,
     /// See [`ShapeCeiling`]. Runtime-only.
     shape_ceiling: Option<ShapeCeiling>,
     /// Half the batch a replica was running when its process died

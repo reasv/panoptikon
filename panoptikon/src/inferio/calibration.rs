@@ -104,6 +104,12 @@ pub struct CalibrationProfile {
     /// Local clean high-water samples; also the confirmation gate.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub local_samples: u32,
+    /// When the next batch size trial is due ([`TrialCadence`]), so a
+    /// restart continues the wait.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub knee_trials_failed: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub knee_retest_after: u32,
     /// The fit sample ring as parallel arrays: `sample_units[i]` units
     /// allocated `sample_delta_mb[i]` MiB over `allocated_at_load`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -158,6 +164,8 @@ impl CalibrationProfile {
     /// can be copied into the baseline directory unedited.
     fn strip_local_authority(&mut self) {
         self.local_samples = 0;
+        self.knee_trials_failed = 0;
+        self.knee_retest_after = 0;
         self.sample_units.clear();
         self.sample_delta_mb.clear();
     }
@@ -266,6 +274,15 @@ pub struct ProfileQuery<'a> {
     pub dtype: Option<&'a str>,
 }
 
+/// When the next trial of the batch sizes next to the working size is due.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrialCadence {
+    /// Trials in a row that left the working size in place.
+    pub failed: u32,
+    /// Windows at the working size still to run before the next trial.
+    pub retest_after: u32,
+}
+
 /// What a matched profile seeds in the ledger.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProfileSeed {
@@ -275,6 +292,8 @@ pub struct ProfileSeed {
     pub samples: usize,
     /// The working batch size, when the matched entry carries one.
     pub knee_units: Option<u64>,
+    /// Zero unless `local`.
+    pub knee_trials: TrialCadence,
     /// True only for an entry from the local store.
     pub local: bool,
     /// Whether the fit fields came from a local entry; differs from `local`
@@ -309,7 +328,9 @@ pub struct ProfileUpdate {
     pub slope_mb_per_unit: f64,
     pub residual_mb: f64,
     pub samples: usize,
+    /// `None` leaves the stored working size as it is.
     pub knee_units: Option<u64>,
+    pub knee_trials: TrialCadence,
     pub max_units_measured: u64,
     pub local_samples: u32,
     pub ring: Vec<FitSample>,
@@ -622,6 +643,8 @@ impl CalibrationStore {
                 dtype_method: update.dtype_method,
                 slope_mb_per_unit: update.slope_mb_per_unit,
                 knee_units: update.knee_units,
+                knee_trials_failed: update.knee_trials.failed,
+                knee_retest_after: update.knee_trials.retest_after,
                 samples: update.samples.min(u32::MAX as usize) as u32,
                 residual_mb: update.residual_mb,
                 measured_at: now_rfc3339(),
@@ -835,6 +858,14 @@ impl CalibrationProfiles for CalibrationStore {
                 .profile
                 .knee_units
                 .or_else(|| donor.and_then(|donor| donor.profile.knee_units)),
+            knee_trials: if best.local {
+                TrialCadence {
+                    failed: best.profile.knee_trials_failed,
+                    retest_after: best.profile.knee_retest_after,
+                }
+            } else {
+                TrialCadence::default()
+            },
             local: best.local,
             fit_is_local: donor.is_some_and(|donor| donor.local),
             exact_torch: best.exact_torch,
@@ -1175,6 +1206,7 @@ mod tests {
             residual_mb: 96.0,
             samples: 38,
             knee_units: None,
+            knee_trials: Default::default(),
             max_units_measured: 1024,
             local_samples: 12,
             ring: (1..=4).map(|k| sample(k * 8)).collect(),
@@ -2257,22 +2289,32 @@ sample_delta_mb = [80, 160]
     }
 
     /// The working size is read back by the next run and, like the anchor,
-    /// travels when the same file is imported as a shipped baseline.
+    /// travels when the same file is imported as a shipped baseline. The wait
+    /// for the next trial is read back too, and stays local.
     #[test]
     fn the_working_size_round_trips_and_travels_into_a_baseline() {
         let root = tempfile::tempdir().unwrap();
         let store = store(root.path());
+        let knee_trials = TrialCadence {
+            failed: 3,
+            retest_after: 84,
+        };
         store.record(ProfileUpdate {
             knee_units: Some(15),
+            knee_trials,
             ..update("clip/vit", "fp16", 0.79)
         });
         let seed = lookup(&store, "clip/vit").expect("the entry matches its own key");
         assert!(seed.local);
-        assert_eq!(seed.knee_units, Some(15));
+        assert_eq!((seed.knee_units, seed.knee_trials), (Some(15), knee_trials));
 
         let mut profile = store.local_entries().remove(0);
         profile.strip_local_authority();
         assert_eq!(profile.knee_units, Some(15));
+        assert_eq!(
+            (profile.knee_trials_failed, profile.knee_retest_after),
+            (0, 0)
+        );
         assert_eq!(profile.max_units_measured, 1024, "the anchor travels too");
     }
 

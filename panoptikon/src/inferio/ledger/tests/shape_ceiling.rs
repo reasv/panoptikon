@@ -240,7 +240,7 @@ fn no_size_is_earned_past_the_shape_ceiling() {
         .map(|_| window_at_the_rate(&handle, &admission, rising))
         .collect();
     assert_eq!(budgets, [4, 4, 8, 16, 32, 64, 128]);
-    assert_eq!(ledger.health()[0].workers[0].ramp_step, 5);
+    assert_eq!(ledger.health()[0].workers[0].trial_units, Some(256));
     drop(admission);
 
     // The same windows under a ceiling of 16: the size climbs *to* it, 4,
@@ -253,8 +253,8 @@ fn no_size_is_earned_past_the_shape_ceiling() {
     }
     let worker = &ledger.health()[0].workers[0];
     assert_eq!(
-        (worker.knee_units, worker.ramp_step),
-        (Some(16), 2),
+        (worker.knee_units, worker.trial_units),
+        (Some(16), None),
         "the trial of 32 never ran, so 32 was never earned"
     );
     assert_eq!(worker.unit_budget, 16);
@@ -410,6 +410,7 @@ fn a_shape_ceiling_never_survives_a_restart() {
             residual_mb: last.residual_mb,
             samples: last.samples,
             knee_units: last.knee_units,
+            knee_trials: last.knee_trials,
             local: true,
             fit_is_local: true,
             exact_torch: true,

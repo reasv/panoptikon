@@ -170,7 +170,6 @@ impl VramLedger {
         cal.knee_units = Some(knee);
         cal.knee_is_local = true;
         cal.trial = None;
-        cal.grew_from = None;
     }
 
     /// Observations in the ring that may decide a batch size.
@@ -187,14 +186,20 @@ impl VramLedger {
             })
     }
 
-    /// The gain rule's state: `(trial windows, windows before the next
-    /// trial, trials in a row that earned nothing)`.
+    /// The gain rule's state: `(the size a trial runs next, windows before
+    /// the next trial, trials in a row that left the working size in place)`.
     #[cfg(test)]
-    pub(super) fn trial_for_test(&self, inference_id: &str, gpu: &str) -> (Option<u32>, u32, u32) {
+    pub(super) fn trial_for_test(&self, inference_id: &str, gpu: &str) -> (Option<u64>, u32, u32) {
         self.lock()
             .calibration
             .get(&(inference_id.to_owned(), gpu.to_owned()))
-            .map(|cal| (cal.trial, cal.retest_after, cal.failed_trials))
+            .map(|cal| {
+                (
+                    cal.trial.map(|trial| trial.run),
+                    cal.retest_after,
+                    cal.failed_trials,
+                )
+            })
             .unwrap_or((None, 0, 0))
     }
 

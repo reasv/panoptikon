@@ -315,6 +315,7 @@ fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
                 residual_mb: 0.0,
                 samples: 0,
                 knee_units: None,
+                knee_trials: Default::default(),
                 local: true,
                 fit_is_local: false,
                 exact_torch: true,

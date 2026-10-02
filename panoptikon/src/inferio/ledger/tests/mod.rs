@@ -17,7 +17,7 @@ use super::oom::{
     OOM_SOURCE_ERROR_FRAME, OOM_SOURCE_MARKER, OOM_SOURCE_MESSAGE_PATTERN, OOM_SOURCE_TYPED,
     OOM_SOURCE_UNCLASSIFIED, OomTrust,
 };
-use super::ramp::{quiet_rate, relative_mad};
+use super::ramp::{faster, quiet_rate, relative_mad};
 use super::test_hooks::CalibrationState;
 
 const GPU: &str = "GPU-aaaa";
@@ -235,6 +235,7 @@ fn seeded_anchor(anchor: u64, local: bool) -> ProfileSeed {
         residual_mb: 0.0,
         samples: 20,
         knee_units: Some(anchor),
+        knee_trials: Default::default(),
         local,
         fit_is_local: local,
         exact_torch: true,
@@ -523,10 +524,20 @@ fn rate(units: u64, units_per_sec: f64, count: usize) -> Vec<ThroughputSample> {
             units,
             units_per_sec,
             occupants: 0,
+            grew_pool: Some(false),
             warmup: false,
         };
         count
     ]
+}
+
+/// The rate the ring holds for batch size `size`, from the observations
+/// comparable with its newest one.
+fn ring_rate(ring: &VecDeque<ThroughputSample>, size: u64, band: f64) -> Option<f64> {
+    quiet_rate(
+        &super::ramp::rates_at(&super::ramp::comparable(ring), size, size / 2),
+        band,
+    )
 }
 
 /// A **warm-pool** batch carrying no allocator reading: it reaches the
@@ -555,6 +566,7 @@ fn recorded(series: &[Recorded]) -> VecDeque<ThroughputSample> {
             units: *units,
             units_per_sec: *rate_,
             occupants: 0,
+            grew_pool: Some(false),
             warmup: *window == 0,
         })
         .collect()
@@ -571,6 +583,7 @@ fn priced_ledger(total_mb: u64) -> Arc<VramLedger> {
             residual_mb: 0.0,
             samples: 20,
             knee_units: None,
+            knee_trials: Default::default(),
             local: false,
             fit_is_local: false,
             exact_torch: true,

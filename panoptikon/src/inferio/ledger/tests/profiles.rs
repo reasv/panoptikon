@@ -14,6 +14,7 @@ fn a_shipped_profiles_anchor_caps_growth_and_does_not_open_the_run() {
             residual_mb: 0.0,
             samples: 20,
             knee_units: None,
+            knee_trials: Default::default(),
             local: false,
             fit_is_local: false,
             exact_torch: true,
@@ -76,6 +77,7 @@ fn a_seeded_anchor_is_never_written_back_as_this_machines_own() {
             residual_mb: 0.0,
             samples: 20,
             knee_units: Some(512),
+            knee_trials: Default::default(),
             local: false,
             fit_is_local: false,
             exact_torch: true,
@@ -217,6 +219,7 @@ fn an_oom_halves_a_seeded_anchor_but_not_a_measured_one() {
                 residual_mb: 0.0,
                 samples: 20,
                 knee_units: None,
+                knee_trials: Default::default(),
                 local: true,
                 fit_is_local: true,
                 exact_torch: true,
@@ -497,6 +500,7 @@ fn a_profile_from_another_sku_of_this_architecture_prices_and_opens_it() {
             residual_mb: 0.0,
             samples: 20,
             knee_units: Some(4096),
+            knee_trials: Default::default(),
             // Measured on a 32 GB card of this architecture; this host's
             // card holds 12 GB. Not local: it is not this machine's own.
             local: false,
@@ -593,6 +597,7 @@ fn a_local_profile_resumes_the_measured_range() {
             residual_mb: 0.0,
             samples: 6,
             knee_units: Some(64),
+            knee_trials: Default::default(),
             local: true,
             fit_is_local: true,
             exact_torch: true,
@@ -636,6 +641,7 @@ fn seeding_happens_once_per_model_and_gpu() {
             residual_mb: 0.0,
             samples: 6,
             knee_units: None,
+            knee_trials: Default::default(),
             local: true,
             fit_is_local: true,
             exact_torch: true,
@@ -745,6 +751,7 @@ fn a_fallback_matched_local_profile_confers_growth_but_not_confirmation() {
             residual_mb: 0.0,
             samples: 6,
             knee_units: None,
+            knee_trials: Default::default(),
             local: true,
             fit_is_local: true,
             // The store fell back across torch builds to find this.
@@ -858,6 +865,7 @@ fn a_seeded_fit_is_never_laundered_into_local_provenance() {
             residual_mb: 42.0,
             samples: 20,
             knee_units: None,
+            knee_trials: Default::default(),
             // A shipped baseline: pricing, nothing else.
             local: false,
             fit_is_local: false,

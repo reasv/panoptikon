@@ -9,6 +9,16 @@ pub(super) fn persistable_anchor(cal: &ModelCalibration) -> u64 {
     cal.max_units_measured_here
 }
 
+/// The trial cadence as it is stored: the trials in a row that left the
+/// working size in place, and the wait for the next rounded down to whole
+/// [`RETEST_WINDOWS`], so a wait is written once per that many windows.
+fn stored_cadence(cal: &ModelCalibration) -> (u32, u32) {
+    (
+        cal.failed_trials,
+        cal.retest_after / RETEST_WINDOWS * RETEST_WINDOWS,
+    )
+}
+
 impl VramLedger {
     /// Prime a (model, GPU)'s calibration from a matched profile. A profile
     /// confers the fit always; the anchor (as a seeded claim) and the working
@@ -49,9 +59,15 @@ impl VramLedger {
         cal.seeded = true;
         // Never overwrite a working size this machine measured. Like the
         // anchor, a stored one is ignored without a fit: it is the size the
-        // run opens at, and nothing could price it.
+        // run opens at, and nothing could price it. A local one was left in
+        // place by a trial here, and the wait for the next trial carries on.
         if !cal.knee_is_local {
             cal.knee_units = seed.knee_units.filter(|_| seed.slope_mb_per_unit > 0.0);
+            if seed.local && cal.knee_units.is_some() {
+                cal.knee_is_local = true;
+                cal.failed_trials = seed.knee_trials.failed;
+                cal.retest_after = seed.knee_trials.retest_after;
+            }
         }
         if adopt_fit {
             cal.fit = Some(FitSnapshot {
@@ -82,11 +98,13 @@ impl VramLedger {
             if confirms {
                 cal.local_samples = cal.local_samples.max(seed.local_samples);
             }
-            // Mark as persisted so the write policy does not write it back. The
-            // working size is `None` because a seeded one is never written,
-            // matching `pending_update_locked`.
-            let in_force = cal.fit.map(|fit| fit.version).unwrap_or(0);
-            cal.persisted = Some((persistable_anchor(cal), in_force, None));
+            // Mark as persisted so the write policy does not write it back.
+            cal.persisted = Some(Persisted {
+                anchor: persistable_anchor(cal),
+                fit_version: cal.fit.map(|fit| fit.version).unwrap_or(0),
+                knee: cal.knee_units.filter(|_| cal.knee_is_local),
+                cadence: stored_cadence(cal),
+            });
         }
         tracing::debug!(
             model = %inference_id,
@@ -104,7 +122,7 @@ impl VramLedger {
     }
 
     /// The write policy, once per settled window: an update when the anchor
-    /// advanced, or the fit or the working size changed.
+    /// advanced, or the fit, the working size or the trial cadence changed.
     /// Requires known `arch`, `torch`, `dtype` and `base_mb`, and
     /// `local_samples > 0`. The fit fields are empty until a local fit exists.
     pub(super) fn pending_update_locked(
@@ -156,27 +174,36 @@ impl VramLedger {
             );
             return None;
         }
-        let previously_persisted = cal.persisted;
+        let before = cal.persisted;
         let fit_version = cal.fit.map(|fit| fit.version).unwrap_or(0);
-        // Only a working size measured here is written.
+        // Only a working size a trial here left in place is written; `None`
+        // leaves the stored one as it is.
         let knee = cal.knee_units.filter(|_| cal.knee_is_local);
-        let current = (persistable_anchor(cal), fit_version, knee);
-        if cal.persisted.is_some_and(|persisted| {
-            persisted.1 == current.1 && persisted.0 >= current.0 && persisted.2 == current.2
+        let cadence = stored_cadence(cal);
+        let anchor = persistable_anchor(cal);
+        if before.is_some_and(|before| {
+            before.fit_version == fit_version
+                && before.anchor >= anchor
+                && (knee.is_none() || before.knee == knee)
+                && before.cadence == cadence
         }) {
             return None;
         }
         // The persisted anchor only moves forward; halvings stay runtime-only.
-        let max_units_measured = cal
-            .persisted
-            .map_or(current.0, |persisted| persisted.0.max(current.0));
-        cal.persisted = Some((max_units_measured, current.1, current.2));
+        let max_units_measured = before.map_or(anchor, |before| before.anchor.max(anchor));
+        cal.persisted = Some(Persisted {
+            anchor: max_units_measured,
+            fit_version,
+            knee: knee.or(before.and_then(|before| before.knee)),
+            cadence,
+        });
         let fit = cal.fit.filter(|_| cal.fit_is_local);
-        let reason = match previously_persisted {
-            Some(persisted) if persisted.1 != current.1 => "fit_changed",
-            Some(persisted) if persisted.2 != current.2 => "knee_changed",
+        let reason = match before {
+            Some(before) if before.fit_version != fit_version => "fit_changed",
+            Some(before) if knee.is_some() && before.knee != knee => "knee_changed",
+            Some(before) if before.cadence != cadence => "trial_cadence",
             Some(_) => "anchor_advanced",
-            None if current.1 > 0 => "fit_changed",
+            None if fit_version > 0 => "fit_changed",
             None => "anchor_advanced",
         };
         tracing::debug!(
@@ -203,6 +230,10 @@ impl VramLedger {
             residual_mb: fit.map(|fit| fit.residual_mb).unwrap_or(0.0),
             samples: fit.map(|fit| fit.samples).unwrap_or(0),
             knee_units: knee,
+            knee_trials: TrialCadence {
+                failed: cadence.0,
+                retest_after: cadence.1,
+            },
             max_units_measured,
             local_samples: cal.local_samples,
             ring: cal.samples.iter().copied().collect(),

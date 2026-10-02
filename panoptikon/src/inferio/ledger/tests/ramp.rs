@@ -56,7 +56,7 @@ fn clean_windows_without_measurements_do_not_grow_the_batch() {
         4,
         "40 measurement-free windows earn nothing"
     );
-    assert_eq!(ledger.health()[0].workers[0].ramp_step, 0);
+    assert_eq!(ledger.health()[0].workers[0].knee_units, None);
 }
 
 /// Deflation halves on a negative sample and CLEAN_WINDOWS_TO_RESTORE clean
@@ -485,8 +485,8 @@ fn a_byte_closed_window_records_its_anchor_without_earning_a_step() {
     );
     assert_eq!(stored_anchor(&profiles), 4, "and the store holds it");
     assert_eq!(
-        ledger.health()[0].workers[0].ramp_step,
-        0,
+        ledger.health()[0].workers[0].knee_units,
+        None,
         "no window ran at its budget"
     );
 
@@ -524,7 +524,6 @@ fn queued_window_leaving_warm(
         .request_grant(window_units, None, 1, 0)
         .expect("granted");
     let granted = token.grant().unit_budget;
-    let rate = rate_at(granted);
     let depth = WINDOW_DEPTH_MULTIPLIER as usize;
     let warm = warm_at(granted).min(depth);
     let pool = 10 * granted + 100;
@@ -536,7 +535,7 @@ fn queued_window_leaving_warm(
                 measurement(granted, pool, pool)
             };
             BatchMeasurement {
-                duration_ms: Some(granted as f64 * 1000.0 / rate),
+                duration_ms: Some(granted as f64 * 1000.0 / rate_at(granted)),
                 ..base
             }
         })
@@ -641,8 +640,8 @@ fn a_resume_is_sized_by_the_stored_working_size_not_the_stored_anchor() {
     );
     assert_eq!(
         budgets.last().copied(),
-        Some(31),
-        "and it is still there 80 windows later"
+        Some(15),
+        "half of it is within 10 % of CLIP's best rate, a quarter is not"
     );
     assert_eq!(
         budgets.iter().copied().max(),
@@ -687,7 +686,7 @@ fn a_batch_with_no_room_for_the_next_item_counts_as_full() {
         (None, 0),
         "1 048 576 of 2 000 000 is below the floor"
     );
-    assert_eq!(window(true, u64::MAX), (Some(2_000_000), 1));
+    assert_eq!(window(true, u64::MAX), (Some(2_000_000), 2));
     assert_eq!(
         window(true, 1_900_000).0,
         None,
@@ -768,7 +767,7 @@ fn a_squeezed_cuda_window_feeds_the_throughput_ring() {
         .unwrap()
         .record_measurements(vec![warm_batch(8, 500.0), measurement(8, 0, 40)]);
     token.finish(WindowOutcome::Responded { oom: None });
-    assert_eq!(ledger.health()[0].workers[0].throughput_samples, 1);
+    assert_eq!(ledger.health()[0].workers[0].throughput_samples, 2);
 }
 
 /// What a worker reports of its pool around a batch.
@@ -786,15 +785,15 @@ enum Pool {
 /// with `room_mb` for its batches, whose windows hold `queued` units: one
 /// batch at the budget and a remainder too short to count, as when the
 /// caller keeps fewer items in flight than a full window. Returns each
-/// window's unit budget and whether the size is held after the last; a batch
-/// that needs more than the room panics.
+/// window's unit budget and the working size after the last; a batch that
+/// needs more than the room panics.
 fn one_batch_windows(
     room_mb: u64,
     windows: usize,
     queued: impl Fn(u64) -> u64,
     rate: impl Fn(u64) -> f64,
     pool: Pool,
-) -> (Vec<u64>, bool) {
+) -> (Vec<u64>, Option<u64>) {
     const PER_UNIT_MB: u64 = 82;
     let ledger = ledger(1000 + room_mb, no_margin());
     let handle = loaded(Some(1000), Some(0));
@@ -839,8 +838,7 @@ fn one_batch_windows(
         token.finish(WindowOutcome::Responded { oom: None });
         budgets.push(units);
     }
-    let held = ledger.health()[0].workers[0].ramp_held;
-    (budgets, held)
+    (budgets, ledger.health()[0].workers[0].knee_units)
 }
 
 /// A window's unit queue of one batch and a half at the budget.
@@ -858,51 +856,127 @@ fn windows_off(budgets: &[u64], size: u64) -> Vec<usize> {
         .collect()
 }
 
-/// A rate that gains nothing. The seed's size is measured (its first window
-/// is warm-up), twice the size is tried once and dropped, and tried again
-/// 12, 24, 48 … and from then every 384 windows at the working size.
+/// A rate that rises 1.41x a doubling up to 64 units and no further.
+fn flat_from_64(units: u64) -> f64 {
+    (units.min(64) as f64).sqrt()
+}
+
+/// Gaussian noise factors around 1 with relative deviation `sigma`, a fixed
+/// sequence per `seed`.
+fn noise(seed: u64, sigma: f64) -> impl FnMut() -> f64 {
+    let mut bits = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut uniform = move || {
+        // xorshift64, mapped to (0, 1).
+        bits ^= bits << 13;
+        bits ^= bits >> 7;
+        bits ^= bits << 17;
+        ((bits >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    move || {
+        let (u1, u2) = (uniform(), uniform());
+        let normal = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+        (1.0 + sigma * normal).max(0.3)
+    }
+}
+
+/// What decides a comparison of two sizes' rates: twelve observations a
+/// side, or fewer when the difference is clear of both sides' scatter.
 #[test]
-fn a_flat_rate_stays_at_its_size_and_retries_ever_less_often() {
+fn a_comparison_takes_twelve_observations_a_side_or_a_clear_difference() {
+    let band = KNEE_MAX_BUCKET_DISPERSION;
+    let step = TRIAL_STEP;
+    // Two a side, 1.44x apart and quiet.
+    assert_eq!(
+        faster(&[100.0, 101.0], &[144.0, 145.0], step, band),
+        Some(true)
+    );
+    assert_eq!(
+        faster(&[144.0, 145.0], &[100.0, 101.0], step, band),
+        Some(false)
+    );
+    // The same medians, scattered by a tenth: not clear.
+    let (lo, hi) = ([90.0, 111.0], [134.0, 155.0]);
+    assert_eq!(faster(&lo, &hi, step, band), None);
+    // 4 % apart with that scatter: twelve a side decide by their medians,
+    // eleven on one side do not.
+    let scattered = |centre: f64, count: usize| -> Vec<f64> {
+        (0..count)
+            .map(|index| centre * (0.9 + 0.2 * index as f64 / (count - 1) as f64))
+            .collect()
+    };
+    let (lo, hi) = (scattered(100.0, 12), scattered(104.0, 12));
+    assert_eq!(faster(&lo, &hi, step, band), Some(true));
+    assert_eq!(faster(&lo, &hi, 1.0 / KNEE_RATIO, band), Some(false));
+    assert_eq!(faster(&lo[..11], &hi, step, band), None);
+    // One observation is no rate; nor is a side scattered past the band.
+    assert_eq!(faster(&[100.0], &[144.0, 145.0], step, band), None);
+    assert_eq!(faster(&[60.0, 140.0], &[244.0, 245.0], step, band), None);
+}
+
+/// A rate that stops rising at the seed's size. The first trial runs one
+/// window at twice the size and one at half, and leaves the size in place;
+/// the next come after 12, 24, 48 … and then every 384 windows at it.
+#[test]
+fn a_size_left_in_place_is_tried_ever_less_often() {
     let (ledger, handle, admission) = ramping_from_seed(64);
     let budgets: Vec<u64> = (0..2_000)
-        .map(|_| window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0))
+        .map(|_| window_leaving_warm(&handle, &admission, |_| 2, flat_from_64))
         .collect();
     let trials = windows_off(&budgets, 64);
     assert_eq!(
         trials,
-        [2, 15, 40, 89, 186, 379, 764, 1149, 1534, 1919],
-        "one window each"
+        [
+            2, 3, 16, 17, 42, 43, 92, 93, 190, 191, 384, 385, 770, 771, 1156, 1157, 1542, 1543,
+            1928, 1929
+        ]
     );
-    assert!(trials.iter().all(|window| budgets[*window] == 128));
+    assert!(
+        trials
+            .chunks(2)
+            .all(|pair| budgets[pair[0]] == 128 && budgets[pair[1]] == 32)
+    );
     let worker = &ledger.health()[0].workers[0];
     assert_eq!(
         (worker.knee_units, worker.knee_is_local, worker.unit_budget),
         (Some(64), true, 64)
     );
-    assert_eq!(
-        (worker.ramp_held, worker.held_units, worker.held_certified),
-        (true, Some(64), true)
-    );
     assert_eq!(worker.max_units_measured, 128, "the anchor is what ran");
 }
 
-/// A larger size is kept only when its rate beats the working size's by
-/// more than the band, 1.11x a doubling. On a 16 GB card, 82 MiB a unit: a
-/// rate rising 1.41x or 1.14x a doubling grows to the 191 units that fit,
-/// the last step (0.58 of a doubling) held to its share of the band, 1.06x;
-/// 1.05x never leaves the seed; a rate that stops rising at 128 stops there.
+/// The working size is the smallest whose rate is within 10 % of the best a
+/// trial measured, and a trial doubles on while the last doubling gained
+/// 3 %. On a 16 GB card, 82 MiB a unit, 191 units fit; the seed is 64.
 #[test]
-fn a_size_is_kept_only_on_a_gain_past_the_band() {
-    let cases: [(Rate, &[u64], u64); 5] = [
+fn the_working_size_is_the_smallest_within_the_band_of_the_best() {
+    // (rate, the first windows, the size kept)
+    let cases: [(Rate, &[u64], u64); 6] = [
+        // 1.41x and 1.14x a doubling: the room. The last step is 0.58 of a
+        // doubling and is held to that share of the band, 1.06x.
         (|units| (units as f64).sqrt(), &[64, 64, 128, 191], 191),
         (|units| (units as f64).powf(0.19), &[64, 64, 128, 191], 191),
-        (|units| (units as f64).powf(0.07), &[64, 64, 128], 64),
-        (|_| 22.0, &[64, 64, 128], 64),
+        // 1.05x: the trial runs to the room, where the rate is 1.08x the
+        // seed's, inside the band; half the seed is outside it.
+        (
+            |units| (units as f64).powf(0.07),
+            &[64, 64, 128, 191, 32],
+            64,
+        ),
+        // 1.02x: the trial stops at 128, and the size steps down while the
+        // smaller one is within 10 % of the rate at 128.
+        (
+            |units| (units as f64).powf(0.03),
+            &[64, 64, 128, 32, 16, 8, 4, 2],
+            4,
+        ),
+        // Flat: down to one unit.
+        (|_| 22.0, &[64, 64, 128, 32, 16, 8, 4, 2, 1], 1),
+        // Rising to 128 and flat above.
         (|units| units.min(128) as f64, &[64, 64, 128, 191], 128),
     ];
     for (rate, opening, settled) in cases {
-        let (budgets, _) = one_batch_windows(15_700, 12, |capped| capped * 3, rate, Pool::Kept);
+        let (budgets, kept) = one_batch_windows(15_700, 12, |capped| capped * 3, rate, Pool::Kept);
         assert_eq!(budgets[..opening.len()], *opening);
+        assert_eq!(kept, Some(settled), "{budgets:?}");
         assert!(
             budgets[opening.len()..]
                 .iter()
@@ -912,207 +986,186 @@ fn a_size_is_kept_only_on_a_gain_past_the_band() {
     }
 }
 
+/// A step memory cut short is held to its share of the band: from 128 units
+/// to the 191 that fit is 0.58 of a doubling, so 191 has to be 1.06x faster.
+#[test]
+fn a_cut_step_is_held_to_its_share_of_the_band() {
+    for (gain, settled) in [(1.04, 128), (1.08, 191)] {
+        let rate = move |units: u64| match units > 128 {
+            true => 128f64.sqrt() * gain,
+            false => (units as f64).sqrt(),
+        };
+        let (budgets, kept) = one_batch_windows(15_700, 8, |capped| capped * 3, rate, Pool::Kept);
+        assert_eq!(budgets[..4], [64, 64, 128, 191], "{gain}");
+        assert_eq!(kept, Some(settled), "{gain}: {budgets:?}");
+    }
+}
+
 /// With room, a rate that rises takes one window per doubling after the
-/// one that measures the seed's size, up to what the room holds.
+/// one that measures the seed's size, up to what the room holds. The
+/// working size moves when the trial ends.
 #[test]
 fn a_rising_rate_takes_a_window_per_doubling() {
     let (ledger, handle, admission) = ramping_from_seed(64);
-    let budgets: Vec<u64> = (0..14)
-        .map(|_| window_leaving_warm(&handle, &admission, |_| 2, |units| (units as f64).sqrt()))
-        .collect();
+    let rising = |units| (units as f64).sqrt();
+    let mut budgets = Vec::new();
+    for _ in 0..10 {
+        budgets.push(window_leaving_warm(&handle, &admission, |_| 2, rising));
+    }
     assert_eq!(
-        budgets[..11],
-        [64, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 19090]
+        budgets,
+        [64, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
     );
-    assert!(budgets[11..].iter().all(|units| *units == 19090));
-    assert_eq!(ledger.health()[0].workers[0].knee_units, Some(19090));
-}
-
-/// A step the room cuts short, earned after many windows at the working
-/// size: the new size's rate is read from its own observations, not from
-/// the old size's, which lie within a doubling of it.
-#[test]
-fn a_cut_step_is_judged_on_its_own_samples() {
-    let batches = std::cell::Cell::new(0usize);
-    // Flat past 128 units for the first 40 batches, rising throughout after.
-    let rate = |units: u64| {
-        batches.set(batches.get() + 1);
-        let gaining = if batches.get() <= 40 {
-            units.min(128)
-        } else {
-            units
-        };
-        (gaining as f64).sqrt()
-    };
-    let (budgets, held) = one_batch_windows(15_700, 24, |capped| capped * 3, rate, Pool::Kept);
-    assert_eq!(budgets[..4], [64, 64, 128, 191]);
-    assert_eq!(budgets[4..16], [128; 12]);
-    assert_eq!(budgets[16..], [191; 8]);
-    assert!(!held);
+    let worker = &ledger.health()[0].workers[0];
+    assert_eq!(
+        (worker.knee_units, worker.trial_units),
+        (Some(64), Some(32768))
+    );
+    for _ in 0..4 {
+        budgets.push(window_leaving_warm(&handle, &admission, |_| 2, rising));
+    }
+    assert_eq!(budgets[10..], [19090; 4]);
+    let worker = &ledger.health()[0].workers[0];
+    assert_eq!(
+        (worker.knee_units, worker.knee_is_local, worker.trial_units),
+        (Some(19090), false, None),
+        "not stored until a trial has left it in place"
+    );
 }
 
 /// A caller that keeps a batch and a half in flight gives one observation
-/// a window, and none in a window whose batch grew the pool: four windows
-/// at the seed, three at each size after it.
+/// a window: three windows at each size.
 #[test]
 fn shallow_windows_take_three_windows_a_size() {
-    let (flat, held) = one_batch_windows(15_700, 9, a_batch_and_a_half, |_| 22.0, Pool::Kept);
-    assert_eq!(flat, [64, 64, 64, 64, 128, 128, 128, 64, 64]);
-    assert!(held);
     let rising = |units| (units as f64).sqrt();
-    let (risen, held) = one_batch_windows(15_700, 12, a_batch_and_a_half, rising, Pool::Kept);
+    let (risen, _) = one_batch_windows(15_700, 12, a_batch_and_a_half, rising, Pool::Kept);
     assert_eq!(
         risen,
         [64, 64, 64, 64, 128, 128, 128, 191, 191, 191, 191, 191]
     );
-    assert!(!held);
 }
 
-/// No measurement is no growth: a worker whose every full batch grows the
-/// pool, or that reports no pool at all, stays at its seed however fast a
-/// larger batch would be, and is not reported as held.
+/// Observations are compared with those taken in the same conditions, so a
+/// worker whose every batch grows the pool, or that reports no pool, still
+/// grows on a rising rate, and one that runs every window beside another
+/// replica's does too.
 #[test]
-fn a_worker_that_gives_no_throughput_sample_stays_at_its_seed() {
+fn like_is_compared_with_like() {
     let rising = |units| (units as f64).sqrt();
     for pool in [Pool::Released, Pool::Unreported] {
-        let (budgets, held) = one_batch_windows(15_700, 40, a_batch_and_a_half, rising, pool);
-        assert_eq!(budgets, [64; 40]);
-        assert!(!held);
+        let (budgets, kept) = one_batch_windows(15_700, 40, a_batch_and_a_half, rising, pool);
+        assert!(kept > Some(64), "{budgets:?}");
     }
-}
 
-/// A trial whose windows give no observation of the larger size (here its
-/// pool grows with every batch) ends after [`TRIAL_WINDOWS`] of them as one
-/// that earned nothing: back to the working size, and the next one later.
-#[test]
-fn a_trial_without_a_verdict_is_bounded() {
-    let (ledger, handle, admission) = ramping_from_seed(64);
-    let warm = |units: u64| if units > 64 { 0 } else { 2 };
-    let budgets: Vec<u64> = (0..8)
-        .map(|_| window_leaving_warm(&handle, &admission, warm, |units| units as f64))
+    let ledger = ledger(200_000, no_margin());
+    let handle = loaded(Some(1000), Some(0));
+    let admission = ledger
+        .register_worker("g/a", item_cost(64), &handle, None)
+        .expect("registers");
+    let neighbour_handle = loaded(Some(1000), Some(0));
+    let neighbour = ledger
+        .register_worker("g/b", item_cost(4), &neighbour_handle, None)
+        .expect("registers");
+    push_memory(&handle, 190_000, 1000);
+    let beside = |rate: Rate| {
+        let held = neighbour.request_grant(4, None, 1, 0).expect("granted");
+        let units = window_leaving_warm(&handle, &admission, |_| 2, rate);
+        drop(held);
+        units
+    };
+    let budgets: Vec<u64> = (0..5).map(|_| beside(rising)).collect();
+    assert_eq!(budgets, [64, 64, 128, 256, 512]);
+    // Alone, the rate at 1 024 units reads three times as high: it is not
+    // compared with the rate at 512 beside the neighbour, so the trial runs
+    // 512 alone before it goes on.
+    let alone = |units: u64| 3.0 * (units as f64).sqrt();
+    let budgets: Vec<u64> = (0..3)
+        .map(|_| window_leaving_warm(&handle, &admission, |_| 2, alone))
         .collect();
-    assert_eq!(budgets, [64, 64, 128, 128, 128, 128, 64, 64]);
-    assert_eq!(
-        ledger.trial_for_test("g/a", GPU),
-        (None, RETEST_WINDOWS - 2, 1)
-    );
-    assert_eq!(ledger.health()[0].workers[0].knee_units, Some(64));
+    assert_eq!(budgets, [1024, 512, 2048]);
 }
 
-/// A rate that is flat when the job starts and rises with the batch from
-/// window 20 or 80 on: the next trial on the cadence finds the gain, at
-/// window 40 or 89, and the size grows from there.
+/// A flat-from-64 rate read through Gaussian noise on every batch, 12 jobs
+/// of 2 000 windows each: at a deviation of 10 % no job ends above 64 units,
+/// and at 20 % none ends more than one size above; the time-averaged size
+/// stays under 128.
 #[test]
-fn a_rate_that_starts_to_rise_later_is_found_by_the_next_trial() {
-    for (rises_at, found_at) in [(20, 40), (80, 89)] {
-        let (_ledger, handle, admission) = ramping_from_seed(64);
-        let budgets: Vec<u64> = (0..100)
-            .map(|window| {
-                let rate = move |units: u64| match window >= rises_at {
-                    true => 22.0 * (units as f64 / 64.0).sqrt(),
-                    false => 22.0,
-                };
-                window_leaving_warm(&handle, &admission, |_| 2, rate)
-            })
-            .collect();
-        assert_eq!(
-            budgets[found_at..found_at + 4],
-            [128, 256, 512, 1024],
-            "rising from window {rises_at}"
-        );
+fn a_noisy_rate_does_not_walk() {
+    for (sigma, most) in [(0.10, 64), (0.20, 128)] {
+        for seed in 1..=12 {
+            let (ledger, handle, admission) = ramping_from_seed(64);
+            let mut noise = noise(seed, sigma);
+            let noise = std::cell::RefCell::new(&mut noise);
+            let rate = |units: u64| flat_from_64(units) * (noise.borrow_mut())();
+            let total: u64 = (0..2_000)
+                .map(|_| window_leaving_warm(&handle, &admission, |_| 2, rate))
+                .sum();
+            let ended = ledger.health()[0].workers[0].knee_units.expect("set");
+            assert!(ended <= most, "sigma {sigma} seed {seed}: {ended}");
+            assert!(total / 2_000 < 128, "sigma {sigma} seed {seed}: {total}");
+        }
     }
-}
-
-/// A gain resets the cadence: after two trials that earned nothing and two
-/// that earned a size, the next that earns nothing is tried again after
-/// [`RETEST_WINDOWS`], not four times that.
-#[test]
-fn a_gain_resets_the_cadence() {
-    let (ledger, handle, admission) = ramping_from_seed(64);
-    for window in 0..44 {
-        // Flat for 20 windows, then rising up to 256 units.
-        let rate = move |units: u64| match window >= 20 {
-            true => (units.min(256) as f64).sqrt(),
-            false => 8.0,
-        };
-        window_leaving_warm(&handle, &admission, |_| 2, rate);
-    }
-    assert_eq!(ledger.health()[0].workers[0].knee_units, Some(256));
-    assert_eq!(
-        ledger.trial_for_test("g/a", GPU),
-        (None, RETEST_WINDOWS - 1, 1)
-    );
 }
 
 /// A working size whose own rate moves by more than the band (the inputs
-/// changed) is re-tested at once, not when the cadence comes round: flat
-/// until window 200, where the next trial is due at 379, then half the rate
-/// at 64 units and rising with the batch.
+/// changed) is tried again at once, and the cadence starts over: here the
+/// rate halves at window 200, where the next trial was due at window 384.
 #[test]
 fn a_working_size_whose_rate_moved_is_tried_again_at_once() {
-    let (_ledger, handle, admission) = ramping_from_seed(64);
-    let budgets: Vec<u64> = (0..300)
+    let (ledger, handle, admission) = ramping_from_seed(64);
+    let budgets: Vec<u64> = (0..210)
         .map(|window| {
             let rate = move |units: u64| match window >= 200 {
-                true => 11.0 * (units as f64 / 64.0).sqrt(),
-                false => 22.0,
+                true => flat_from_64(units) / 2.0,
+                false => flat_from_64(units),
             };
             window_leaving_warm(&handle, &admission, |_| 2, rate)
         })
         .collect();
-    let grown = budgets.iter().position(|units| *units > 128);
+    assert_eq!(budgets[200..], [64, 64, 64, 64, 128, 32, 64, 64, 64, 64]);
     assert_eq!(
-        grown,
-        Some(234),
-        "once the ring's median at 64 units has moved: {:?}",
-        first_reached(&budgets)
+        ledger.trial_for_test("g/a", GPU),
+        (None, RETEST_WINDOWS - 4, 1)
     );
 }
 
-/// A flat rate read through ±10 % noise, 60 jobs of 400 windows. Where a
-/// trial's two observations read a gain past the band, the size is given up
-/// again once it has [`CONFIRM_SAMPLES`] of them, unless the seed's own rate
-/// was read low from its first two: 2 jobs end one size up, none further.
+/// A rate that starts to rise above the working size while the size's own
+/// rate stays put is found by the next trial on the cadence: rising from
+/// window 20, found by the trial at window 42.
 #[test]
-fn a_flat_noisy_rate_does_not_walk() {
-    let state = std::cell::Cell::new(0x9E37_79B9_7F4A_7C15u64);
-    let noise = || {
-        // xorshift64, mapped to 0.9..1.1.
-        let mut bits = state.get();
-        bits ^= bits << 13;
-        bits ^= bits >> 7;
-        bits ^= bits << 17;
-        state.set(bits);
-        0.9 + 0.2 * ((bits >> 11) as f64 / (1u64 << 53) as f64)
-    };
-    let mut ended = Vec::new();
-    for _ in 0..60 {
-        let (ledger, handle, admission) = ramping_from_seed(64);
-        for _ in 0..400 {
-            window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0 * noise());
-        }
-        ended.push(ledger.health()[0].workers[0].knee_units.expect("measured"));
-    }
-    let grown = ended.iter().filter(|units| **units > 64).count();
-    assert_eq!(grown, 2, "{ended:?}");
-    assert!(ended.iter().all(|units| *units <= 128), "{ended:?}");
+fn a_rate_that_starts_to_rise_later_is_found_by_the_next_trial() {
+    let (ledger, handle, admission) = ramping_from_seed(64);
+    let budgets: Vec<u64> = (0..56)
+        .map(|window| {
+            let rate = move |units: u64| match window >= 20 && units > 64 {
+                true => (units as f64).sqrt(),
+                false => flat_from_64(units),
+            };
+            window_leaving_warm(&handle, &admission, |_| 2, rate)
+        })
+        .collect();
+    assert_eq!(budgets[42..46], [128, 256, 512, 1024]);
+    // A trial that moved the size resets the cadence: the next one that
+    // leaves it in place waits 12 windows, not 48.
+    assert_eq!(ledger.health()[0].workers[0].knee_units, Some(19090));
+    assert_eq!(ledger.trial_for_test("g/a", GPU).2, 0);
 }
 
 /// A job's first window holds one item while the scanner fills, and the
 /// ratchet admits twice the largest batch run: the first window at its
 /// budget is 2 units, whatever the seed, and every size from there is
-/// earned. A rate flat at every size stays at 2 units and tries 4 six times
-/// in 380 windows. CLIP on an M3 Max (113 items/s at 8 units, 125 at 16:
-/// 1.107x) stays at 8.
+/// earned. A rate flat at every size ends at one unit. CLIP on an M3 Max
+/// (113 items/s at 8 units, 125 at 16) ends at 8, the smallest size within
+/// 10 % of its best rate.
 #[test]
 fn a_job_opens_small_after_a_queue_sized_first_window_and_earns_from_there() {
-    // (seed, rate, the first windows, the size kept, later trials)
+    // (seed, rate, the first windows, the size kept)
     let clip: Rate = |units| ladder_rate(&CLIP_M3_MAX, units);
-    let cases: [(u32, Rate, &[u64], u64, usize); 2] = [
-        (16, |_| 6.5, &[1, 2, 2, 4, 2, 2], 2, 5),
-        (64, clip, &[1, 2, 2, 4, 8, 16, 8, 8], 8, 4),
+    let cases: [(u32, Rate, &[u64], u64); 2] = [
+        (16, |_| 6.5, &[1, 2, 2, 4, 1, 1], 1),
+        (64, clip, &[1, 2, 2, 4, 8, 16, 32, 8, 8], 8),
     ];
-    for (seed, rate, opening, settled, later) in cases {
+    for (seed, rate, opening, settled) in cases {
         let (ledger, handle, admission) = ramping_from_seed(seed);
         let mut budgets = vec![queued_window_leaving_warm(
             &handle,
@@ -1128,9 +1181,7 @@ fn a_job_opens_small_after_a_queue_sized_first_window_and_earns_from_there() {
             Some(settled),
             "seed {seed}"
         );
-        let trials = windows_off(&budgets[opening.len()..], settled);
-        assert_eq!(trials.len(), later, "seed {seed}: {trials:?}");
-        assert!(budgets.iter().all(|units| *units <= 2 * settled));
+        assert!(budgets.iter().all(|units| *units <= 4 * settled));
     }
 }
 
@@ -1140,114 +1191,82 @@ fn a_job_opens_small_after_a_queue_sized_first_window_and_earns_from_there() {
 fn queue_sized_windows_wait() {
     let (ledger, handle, admission) = ramping_from_seed(64);
     for _ in 0..5 {
-        queued_window_leaving_warm(&handle, &admission, 32, |_| 2, |_| 22.0);
+        queued_window_leaving_warm(&handle, &admission, 32, |_| 2, flat_from_64);
     }
     assert_eq!(ledger.health()[0].workers[0].knee_units, None);
     let open: Vec<u64> = (0..2)
-        .map(|_| window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0))
+        .map(|_| window_leaving_warm(&handle, &admission, |_| 2, flat_from_64))
         .collect();
     assert_eq!(open, [64, 64]);
-    assert_eq!(ledger.trial_for_test("g/a", GPU), (Some(0), 0, 0));
+    assert_eq!(ledger.trial_for_test("g/a", GPU), (Some(128), 0, 0));
     for _ in 0..(2 * TRIAL_WINDOWS) {
-        queued_window_leaving_warm(&handle, &admission, 8, |_| 2, |_| 22.0);
+        queued_window_leaving_warm(&handle, &admission, 8, |_| 2, flat_from_64);
     }
-    assert_eq!(ledger.trial_for_test("g/a", GPU), (Some(0), 0, 0));
-    assert_eq!(ledger.health()[0].workers[0].unit_budget, 128);
-    // The trial earns nothing; 48 units of work are 64-unit samples too.
-    window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0);
+    assert_eq!(ledger.trial_for_test("g/a", GPU), (Some(128), 0, 0));
+    // The trial leaves the size in place. 48 units of work are neither a
+    // window at 64 units nor one at 32.
+    for _ in 0..2 {
+        window_leaving_warm(&handle, &admission, |_| 2, flat_from_64);
+    }
     for _ in 0..5 {
-        queued_window_leaving_warm(&handle, &admission, 48, |_| 2, |_| 22.0);
+        queued_window_leaving_warm(&handle, &admission, 48, |_| 2, flat_from_64);
     }
     assert_eq!(ledger.trial_for_test("g/a", GPU), (None, RETEST_WINDOWS, 1));
 }
 
-/// A trial window that ran beside another replica's measures nothing: the
-/// trial is put off for [`RETEST_WINDOWS`], and it does not count as one
-/// that earned nothing.
+/// A trial ends at a window that runs out of memory or whose worker dies,
+/// and keeps what it measured below that size; an aborted window changes
+/// nothing. Deflation then halves the batch as after any failure, and
+/// deflated windows do not count towards the next trial.
 #[test]
-fn a_trial_beside_another_replica_is_put_off() {
-    let ledger = ledger(200_000, no_margin());
-    let handle = loaded(Some(1000), Some(0));
-    let admission = ledger
-        .register_worker("g/a", item_cost(64), &handle, None)
-        .expect("registers");
-    let neighbour_handle = loaded(Some(1000), Some(0));
-    let neighbour = ledger
-        .register_worker("g/b", item_cost(4), &neighbour_handle, None)
-        .expect("registers");
-    push_memory(&handle, 190_000, 1000);
-    for _ in 0..2 {
-        window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0);
+fn a_trial_ends_at_a_window_that_fails() {
+    let failures = [
+        WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Marker),
+        },
+        WindowOutcome::WorkerDied,
+    ];
+    for failure in failures {
+        let (ledger, handle, admission) = ramping_from_seed(64);
+        let rising = |units| (units as f64).sqrt();
+        for _ in 0..3 {
+            window_leaving_warm(&handle, &admission, |_| 2, rising);
+        }
+        let aborted = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(aborted.grant().unit_budget, 256);
+        aborted.finish(WindowOutcome::Aborted);
+        assert_eq!(ledger.trial_for_test("g/a", GPU), (Some(256), 0, 0));
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().unit_budget, 256);
+        token.finish(failure);
+        assert_eq!(ledger.trial_for_test("g/a", GPU), (None, RETEST_WINDOWS, 1));
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            (worker.knee_units, worker.knee_is_local),
+            (Some(128), false),
+            "128 units measured faster than 64 before 256 failed"
+        );
     }
-    let beside = neighbour.request_grant(4, None, 1, 0).expect("granted");
-    assert_eq!(
-        window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0),
-        128
-    );
-    drop(beside);
-    assert_eq!(ledger.trial_for_test("g/a", GPU), (None, RETEST_WINDOWS, 0));
-    assert_eq!(
-        window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0),
-        64
-    );
-    // Nor do windows beside it count towards the next trial.
-    let beside = neighbour.request_grant(4, None, 1, 0).expect("granted");
-    for _ in 0..3 {
-        window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0);
-    }
-    drop(beside);
-    assert_eq!(
-        ledger.trial_for_test("g/a", GPU),
-        (None, RETEST_WINDOWS - 1, 0)
-    );
-}
 
-/// A trial window that runs out of memory ends the trial as one that earned
-/// nothing; deflation then halves the working size as after any failure.
-#[test]
-fn a_trial_that_runs_out_of_memory_is_over() {
     let (ledger, handle, admission) = ramping_from_seed(64);
     for _ in 0..2 {
-        window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0);
+        window_leaving_warm(&handle, &admission, |_| 2, flat_from_64);
     }
-    let token = admission
+    admission
         .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
-    assert_eq!(token.grant().unit_budget, 128);
-    token.finish(WindowOutcome::Responded {
-        oom: Some(ErrorFrameOom::Marker),
-    });
-    assert_eq!(ledger.trial_for_test("g/a", GPU), (None, RETEST_WINDOWS, 1));
-    let worker = &ledger.health()[0].workers[0];
-    assert_eq!((worker.knee_units, worker.unit_budget), (Some(64), 32));
-    // Deflated windows do not count towards the next trial.
+        .expect("granted")
+        .finish(failures[0]);
     for _ in 0..2 {
         assert_eq!(
-            window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0),
+            window_leaving_warm(&handle, &admission, |_| 2, flat_from_64),
             32
         );
     }
     assert_eq!(ledger.trial_for_test("g/a", GPU), (None, RETEST_WINDOWS, 1));
-}
-
-/// A trial whose two observations read 1.18x the seed's rate earns the size.
-/// Its rate then reads lower than it did, which tries the next size once
-/// more; once it has [`CONFIRM_SAMPLES`] observations of its own, at the
-/// seed's rate, it is given up.
-#[test]
-fn a_size_earned_on_a_high_reading_is_given_up_once_measured_more() {
-    let (ledger, handle, admission) = ramping_from_seed(64);
-    let budgets: Vec<u64> = (0..12)
-        .map(|window| {
-            let rate = move |_| if window == 2 { 26.0 } else { 22.0 };
-            window_leaving_warm(&handle, &admission, |_| 2, rate)
-        })
-        .collect();
-    assert_eq!(
-        budgets,
-        [64, 64, 128, 256, 128, 128, 256, 128, 128, 128, 64, 64]
-    );
-    assert_eq!(ledger.health()[0].workers[0].knee_units, Some(64));
 }
 
 /// The working size and the cadence belong to the (model, device): a
@@ -1255,8 +1274,8 @@ fn a_size_earned_on_a_high_reading_is_given_up_once_measured_more() {
 #[test]
 fn a_reloaded_replica_carries_on_at_the_working_size() {
     let (ledger, handle, admission) = ramping_from_seed(64);
-    for _ in 0..5 {
-        window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0);
+    for _ in 0..6 {
+        window_leaving_warm(&handle, &admission, |_| 2, flat_from_64);
     }
     let before = ledger.trial_for_test("g/a", GPU);
     assert_eq!(before, (None, RETEST_WINDOWS - 2, 1));
@@ -1268,7 +1287,7 @@ fn a_reloaded_replica_carries_on_at_the_working_size() {
         .expect("registers");
     push_memory(&handle, 190_000, 1000);
     assert_eq!(
-        window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0),
+        window_leaving_warm(&handle, &admission, |_| 2, flat_from_64),
         64
     );
     assert_eq!(
@@ -1278,34 +1297,37 @@ fn a_reloaded_replica_carries_on_at_the_working_size() {
     );
 }
 
-/// A trial that earns nothing says so once, at INFO, with both rates and
-/// when the next one is due.
+/// A trial says once, at INFO, where it left the size and when the next
+/// one is due.
 #[test]
-fn a_trial_that_earned_nothing_says_so() {
+fn a_trial_says_how_it_ended() {
     let (_ledger, handle, admission) = ramping_from_seed(64);
     let ((), log) = logs_from(|| {
         for _ in 0..20 {
-            window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0);
+            window_leaving_warm(&handle, &admission, |_| 2, flat_from_64);
         }
     });
     let lines: Vec<&str> = log
         .lines()
-        .filter(|line| line.contains("a larger batch size measured no faster"))
+        .filter(|line| line.contains("a batch size trial is over"))
         .collect();
     assert_eq!(lines.len(), 2, "{log}");
-    assert!(lines[0].contains("retest_after_windows=12"), "{log}");
+    assert!(
+        lines[0].contains("units=64 moved=false largest_units=128 retest_after_windows=12"),
+        "{log}"
+    );
     assert!(lines[1].contains("retest_after_windows=24"), "{log}");
 }
 
 /// A stored row without a working size (an earlier build's, or a shipped
-/// one for a model that never kneed) opens at the seed, whatever its
+/// one for a model that never had one) opens at the seed, whatever its
 /// anchor: a rising rate earns its way to the anchor a window per doubling,
-/// a flat one stays at the seed.
+/// a flat one steps down from the seed.
 #[test]
 fn a_stored_anchor_without_a_working_size_opens_at_the_seed() {
     let cases: [(Rate, [u64; 6]); 2] = [
         (|units| (units as f64).sqrt(), [8, 8, 16, 32, 64, 128]),
-        (|_| 22.0, [8, 8, 16, 8, 8, 8]),
+        (|_| 22.0, [8, 8, 16, 4, 2, 1]),
     ];
     for (rate, expected) in cases {
         let profiles = Arc::new(FakeProfiles {
@@ -1328,17 +1350,12 @@ fn a_stored_anchor_without_a_working_size_opens_at_the_seed() {
     }
 }
 
-/// Six process starts over one store, at a flat rate: each opens at the
-/// stored working size, tries the next size once and returns. The stored
-/// size does not walk, and the anchor stays at the one size above it that
-/// was tried.
-#[test]
-fn a_restart_does_not_walk() {
-    let root = tempfile::tempdir().unwrap();
-    let store = CalibrationStore::with_debounce(
+/// A local store, as a process start sees it.
+fn local_store(root: &std::path::Path) -> Arc<CalibrationStore> {
+    CalibrationStore::with_debounce(
         StorePaths {
             shipped_dirs: Vec::new(),
-            local_path: root.path().join("inferio/calibration.toml"),
+            local_path: root.join("inferio/calibration.toml"),
         },
         StoreEnv {
             platform: "linux".to_owned(),
@@ -1346,23 +1363,96 @@ fn a_restart_does_not_walk() {
             generator: "panoptikon test".to_owned(),
         },
         Duration::ZERO,
+    )
+}
+
+/// One process start over `store`: `windows` windows of a replica seeded 64
+/// at `rate`. Returns their budgets.
+fn process_start(store: &Arc<CalibrationStore>, windows: usize, rate: Rate) -> Vec<u64> {
+    let ledger = VramLedger::for_test_with(
+        &[(GPU, "TEST 9000", 200_000)],
+        no_margin(),
+        Some(Arc::clone(store) as Arc<dyn CalibrationProfiles>),
     );
-    for start in 0..6 {
-        let ledger = VramLedger::for_test_with(
-            &[(GPU, "TEST 9000", 200_000)],
-            no_margin(),
-            Some(Arc::clone(&store) as Arc<dyn CalibrationProfiles>),
-        );
-        let handle = loaded(Some(1000), Some(0));
-        let admission = ledger
-            .register_worker("g/a", item_cost(64), &handle, None)
-            .expect("registers");
-        push_memory(&handle, 190_000, 1000);
-        let budgets: Vec<u64> = (0..6)
-            .map(|_| window_leaving_warm(&handle, &admission, |_| 2, |_| 22.0))
-            .collect();
-        assert_eq!(budgets, [64, 64, 128, 64, 64, 64], "start {start}");
+    let handle = loaded(Some(1000), Some(0));
+    let admission = ledger
+        .register_worker("g/a", item_cost(64), &handle, None)
+        .expect("registers");
+    push_memory(&handle, 190_000, 1000);
+    (0..windows)
+        .map(|_| window_leaving_warm(&handle, &admission, |_| 2, rate))
+        .collect()
+}
+
+/// Process starts over one store. The first start's trial leaves 64 units
+/// in place; that size, the trials that left it there and the wait for the
+/// next (in whole twelves, rounded down) are stored, so the later starts
+/// carry the wait on instead of starting a trial each: seven starts of ten
+/// windows run three trials, as one job of seventy windows does.
+#[test]
+fn a_restart_carries_the_wait_on() {
+    let root = tempfile::tempdir().unwrap();
+    let store = local_store(root.path());
+    let mut budgets = Vec::new();
+    for _ in 0..7 {
+        budgets.extend(process_start(&store, 10, flat_from_64));
         let row = store.lookup(&item_query("g/a")).expect("stored");
         assert_eq!((row.knee_units, row.max_units_measured), (Some(64), 128));
+    }
+    assert_eq!(windows_off(&budgets, 64), [2, 3, 12, 13, 32, 33]);
+}
+
+/// A stored working size that is too large corrects itself: a flat rate
+/// opening at a stored 256 units steps down to one. Each smaller size is
+/// stored as it is reached, so a restart carries on from there.
+#[test]
+fn a_stored_size_that_is_too_large_steps_down() {
+    let root = tempfile::tempdir().unwrap();
+    let store = local_store(root.path());
+    let stored = || {
+        store
+            .lookup(&item_query("g/a"))
+            .and_then(|row| row.knee_units)
+    };
+    // A rate that rises to 256 units: the first trial moves the size there,
+    // and it is stored once the next has left it in place.
+    let to_256: Rate = |units| (units.min(256) as f64).sqrt();
+    let budgets = process_start(&store, 5, to_256);
+    assert_eq!(budgets, [64, 64, 128, 256, 512]);
+    assert_eq!(stored(), None);
+    let budgets = process_start(&store, 20, to_256);
+    assert_eq!(budgets[..5], [64, 64, 128, 256, 512]);
+    assert_eq!(stored(), Some(256));
+
+    let flat: Rate = |_| 22.0;
+    assert_eq!(process_start(&store, 6, flat), [256, 256, 512, 128, 64, 32]);
+    assert_eq!(stored(), Some(32), "stored while the trial goes on");
+    assert_eq!(
+        process_start(&store, 9, flat),
+        [32, 32, 64, 16, 8, 4, 2, 1, 1]
+    );
+    assert_eq!(stored(), Some(1));
+}
+
+/// A trial that ran a larger size than the one it leaves asks the replica to
+/// release its pool; one that moved up to the largest size it ran does not.
+#[test]
+fn a_trial_that_ran_a_larger_size_asks_the_pool_back() {
+    for (rate, windows, asked) in [
+        (flat_from_64 as Rate, 4, true),
+        (|units| units as f64, 12, false),
+    ] {
+        let (ledger, handle, admission) = ramping_from_seed(64);
+        for _ in 0..windows {
+            window_leaving_warm(&handle, &admission, |_| 2, rate);
+        }
+        assert_eq!(
+            ledger.trial_for_test("g/a", GPU).0,
+            None,
+            "the trial is over"
+        );
+        let trims = ledger.take_pending_trims();
+        assert_eq!(trims.len(), usize::from(asked));
+        assert!(trims.iter().all(|trim| trim.trigger == TRIM_TRIGGER_TRIAL));
     }
 }
