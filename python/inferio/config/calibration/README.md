@@ -183,7 +183,8 @@ The local store carries fields of *local evidence* — `local_samples`,
 `sample_units`, `sample_delta_mb`: how much local evidence stands behind the
 fit, and the raw samples it was fitted from — and of local state,
 `knee_trials_failed` and `knee_retest_after`: when this machine next re-tests
-its `knee_units`. They are **stripped on import**,
+its `knee_units`, and `knee_rate_units` and `knee_rates`: what a trial of it
+had measured when its run ended. They are **stripped on import**,
 so you may leave them in the copied file; they will be ignored. Nothing else
 needs editing.
 
