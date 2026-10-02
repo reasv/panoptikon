@@ -2325,8 +2325,7 @@ mod tests {
     }
 
     /// A release a batch size trial left pending runs when the replica's
-    /// window returns, with work queued or not, and the replica keeps
-    /// serving.
+    /// window returns, and the replica keeps serving.
     #[tokio::test]
     async fn a_trial_trim_runs_when_the_window_returns() {
         let harness = one_replica(32_768, "echo_test", item_cost(4)).await;
@@ -2350,6 +2349,52 @@ mod tests {
             !harness.ledger.trial_trim_for_test(harness.worker_id, None),
             "taken at the first window's return"
         );
+        assert_eq!(harness.stats.total_batches.load(Relaxed), 2);
+        harness.shutdown().await;
+    }
+
+    /// With work queued behind the window the release runs all the same,
+    /// before the next window: the second request is served by a replica
+    /// that has answered the trim.
+    #[tokio::test]
+    async fn a_trial_trim_runs_before_the_next_queued_window() {
+        let harness = one_replica(32_768, "slow_test", item_cost(4)).await;
+        harness
+            .ledger
+            .trial_trim_for_test(harness.worker_id, Some(true));
+        let send = || {
+            let (reply, answer) = oneshot::channel();
+            harness
+                .tx
+                .send(DispatchMsg::Predict(DispatchRequest {
+                    inputs: vec![WorkerInput {
+                        data: Some(json!("slow")),
+                        file: None,
+                    }],
+                    max_batch: None,
+                    reply,
+                }))
+                .expect("queued");
+            answer
+        };
+        let first = send();
+        // The second arrives while the first holds the only replica.
+        while harness.stats.in_flight_windows.load(Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let second = send();
+        for answer in [first, second] {
+            answer
+                .await
+                .expect("the dispatcher replied")
+                .expect("served");
+        }
+        let served = std::time::Instant::now();
+        let trimmed = harness
+            .ledger
+            .last_trim_for_test(harness.worker_id)
+            .expect("trimmed");
+        assert!(trimmed < served);
         assert_eq!(harness.stats.total_batches.load(Relaxed), 2);
         harness.shutdown().await;
     }

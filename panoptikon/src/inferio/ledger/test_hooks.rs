@@ -173,6 +173,12 @@ impl VramLedger {
         entry.trial_trim_due
     }
 
+    /// When `worker` last answered a trim.
+    #[cfg(test)]
+    pub(in crate::inferio) fn last_trim_for_test(&self, worker: u64) -> Option<Instant> {
+        self.lock().workers.get(&worker)?.last_trim_at
+    }
+
     /// The throughput ring as `(units, units/sec)`.
     #[cfg(test)]
     pub(super) fn throughput_for_test(&self, inference_id: &str, gpu: &str) -> Vec<(u64, f64)> {
