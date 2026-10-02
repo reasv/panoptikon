@@ -1108,6 +1108,25 @@ fn a_cut_size_is_the_fastest_by_its_own_batches() {
     assert_eq!(kept, Some(128));
 }
 
+/// A look-ahead that does not fit is not run and not asked for again: the
+/// trial goes on comparing the sizes it did run. On a card for 191 units a
+/// rate that is the same at every size, read through scatter, leaves 128
+/// units undecided against 64 after the look-ahead, and they run in turn.
+#[test]
+fn a_look_ahead_that_does_not_fit_is_not_asked_for_again() {
+    let fits_191 = 191 * OneBatch::PER_UNIT_MB;
+    let batches = std::cell::Cell::new(0u32);
+    let rate = |_| {
+        batches.set(batches.get() + 1);
+        10.0 * (0.9 + 0.1 * f64::from(batches.get() % 3))
+    };
+    let (budgets, kept) = one_batch_windows(fits_191, 30, |capped| capped * 3, rate, Pool::Kept);
+    assert_eq!(budgets[..3], [64, 64, 128]);
+    // The window that asked for 256 units ran 64; no second one follows it.
+    assert!(budgets[2..].windows(2).all(|pair| pair != [64, 64]));
+    assert_eq!(kept, Some(64));
+}
+
 /// While memory grants nothing above the working size, the replica keeps
 /// asking for twice the size, which costs nothing, and the first window
 /// granted a larger size starts a trial: a rising rate in a room for 100
@@ -1748,6 +1767,18 @@ fn a_queue_that_runs_dry_inside_a_trial_asks_the_pool_back() {
     admission.note_trim_declined();
     admission.note_demand(0);
     assert!(!admission.take_trial_trim(), "a release just answered");
+
+    // A trial that memory granted nothing above the working size holds no
+    // more pool than that size needs.
+    let mut replica = OneBatch::on_a_card_of(191 * OneBatch::PER_UNIT_MB);
+    let fits_70 = 70 * OneBatch::PER_UNIT_MB;
+    let budgets: Vec<u64> = (0..3)
+        .map(|_| replica.window(fits_70, |capped| capped * 3, flat_from_64, Pool::Kept, None))
+        .collect();
+    assert_eq!(budgets, [64, 64, 70]);
+    assert_eq!(replica.ledger.trial_for_test("g/a", GPU).0, Some(32));
+    replica.admission.note_demand(0);
+    assert!(!replica.admission.take_trial_trim());
 }
 
 /// A window of three batches at ten units a second, out for its batches'
@@ -1998,6 +2029,33 @@ fn a_run_that_ends_inside_a_trial_is_carried_on_by_the_next() {
         process_start(&store, 5, rising),
         [512, 1024, 512, 2048, 4096]
     );
+}
+
+/// What the last run's trial had measured goes before this run's
+/// observations: the ring drops it first.
+#[test]
+fn stored_observations_are_older_than_this_runs() {
+    let stored = (0..70).flat_map(|_| [(64, 8.0), (128, 8.0)]).collect();
+    let profiles = Arc::new(FakeProfiles {
+        seed: Some(ProfileSeed {
+            knee_units: Some(64),
+            knee_rates: stored,
+            ..seeded_anchor(128, true)
+        }),
+        ..FakeProfiles::default()
+    });
+    let ledger = ledger_with(200_000, no_margin(), &profiles);
+    let handle = loaded(Some(1_000), Some(0));
+    let admission = ledger
+        .register_worker("g/a", item_cost(64), &handle, None)
+        .expect("registers");
+    push_memory(&handle, 190_000, 1_000);
+    for _ in 0..2 {
+        window_leaving_warm(&handle, &admission, |_| 2, |_| 8.08);
+    }
+    let ring = ledger.throughput_for_test("g/a", GPU);
+    assert_eq!(ring.len(), KNEE_RING);
+    assert_eq!((ring[0].1, ring[KNEE_RING - 1]), (8.0, (64, 8.08)));
 }
 
 /// A trial that steps the size down counts as one that moved it: the next

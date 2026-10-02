@@ -117,10 +117,7 @@ fn observed(samples: &[(u64, f64)], working: u64, trial: &Trial) -> Vec<(u64, Ve
     let mut sizes = ladder(samples, working, asked);
     if trial.granted < asked && trial.granted as f64 * SAME_SIZE_RATIO > below as f64 {
         sizes.retain(|(size, _)| *size <= below);
-        // A look-ahead memory cut is not measured.
-        if !trial.looks_ahead {
-            sizes.push((trial.granted, rates_at(samples, trial.granted, below)));
-        }
+        sizes.push((trial.granted, rates_at(samples, trial.granted, below)));
     }
     sizes
 }
@@ -542,7 +539,6 @@ impl VramLedger {
             |from, to| clearly_faster(from, to, 1.0 / KNEE_RATIO, band, CLEAR_ERRORS) == Some(true);
         if quiet_rate(&now, band).is_none() || moved(&then, &now) || moved(&now, &then) {
             cal.unfinished.clear();
-            cal.store_due = true;
             return false;
         }
         for (units, units_per_sec) in cal.unfinished.iter().rev() {
@@ -782,7 +778,6 @@ impl VramLedger {
         // and a restart has nothing to go on with.
         cal.throughput
             .retain(|sample| is_size(sample.units, working, working / 2));
-        cal.store_due |= !cal.unfinished.is_empty();
         cal.unfinished.clear();
         tracing::info!(
             model = %key.0,

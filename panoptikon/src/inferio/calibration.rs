@@ -883,12 +883,10 @@ impl CalibrationProfiles for CalibrationStore {
             } else {
                 TrialCadence::default()
             },
-            knee_rates: if best.local {
+            knee_rates: {
                 let profile = &best.profile;
                 let rates = profile.knee_rates.iter().copied();
                 profile.knee_rate_units.iter().copied().zip(rates).collect()
-            } else {
-                Vec::new()
             },
             local: best.local,
             fit_is_local: donor.is_some_and(|donor| donor.local),
