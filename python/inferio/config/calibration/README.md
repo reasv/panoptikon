@@ -95,16 +95,13 @@ base_platform     = "linux"            # optional: the platform base_mb was
                                        # measured elsewhere (see below)
 slope_mb_per_unit = 0.79               # marginal cost per unit, MiB of
                                        # *allocated* memory (schema 2)
-knee_units        = 512                # optional: the throughput knee. A cap, not
-                                       # a ceiling — the orchestrator widens it by
-                                       # one log2 bucket after clean windows run
-                                       # at it with memory to spare, and withdraws
-                                       # it once it can no longer bind.
-                                       # A knee the importing machine did not
-                                       # measure itself is *provisional*: it gets
-                                       # 4 such windows per step rather than 12,
-                                       # so a wrong one is climbed out of in
-                                       # seconds rather than never
+knee_units        = 512                # optional: the working batch size, the
+                                       # largest that measured faster than the
+                                       # size below it. A run opens here and
+                                       # tries twice the size from time to
+                                       # time, keeping it only if it measures
+                                       # faster. Without it a run opens at the
+                                       # model's seed and earns each doubling
 samples           = 38
 residual_mb       = 96                 # fit scatter → confidence
 measured_at       = "2026-07-30T00:00:00Z"
@@ -183,30 +180,25 @@ Baselines accrete from maintainers' and volunteers' local stores. To
 contribute one, copy entries out of your
 `<data_folder>/inferio/calibration.toml` into a file here.
 
-The local store carries four fields of *local evidence* — `local_samples`,
-`sample_units`, `sample_delta_mb`, `knee_clean_windows`: how much local
-evidence stands behind the fit, the raw samples it was fitted from, and how many clean windows that machine has already run at `knee_units`
-towards retiring it. They are **stripped on import**, so you may leave them in
-the copied file; they will be ignored. Nothing else needs editing.
+The local store carries three fields of *local evidence* — `local_samples`,
+`sample_units`, `sample_delta_mb`: how much local evidence stands behind the
+fit, and the raw samples it was fitted from. They are **stripped on import**,
+so you may leave them in the copied file; they will be ignored. Nothing else
+needs editing.
 
 `max_units_measured` and `knee_units` are *not* stripped. The anchor travels:
 any matching profile — shipped or local — that also carries a
-`slope_mb_per_unit` floors the ramp at the largest power-of-two step at or
-below the batch it recorded and caps growth at `RATCHET_FACTOR ×` that figure,
-so a fresh host reaches a working size in a few grants instead of a dozen. An
-anchor with no slope beside it confers nothing, there being no way to price it
-in MB. The card name is not a gate (a 12 GB and a 32 GB card of one
+`slope_mb_per_unit` caps growth at `RATCHET_FACTOR ×` the batch it recorded.
+Where a run opens is `knee_units`, so a fresh host starts at a working size
+instead of earning it from the seed. Neither confers anything with no slope
+beside it, there being no way to price it in MB. The card name is not a gate (a 12 GB and a 32 GB card of one
 architecture share the row; the importer's own headroom bounds every grant).
 The backstop is the out-of-memory window — its own error frame, a batch's, or
 one that kills the worker: it halves an anchor no clean batch on the reading
 card has reached, where one that has stands, and such an anchor is
 never written back to the local store as this machine's own. What *is* written
 back is the largest clean batch this card ran itself, even where its headroom
-stopped that short of the anchor it was given. A knee can only ever make a
-grant smaller, which is the other authority a foreign profile has beyond
-pricing.
-What does not travel with either is the progress towards re-testing the knee:
-those windows ran on your GPU, not on the importer's.
+stopped that short of the anchor it was given.
 
 There is one cap the store deliberately cannot express, and it is worth
 knowing about when a model's `/health` reports a `unit_budget` far below its
@@ -215,7 +207,7 @@ size-dependent kernel limit that is not a memory condition at all — easyOCR's
 detector hits a 32-bit index limit in CRAFT's first pooling kernel at 28 items
 of a 1824×2560 padded tensor, whatever the GPU has free — and the worker
 reports the trim as `clamped.reason = "index_limit"`. The orchestrator caps the
-budget and the ramp at the reported size and shows it as `shape_ceiling_units`.
+budget at the reported size and shows it as `shape_ceiling_units`.
 
 It is **runtime-only** and appears in no profile, here or in a local store, and
 that is deliberate rather than an omission: it depends on *your corpus's*
@@ -227,15 +219,13 @@ costs one window. Contributing one would hand every importer a cap measured
 against a corpus they will never see. Do not add the field, and do not
 hand-write one.
 
-A knee you contribute will be treated as **provisional** on every machine that
-imports it: it caps from the first grant, and it is re-tested after
-`KNEE_SEED_REVALIDATION_WINDOWS` = 4 clean windows run at it rather than the 12
-a locally measured knee gets, widening one log2 bucket at a time until either
-the importer's own observations re-fit it or it stops binding and is withdrawn.
-So a knee that is right for your GPU costs its importers a probing window
-every five; a knee that is wrong for theirs costs them seconds. Contribute the
-one you measured, and do not hand-tune it downward "to be safe" — a knee too
-low costs throughput on every importer until re-testing climbs out of it.
+A `knee_units` you contribute is where every machine that imports it opens,
+and each re-tests it: once the size's rate is measured there, twice the size
+is tried, kept if it measures more than 1.11x faster, and tried again later
+if not. So one that is too low for the importer's GPU is climbed out of a
+window per doubling, and one that is right costs a trial window now and then.
+One that is too high is not corrected downwards: contribute the one you
+measured.
 
 Two things make a baseline worth shipping: it was measured under real load
 (not a single window), and `residual_mb` is small relative to `base_mb` — a
