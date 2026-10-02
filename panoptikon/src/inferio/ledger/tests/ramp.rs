@@ -1930,6 +1930,34 @@ fn each_doubling_has_its_own_windows_to_be_decided_in() {
     );
 }
 
+/// Batches of whole 3-unit items fill a budget of 64 units with 63, and the
+/// ratchet then admits 126 of the 128 a trial asks for: a full batch of
+/// that size, not a step memory cut short, and the trial goes on past it.
+#[test]
+fn a_batch_of_whole_items_just_under_its_budget_is_a_full_batch() {
+    let (_ledger, handle, admission) = ramping_from_seed(64);
+    let budgets: Vec<u64> = (0..6)
+        .map(|_| {
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            let granted = token.grant().unit_budget;
+            let units = granted - granted % 3;
+            let pool = 10 * granted + 100;
+            let batches = (0..3)
+                .map(|index| BatchMeasurement {
+                    duration_ms: Some(1000.0 * (units as f64).sqrt()),
+                    ..measurement(units, if index == 0 { 0 } else { pool }, pool)
+                })
+                .collect();
+            handle.lock().unwrap().record_measurements(batches);
+            token.finish(WindowOutcome::Responded { oom: None });
+            granted
+        })
+        .collect();
+    assert_eq!(budgets, [64, 64, 126, 252, 504, 1008]);
+}
+
 /// What a step memory blocked leaves behind, on a card with room for 70
 /// units and a rate that stops rising at 64.
 #[test]

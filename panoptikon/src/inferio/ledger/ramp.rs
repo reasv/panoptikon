@@ -473,7 +473,15 @@ impl VramLedger {
         // This window asked for the size the trial is measuring.
         let asked_up = trial.up == Some(charge.size_asked);
         if asked_up {
-            trial.granted = charge.unit_budget;
+            // Trimmed by the ratchet, not by memory, to a full batch of the
+            // size asked: it ran that size.
+            let trimmed = !charge.squeezed
+                && !charge.ram_bound
+                && charge.unit_budget as f64 >= charge.size_asked as f64 * FULL_BATCH_RATIO;
+            trial.granted = match trimmed {
+                true => charge.size_asked,
+                false => charge.unit_budget,
+            };
         }
         let step = Self::trial_step(cal, &key, &mut trial, &samples, asked_up, band);
         cal.trial = Some(trial);
