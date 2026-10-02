@@ -840,9 +840,9 @@ withholds its `REQUEST_UNIT_BUDGET` note for the same models.
 **A size no trial has left in place is a stall.** `knee_units` alone is not
 evidence: it is set the moment a replica opens, and it may come from a shipped
 profile. `knee_is_local` is false for both, and for a size a trial has just
-moved; a leg that ends that way at its seed has measured nothing and is named
-as "never left the seed". `utilization` reads the same flag: only a size a
-trial left in place lowers its denominator from the probe boundary to the
+moved up to; a leg that ends that way at its seed has measured nothing and is
+named as "never left the seed". `utilization` reads the same flag: only a size
+a trial left in place lowers its denominator from the probe boundary to the
 largest batch that ran.
 
 `peak_fds` is report-only and exists because, with local

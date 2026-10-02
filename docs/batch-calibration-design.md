@@ -95,7 +95,7 @@ after `wait` full windows at W, a trial:
   over:  W moved  -> wait = RETEST_WINDOWS (12), failed = 0
          W stayed -> W is confirmed; wait = 12 << failed (384 at most); failed += 1
          the observations of the other sizes are dropped, and a pool larger
-         than W needs is asked back (a trim)
+         than W needs is released when the replica's window returns
 ```
 
 - **The band is `KNEE_RATIO`.** Rates within 10 % of the best are a plateau,
@@ -122,6 +122,11 @@ after `wait` full windows at W, a trial:
   `W`'s own rate moves by more than the band (its newest twelve observations
   against its oldest twelve, clear of their scatter) the older observations
   are dropped and a trial starts at once: the inputs changed.
+- **The pool follows the size.** A trial that ran a larger size than the one
+  it leaves marks the replica, and the dispatcher sends it a `trim`
+  (`trial_over`) when its window returns, before the next one. The other
+  trims go to idle replicas and are declined by a busy one; this one is for
+  a replica in the middle of a job. A pool under `TRIM_SLACK_MB` is left.
 - **Memory decides what a trial may run.** When memory grants nothing above
   `W`, the up half is skipped and the replica keeps asking for `2 W`, which
   costs nothing; the first window granted a larger size starts a trial at
@@ -141,8 +146,9 @@ after `wait` full windows at W, a trial:
   doubling, and one window at half the size twelve windows later. A caller
   that keeps a batch and a half in flight takes three per size.
 - `/health`: `knee_units` is `W`; `knee_is_local` says a trial on this machine
-  left it in place (in this run or the one that stored it); `trial_units` is
-  the size a trial runs next; `retest_after_windows` the wait.
+  left it in place or stepped down to it (in this run or the one that stored
+  it); `trial_units` is the size a trial runs next; `retest_after_windows`
+  the wait.
 
 What the rule cannot see: the rate is the worker's batch rate, so time spent
 between windows is not in it; a rate that is flat for a doubling and rises
