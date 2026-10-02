@@ -403,23 +403,14 @@ impl VramLedger {
         };
         if failed || charge.pressure != mps::MemoryPressure::Normal {
             // The trial is over, or put off under memory pressure, where
-            // nothing is measured. What it measured below this window's
-            // size still counts.
+            // nothing is measured. The working size keeps what the climb
+            // had placed.
             if failed {
                 cal.room_cut = false;
             }
-            if let Some(mut trial) = cal.trial {
-                let mut samples = comparable(&cal.throughput);
-                samples.retain(|(units, _)| !failed || *units < charge.unit_budget);
-                if trial.up.is_some() {
-                    let sizes = observed(&samples, working, &trial);
-                    Self::keep_earned(cal, &key, &mut trial, &sizes, band, true);
-                    cal.trial = Some(trial);
-                }
-                let over = if failed { Over::Failed } else { Over::PutOff };
-                if Self::end_trial(cal, &key, over) {
-                    Self::flag_trial_trim_locked(state, worker);
-                }
+            let over = if failed { Over::Failed } else { Over::PutOff };
+            if Self::end_trial(cal, &key, over) {
+                Self::flag_trial_trim_locked(state, worker);
             }
             return;
         }

@@ -1087,6 +1087,23 @@ fn a_cut_step_is_held_to_its_share_of_the_band() {
     assert_eq!((budgets, kept), (vec![64, 64, 70, 32, 70, 70], Some(64)));
 }
 
+/// A step down is compared with the fastest size's own batches, also when
+/// that size is one memory cut a little above the working size. 150 units
+/// fit; 128 are within their share of the band of the rate at 150, and 64
+/// are not within the band of it, though they are of the rate at 128.
+#[test]
+fn a_cut_size_is_the_fastest_by_its_own_batches() {
+    let rate = |units: u64| match units {
+        0..=95 => 1.0,
+        96..=139 => 1.05,
+        _ => 1.0605,
+    };
+    let (budgets, kept) = one_batch_windows(12_300, 22, |capped| capped * 3, rate, Pool::Kept);
+    assert_eq!(budgets[..4], [64, 64, 128, 150]);
+    assert_eq!(budgets[16..19], [150, 64, 128], "the second trial");
+    assert_eq!(kept, Some(128));
+}
+
 /// While memory grants nothing above the working size, the replica keeps
 /// asking for twice the size, which costs nothing, and the first window
 /// granted a larger size starts a trial: a rising rate in a room for 100
@@ -1455,6 +1472,10 @@ fn a_trial_ends_at_a_window_that_fails() {
         );
     }
     assert_eq!(ledger.trial_for_test("g/a", GPU), (None, RETEST_WINDOWS, 1));
+    assert!(
+        !ledger.health()[0].workers[0].knee_is_local,
+        "no trial has measured the size the replica opened at"
+    );
 }
 
 /// The working size and the cadence belong to the (model, device): a
@@ -1935,7 +1956,7 @@ fn each_doubling_has_its_own_windows_to_be_decided_in() {
 /// that size, not a step memory cut short, and the trial goes on past it.
 #[test]
 fn a_batch_of_whole_items_just_under_its_budget_is_a_full_batch() {
-    let (_ledger, handle, admission) = ramping_from_seed(64);
+    let (ledger, handle, admission) = ramping_from_seed(64);
     let budgets: Vec<u64> = (0..6)
         .map(|_| {
             let token = admission
@@ -1956,6 +1977,7 @@ fn a_batch_of_whole_items_just_under_its_budget_is_a_full_batch() {
         })
         .collect();
     assert_eq!(budgets, [64, 64, 126, 252, 504, 1008]);
+    assert_eq!(ledger.health()[0].workers[0].knee_units, Some(1024));
 }
 
 /// What a step memory blocked leaves behind, on a card with room for 70
