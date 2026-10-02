@@ -100,7 +100,7 @@ impl VramLedger {
         // The batch size, and what of it the window's content asks for. An
         // item cap (the user's included) limits the content like a short
         // queue: for a count-priced model it is a unit count.
-        let (capped, wanted, item_cap) = {
+        let (size_asked, capped, wanted, item_cap) = {
             let entry = state.workers.get(&worker)?;
             let capped = Self::budget_locked(&state, entry);
             let item_cap = Self::item_cap_locked(&state, entry)
@@ -111,7 +111,12 @@ impl VramLedger {
                 }
                 _ => window_units,
             };
-            (capped, capped.min(content.max(1)).max(1), item_cap)
+            (
+                Self::size_locked(&state, entry),
+                capped,
+                capped.min(content.max(1)).max(1),
+                item_cap,
+            )
         };
         let share = self.share_locked(&state, worker, signed_headroom, wanted);
         let (
@@ -232,6 +237,7 @@ impl VramLedger {
                     room: share.room,
                     requests: window_requests,
                     unit_budget,
+                    size_asked,
                     squeezed,
                     room_bound,
                     peak_occupants: 0,

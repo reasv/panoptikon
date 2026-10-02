@@ -794,16 +794,29 @@ fn one_batch_windows(
     rate: impl Fn(u64) -> f64,
     pool: Pool,
 ) -> (Vec<u64>, Option<u64>) {
+    one_batch_windows_in(|_| room_mb, windows, queued, rate, pool)
+}
+
+/// The same with the room in MiB a function of the window.
+fn one_batch_windows_in(
+    room_at: impl Fn(usize) -> u64,
+    windows: usize,
+    queued: impl Fn(u64) -> u64,
+    rate: impl Fn(u64) -> f64,
+    pool: Pool,
+) -> (Vec<u64>, Option<u64>) {
     const PER_UNIT_MB: u64 = 82;
-    let ledger = ledger(1000 + room_mb, no_margin());
+    let total = (0..windows).map(&room_at).max().unwrap_or(0);
+    let ledger = ledger(1000 + total, no_margin());
     let handle = loaded(Some(1000), Some(0));
     let admission = ledger
         .register_worker("g/a", item_cost(64), &handle, None)
         .expect("registers");
     let mut held = 0;
     let mut budgets = Vec::new();
-    for _ in 0..windows {
-        ledger.record_free_for_test(GPU, room_mb - held);
+    for window in 0..windows {
+        let room_mb = room_at(window);
+        ledger.record_free_for_test(GPU, room_mb.saturating_sub(held));
         let capped = admission.window_target_units() / WINDOW_DEPTH_MULTIPLIER;
         let queue = queued(capped);
         let token = admission.request_grant(queue, None, 1, 0).expect("granted");
@@ -940,6 +953,10 @@ fn a_size_left_in_place_is_tried_ever_less_often() {
         (worker.knee_units, worker.knee_is_local, worker.unit_budget),
         (Some(64), true, 64)
     );
+    assert_eq!(
+        (worker.trial_units, worker.retest_after_windows),
+        (None, 384 - 70)
+    );
     assert_eq!(worker.max_units_measured, 128, "the anchor is what ran");
 }
 
@@ -999,6 +1016,35 @@ fn a_cut_step_is_held_to_its_share_of_the_band() {
         assert_eq!(budgets[..4], [64, 64, 128, 191], "{gain}");
         assert_eq!(kept, Some(settled), "{gain}: {budgets:?}");
     }
+    // A step cut to 230 of the 256 units asked is kept as 230.
+    let rising = |units| (units as f64).sqrt();
+    let (budgets, kept) = one_batch_windows(18_860, 8, |capped| capped * 3, rising, Pool::Kept);
+    assert_eq!(budgets[..4], [64, 64, 128, 230]);
+    assert_eq!(kept, Some(230));
+    // A room for 70 units holds no larger size than 64: the trial goes on
+    // to half the size, the size stays, and the replica runs what memory
+    // grants of the 128 it keeps asking for.
+    let (budgets, kept) = one_batch_windows(5_740, 6, |capped| capped * 3, rising, Pool::Kept);
+    assert_eq!((budgets, kept), (vec![64, 64, 70, 32, 70, 70], Some(64)));
+}
+
+/// While memory grants nothing above the working size, the replica keeps
+/// asking for twice the size, which costs nothing, and the first window
+/// granted a larger size starts a trial: a rising rate in a room for 100
+/// units that grows to 191 at window 24 runs 191 units in that window.
+#[test]
+fn room_that_returns_is_tried_at_once() {
+    let room = |window| if window < 24 { 8_200 } else { 15_700 };
+    let rising = |units| (units as f64).sqrt();
+    let (budgets, kept) = one_batch_windows_in(room, 28, |capped| capped * 3, rising, Pool::Kept);
+    assert_eq!(budgets[..4], [64, 64, 100, 100]);
+    assert_eq!(windows_off(&budgets[..24], 100), [0, 1, 16], "{budgets:?}");
+    assert_eq!(
+        budgets[16], 50,
+        "the trial: nothing above, and half is slower"
+    );
+    assert_eq!(budgets[24..], [191; 4]);
+    assert_eq!(kept, Some(191));
 }
 
 /// With room, a rate that rises takes one window per doubling after the
@@ -1031,6 +1077,44 @@ fn a_rising_rate_takes_a_window_per_doubling() {
         (Some(19090), false, None),
         "not stored until a trial has left it in place"
     );
+}
+
+/// A window is judged by the size it was asked to run: one granted 16
+/// units that settles after the trial has moved on to 32 is not 32 cut
+/// short by memory, and the trial goes on.
+#[test]
+fn a_window_granted_before_the_trial_moved_on_is_not_a_cut_step() {
+    // A stored fit, so two windows can be out at once.
+    let profiles = Arc::new(FakeProfiles {
+        seed: Some(ProfileSeed {
+            knee_units: None,
+            ..seeded_anchor(512, true)
+        }),
+        ..FakeProfiles::default()
+    });
+    let ledger = ledger_with(200_000, no_margin(), &profiles);
+    let handle = loaded(Some(1_000), Some(0));
+    let admission = ledger
+        .register_worker("g/a", item_cost(8), &handle, None)
+        .expect("registers");
+    push_memory(&handle, 190_000, 1_000);
+    let rising = |units| (units as f64).sqrt();
+    for _ in 0..2 {
+        window_leaving_warm(&handle, &admission, |_| 2, rising);
+    }
+    let late = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(late.grant().unit_budget, 16);
+    assert_eq!(window_leaving_warm(&handle, &admission, |_| 2, rising), 16);
+    assert_eq!(ledger.trial_for_test("g/a", GPU).0, Some(32));
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![warm_batch(16, rising(16)); 2]);
+    late.finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(ledger.trial_for_test("g/a", GPU).0, Some(32));
+    assert_eq!(window_leaving_warm(&handle, &admission, |_| 2, rising), 32);
 }
 
 /// A caller that keeps a batch and a half in flight gives one observation
@@ -1077,12 +1161,14 @@ fn like_is_compared_with_like() {
     assert_eq!(budgets, [64, 64, 128, 256, 512]);
     // Alone, the rate at 1 024 units reads three times as high: it is not
     // compared with the rate at 512 beside the neighbour, so the trial runs
-    // 512 alone before it goes on.
-    let alone = |units: u64| 3.0 * (units as f64).sqrt();
-    let budgets: Vec<u64> = (0..3)
+    // 512 alone before it goes on. It stops at 4 096 units, runs the working
+    // size alone to place it, and skips the sizes it only ran beside the
+    // neighbour.
+    let alone = |units: u64| 3.0 * (units.min(2048) as f64).sqrt();
+    let budgets: Vec<u64> = (0..7)
         .map(|_| window_leaving_warm(&handle, &admission, |_| 2, alone))
         .collect();
-    assert_eq!(budgets, [1024, 512, 2048]);
+    assert_eq!(budgets, [1024, 512, 2048, 4096, 64, 2048, 2048]);
 }
 
 /// A flat-from-64 rate read through Gaussian noise on every batch, 12 jobs
@@ -1185,6 +1271,33 @@ fn a_job_opens_small_after_a_queue_sized_first_window_and_earns_from_there() {
     }
 }
 
+/// A comparison that stays undecided is bounded: here the larger size's rate
+/// is scattered past the band, so it has no rate at all. The trial runs it
+/// and the working size in turn for [`TRIAL_WINDOWS`] windows, then counts
+/// it as not shown and goes on to the smaller size.
+#[test]
+fn a_trial_without_a_verdict_is_bounded() {
+    let (ledger, handle, admission) = ramping_from_seed(64);
+    let batches = std::cell::Cell::new(0u32);
+    let rate = |units: u64| {
+        batches.set(batches.get() + 1);
+        match units > 64 {
+            true => 8.0 * f64::from(1 + 2 * (batches.get() % 2)),
+            false => flat_from_64(units),
+        }
+    };
+    let budgets: Vec<u64> = (0..(TRIAL_WINDOWS as usize + 8))
+        .map(|_| window_leaving_warm(&handle, &admission, |_| 2, rate))
+        .collect();
+    let (trial, after) = budgets[2..].split_at(TRIAL_WINDOWS as usize);
+    assert!(trial.iter().all(|units| *units == 128 || *units == 64));
+    assert_eq!(after, [32, 64, 64, 64, 64, 64]);
+    assert_eq!(
+        ledger.trial_for_test("g/a", GPU),
+        (None, RETEST_WINDOWS - 5, 1)
+    );
+}
+
 /// Windows the queue sized neither set the working size nor count towards
 /// a trial or the wait for the next one, and a trial waits through them.
 #[test]
@@ -1236,12 +1349,21 @@ fn a_trial_ends_at_a_window_that_fails() {
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
         assert_eq!(aborted.grant().unit_budget, 256);
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![warm_batch(256, 16.0); 2]);
         aborted.finish(WindowOutcome::Aborted);
         assert_eq!(ledger.trial_for_test("g/a", GPU), (Some(256), 0, 0));
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
         assert_eq!(token.grant().unit_budget, 256);
+        // Its batches before the failure are no measurement of 256 units.
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![warm_batch(256, 16.0); 2]);
         token.finish(failure);
         assert_eq!(ledger.trial_for_test("g/a", GPU), (None, RETEST_WINDOWS, 1));
         let worker = &ledger.health()[0].workers[0];

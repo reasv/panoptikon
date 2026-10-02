@@ -54,6 +54,18 @@ fn minilms_recorded_size_is_refused_by_the_variance_filter() {
     assert_eq!(ring_rate(&ring, 8, KNEE_MAX_BUCKET_DISPERSION), None);
 }
 
+/// A batch counts as one of a size when it is a full batch of it
+/// ([`FULL_BATCH_RATIO`]) or less than 1.11x larger: 52 to 71 units are
+/// observations of 64, 51 and 72 are not.
+#[test]
+fn a_size_is_its_full_batches_and_those_a_little_larger() {
+    let band = KNEE_MAX_BUCKET_DISPERSION;
+    for (units, counted) in [(51, false), (52, true), (64, true), (71, true), (72, false)] {
+        let ring = curve(&[(units, 100.0)], 3);
+        assert_eq!(ring_rate(&ring, 64, band).is_some(), counted, "{units}");
+    }
+}
+
 /// Observations taken beside another replica, or with a growing pool, are
 /// read apart from the others: a size's rate is that of the conditions most
 /// of the last six observations were taken in. A single one is no rate.
@@ -343,6 +355,7 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         room: 512,
         requests: 1,
         unit_budget: 64,
+        size_asked: 64,
         squeezed: false,
         room_bound: false,
         peak_occupants: 0,
@@ -728,7 +741,11 @@ fn a_persisted_knee_seeds_the_next_run() {
     assert_eq!(
         token.grant().unit_budget,
         16,
-        "the next run's first window is the size the last one earned"
+        "the next run's first window is the size the last one left in place"
+    );
+    assert!(
+        next.health()[0].workers[0].knee_is_local,
+        "a size this machine's own store holds was confirmed here"
     );
 }
 

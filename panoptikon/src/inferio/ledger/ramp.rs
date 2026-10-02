@@ -400,10 +400,7 @@ impl VramLedger {
             None if cal.room_cut && charge.unit_budget as f64 * KNEE_RATIO > working as f64 => {
                 cal.room_cut = false;
                 cal.failed_trials = 0;
-                Trial {
-                    run: working.saturating_mul(2),
-                    ..Trial::start(working)
-                }
+                Trial::start(working)
             }
             None => {
                 let own = rates_at(&samples, working, working / 2);
@@ -432,10 +429,12 @@ impl VramLedger {
         };
         trial.largest = trial.largest.max(charge.unit_budget);
         trial.windows += 1;
-        if trial.up == Some(trial.run) {
+        // This window asked for the size the trial is measuring.
+        let asked_up = trial.up == Some(charge.size_asked);
+        if asked_up {
             trial.granted = charge.unit_budget;
         }
-        let step = Self::trial_step(cal, &key, &mut trial, &samples, band);
+        let step = Self::trial_step(cal, &key, &mut trial, &samples, asked_up, band);
         cal.trial = Some(trial);
         match step {
             Step::Run(size) => {
@@ -483,7 +482,8 @@ impl VramLedger {
         None
     }
 
-    /// One step of a trial, from what the ring holds after its last window.
+    /// One step of a trial, from what the ring holds after its last window;
+    /// `asked_up` when that window asked for the larger size being measured.
     ///
     /// Upward, the trial doubles the size while the last doubling was
     /// [`TRIAL_STEP`] faster and memory granted it in full. The working size
@@ -500,6 +500,7 @@ impl VramLedger {
         key: &(String, String),
         trial: &mut Trial,
         samples: &[(u64, f64)],
+        mut asked_up: bool,
         band: f64,
     ) -> Step {
         let Some(mut working) = cal.knee_units else {
@@ -508,6 +509,8 @@ impl VramLedger {
         let mut waited = trial.windows > TRIAL_WINDOWS;
         while let Some(asked) = trial.up {
             let below = asked / 2;
+            // Memory granted nothing above `below`.
+            let mut blocked = false;
             let mut sizes = ladder(samples, working, asked);
             // A step memory cuts is the size it grants now, not a larger
             // one it granted before.
@@ -518,11 +521,11 @@ impl VramLedger {
             let (top, top_rates) = sizes.last().expect("the working size");
             if (*top as f64) * KNEE_RATIO <= below as f64 {
                 // Nothing observed above `below` yet.
-                let cut = trial.run == asked && trial.granted as f64 * KNEE_RATIO <= below as f64;
+                let cut = asked_up && trial.granted as f64 * KNEE_RATIO <= below as f64;
                 if !cut && !waited {
                     return Step::Run(asked);
                 }
-                cal.room_cut = cut && below == working;
+                blocked = cut;
             } else {
                 let lower_rates = rates_at(samples, below, below / 2);
                 let step = share(TRIAL_STEP, below, *top);
@@ -537,6 +540,7 @@ impl VramLedger {
                     Some(true) if trial.granted >= asked => {
                         trial.up = Some(asked.saturating_mul(2));
                         trial.granted = u64::MAX;
+                        asked_up = false;
                         trial.windows = 0;
                         waited = false;
                         continue;
@@ -545,10 +549,12 @@ impl VramLedger {
                 }
             }
             // The climb is over: place the working size.
-            match Self::keep_earned(cal, key, trial, &sizes, band, waited) {
-                Some(size) => return Step::Run(size),
-                None if trial.moved => return Step::Over,
-                None => {}
+            if let Some(size) = Self::keep_earned(cal, key, trial, &sizes, band, waited) {
+                return Step::Run(size);
+            }
+            cal.room_cut = blocked && cal.knee_units == Some(below);
+            if trial.moved {
+                return Step::Over;
             }
             trial.up = None;
             trial.windows = 0;

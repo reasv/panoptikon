@@ -474,8 +474,8 @@ struct Trial {
     up: Option<u64>,
     /// The size the next window is asked to run.
     run: u64,
-    /// What memory granted the last window that asked for `up`; until one
-    /// has, the size counts as granted in full.
+    /// What the last window that asked for `up` was granted; until one has,
+    /// the size counts as granted in full.
     granted: u64,
     /// Windows since the last verdict.
     windows: u32,
@@ -486,11 +486,11 @@ struct Trial {
 }
 
 impl Trial {
-    /// A trial of twice `working`, begun by a window that ran `working`.
+    /// A trial of twice `working`.
     fn start(working: u64) -> Self {
         Self {
             up: Some(working.saturating_mul(2)),
-            run: working,
+            run: working.saturating_mul(2),
             granted: u64::MAX,
             windows: 0,
             moved: false,
@@ -544,6 +544,9 @@ struct GrantCharge {
     /// The admitted per-batch unit budget; the batch size may move before
     /// settle.
     unit_budget: u64,
+    /// The batch size the gain rule asked for this window
+    /// ([`VramLedger::size_locked`]), before anything cut it.
+    size_asked: u64,
     /// Memory held this window back ([`Grant::squeezed`]).
     squeezed: bool,
     /// The fitted price cut this window's batch to the device's room: not
@@ -1091,7 +1094,7 @@ struct PressureCap {
 struct Persisted {
     anchor: u64,
     fit_version: u64,
-    /// The stored working size, when this run wrote or read one.
+    /// The working size last written or read, if any.
     knee: Option<u64>,
     /// `(failed_trials, retest_after)` as [`calibration_store`] rounds them.
     cadence: (u32, u32),

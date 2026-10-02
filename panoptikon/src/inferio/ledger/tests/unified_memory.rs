@@ -1910,6 +1910,11 @@ fn at_warning_without_paging_the_batch_size_is_held() {
     let (size_during, _, samples_during, _) = ramp_figures(&ledger);
     assert_eq!(size_during, Some(64), "what the trial had measured");
     assert!(samples_during <= samples);
+    assert_eq!(
+        ledger.trial_for_test("g/a", MPS_GPU),
+        (None, RETEST_WINDOWS, 0),
+        "put off, not counted as a trial that left the size in place"
+    );
     let reached =
         ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].max_units_measured_here;
     assert_eq!(

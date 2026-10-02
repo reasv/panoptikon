@@ -194,7 +194,7 @@ impl VramLedger {
         cal.persisted = Some(Persisted {
             anchor: max_units_measured,
             fit_version,
-            knee: knee.or(before.and_then(|before| before.knee)),
+            knee,
             cadence,
         });
         let fit = cal.fit.filter(|_| cal.fit_is_local);
