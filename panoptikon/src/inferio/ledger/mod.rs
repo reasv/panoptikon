@@ -484,7 +484,8 @@ struct GrantCharge {
     room: u64,
     /// Requests in this window, retired from `pending_requests` at settle.
     requests: usize,
-    /// The admitted per-batch unit budget; the ramp may move before settle.
+    /// The admitted per-batch unit budget; the batch size may move before
+    /// settle.
     unit_budget: u64,
     /// Memory held this window back ([`Grant::squeezed`]).
     squeezed: bool,
@@ -494,24 +495,23 @@ struct GrantCharge {
     room_bound: bool,
     /// The contention tag: the most other replicas holding a window on this GPU
     /// at once while this one was out; 0 is sole occupancy. See
-    /// docs/batch-calibration-design.md, "Throughput knee: narrowing the
-    /// evidence", (b).
+    /// docs/batch-calibration-design.md, "Batch size: what counts as a
+    /// measurement".
     peak_occupants: u32,
-    /// Room for a batch [`RATCHET_FACTOR`] × the appetite's, and not squeezed.
-    ample_headroom: bool,
     /// Less work in hand than the budget admitted.
     queue_bound: bool,
     /// `dispatch::MAX_WINDOW_BYTES` closed this window: its batches count, but
-    /// it earns no ramp step.
+    /// it did not run at its budget.
     byte_bound: bool,
     /// Host RAM booked on the CPU device for this window (a GPU replica).
     ram_mb: u64,
-    /// Host RAM, not the GPU, set this window's unit budget: it earns no ramp
-    /// step and feeds no knee.
+    /// Host RAM, not the GPU, set this window's unit budget: it did not run
+    /// at its budget and feeds no throughput sample.
     ram_bound: bool,
     /// macOS's memory pressure while this window was out, the higher of its
-    /// grant and its settle. Above normal the window earns no ramp step,
-    /// feeds no knee, and its throughput-collapse flags are ignored. While
+    /// grant and its settle. Above normal the window did not run at its
+    /// budget, feeds no throughput sample, and its throughput-collapse flags
+    /// are ignored. While
     /// paging it also sets the [`PressureCap`] and its out-of-memory failures
     /// do not count toward [`OOM_WINDOWS_AT_FLOOR`].
     pressure: mps::MemoryPressure,
@@ -932,7 +932,8 @@ struct WindowSettled {
     clean_windows: u32,
     max_units_measured: u64,
     /// Measurements that ran under their granted budget, and why
-    /// ([`grants::clamp_log_field`]); these are excluded from the knee ring.
+    /// ([`grants::clamp_log_field`]); these are excluded from the throughput
+    /// ring.
     clamped_samples: usize,
     clamped_reason: String,
     /// Allocator retries in this window; `None` off CUDA.
@@ -983,16 +984,16 @@ struct Ingested {
     /// At least one measurement reported an OOM, a throughput collapse or a
     /// spill.
     negative: bool,
-    /// Samples that entered the cost fit; growth is earned only on these.
+    /// Samples that entered the cost fit.
     fit_samples: usize,
-    /// The window ran at the ramp's budget: enough work in hand, and a batch
+    /// The window ran at its budget: enough work in hand, and a batch
     /// reached [`FULL_BATCH_RATIO`] of it or had no room for the next item.
-    /// Only such a window earns a doubling.
+    /// Only such a window counts for the gain rule.
     at_budget: bool,
     /// The same, whatever the memory pressure: the [`PressureCap`] grows on
     /// these.
     filled: bool,
-    /// Samples that entered the knee ring.
+    /// Samples that entered the throughput ring.
     throughput_samples: usize,
     /// Which kind of negative, for the log; all fold into `negative`.
     oom: bool,
@@ -1027,7 +1028,7 @@ struct PressureCap {
 }
 
 /// Per-(model, GPU) calibration state: the fit, its samples, the anchor and
-/// the knee.
+/// the working batch size.
 #[derive(Default)]
 struct ModelCalibration {
     /// At most one sample per distinct `units`; see [`FIT_RING`].

@@ -335,7 +335,6 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         squeezed: false,
         room_bound: false,
         peak_occupants: 0,
-        ample_headroom: true,
         queue_bound: false,
         byte_bound: false,
         ram_mb: 0,
@@ -343,9 +342,9 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         pressure: mps::MemoryPressure::Normal,
         item_cap: None,
     };
-    assert!(knee_admits_window(&honest));
+    assert!(ring_admits_window(&honest));
     assert!(
-        knee_admits_window(&GrantCharge {
+        ring_admits_window(&GrantCharge {
             squeezed: true,
             ..honest
         }),
@@ -354,18 +353,18 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
          the ring may not refuse the same evidence"
     );
     assert!(
-        !knee_admits_window(&GrantCharge { mb: 0, ..honest }),
+        !ring_admits_window(&GrantCharge { mb: 0, ..honest }),
         "a memory-blind grant priced nothing, so its rate describes nothing"
     );
     assert!(
-        !knee_admits_window(&GrantCharge {
+        !ring_admits_window(&GrantCharge {
             ram_bound: true,
             ..honest
         }),
         "host RAM set the size, so its rate says nothing about the GPU's curve"
     );
     assert!(
-        !knee_admits_window(&GrantCharge {
+        !ring_admits_window(&GrantCharge {
             pressure: mps::MemoryPressure::Warning,
             ..honest
         }),
@@ -373,7 +372,7 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
     );
 }
 
-/// A squeezed window's warm batches reach the knee ring at the size they ran,
+/// A squeezed window's warm batches reach the throughput ring at the size they ran,
 /// and its pool-growing batch reaches the **cost fit**.
 #[test]
 fn a_squeezed_windows_batches_reach_the_fit_and_the_knee() {
@@ -550,7 +549,6 @@ fn deflation_still_halves_below_the_knee() {
             exact_torch: true,
             max_units_measured: 0,
             local_samples: 0,
-            knee_clean_windows: 0,
             ring: Vec::new(),
         }),
         ..FakeProfiles::default()
@@ -623,7 +621,6 @@ fn a_seeded_knee_is_never_laundered_into_local_provenance() {
             exact_torch: true,
             max_units_measured: 0,
             local_samples: 0,
-            knee_clean_windows: 0,
             ring: Vec::new(),
         }),
         ..FakeProfiles::default()
@@ -718,7 +715,7 @@ fn a_persisted_knee_seeds_the_next_run() {
     );
 }
 
-/// What reaches the knee ring is decided by the window's own granted
+/// What reaches the throughput ring is decided by the window's own granted
 /// budget, not by the batch's size in the abstract.
 #[test]
 fn only_budget_spending_batches_teach_the_knee() {
@@ -818,7 +815,6 @@ fn a_late_seed_never_overwrites_a_locally_fitted_knee() {
                 exact_torch: true,
                 max_units_measured: 0,
                 local_samples: 0,
-                knee_clean_windows: 0,
                 ring: Vec::new(),
             }),
             "g/a",
@@ -860,7 +856,6 @@ fn a_late_seed_never_overwrites_a_locally_fitted_knee() {
                 exact_torch: true,
                 max_units_measured: 0,
                 local_samples: 0,
-                knee_clean_windows: 0,
                 ring: Vec::new(),
             }),
             "g/b",
@@ -946,11 +941,10 @@ fn a_knee_shrinks_the_models_contention_appetite() {
     assert_eq!(capped, 3000, "8000 × 7/15 = 3733 MiB, i.e. 3 whole units");
 }
 
-/// The smallest knee there is.
+/// The smallest working size there is.
 #[test]
-fn a_knee_at_the_smallest_bucket_still_grants_whole_units() {
-    // `knee_units = 1` is unreachable from a fit (rule 2 of [`fit_knee`]),
-    // but a stored profile may still carry one.
+fn a_working_size_of_one_still_grants_whole_units() {
+    // A stored profile may carry `knee_units = 1`.
     let (ledger, _handle, admission) = knee_capped(1);
     let worker = &ledger.health()[0].workers[0];
     assert_eq!(worker.knee_units, Some(1), "the top of bucket 0 is 1");

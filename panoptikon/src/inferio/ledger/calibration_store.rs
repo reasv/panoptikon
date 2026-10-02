@@ -83,8 +83,8 @@ impl VramLedger {
                 cal.local_samples = cal.local_samples.max(seed.local_samples);
             }
             // Mark as persisted so the write policy does not write it back. The
-            // knee is `None` because a seeded knee is never written, matching
-            // `pending_update_locked`.
+            // working size is `None` because a seeded one is never written,
+            // matching `pending_update_locked`.
             let in_force = cal.fit.map(|fit| fit.version).unwrap_or(0);
             cal.persisted = Some((persistable_anchor(cal), in_force, None));
         }
@@ -104,7 +104,7 @@ impl VramLedger {
     }
 
     /// The write policy, once per settled window: an update when the anchor
-    /// advanced, the fit or the knee changed, or the knee was withdrawn.
+    /// advanced, or the fit or the working size changed.
     /// Requires known `arch`, `torch`, `dtype` and `base_mb`, and
     /// `local_samples > 0`. The fit fields are empty until a local fit exists.
     pub(super) fn pending_update_locked(
@@ -203,10 +203,8 @@ impl VramLedger {
             residual_mb: fit.map(|fit| fit.residual_mb).unwrap_or(0.0),
             samples: fit.map(|fit| fit.samples).unwrap_or(0),
             knee_units: knee,
-            knee_withdrawn: false,
             max_units_measured,
             local_samples: cal.local_samples,
-            knee_clean_windows: 0,
             ring: cal.samples.iter().copied().collect(),
         })
     }

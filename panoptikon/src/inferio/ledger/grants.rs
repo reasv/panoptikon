@@ -47,7 +47,7 @@ impl VramLedger {
 
     /// Items the dispatcher may put in one window. Under an item cap
     /// ([`Self::item_cap_locked`]) that is [`WINDOW_DEPTH_MULTIPLIER`]
-    /// batches of it, whatever the ramp's budget, and one item while the cap
+    /// batches of it, whatever the unit budget, and one item while the cap
     /// is one, the replica's first window; else no bound.
     pub(super) fn window_item_bound(&self, worker: WorkerId) -> usize {
         let state = self.lock();
@@ -122,7 +122,6 @@ impl VramLedger {
             canvas_pixels,
             max_tokens,
             squeezed,
-            ample_headroom,
             queue_bound,
             ram_mb,
             ram_bound,
@@ -131,10 +130,6 @@ impl VramLedger {
         ) = {
             let entry = state.workers.get(&worker)?;
             let price = Self::grant_price_locked(&state, entry);
-            // Room for a batch `RATCHET_FACTOR` × the appetite's, measured
-            // against the requester's own room (its pool included).
-            let ample_headroom =
-                (share.room as f64) >= self.appetite_mb_locked(&state, entry, RATCHET_FACTOR);
             let mut units = wanted;
             let mut mb = share.mb;
             // Memory, not the batch size, ratchet or queue, held this window back.
@@ -192,10 +187,6 @@ impl VramLedger {
                 entry.canvas_pixels,
                 entry.max_tokens,
                 squeezed,
-                ample_headroom
-                    && !squeezed
-                    && !ram_bound
-                    && pressure == mps::MemoryPressure::Normal,
                 // queue_bound: less work in hand than the batch size admits.
                 wanted < capped,
                 ram_mb,
@@ -244,7 +235,6 @@ impl VramLedger {
                     squeezed,
                     room_bound,
                     peak_occupants: 0,
-                    ample_headroom,
                     queue_bound,
                     byte_bound,
                     ram_mb,
@@ -433,7 +423,6 @@ impl VramLedger {
         // Pressure that began while the window was out counts as well.
         let charge = entry.grants.remove(&grant_id).map(|charge| GrantCharge {
             pressure: charge.pressure.max(pressure),
-            ample_headroom: charge.ample_headroom && pressure == mps::MemoryPressure::Normal,
             ..charge
         });
         if let Some(charge) = charge {
@@ -600,8 +589,8 @@ pub struct Grant {
     /// Per-item token cap; `None` = uncapped. The `token`-unit twin of
     /// [`Self::canvas_pixels`].
     pub max_tokens: Option<u32>,
-    /// Memory (the GPU's or host RAM), not the ramp, ratchet or queue, held
-    /// this window back.
+    /// Memory (the GPU's or host RAM), not the batch size, ratchet or queue,
+    /// held this window back.
     pub squeezed: bool,
     /// The part of `mb` a batch costs whatever its size; 0 pre-fit.
     pub fixed_mb: u64,

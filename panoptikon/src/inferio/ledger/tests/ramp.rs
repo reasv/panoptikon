@@ -345,7 +345,7 @@ fn an_absorbed_oom_splits_the_ratchet_anchor_from_the_persisted_one() {
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
     let granted = token.grant().unit_budget;
-    assert_eq!(granted, 16, "the ramp's next rung");
+    assert_eq!(granted, 16, "the next size");
     handle.lock().unwrap().record_measurements(vec![
         measurement(16, 0, 10 * 16 + 100),
         BatchMeasurement {
@@ -400,7 +400,7 @@ fn a_run_of_absorbed_ooms_deflates_instead_of_ramping() {
         ]);
         token.finish(WindowOutcome::Responded { oom: None });
     }
-    assert_eq!(highest, 16, "one rung above the seed, and never again");
+    assert_eq!(highest, 16, "one size above the seed, and never again");
     assert_eq!(
         ledger.health()[0].workers[0].unit_budget,
         1,
@@ -448,8 +448,8 @@ fn a_large_seed_grants_it_all_and_stores_the_first_windows_size() {
 }
 
 /// An item-priced model whose items are too large for one window: the byte
-/// wall closes every window short of the rung. The machine records the size
-/// it reached and the store gets a row, but the ramp earns nothing.
+/// wall closes every window short of its budget. The machine records the
+/// size it reached and the store gets a row, but no working size is set.
 #[test]
 fn a_byte_closed_window_records_its_anchor_without_earning_a_step() {
     let byte_closed = |profiles: &Arc<FakeProfiles>, byte_bound: bool| {
@@ -487,7 +487,7 @@ fn a_byte_closed_window_records_its_anchor_without_earning_a_step() {
     assert_eq!(
         ledger.health()[0].workers[0].ramp_step,
         0,
-        "no window tested the rung in force, so none earned a doubling"
+        "no window ran at its budget"
     );
 
     // The same window cut by the queue, not the wall, records nothing.
@@ -550,7 +550,7 @@ fn queued_window_leaving_warm(
 fn first_reached(budgets: &[u64]) -> Vec<(u64, usize)> {
     let mut seen: Vec<(u64, usize)> = Vec::new();
     for (index, units) in budgets.iter().enumerate() {
-        if !seen.iter().any(|(rung, _)| rung == units) {
+        if !seen.iter().any(|(size, _)| size == units) {
             seen.push((*units, index + 1));
         }
     }

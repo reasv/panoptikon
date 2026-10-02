@@ -134,15 +134,15 @@ impl VramLedger {
 
     /// Maintain the [`PressureCap`] with one settled window.
     ///
-    /// A paging window that memory or the ramp sized (not the queue) sets the
+    /// A paging window that memory or the batch size set (not the queue) sets the
     /// cap to its unit budget. The first one of an episode also sets how far
     /// the cap may grow back at warning: half the budget in force before it,
     /// or half the previous bound, at least 1. So a batch size that made the
     /// Mac page is not returned to while the level stays at warning.
     ///
     /// Otherwise a clean window that `filled` its budget doubles the cap: at
-    /// warning up to that bound, at normal until it reaches what the ramp
-    /// admits, where it lifts. The bound lasts as long as the cap, so a
+    /// warning up to that bound, at normal until it reaches the batch size
+    /// admitted, where it lifts. The bound lasts as long as the cap, so a
     /// warning that returns first grows back to the same bound.
     pub(super) fn note_pressure_size_locked(
         state: &mut LedgerState,
@@ -153,7 +153,7 @@ impl VramLedger {
         let Some(entry) = state.workers.get(&worker) else {
             return;
         };
-        let ramp = admitted_units(
+        let admitted = admitted_units(
             entry,
             Self::size_locked(state, entry),
             Self::anchor_locked(state, entry),
@@ -170,7 +170,7 @@ impl VramLedger {
             }
             let regrow_to = match cap {
                 Some(cap) if cap.paging => cap.regrow_to,
-                _ => (cap.map_or(ramp, |cap| cap.regrow_to) / 2).max(1),
+                _ => (cap.map_or(admitted, |cap| cap.regrow_to) / 2).max(1),
             };
             Some(PressureCap {
                 units: charge.unit_budget,
@@ -190,7 +190,7 @@ impl VramLedger {
                     ..cap
                 })
             } else {
-                (grown < ramp).then_some(PressureCap {
+                (grown < admitted).then_some(PressureCap {
                     units: grown,
                     paging: false,
                     ..cap

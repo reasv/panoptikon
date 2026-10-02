@@ -104,7 +104,7 @@ fn gpu_replica(
 }
 
 /// Drops what a replica's windows so far taught the GPU side (fit, anchor,
-/// knee ring, ramp), so a test of host RAM starts its ramp at the seed.
+/// throughput ring, ramp), so a test of host RAM starts its ramp at the seed.
 fn forget_gpu_side(ledger: &Arc<VramLedger>, model: &str, gpu: &str) {
     let mut state = ledger.lock();
     let ram = state
@@ -335,7 +335,7 @@ fn plentiful_host_ram_changes_no_grant() {
 }
 
 /// When host RAM gets tight mid-job the next grant is what it holds, like
-/// the edge of a full card: the ramp keeps its place, the knee ring takes
+/// the edge of a full card: the ramp keeps its place, the throughput ring takes
 /// nothing and nothing deflates. When RAM frees up the ramp resumes where it
 /// stood.
 #[test]

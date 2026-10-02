@@ -21,7 +21,7 @@ pub(super) struct PreFitPrice {
     /// the rise between the two largest sizes, at least 0, and with one size
     /// or none the registry's seed budget per seed batch (a design figure,
     /// exact only for a model whose seed was measured). At 0 a larger batch
-    /// costs what the largest did; the ramp admits at most twice that batch.
+    /// costs what the largest did; the ratchet admits at most twice that batch.
     per_unit: f64,
 }
 
@@ -432,8 +432,8 @@ impl VramLedger {
             .unwrap_or(0)
     }
 
-    /// The throughput knee in force for this (model, GPU), fitted or seeded;
-    /// `None` is no cap.
+    /// The working batch size of this (model, GPU), measured here or seeded
+    /// ([`ModelCalibration::knee_units`]); `None` until one is set.
     pub(super) fn knee_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
         cal_locked(state, entry)
             .and_then(|cal| cal.knee_units)
@@ -495,16 +495,8 @@ impl VramLedger {
     }
 
     /// The contention appetite in MiB: the price of `min(anchor, knee, what
-    /// the card affords)` units, or the model's `base` pre-fit. With
-    /// `factor`, the price of a batch that many times as large. The share
-    /// split (`factor` 1) and the grant path's ample-headroom test must both
-    /// use this one figure.
-    pub(super) fn appetite_mb_locked(
-        &self,
-        state: &LedgerState,
-        entry: &WorkerEntry,
-        factor: u64,
-    ) -> f64 {
+    /// the card affords)` units, or the model's `base` pre-fit.
+    pub(super) fn appetite_mb_locked(&self, state: &LedgerState, entry: &WorkerEntry) -> f64 {
         let anchor = match Self::knee_locked(state, entry) {
             Some(knee) => Self::anchor_locked(state, entry).min(knee),
             None => Self::anchor_locked(state, entry),
@@ -513,9 +505,9 @@ impl VramLedger {
             Some(price) if anchor > 0 => {
                 let affordable = price.units(self.limit_locked(state, &entry.gpu));
                 let units = anchor.min(affordable.max(1));
-                price.cost(units.saturating_mul(factor)).max(1.0)
+                price.cost(units).max(1.0)
             }
-            _ => (entry.base_mb.unwrap_or(SEED_BATCH_FLOOR_MB).max(1) * factor) as f64,
+            _ => entry.base_mb.unwrap_or(SEED_BATCH_FLOOR_MB).max(1) as f64,
         }
     }
 
@@ -659,7 +651,7 @@ impl VramLedger {
             })
             .map(|(_, entry)| entry)
             .collect();
-        let appetite = |entry: &WorkerEntry| -> f64 { self.appetite_mb_locked(state, entry, 1) };
+        let appetite = |entry: &WorkerEntry| -> f64 { self.appetite_mb_locked(state, entry) };
         let floor_mb = |entry: &WorkerEntry| -> u64 {
             match Self::grant_price_locked(state, entry) {
                 Some(price) => price.cost_mb(entry.seed_units).max(1),

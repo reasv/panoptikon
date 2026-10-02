@@ -10,7 +10,7 @@ use super::grants::{canvas_log_field, clamp_log_field};
 use super::load_reservations::OversizedLoad;
 use super::measurements::{
     CEILING_CAUSE_PROFILE, CEILING_CAUSE_RAN_WIDER, CEILING_CAUSE_REPORTED,
-    CLAMP_REASON_INDEX_LIMIT, knee_admits_window, ram_cost, robust_fit, update_shape_ceiling,
+    CLAMP_REASON_INDEX_LIMIT, ram_cost, ring_admits_window, robust_fit, update_shape_ceiling,
     watermark_gap,
 };
 use super::oom::{
@@ -240,7 +240,6 @@ fn seeded_anchor(anchor: u64, local: bool) -> ProfileSeed {
         exact_torch: true,
         max_units_measured: anchor,
         local_samples: if local { 20 } else { 0 },
-        knee_clean_windows: 0,
         ring: Vec::new(),
     }
 }
@@ -577,7 +576,6 @@ fn priced_ledger(total_mb: u64) -> Arc<VramLedger> {
             exact_torch: true,
             max_units_measured: 0,
             local_samples: 0,
-            knee_clean_windows: 0,
             ring: Vec::new(),
         }),
         ..FakeProfiles::default()

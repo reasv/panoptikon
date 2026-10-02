@@ -415,7 +415,6 @@ fn a_shape_ceiling_never_survives_a_restart() {
             exact_torch: true,
             max_units_measured: last.max_units_measured,
             local_samples: last.local_samples,
-            knee_clean_windows: last.knee_clean_windows,
             ring: last.ring.clone(),
         }),
         ..FakeProfiles::default()

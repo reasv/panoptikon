@@ -1730,7 +1730,10 @@ fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
     let (step_during, deflation, samples_during, _) = ramp_figures(&ledger);
     assert_eq!(step_during, step, "no window earned a step");
     assert_eq!(deflation, 0, "no collapse was counted");
-    assert_eq!(samples_during, samples, "no rate reached the knee ring");
+    assert_eq!(
+        samples_during, samples,
+        "no rate reached the throughput ring"
+    );
 
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
     push_ram(&handle, MAC_TOTAL_MB, 90_000, 180, 0);

@@ -320,7 +320,6 @@ fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
                 exact_torch: true,
                 max_units_measured: 0,
                 local_samples: LOCAL_CONFIRMATION_SAMPLES,
-                knee_clean_windows: 0,
                 ring: Vec::new(),
             }),
             ..FakeProfiles::default()

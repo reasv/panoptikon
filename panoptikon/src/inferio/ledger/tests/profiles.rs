@@ -19,7 +19,6 @@ fn a_shipped_profiles_anchor_caps_growth_and_does_not_open_the_run() {
             exact_torch: true,
             max_units_measured: 512,
             local_samples: 99,
-            knee_clean_windows: 0,
             ring: vec![FitSample {
                 units: 512,
                 delta_mb: 5_120,
@@ -82,7 +81,6 @@ fn a_seeded_anchor_is_never_written_back_as_this_machines_own() {
             exact_torch: true,
             max_units_measured: 512,
             local_samples: 0,
-            knee_clean_windows: 0,
             ring: Vec::new(),
         }),
         ..FakeProfiles::default()
@@ -224,7 +222,6 @@ fn an_oom_halves_a_seeded_anchor_but_not_a_measured_one() {
                 exact_torch: true,
                 max_units_measured: 512,
                 local_samples: 0,
-                knee_clean_windows: 0,
                 ring: Vec::new(),
             }),
             ..FakeProfiles::default()
@@ -404,7 +401,7 @@ fn a_conferred_anchor_buys_no_appetite_this_card_cannot_run() {
                 .values()
                 .find(|entry| entry.inference_id == model)
                 .expect("registered");
-            ledger.appetite_mb_locked(&state, entry, 1)
+            ledger.appetite_mb_locked(&state, entry)
         };
         assert_eq!(
             (appetite("g/a"), appetite("g/b")),
@@ -507,7 +504,6 @@ fn a_profile_from_another_sku_of_this_architecture_prices_and_opens_it() {
             exact_torch: true,
             max_units_measured: 4096,
             local_samples: 99,
-            knee_clean_windows: 0,
             ring: Vec::new(),
         }),
         ..FakeProfiles::default()
@@ -602,7 +598,6 @@ fn a_local_profile_resumes_the_measured_range() {
             exact_torch: true,
             max_units_measured: 64,
             local_samples: 6,
-            knee_clean_windows: 0,
             ring: ring.clone(),
         }),
         ..FakeProfiles::default()
@@ -646,7 +641,6 @@ fn seeding_happens_once_per_model_and_gpu() {
             exact_torch: true,
             max_units_measured: 64,
             local_samples: 6,
-            knee_clean_windows: 0,
             ring: vec![FitSample {
                 units: 64,
                 delta_mb: 640,
@@ -757,7 +751,6 @@ fn a_fallback_matched_local_profile_confers_growth_but_not_confirmation() {
             exact_torch: false,
             max_units_measured: 64,
             local_samples: 6,
-            knee_clean_windows: 0,
             ring: vec![FitSample {
                 units: 64,
                 delta_mb: 740,
@@ -871,7 +864,6 @@ fn a_seeded_fit_is_never_laundered_into_local_provenance() {
             exact_torch: true,
             max_units_measured: 0,
             local_samples: 0,
-            knee_clean_windows: 0,
             ring: Vec::new(),
         }),
         ..FakeProfiles::default()
