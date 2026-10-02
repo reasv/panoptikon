@@ -96,12 +96,11 @@ base_platform     = "linux"            # optional: the platform base_mb was
 slope_mb_per_unit = 0.79               # marginal cost per unit, MiB of
                                        # *allocated* memory (schema 2)
 knee_units        = 512                # optional: the working batch size, the
-                                       # largest that measured faster than the
-                                       # size below it. A run opens here and
-                                       # tries twice the size from time to
-                                       # time, keeping it only if it measures
-                                       # faster. Without it a run opens at the
-                                       # model's seed and earns each doubling
+                                       # smallest whose rate measured within
+                                       # 10 % of the best. A run opens here
+                                       # and measures the sizes next to it
+                                       # from time to time; without it a run
+                                       # opens at the model's seed
 samples           = 38
 residual_mb       = 96                 # fit scatter → confidence
 measured_at       = "2026-07-30T00:00:00Z"
@@ -180,9 +179,11 @@ Baselines accrete from maintainers' and volunteers' local stores. To
 contribute one, copy entries out of your
 `<data_folder>/inferio/calibration.toml` into a file here.
 
-The local store carries three fields of *local evidence* — `local_samples`,
+The local store carries fields of *local evidence* — `local_samples`,
 `sample_units`, `sample_delta_mb`: how much local evidence stands behind the
-fit, and the raw samples it was fitted from. They are **stripped on import**,
+fit, and the raw samples it was fitted from — and of local state,
+`knee_trials_failed` and `knee_retest_after`: when this machine next re-tests
+its `knee_units`. They are **stripped on import**,
 so you may leave them in the copied file; they will be ignored. Nothing else
 needs editing.
 
@@ -190,7 +191,7 @@ needs editing.
 any matching profile — shipped or local — that also carries a
 `slope_mb_per_unit` caps growth at `RATCHET_FACTOR ×` the batch it recorded.
 Where a run opens is `knee_units`, so a fresh host starts at a working size
-instead of earning it from the seed. Neither confers anything with no slope
+instead of measuring its way there from the seed. Neither confers anything with no slope
 beside it, there being no way to price it in MB. The card name is not a gate (a 12 GB and a 32 GB card of one
 architecture share the row; the importer's own headroom bounds every grant).
 The backstop is the out-of-memory window — its own error frame, a batch's, or
@@ -220,12 +221,12 @@ against a corpus they will never see. Do not add the field, and do not
 hand-write one.
 
 A `knee_units` you contribute is where every machine that imports it opens,
-and each re-tests it: once the size's rate is measured there, twice the size
-is tried, kept if it measures more than 1.11x faster, and tried again later
-if not. So one that is too low for the importer's GPU is climbed out of a
-window per doubling, and one that is right costs a trial window now and then.
-One that is too high is not corrected downwards: contribute the one you
-measured.
+and each re-tests it: a trial there measures twice the size and half the
+size, and moves to the smallest size whose rate is within 10 % of the best it
+measured. So one that is too low for the importer's GPU is climbed out of a
+window per doubling, one that is too high is stepped down from, and one that
+is right costs a few trial windows now and then. The local store writes it
+only once a trial has left it in place.
 
 Two things make a baseline worth shipping: it was measured under real load
 (not a single window), and `residual_mb` is small relative to `base_mb` — a

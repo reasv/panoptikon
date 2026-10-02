@@ -32,10 +32,10 @@ Step 5 (the taxonomy table's impl-time verifications) is done — see the
 table's status column and the registry's `metadata.cost` comments, both of
 which now cite the code. Step 3 (auto everywhere with the number as a cap,
 plus the stamped one-time config migration) is implemented. Step 4's
-throughput half is implemented: the batch size grows only on a gain measured
-orchestrator-side in units/sec from warm-pool batches, and the size that
-earned its place is persisted through the existing store write path — see
-"Batch size: growing only on a measured gain" below. The
+throughput half is implemented: the batch size moves only on rates measured
+orchestrator-side in units/sec, and the size a trial left in place is
+persisted through the existing store write path — see "Batch size: growing
+only on a measured gain" below. The
 shipped-baseline *directory* has been wired since 1c but no actual baselines
 exist yet, which is the remainder of step 4. The easyOCR acceptance test of
 step 1 is still outstanding (see "Remaining for the easyOCR acceptance test"
@@ -51,128 +51,137 @@ and unified-memory pools are covered too — the admission key (`device_key`,
 ### Batch size: growing only on a measured gain
 
 The rule (2026-10-02): do not waste memory, but use as much of the hardware
-as makes a batch faster. **A larger batch size must earn its place**: it is
-kept only when it measures faster than the size below it, never because it
-was merely no slower, and never because a timer ran out. The earlier
-machinery (a ramp that doubled until a gate stopped it, a hold, a knee fitted
-over the whole curve, and a knee that expired, widened and was withdrawn)
-grew by default whenever evidence was missing: a model running 6.5 items/s at
-every batch size was held at 7 units for eleven minutes and then walked to
-400, 90 GiB of pool for nothing. It is replaced by one rule.
+as makes a batch faster. **The working batch size is the smallest size whose
+rate is within 10 % of the best rate measured**, and it moves only on
+measurements: never because a larger size was merely no slower, and never
+because a timer ran out. The earlier machinery (a ramp that doubled until a
+gate stopped it, a hold, a knee fitted over the whole curve, and a knee that
+expired, widened and was withdrawn) grew by default whenever evidence was
+missing: a model running 6.5 items/s at every batch size was held at 7 units
+for eleven minutes and then walked to 400, 90 GiB of pool for nothing.
 
 Per (model, device) the ledger keeps a **working size** `W`, stored and
-published as `knee_units`, and at times a **trial** of the next size. The
-unit budget is `W`, or `2 W` while a trial is on; the memory rules then cut
-it as before (room, reserve, pre-fit cut, host-RAM ceiling and item cap, the
-ratchet at `RATCHET_FACTOR ×` the anchor, shape ceiling, death and pressure
-caps, deflation).
+published as `knee_units`, and at times a **trial** of the sizes next to it.
+The unit budget is `W`, or the size the trial runs next; the memory rules
+then cut it as before (room, reserve, pre-fit cut, host-RAM ceiling and item
+cap, the ratchet at `RATCHET_FACTOR ×` the anchor, shape ceiling, death and
+pressure caps, deflation).
 
 ```text
-at    = median rate of the ring's deciding samples with W/2 < units <= W
-above = the same for units > W            # only a trial puts samples there
-        (unknown with fewer than MIN_KNEE_BUCKET_SAMPLES, or a relative MAD
-         over the device's band)
+rate(s)   = median units/sec of the comparable observations of size s
+            (unknown with fewer than 2, or a relative MAD over the device's band)
+d(a, b)   = the doublings between two sizes, 1 at most
 
-opening:  W = the stored knee_units (a row with a fit); otherwise the size of
-          the first window that ran at its budget with memory to spare
+faster(lo, hi, f): is rate(hi) > f × rate(lo)?
+    CONFIRM_SAMPLES (12) observations on both sides  -> the medians decide
+    fewer                                            -> only a difference of more than
+                                                        CLEAR_ERRORS (4) standard errors
+    undecided -> the next window runs the side with fewer observations;
+                 after TRIAL_WINDOWS (24) windows it counts as not shown
 
-gains:    rate * KNEE_RATIO ^ d > the smaller size's rate, d the doublings
-          between the two sizes (1, or less when the room cut the step)
+opening:  W = the stored knee_units (a row with a fit), with the wait stored
+          beside it; otherwise the first window that ran at its budget with
+          memory to spare, and a trial at once
 
-after each clean window:
-  W has CONFIRM_SAMPLES (12) samples of its own and no longer gains on the
-  rate of the size it grew from                         -> back to that size
-  trial on:
-    at and above known:  above gains on at        -> W = largest size sampled,
-                                                     its samples alone are kept,
-                                                     and the next trial at once
-                         else                     -> end the trial
-    else, a window granted more than W:
-        beside another replica, or under memory pressure -> put the trial off
-        TRIAL_WINDOWS of them without a verdict          -> end the trial
-  trial off, at known, the window at its budget, quiet, not deflated:
-    at moved by more than the band since the last verdict -> trial at once
-    else after `retest` such windows                       -> trial
-
-end the trial:  drop the samples above W;
-                retest = RETEST_WINDOWS << failed (12, 24, … 384); failed += 1
-a window that failed (out of memory, collapse, death) ends a trial too
+after `wait` full windows at W, a trial:
+  up:    T = 2W, 4W, … while faster(T/2, T, TRIAL_STEP ^ d) and memory granted T
+         in full; a size memory cut is the size it granted
+         best = the fastest size from W to T
+         W'   = the smallest size from W up to best that is not shown slower
+                than the band: not faster(s, best, (1 / KNEE_RATIO) ^ d)
+         W' > W -> W = W', and the trial is over
+  down:  (when the up half moved nothing)  D = W / 2
+         faster(D, best, (1 / KNEE_RATIO) ^ d) is shown false -> W = D, again
+  over:  W moved  -> wait = RETEST_WINDOWS (12), failed = 0
+         W stayed -> W is confirmed; wait = 12 << failed (384 at most); failed += 1
+         the observations of the other sizes are dropped, and a pool larger
+         than W needs is asked back (a trim)
 ```
 
-- **A gain is `KNEE_RATIO`.** Rates within 10 % of each other are a plateau,
-  so twice the size is kept when it is more than 1.11× faster. A step the
-  room cuts short is held to its share of that: 128 → 191 units is 0.58 of
-  a doubling and must gain 1.06×. A rate rising 1.44× or 1.14× per doubling
-  earns every step; one rising 1.05× never leaves the size it opened at,
-  where the old ramp walked it to the room. That is the rule: each doubling
-  doubles the memory for a gain the ledger cannot tell from none. The price
-  is on curves with a soft bend: a model 10 % faster at twice the size
-  stays at the smaller one.
-- **No evidence is not growth.** Too few samples, a pool that grows with
-  every batch, a first window that is all warm-up: the size is measured
-  again, a trial for at most `TRIAL_WINDOWS` windows, and then counts as not
-  earned. A worker that never gives a deciding sample stays at the size it
-  opened at.
-- **Nothing is permanent.** A size that did not earn its place is tried again
-  after 12, 24, 48 … 384 windows at the working size, and at once when the
-  working size's own rate moves by more than the band (the inputs changed).
-  A flat model pays one or two trial windows in a few hundred.
-- **An earned size is confirmed once.** A trial is judged on as few as two
-  observations, which noise can carry past the band. When the new working
-  size has `CONFIRM_SAMPLES` (12) of its own and no longer beats the old
-  one's rate, the replica goes back. Through ±10 % noise a flat rate then
-  ends one size up in 2 jobs of 60, and none goes further.
-- **The store holds the size that earned its place**: `knee_units = W` once
-  this machine measured it. A restart opens at `W`, tries `2 W` once and
-  returns; nothing walks. `max_units_measured` is still the ratchet's anchor
-  (the largest clean batch run) and no longer says where a run opens. A row
-  with an anchor and no `knee_units`, an earlier build's or a shipped one for
-  a model that never kneed, opens at the seed and earns each doubling: one
-  window per doubling when the rate rises.
+- **The band is `KNEE_RATIO`.** Rates within 10 % of the best are a plateau,
+  and `W` is its smallest size. A trial doubles on while the last doubling
+  gained `TRIAL_STEP` (3 %), so a curve with a soft bend is followed to
+  where it flattens before `W` is placed: a rate rising 1.05× a doubling ends
+  within 8 % of its best rate instead of at the size it opened at. A step
+  memory cuts short is held to its share of both thresholds: 128 → 191 units
+  is 0.58 of a doubling and must be 1.06× faster to be kept. A size less
+  than 1.11× the one below it is the same size.
+- **Down as well as up.** A model that opens larger than it needs (a full
+  queue at the seed, a stored size, a shipped one) steps down while half the
+  size is within the band of the best rate the trial measured. A rate flat
+  at every size ends at one unit.
+- **A verdict needs evidence that survives noise.** Two sizes are compared on
+  twelve observations each, or on fewer when their difference is more than
+  four standard errors of both sides' scatter, so a model 1.44× faster per
+  doubling still takes one window per doubling and a noisy flat one waits.
+  The observations of both sizes are kept until the trial is over.
+- **No evidence is not a move.** A comparison that stays undecided for
+  `TRIAL_WINDOWS` windows counts as not shown, and `W` stays.
+- **Nothing is permanent.** A trial that left `W` in place is repeated after
+  12, 24, 48 … 384 full windows at `W`; one that moved it after 12. When
+  `W`'s own rate moves by more than the band (its newest twelve observations
+  against its oldest twelve, clear of their scatter) the older observations
+  are dropped and a trial starts at once: the inputs changed.
+- **Memory decides what a trial may run.** When memory grants nothing above
+  `W`, the up half is skipped and the replica keeps asking for `2 W`, which
+  costs nothing; the first window granted a larger size starts a trial at
+  once. A window that runs out of memory, collapses, or whose worker dies
+  ends the trial; one under memory pressure puts it off for 12 windows.
+  Either way `W` keeps what the trial had measured below that window's size.
+- **The store holds a confirmed size.** `knee_units` is written when a trial
+  has left `W` in place, and at once when a trial moves it *down*; a size a
+  trial has just moved up is not written until the next one leaves it there.
+  The wait is stored beside it (`knee_trials_failed`, `knee_retest_after` in
+  whole twelves, rounded down), so a restart carries the wait on instead of
+  starting a trial. `max_units_measured` is still the ratchet's anchor (the
+  largest clean batch run) and does not say where a run opens. A row with an
+  anchor and no `knee_units` opens at the seed.
 - **Rising rates.** One window more than before at the opening size (it must
   be measured before the next can be compared with it), then one window per
-  doubling. A caller that keeps a batch and a half in flight takes three per
-  size.
-- A replica under the host-RAM item cap opens at one item, so every size it
-  runs is earned: a tagger bound by CPU preprocessing (8, 14, 21, 22.5
-  items/s at 1, 2, 4, 8 units) stays at 4.
-- `/health` keeps its fields: `knee_units` is `W`, `ramp_held` says the last
-  trial earned nothing and the next is not on yet, `held_units` is `W` then,
-  `held_certified` that `W`'s rate was measured here, `ramp_step` the
-  doublings of `W` over the seed.
+  doubling, and one window at half the size twelve windows later. A caller
+  that keeps a batch and a half in flight takes three per size.
+- `/health`: `knee_units` is `W`; `knee_is_local` says a trial on this machine
+  left it in place (in this run or the one that stored it); `trial_units` is
+  the size a trial runs next; `retest_after_windows` the wait.
+
+What the rule cannot see: the rate is the worker's batch rate, so time spent
+between windows is not in it; a rate that is flat for a doubling and rises
+beyond it is not followed; a rate scattered past the device's band has no
+value, and the size stays where it is.
 
 ### Batch size: what counts as a measurement
 
 The ring holds the last `KNEE_RING` (128) throughput observations per (model,
-device), in units/sec. What may enter it, and what may decide a size:
+device), in units/sec. What may enter it, and what is compared with what:
 
-- **Warm, full batches only.** A batch that grew the allocator pool pays
-  `cudaMalloc` for the size it is reaching and is excluded. The reading that
-  decides it is the pool **after** the batch (`reserved_after_mb`) against
-  the pool before it, never a peak: MPS has no peak counter, and
+- **Full batches.** A batch must carry `FULL_BATCH_RATIO` (80 %) of its
+  window's granted budget, or be one the next item would have pushed past it
+  (`next_over_budget`): window tails and user-capped batches ran small for
+  want of work. A batch that filled a deflated grant, or one the room or
+  host RAM cut, counts at the size it ran.
+- **A window that could not be measured is excluded**: a memory-blind one
+  (the grant's `mb` is 0), one run under memory pressure, and any batch the
+  worker's defensive clamp or a shape limit shrank (per batch). All still
+  feed the cost fit and the ratchet.
+- **Like is compared with like.** Every observation carries the conditions
+  it was taken in: whether another replica held a window on the device while
+  its own was out, and whether the batch grew the allocator pool, left it as
+  it was, or reported no pool. A batch that grows the pool pays `cudaMalloc`
+  for the size it is reaching; one beside a neighbour shares the device. The
+  reading is the pool **after** the batch (`reserved_after_mb`) against the
+  pool before it, never a peak: MPS has no peak counter, and
   `max_memory_reserved()` on CUDA exceeds the post-batch pool whenever the
-  allocator released cached blocks to retry. A batch must carry
-  `FULL_BATCH_RATIO` (80 %) of its window's granted budget, or be one the
-  next item would have pushed past it (`next_over_budget`): window tails and
-  user-capped batches ran small for want of work. A batch that filled a
-  deflated or squeezed grant counts at the size it ran. A measurement with no
-  allocator reading is excluded, not assumed warm.
-- **A window that was not free to choose its size is excluded**: a
-  memory-blind one (the grant's `mb` is 0), one host RAM sized, one run under
-  memory pressure, and any batch the worker's defensive clamp or a shape
-  limit shrank (per batch). All still feed the cost fit and the ratchet.
-- **Only a sole occupant decides.** Every sample carries the largest number
-  of other replicas that held a window on the device while its own was out
-  (a high-water mark over the window's life), and only zero-tagged ones are
-  read. The worker's throughput-collapse flag is trusted under the same tag.
-  Samples are tagged and kept, so `/health` still counts them.
-- **No verdict out of noisy evidence.** A size's rate is known only from at
-  least two deciding observations whose relative MAD (`MAD / median`) is
-  within `KNEE_MAX_BUCKET_DISPERSION`, 0.20: twice the 10 % gap the rule
-  decides on, and between the 0.003–0.05 quiet GPUs measure and the 0.9 of
-  three models contending for one. The CPU device ships 0.35 (a quiet CPU
-  host measures 0.13–0.20); both are overridden by
-  `knee_max_bucket_dispersion` in `[inference_local.vram]`.
+  allocator released cached blocks to retry. A rate is read from the
+  observations taken in the conditions of most of the last six, so a replica
+  that always runs beside another, whose pool grows with every batch, or
+  whose windows are one batch deep after a release is still measured, against
+  itself.
+- **No rate out of scattered evidence.** A size's rate is known only from at
+  least two observations whose relative MAD (`MAD / median`) is within
+  `KNEE_MAX_BUCKET_DISPERSION`, 0.20: twice the 10 % band, and between the
+  0.003–0.05 quiet GPUs measure and the 0.9 of three models contending for
+  one. The CPU device ships 0.35 (a quiet CPU host measures 0.13–0.20); both
+  are overridden by `knee_max_bucket_dispersion` in `[inference_local.vram]`.
 - **Warm-up decides nothing**: a replica's first settled window (cuDNN
   autotune, first-of-shape kernels, lazy init), and the batches up to
   `KNEE_WARMUP_BATCHES` after a first window of one small batch (ONNX
@@ -1069,7 +1078,7 @@ grant     = min(min(headroom share of w + own pool of w, room(w)),
                 priced content of the window itself)
 ```
 
-The batch size is the working size, or twice it during a trial ("Batch
+The batch size is the working size, or the size a trial runs next ("Batch
 size: growing only on a measured gain"), under the ratchet. Its term is
 written on the MB side here and enforced on the **unit** side in the
 implementation (`admitted_units`): post-fit the two are the same constraint,
@@ -2226,8 +2235,8 @@ slope_mb_per_unit = 0.79               # marginal cost in MiB per unit, fitted
                                        # on allocated deltas (peak_allocated −
                                        # allocated_at_load; see Measurement)
 knee_units        = 512                # optional: the working batch size, the
-                                       # largest that measured faster than
-                                       # the size below it; a run opens here
+                                       # smallest whose rate measured within
+                                       # 10 % of the best; a run opens here
 samples           = 38
 residual_mb       = 96                 # fit scatter → confidence / safety margin
 measured_at       = "2026-07-30T00:00:00Z"
@@ -2241,6 +2250,9 @@ max_units_measured = 1024              # ratchet anchor: the largest clean
 # they carry local authority a foreign measurement cannot):
 local_samples      = 12                # local clean samples; also the
                                        # non-local-profile confirmation gate
+knee_trials_failed = 3                 # optional: trials in a row that left
+knee_retest_after  = 84                # knee_units in place, and the windows
+                                       # to wait before the next (absent: 0)
 ```
 
 Key tuple for lookup: `(inference_id, epoch, arch, unit, aggregation,
@@ -2494,8 +2506,8 @@ The current single number splits three ways:
    order, because the seed and the profile answer different questions.
    The seed batch size is `metadata.cost.seed_units`, falling back to the
    global conservative constant; a profile never supplies it. What a
-   profile supplies is where the run *opens*: its `knee_units`, the batch
-   size that earned its place, whether the row is local or shipped. A row
+   profile supplies is where the run *opens*: its `knee_units`, the working
+   batch size, whether the row is local or shipped. A row
    without one prices the window (slope, `base`) and bounds growth (the
    ratchet anchor), and the run opens at the seed.
 
