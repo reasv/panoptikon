@@ -71,7 +71,7 @@ VALUE_FIELDS = (
 # list: it is shipped, and a reading host adopts it as a seeded claim only.
 LOCAL_ONLY = (
     "local_samples", "knee_clean_windows", "knee_trials_failed",
-    "knee_retest_after",
+    "knee_retest_after", "knee_rate_units", "knee_rates",
     "sample_units", "sample_delta_mb",
 )
 
