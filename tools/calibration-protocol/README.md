@@ -1392,22 +1392,38 @@ so it cannot be driven by a job), `poison`, `poisonmix`, `pixmix`, `ocr` and
 `sizing_sim` (`panoptikon/src/inferio/ledger/tests/sizing_sim.rs`, an ignored
 test) drives the real ledger window by window: a synthetic rate curve or a
 recorded trace says how long each batch takes, and the ledger sizes the next
-window. It writes one line per process start. Traces come from archived real
-runs and hold private data, so they live outside the repository.
+window. The test stands in for the dispatcher (window taken within the
+ledger's window target, the queue's counts passed with the grant) and for the
+worker (packing, the live memory clamp, the pool release, memory reported as
+that device's worker reports it). Every restart reads the calibration store
+back from disk. It writes one line per process start. Traces come from
+archived real runs and stay outside the repository.
 
 ```bash
 # Traces from ~/panoptikon-archive into ~/panoptikon-archive/sizing-traces (needs `zstd`)
 python3 tools/calibration-protocol/sizing_traces.py
 # The test binary (its path is the "Executable" line)
 cargo test -p panoptikon --bin panoptikon sizing_sim --no-run
-# The acceptance table, per device class and sizing mode (CPU only; ~7 min at 8 seeds, 12 jobs)
+# The acceptance tables, per device class and sizing mode (CPU only; 8 seeds, 12 jobs)
 python3 tools/calibration-protocol/sizing_table.py --bin target/debug/deps/panoptikon-<hash> --jobs 12
-# The 2026-10-02 trace-replay cells, to check the simulator still reproduces them
-python3 tools/calibration-protocol/sizing_table.py --bin ... --set verify4 --seeds 100
+# Real jobs of the sizing code under test beside their replay
+python3 tools/calibration-protocol/sizing_table.py --bin ... --set fidelity --seeds 40
+# The batches behind each traced size; the earlier study's trace-replay cells
+python3 tools/calibration-protocol/sizing_table.py --bin ... --set traces
+python3 tools/calibration-protocol/sizing_table.py --bin ... --set reference --seeds 100
 ```
 
 The gains a larger batch must show per doubling are parameters (`--gpu`,
 `--strict` for CPU and unified memory, `--throughput`); they set the
-"implied W" columns. The scenario keys are listed on `Scenario` in the test.
-Results vary by a few tenths of a percent between runs: the ledger's own
-clocks run in real time, only the window wall time is simulated.
+"step-rule W" columns: the size a rule that doubles only on that gain settles
+at, from the model's seed, on the fixed-size rates. Fixed-size rows run one
+size every window without asking the ledger. The scenario keys are listed on
+`Scenario` in the test; a scenario that panics fails the table.
+
+Limits of a replay: a size between traced sizes takes the nearest one's
+rates; above the largest it takes the largest one's rate per unit, and the
+window time outside the batches grows in proportion. A series shorter than
+the job loops. `--set traces` shows how many batches stand behind each size.
+The ledger's own clocks run in real time; the simulator ages the grant, idle
+and trim clocks by each window's simulated time, so results still vary by a
+few tenths of a percent between runs.
