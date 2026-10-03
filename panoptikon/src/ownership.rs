@@ -580,7 +580,7 @@ pub(crate) mod tests {
         let data = data_folder();
         let index = data.path().join("index");
         let access = |path: &Path| {
-            if path == index {
+            if path == index || path == index.join("second") {
                 Access::Denied { owner: 0 }
             } else {
                 Access::Writable
@@ -595,7 +595,8 @@ pub(crate) mod tests {
         assert_eq!(explained(&denied, "new"), named);
         assert_eq!(explained(&denied, "second"), None, "nothing to create");
         let failed = FailedDatabase(index.join("second/index.db"));
-        assert_eq!(explained(&denied.context(failed), "second"), None);
+        let second = Some(owned_by(&index.join("second"), 0, 1000, data.path()));
+        assert_eq!(explained(&denied.context(failed), "second"), second);
     }
 
     /// A file that cannot be created or replaced is explained by itself or
@@ -611,6 +612,7 @@ pub(crate) mod tests {
             ("", "conf/old/a.toml", "conf/old/a.toml", Some("")),
             ("", "conf/old/b.toml", "conf/old", Some("")),
             ("", "conf/old/b.toml", "conf", None),
+            ("", "conf/old", "conf", Some("")),
             ("", "conf/new/b.toml", "conf", Some("")),
             ("conf/new", "conf/new/b.toml", "conf", Some("conf")),
         ] {

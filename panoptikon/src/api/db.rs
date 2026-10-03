@@ -133,7 +133,7 @@ mod tests {
     /// and its owner named in the 500 body.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn db_create_names_a_database_folder_another_user_owns() {
+    async fn db_create_names_an_index_folder_another_user_owns() {
         use crate::ownership::tests::{foreign_folder, owned_by_another_user};
         let Some((folder, owner)) = foreign_folder(false) else {
             return;
