@@ -385,7 +385,8 @@ pub struct BatchHealth {
     pub age_ms: u64,
     /// Inputs in the batch, not cost-dimension units.
     pub items: Option<u64>,
-    /// Size in cost-dimension units; absent without a grant.
+    /// Size in cost-dimension units; absent without a grant or when the batch
+    /// was unpriced.
     pub units: Option<u64>,
     pub reserved_before_mb: Option<u64>,
     pub peak_reserved_mb: Option<u64>,
@@ -394,7 +395,7 @@ pub struct BatchHealth {
     pub duration_ms: Option<f64>,
     /// Allocator retries this batch caused; `None` off CUDA.
     pub alloc_retries: Option<u64>,
-    /// Part of the pool was in system RAM after this batch.
+    /// More than 512 MiB of the pool was in system RAM after this batch.
     pub spilled: bool,
     /// The pool release this batch re-grew from (`"trim"`, `"shrink"`,
     /// `"growth"` or `"spill"`), on the first batch after it only.

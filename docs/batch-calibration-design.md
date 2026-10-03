@@ -2265,8 +2265,8 @@ limit   = min(total × cap_fraction, total − external − reserve)
   co-tenant's transient growth spills us without any error, at a fraction of
   the speed; the last gigabyte buys no throughput, since the knee ends the
   ramp before it. The host probe decides this once per GPU
-  (`GpuInventory::spilling_gpus`, `spill_verdict`), and the worker's own growth release
-  follows the same verdict. The CPU device is not a CUDA GPU and takes its
+  (`GpuInventory::spilling_gpus`, `spill_verdict`), and the worker's own
+  growth release follows the same verdict. The CPU device is not a CUDA GPU and takes its
   own floor ("Host RAM on the CPU device"); the refusal room still reserves
   nothing.
 

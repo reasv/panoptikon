@@ -6121,7 +6121,7 @@
           },
           "spilled": {
             "type": "boolean",
-            "description": "Part of the pool was in system RAM after this batch."
+            "description": "More than 512 MiB of the pool was in system RAM after this batch."
           },
           "units": {
             "type": [
@@ -6129,7 +6129,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Size in cost-dimension units; absent without a grant.",
+            "description": "Size in cost-dimension units; absent without a grant or when the batch\nwas unpriced.",
             "minimum": 0
           }
         }
