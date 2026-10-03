@@ -1613,7 +1613,11 @@ either way, so a trim never races a batch.
   Both outside states mean a `signal: 9` came from elsewhere — the kernel's
   OOM killer, the driver, an operator. The WARN line carries the state as
   `attribution=…` and keeps a derived `killed_by_gateway=` boolean, which is
-  true only for `still_running`.
+  true only for `still_running`. Its `kind=` is `MemoryKill` for an outside
+  `signal: 9` or a Windows exit status `STATUS_NO_MEMORY` /
+  `STATUS_COMMITMENT_LIMIT`, and `Crash` for anything else; only a memory
+  kill teaches the ledger anything (docs/batch-calibration-design.md, "A
+  memory kill caps the batch").
   Deliberate kills that leave *no* death report — the `unload`/terminate/
   kill ladder, a failed handshake or configure, the whole-set teardown
   after one replica dies, a dropped in-flight window — announce themselves
