@@ -633,7 +633,7 @@ analyze.py --scenario results/<run>/<scenario>
            [--expect-deflated]
            [--baseline-jobs FILE | --baseline-items-per-s F]
            [--throughput-floor 0.9] [--utilization-floor 0.25]
-           [--idle-window 60] [--join-tolerance 1.5] [--base-window 10]
+           [--idle-window 60] [--join-tolerance S] [--base-window 10]
            [--worker-pattern RE] [--probe FILE ...]
            [--json FILE] [--plot FILE] [--quiet]
            # or point at each file: --vramrec/--healthrec/--hog/--log/
@@ -655,11 +655,12 @@ clause**, which joins every `issued a memory grant` line to the latest
 `vramrec.jsonl` sample at or before it (a later one can already hold the
 granted batch) and compares the grant with the GPU's *live free memory* at that
 instant. A grant over that free memory is a FAIL, unless the next sample,
-within `--join-tolerance` of the grant, shows a release that covers the
-shortfall: the release may have come first, so the grant is listed and the
-check reads **WARN**. Only processes other than the requester that are still
-alive count as releasing; the requester emptying its cache after an
-out-of-memory error, or a worker that died, is a consequence of the grant. A
+within `--join-tolerance` of the grant (default: twice the median gap
+between `vramrec.py`'s samples), shows a release that covers the shortfall:
+the release may have come first, so the grant is listed and the check reads
+**WARN**. Only processes other than the requester that are still alive count
+as releasing; the requester emptying its cache after an out-of-memory error,
+or a worker that died, is a consequence of the grant. A
 grant with no sample within `--join-tolerance` before it is not decidable, and
 also keeps the check at WARN. Grants on the CPU device are left out: the oracle
 records GPUs only. That

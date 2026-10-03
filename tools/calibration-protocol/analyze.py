@@ -246,24 +246,34 @@ class Context:
         self.worker_spawns = _worker_spawns(self.log)
         self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
         self._pid_first_seen: Optional[Dict[int, float]] = None
+        self.vram_tolerance = self._join_tolerance(self._vram_times)
+        self.hog_tolerance = self._join_tolerance(self._hog_times)
+
+    def _join_tolerance(self, times: List[float]) -> float:
+        """`--join-tolerance`, else twice the median gap between the
+        recorder's samples."""
+        if getattr(self.args, "join_tolerance", None) is not None:
+            return self.args.join_tolerance
+        gaps = sorted(later - earlier for earlier, later in zip(times, times[1:]))
+        return 2.0 * gaps[len(gaps) // 2] if gaps else 0.0
 
     def vram_at(self, t_wall: float) -> Optional[Dict[str, Any]]:
         return _nearest(self.vram_samples, self._vram_times, t_wall,
-                        self.args.join_tolerance)
+                        self.vram_tolerance)
 
     def vram_before(self, t_wall: float) -> Tuple[Optional[Dict[str, Any]],
                                                   Optional[Dict[str, Any]]]:
         """The latest oracle sample at or before `t_wall`, if it is at most
-        `--join-tolerance` old, and the sample after it."""
+        the join tolerance old, and the sample after it."""
         index = bisect.bisect_right(self._vram_times, t_wall)
-        if index == 0 or t_wall - self._vram_times[index - 1] > self.args.join_tolerance:
+        if index == 0 or t_wall - self._vram_times[index - 1] > self.vram_tolerance:
             return None, None
         after = self.vram_samples[index] if index < len(self.vram_samples) else None
         return self.vram_samples[index - 1], after
 
     def hog_at(self, t_wall: float) -> Optional[Dict[str, Any]]:
         return _nearest(self.hog_samples, self._hog_times, t_wall,
-                        self.args.join_tolerance)
+                        self.hog_tolerance)
 
     def oracle_gpu(self, sample: Dict[str, Any], uuid: str) -> Optional[Dict[str, Any]]:
         for gpu in sample.get("gpus", []):
@@ -772,7 +782,7 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     if joined == 0:
         return Verdict("oracle_agreement", "SKIP",
                        "no health sample could be joined to a vramrec sample "
-                       f"within {ctx.args.join_tolerance}s" + skipped,
+                       f"within {ctx.vram_tolerance:.2f}s" + skipped,
                        {"joined": 0, "skewed_samples": skewed})
     verdict = "PASS" if breaches == 0 else "FAIL"
     return Verdict(
@@ -1331,7 +1341,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
                "model": fields.get("model")}
         nxt = (ctx.oracle_gpu(after, fields.get("gpu"))
                if after and after["t_wall"] - event["t_wall"]
-               <= ctx.args.join_tolerance else None)
+               <= ctx.vram_tolerance else None)
         if (nxt and nxt.get("used_mb") is not None
                 and oracle.get("used_mb") is not None):
             released = _released_mb(oracle, nxt, _requester_pids(
@@ -1370,7 +1380,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
                       "safety)"
                       if not ctx.vram_samples else
                       f"no grant was decidable against a vramrec sample at "
-                      f"or before it, within {ctx.args.join_tolerance}s")
+                      f"or before it, within {ctx.vram_tolerance:.2f}s")
                    + ". Only the ledger's own arithmetic was verified")
     return Verdict(
         "grant_safety", verdict, detail,
@@ -2696,7 +2706,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--throughput-floor", type=float, default=0.9)
     parser.add_argument("--utilization-floor", type=float, default=0.25)
     parser.add_argument("--idle-window", type=float, default=60.0)
-    parser.add_argument("--join-tolerance", type=float, default=1.5)
+    parser.add_argument("--join-tolerance", type=float, default=None,
+                        help="max |dt| in seconds when joining a recording "
+                             "by time (default: twice the median gap between "
+                             "that recorder's samples)")
     parser.add_argument("--base-window", type=float, default=10.0,
                         help="max |dt| between a worker admission and the "
                              "oracle sample base_accuracy compares against")

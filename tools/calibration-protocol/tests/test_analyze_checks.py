@@ -638,6 +638,20 @@ def test_grant_safety_never_passes_a_grant_a_release_may_have_covered():
         assert analyze.check_grant_safety(held).verdict == "FAIL"
 
 
+def test_grant_safety_refuses_a_sample_older_than_twice_the_recorder_interval():
+    """vramrec samples every 0.25 s, the last 1 s before the grant: too old
+    to clear or fail it, unless `--join-tolerance` says otherwise."""
+    samples = [_timed(98.0 + 0.25 * step, 10000) for step in range(5)]
+    for tolerance, verdict in ((None, "WARN"), (1.5, "FAIL")):
+        ctx = analyze.Context(
+            args=_args(join_tolerance=tolerance), vramrec=samples,
+            healthrec=[], hog=[], log=[_room_grant(100.0, 15000, 15000)],
+            before=None, after=None, jobs=None, probes=[])
+        result = analyze.check_grant_safety(ctx)
+        assert (result.verdict, result.numbers["undecided"]) == (
+            verdict, int(verdict == "WARN"))
+
+
 def _spawn(pid, model):
     return {"ts": "2026-09-06T07:12:08.000000Z", "t_wall": 90.0,
             "level": "INFO", "target": "panoptikon::inferio",
