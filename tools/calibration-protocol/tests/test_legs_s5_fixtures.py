@@ -14,8 +14,11 @@ Run with the managed interpreter:
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
+
+import pytest
 
 HERE = Path(__file__).resolve().parents[1]
 
@@ -30,6 +33,7 @@ def _load(name: str, path: Path):
 
 
 legs = _load("_calib_legs_s5", HERE / "legs.py")
+analyze = _load("_calib_analyze_s5", HERE / "analyze.py")
 
 
 # --- the table -------------------------------------------------------------
@@ -71,3 +75,58 @@ def test_the_dies_on_load_leg_declares_its_empty_setter_both_ways():
     assert leg.expects_no_items() is True
     assert "--expect-empty-setters" in leg.expectations()
     assert not _leg("calibfixture/dying_cuda").expects_no_items()
+
+
+def test_s5_samples_health_often_enough_to_see_a_fixture_job():
+    """A fixture's job can last 0.3 s; the default 0.5 s poll misses it."""
+    assert legs.SCENARIOS["S5"].health_interval <= 0.1
+
+
+# --- what analyze.py makes of them ------------------------------------------
+
+#: Each count `--expect-*` flag, and the check that judges it.
+COUNTS = {"--expect-ooms": "failures", "--expect-deaths": "failures",
+          "--expect-failures": "job_outcome",
+          "--expect-failed-jobs": "job_outcome"}
+
+
+def _verdicts(directory: Path, model: str, expect, counts):
+    """`failures` and `job_outcome` over a recording holding `counts`."""
+    directory.mkdir()
+    log = ["2026-10-03T00:00:00.000000Z  INFO panoptikon: started"]
+    log += [f"2026-10-03T00:00:00.{index:06d}Z  WARN panoptikon::inferio::"
+           f"ledger: settled a granted window model={model} outcome=negative "
+           f"reason=oom" for index in range(counts["--expect-ooms"])]
+    log += [f"2026-10-03T00:00:01.000000Z ERROR panoptikon::inferio: worker "
+            f"died fatally model={model}"] * counts["--expect-deaths"]
+    (directory / "panoptikon.log").write_text("\n".join(log) + "\n")
+    items = 0 if "--expect-empty-setters" in expect else 1
+    (directory / "jobs.json").write_text(json.dumps({
+        "history": [{"setter": model, "total_segments": items,
+                     "failed_items": counts["--expect-failures"]}],
+        "outcomes": [{"status": "failed"}] * counts["--expect-failed-jobs"]}))
+    out = directory / "verdicts.json"
+    analyze.main(["--scenario", str(directory), "--checks",
+                  "failures,job_outcome", "--quiet", "--json", str(out),
+                  *expect])
+    return {row["name"]: row["verdict"]
+            for row in json.loads(out.read_text())["verdicts"]}
+
+
+@pytest.mark.parametrize("name", sorted(legs.S5_FIXTURES))
+def test_each_fixture_passes_at_its_thresholds_and_fails_one_past(tmp_path,
+                                                                 name):
+    model = f"calibfixture/{name}_cuda"
+    expect = list(_leg(model).expectations())
+    at = {flag: int(expect[expect.index(flag) + 1]) if flag in expect else 0
+          for flag in COUNTS}
+    # One OOM negative per item: every one of the smoke tier's 180 images.
+    if name in ("oom", "oom_timed"):
+        assert at["--expect-ooms"] == 180
+    verdicts = _verdicts(tmp_path / "at", model, expect, at)
+    assert verdicts["failures"] in ("PASS", "WARN")
+    assert verdicts["job_outcome"] == "PASS"
+    for flag, check in COUNTS.items():
+        over = _verdicts(tmp_path / flag, model, expect,
+                         {**at, flag: at[flag] + 1})
+        assert over[check] == "FAIL", flag

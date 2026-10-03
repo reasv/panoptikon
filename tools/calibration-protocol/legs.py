@@ -135,6 +135,7 @@ HERE = Path(__file__).resolve().parent
 IS_WINDOWS = os.name == "nt"
 
 sys.path.insert(0, str(HERE))
+import corpus as corpus_tiers  # noqa: E402
 import rocm_sysfs  # noqa: E402
 
 # The board every figure in SCENARIOS was measured against, so `--list` can
@@ -199,6 +200,8 @@ class Scenario:
     expect: Tuple[str, ...] = ()
     #: what the scenario needs of the host before it starts
     preconditions: Tuple[str, ...] = ()
+    #: healthrec's polling interval, unless `--health-interval` sets one
+    health_interval: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -212,16 +215,24 @@ class Fixture:
     no_items: bool = False
 
 
+#: The smoke tier's images, the only items the fixtures' handler accepts.
+SMOKE_IMAGES = sum(group.count for group in corpus_tiers.tier_groups("smoke")
+                   if group.kind == "image")
+
 #: Keyed by the inference id with its `_cuda`/`_cpu` suffix stripped: the two
 #: variants differ in whether the ledger prices them, not in what they
-#: inject. The thresholds are per fixture, against the 180-item smoke tier; a
-#: leg on a bigger corpus raises them by hand. One flat `--expect-ooms 1` for
-#: the whole table would FAIL every fixture but one for working as designed.
+#: inject. The thresholds are per fixture, against the smoke tier; a leg on a
+#: bigger corpus raises them by hand. One flat `--expect-ooms 1` for the whole
+#: table would FAIL every fixture but one for working as designed. A fixture
+#: that OOMs on every batch logs at most one OOM negative per item, and `oom`
+#: never runs a clean window, so its deflation never returns to 0.
 S5_FIXTURES: Dict[str, Fixture] = {
     "oom_second_batch": Fixture(("--expect-ooms", "1")),
-    "oom": Fixture(("--expect-ooms", "60", "--expect-failures", "180",
-                    "--expect-failed-jobs", "1")),
-    "oom_timed": Fixture(("--expect-ooms", "60", "--expect-failures", "180",
+    "oom": Fixture(("--expect-ooms", str(SMOKE_IMAGES),
+                    "--expect-failures", str(SMOKE_IMAGES),
+                    "--expect-failed-jobs", "1", "--expect-deflated")),
+    "oom_timed": Fixture(("--expect-ooms", str(SMOKE_IMAGES),
+                          "--expect-failures", str(SMOKE_IMAGES),
                           "--expect-failed-jobs", "1")),
     "failbatch": Fixture(),
     "failbatch_oomtext": Fixture(),
@@ -347,6 +358,8 @@ SCENARIOS: Dict[str, Scenario] = {
         model="calibfixture/oom_second_batch_cuda",
         checks="all",
         expect=("--expect-ooms", "1"),
+        # A fixture's job can last 0.3 s.
+        health_interval=0.1,
         preconditions=(
             "run fixtures/install-fixtures.sh first, or point the gateway's "
             "config_dirs/impl_dirs at fixtures/registry and fixtures/impls",
@@ -1774,7 +1787,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="seconds between the job and the final snapshots")
     parser.add_argument("--stop-grace", type=float, default=60.0)
     parser.add_argument("--vram-interval", type=float, default=0.25)
-    parser.add_argument("--health-interval", type=float, default=0.5)
+    parser.add_argument("--health-interval", type=float, default=None,
+                        help="seconds; default: the scenario's (0.5, S5 0.1)")
     parser.add_argument("--health-full", action="store_true",
                         help="healthrec.py --full (keeps the raw payload; "
                              "~2x the file, needed for inference_clients and "
@@ -2070,7 +2084,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 3. the gateway's own view, then the gateway
         health_argv = [args.python, str(HERE / "healthrec.py"), "--base", base,
                        "--out", str(leg.path("healthrec.jsonl")), "--interval",
-                       str(args.health_interval), "--quiet"]
+                       str(args.health_interval
+                           or leg.scenario.health_interval), "--quiet"]
         if args.health_full:
             health_argv.append("--full")
         leg.supervisor.start("healthrec", health_argv)
