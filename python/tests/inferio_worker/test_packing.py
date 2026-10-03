@@ -972,8 +972,12 @@ def test_an_mps_worker_keeps_the_ram_reserve_free():
         live = packing.clamp_to_live_memory(4, 8_100, ram_reserve_mb=2_000)
         assert live.units == 3, "6 000 above the reserve plus 200 of pool"
     with mps_host(available_mb=120 * 1024):
-        live = packing.clamp_to_live_memory(4, 96 * 1024, ram_reserve_mb=13_107)
-        assert live.clamped is None, "the 96 GiB ceiling binds, not the reserve"
+        live = packing.clamp_to_live_memory(8, 128 * 1024, ram_reserve_mb=13_107)
+        assert live.units == 6, "the 96 GiB ceiling binds, not the reserve"
+    with mps_host(available_mb=1_000) as mps:
+        mps.allocate(1_000, driver_mb=5_000)
+        live = packing.clamp_to_live_memory(8, 8_000, ram_reserve_mb=2_000)
+        assert live.units == 4, "RAM below the reserve takes nothing from the pool"
 
 
 def test_a_rocm_worker_uses_the_cuda_arm_of_the_credit(fake_rocm_torch):

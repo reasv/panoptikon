@@ -876,10 +876,11 @@ def clamp_to_live_memory(
     shrunk, clamped = unit_budget, None
     if grant_mb and grant_mb > 0 and free_mb is not None:
         reserve_mb = ram_reserve_mb if free_source in ("ram", "mps") else 0
-        above_mb = max(free_mb - reserve_mb, 0)
-        if free_source == "mps" and reading.ram_available_mb is not None:
+        if free_source == "mps":
             # Metal's ceiling, or the RAM above the reserve when that is less.
-            above_mb = min(free_mb, max(reading.ram_available_mb - reserve_mb, 0))
+            above_mb = max(min(free_mb, reading.ram_available_mb - reserve_mb), 0)
+        else:
+            above_mb = max(free_mb - reserve_mb, 0)
         pool_mb = memory.releasable_pool_mb() or 0
         held_mb = min(fixed_mb, memory.held_since_load_mb())
         spendable_mb = above_mb + pool_mb + held_mb
@@ -890,7 +891,7 @@ def clamp_to_live_memory(
                 "pool) above a %d MiB reserve against a %d MiB grant; shrinking "
                 "this batch's budget from %d to %d units",
                 spendable_mb,
-                free_mb,
+                above_mb,
                 pool_mb,
                 reserve_mb,
                 grant_mb,
