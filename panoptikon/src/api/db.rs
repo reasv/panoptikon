@@ -93,7 +93,8 @@ pub(crate) async fn create_databases(
     .map_err(|err| {
         let runtime = crate::config::runtime();
         let index_db = index_db.as_deref().unwrap_or(&runtime.index_db);
-        let reason = crate::ownership::creation_problem(&err, &runtime.data_folder, index_db);
+        let reason =
+            crate::ownership::create_databases_problem(&err, &runtime.data_folder, index_db);
         tracing::error!(error = %format_args!("{err:#}"), reason, "failed to create databases");
         ApiError::internal(match reason {
             Some(reason) => format!("Failed to create databases: {reason}"),
@@ -128,7 +129,7 @@ mod tests {
         );
     }
 
-    /// A database folder another user owns fails the create with the folder
+    /// An index folder another user owns fails the create with the folder
     /// and its owner named in the 500 body.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
@@ -138,17 +139,20 @@ mod tests {
             return;
         };
         let env = crate::test_utils::test_data_dir();
-        let link = env.path().join("index/foreign_owned");
-        std::fs::create_dir_all(env.path().join("index")).unwrap();
-        std::os::unix::fs::symlink(folder, &link).unwrap();
+        let index = env.path().join("index");
+        let aside = env.path().join("index.aside");
+        std::fs::create_dir_all(&index).unwrap();
+        std::fs::rename(&index, &aside).unwrap();
+        std::os::unix::fs::symlink(folder, &index).unwrap();
         let result = db_create(Query(DbCreateQuery {
-            new_index_db: Some("foreign_owned".to_string()),
+            new_index_db: Some("new".to_string()),
             new_user_data_db: None,
         }))
         .await;
-        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_file(&index).unwrap();
+        std::fs::rename(&aside, &index).unwrap();
         let error = result.err().expect("the create fails");
-        let expected = owned_by_another_user(&link, owner, folder);
+        let expected = owned_by_another_user(&index, owner, folder);
         assert!(error.detail().ends_with(&expected), "{}", error.detail());
         let status = error.into_response().status();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);

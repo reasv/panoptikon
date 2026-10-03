@@ -85,17 +85,17 @@ pub(crate) fn explain(err: anyhow::Error, tree: &Path, paths: &[PathBuf]) -> any
 /// Why creating databases failed, if another user owns or a read-only
 /// filesystem holds what it writes: the database a migration failed on, or
 /// else the folder a missing `index/<index_db>` or `user_data/` is made in.
-pub(crate) fn creation_problem(
+pub(crate) fn create_databases_problem(
     err: &anyhow::Error,
     data_folder: &Path,
     index_db: &str,
 ) -> Option<String> {
     let data_folder = absolute(data_folder);
-    let paths = creation_paths(err, &data_folder, index_db);
+    let paths = create_databases_paths(err, &data_folder, index_db);
     reason(&data_folder, &paths, true)
 }
 
-fn creation_paths(err: &anyhow::Error, data_folder: &Path, index_db: &str) -> Vec<PathBuf> {
+fn create_databases_paths(err: &anyhow::Error, data_folder: &Path, index_db: &str) -> Vec<PathBuf> {
     let paths = migration_paths(err);
     if !paths.is_empty() {
         return paths;
@@ -587,7 +587,7 @@ pub(crate) mod tests {
             }
         };
         let explained = |err: &anyhow::Error, index_db: &str| {
-            let paths = creation_paths(err, data.path(), index_db);
+            let paths = create_databases_paths(err, data.path(), index_db);
             unix::reason(data.path(), &paths, true, 1000, access)
         };
         let denied = anyhow::anyhow!("permission denied");
