@@ -513,10 +513,22 @@ fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
             expected
         );
     }
-    host.lock().metal_allocator = true;
+    let zero = VramLedger::for_test(
+        &[
+            (GPU, "TEST 9000", 24_576),
+            (super::cpu::DEVICE_KEY, "CPU", 65_536),
+        ],
+        user_margin(0.0),
+    );
+    {
+        let mut state = zero.lock();
+        state.gpus.get_mut(GPU).unwrap().unified_ram_mb = Some(65_536);
+        state.metal_allocator = true;
+    }
     for device in [super::cpu::DEVICE_KEY, GPU] {
+        let margin = zero.budgets.for_gpu(device).margin_in_force();
         assert_eq!(
-            host.reserve_locked(&host.lock(), device, 165, 0.0),
+            zero.reserve_locked(&zero.lock(), device, 165, margin),
             (6_553, RESERVE_RULE_RAM_FLOOR),
             "{device} on a Mac with a margin of 0"
         );
