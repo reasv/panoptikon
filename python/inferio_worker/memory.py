@@ -1239,10 +1239,55 @@ def _reclaimable_slab_bytes() -> int:
     return 0
 
 
+def windows_available_bytes() -> int | None:
+    """RAM a new allocation could get on Windows, or None off it: free
+    physical memory bounded by the commit the process can still make, since
+    an allocation past the commit limit fails whatever is physically free.
+    Same as `cpu.rs::windows_deliverable`.
+    """
+    status = _windows_memory_status()
+    if status is None:
+        return None
+    avail_phys, avail_commit = status
+    return min(avail_phys, avail_commit)
+
+
+def _windows_memory_status() -> tuple[int, int] | None:
+    """`(ullAvailPhys, ullAvailPageFile)` from `GlobalMemoryStatusEx`, or None
+    off Windows or on error."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(MemoryStatusEx)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Windows memory status unreadable: %s", exc)
+        return None
+    return (int(status.ullAvailPhys), int(status.ullAvailPageFile))
+
+
 def _ram_bounds_bytes(root: str | None = None) -> tuple[int | None, int | None]:
     """`(total, available)` in bytes for a CPU-priced host, or `(None, None)`:
-    psutil (macOS available from `mac_available_bytes`; Linux less
-    `SReclaimable`), bounded by the cgroup limit. Must match `cpu.rs`.
+    psutil (macOS available from `mac_available_bytes`, Windows from
+    `windows_available_bytes`; Linux less `SReclaimable`), bounded by the
+    cgroup limit. Must match `cpu.rs`.
     """
     memory = _virtual_memory()
     if memory is None:
@@ -1254,9 +1299,9 @@ def _ram_bounds_bytes(root: str | None = None) -> tuple[int | None, int | None]:
         return (None, None)
     if total <= 0:
         return (None, None)
-    mac_available = mac_available_bytes()
-    if mac_available is not None:
-        available = mac_available
+    for platform_available in (mac_available_bytes(), windows_available_bytes()):
+        if platform_available is not None:
+            available = platform_available
     available = max(available - _reclaimable_slab_bytes(), 0)
     limit, used = cgroup_limit_used_bytes(root)
     if limit is not None:

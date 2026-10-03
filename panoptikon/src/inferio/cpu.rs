@@ -2,10 +2,10 @@
 //!
 //! Total is physical RAM (`MemTotal`, `ullTotalPhys`, `hw.memsize`) and free
 //! is what the OS could deliver now (`MemAvailable − SReclaimable`,
-//! `ullAvailPhys`, macOS free+inactive pages), matching the worker's `"ram"`
-//! reading. On Linux both are bounded by the cgroup memory limit, since
-//! `/proc/meminfo` is not namespaced. See docs/unified-memory-admission.md
-//! "Backend C: CPU".
+//! `min(ullAvailPhys, ullAvailPageFile)`, macOS free+inactive pages),
+//! matching the worker's `"ram"` reading. On Linux both are bounded by the
+//! cgroup memory limit, since `/proc/meminfo` is not namespaced. See
+//! docs/unified-memory-admission.md "Backend C: CPU".
 
 use std::path::PathBuf;
 
@@ -237,8 +237,18 @@ mod sys {
     }
 
     pub(super) fn available_mb() -> Option<u64> {
-        status().map(|status| status.ullAvailPhys / MIB)
+        status().map(|status| {
+            super::windows_deliverable(status.ullAvailPhys, status.ullAvailPageFile) / MIB
+        })
     }
+}
+
+/// Bytes Windows could deliver now: free physical memory, bounded by the
+/// commit the process can still make, since an allocation past the commit
+/// limit fails whatever is physically free.
+#[cfg(any(target_os = "windows", test))]
+fn windows_deliverable(avail_phys: u64, avail_commit: u64) -> u64 {
+    avail_phys.min(avail_commit)
 }
 
 #[cfg(test)]
@@ -375,6 +385,15 @@ mod tests {
         )
         .expect("write meminfo");
         assert_eq!(ram_available_mb(&limited), Some(10 * 1024));
+    }
+
+    /// Windows free RAM is free physical memory bounded by the commit the
+    /// process can still make: with a small pagefile commit runs out first.
+    #[test]
+    fn windows_free_ram_is_bounded_by_available_commit() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(windows_deliverable(12 * gib, 3 * gib), 3 * gib);
+        assert_eq!(windows_deliverable(12 * gib, 40 * gib), 12 * gib);
     }
 
     /// Fixture roots for one cgroup layout: `files` is written under a

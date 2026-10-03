@@ -758,8 +758,9 @@ therefore differs from a GPU in six ways.
   time under a fast allocation. The reading is low by at most
   `min(SReclaimable / 2, low watermark)`, the part `MemAvailable` already
   leaves out. Shared memory is in neither figure. Windows reads
-  `ullAvailPhys` and macOS RAM less wired, compressed and anonymous pages, as
-  before.
+  `min(ullAvailPhys, ullAvailPageFile)`: an allocation past the commit limit
+  (RAM plus pagefile) fails whatever is physically free. macOS reads RAM less
+  wired, compressed and anonymous pages, as before.
 - **A replica's footprint is the memory it holds now.** A CPU worker reports
   its lifetime peak resident set as `reserved` (the knee's warm/high-water
   split needs it), and its heap is trimmed after every batch, so the peak is
@@ -827,10 +828,6 @@ Known limits:
   down (0.4 to 2 s for a process of several GiB) still reads as a death in
   the middle of its window. On Linux the leader's zombie state shows it
   within a millisecond.
-- Windows refuses an allocation at the commit limit (RAM plus pagefile),
-  whatever is physically free. Free RAM there is `ullAvailPhys` alone, so
-  with a small pagefile a batch can fail to allocate while the reserve is
-  intact; nothing is killed.
 
 ### RAM ceiling for GPU models
 

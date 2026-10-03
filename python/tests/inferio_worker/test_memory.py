@@ -2199,7 +2199,10 @@ def test_while_the_mac_pages_a_cpu_worker_on_it_has_nothing_free() -> None:
     counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 4, 0)
     memory_info = SimpleNamespace(total=128 * 1024 * MIB, available=40 * 1024 * MIB)
     with mac_counters(counters):
-        with mock.patch("psutil.virtual_memory", return_value=memory_info):
+        with (
+            mock.patch("psutil.virtual_memory", return_value=memory_info),
+            mock.patch.object(sys, "platform", "darwin"),
+        ):
             assert memory.ram_free_total_mb()[0] == 0
 
 
@@ -2367,8 +2370,8 @@ def cpu_host(
     `INFERIO_DEVICE=cpu`, which is the whole of the signal. `cgroup` points at
     a fake cgroup root and `meminfo` at a fake `/proc/meminfo`; absent, at
     nothing, so the host running the suite cannot lend its own limit or slab
-    to a test that says nothing about one. The macOS reading is stubbed out
-    for the same reason: psutil is the RAM on every host."""
+    to a test that says nothing about one. The macOS and Windows readings are
+    stubbed out for the same reason: psutil is the RAM on every host."""
     ram = ram if ram is not None else FakeRam()
     with isolated(torch_module):
         os.environ.pop("PANOPTIKON_DEVICE_PIN", None)
@@ -2391,6 +2394,9 @@ def cpu_host(
                 memory, "PROC_MEMINFO", meminfo or "/nonexistent/meminfo"
             ),
             mock.patch.object(memory, "_mac_memory_counters", return_value=None),
+            mock.patch.object(
+                memory, "_windows_memory_status", return_value=None
+            ),
         ):
             yield ram
 
@@ -2563,6 +2569,21 @@ def test_linux_free_ram_leaves_out_reclaimable_slab(
     meminfo.write_text("SReclaimable:    6144000 kB\n")
     with cpu_host(FakeRam(128 * 1024, 30_605), cgroup=str(group), meminfo=str(meminfo)):
         assert memory.ram_free_total_mb() == (10 * 1024, 16 * 1024)
+
+
+def test_windows_free_ram_is_bounded_by_available_commit() -> None:
+    # With a small pagefile commit runs out before physical memory, and an
+    # allocation past the commit limit fails whatever is physically free.
+    with cpu_host(FakeRam(total_mb=64 * 1024, available_mb=40 * 1024)):
+        for phys_mb, commit_mb, free_mb in (
+            (12_288, 3_072, 3_072),
+            (12_288, 40_960, 12_288),
+        ):
+            status = (phys_mb * MIB, commit_mb * MIB)
+            with mock.patch.object(
+                memory, "_windows_memory_status", return_value=status
+            ):
+                assert memory.ram_free_total_mb() == (free_mb, 64 * 1024)
 
 
 def test_freed_host_memory_is_returned_before_the_resident_readings(
