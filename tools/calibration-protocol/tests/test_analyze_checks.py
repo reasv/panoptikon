@@ -640,17 +640,22 @@ def test_grant_safety_never_passes_a_grant_a_release_may_have_covered():
 
 
 def test_grant_safety_refuses_a_sample_older_than_twice_the_recorder_interval():
-    """vramrec samples every 0.25 s, the last 1 s before the grant: too old
-    to clear or fail it, unless `--join-tolerance` says otherwise."""
-    samples = [_timed(98.0 + 0.25 * step, 10000) for step in range(5)]
-    for tolerance, verdict in ((None, "WARN"), (1.5, "FAIL")):
-        ctx = analyze.Context(
-            args=_args(join_tolerance=tolerance), vramrec=samples,
-            healthrec=[], hog=[], log=[_room_grant(100.0, 15000, 15000)],
+    """vramrec's median gap is 0.25 s: a grant 0.3 s after the last sample is
+    judged, one 0.6 s after it is not, unless `--join-tolerance` says
+    otherwise. A single sample: twice the header's interval, else 1.5 s."""
+    def context(vramrec, tolerance=None):
+        return analyze.Context(
+            args=_args(join_tolerance=tolerance), vramrec=vramrec, healthrec=[],
+            hog=[], log=[_room_grant(98.9, 15000, 15000),
+                         _room_grant(99.2, 15000, 15000)],
             before=None, after=None, jobs=None, probes=[])
-        result = analyze.check_grant_safety(ctx)
-        assert (result.verdict, result.numbers["undecided"]) == (
-            verdict, int(verdict == "WARN"))
+    samples = [_timed(t, 10000) for t in (97.0, 98.0, 98.25, 98.5, 98.6)]
+    for tolerance, undecided in ((None, 1), (1.5, 0)):
+        result = analyze.check_grant_safety(context(samples, tolerance))
+        assert (result.verdict, result.numbers["undecided"]) == ("FAIL", undecided)
+    for header, tolerance in (([{"kind": "header", "interval_s": 0.25}], 0.5),
+                              ([], 1.5)):
+        assert context(header + [_timed(99.0, 10000)]).vram_tolerance == tolerance
 
 
 def _spawn(pid, model):
@@ -661,9 +666,10 @@ def _spawn(pid, model):
             "line": ""}
 
 
-def _worker_sample(t_wall, workers):
+def _worker_sample(t_wall, workers, free_mb=None):
     """Workers 900 (the requester) and 901, over 16607 MiB of other use."""
-    sample = _timed(t_wall, 16000 - sum(workers.values()))
+    sample = _timed(t_wall, 16000 - sum(workers.values())
+                    if free_mb is None else free_mb)
     sample["gpus"][0]["procs"] = [_proc(pid, mb, "inferio-worker")
                                   for pid, mb in workers.items()]
     return sample
@@ -685,22 +691,28 @@ def test_grant_safety_counts_only_releases_by_other_live_processes():
 
 
 def test_grant_safety_without_a_spawn_line_tries_each_possible_requester():
-    """No spawn line names the model: 901 freeing 5500 MiB covers the grant
-    unless 901 asked for it, so WARN; 2000 MiB covers it under no choice, so
-    FAIL. A model whose spawned PID is not on the GPU has no requester there."""
-    before = _worker_sample(99.8, {900: 10000, 901: 6000})
-    def judge(log, workers):
-        return analyze.check_grant_safety(analyze.Context(
-            args=_args(), vramrec=[before, _worker_sample(100.1, workers)],
+    """No spawn line names the model, or its PID is not on the GPU: 901
+    freeing 5500 MiB covers the grant unless 901 asked for it, so WARN;
+    2000 MiB covers it under no choice, so FAIL. A worker spawned for another
+    model is never the requester, so its growth is no release. The requester
+    may not be on the GPU at all, so 901 alone freeing enough is a WARN."""
+    def judge(log, workers, free_mb=None,
+              before=_worker_sample(99.8, {900: 10000, 901: 6000})):
+        verdict = analyze.check_grant_safety(analyze.Context(
+            args=_args(), vramrec=[before, _worker_sample(100.1, workers, free_mb)],
             healthrec=[], hog=[], log=log + [_room_grant(100.0, 5000, 5000)],
             before=None, after=None, jobs=None, probes=[]))
-    untied = judge([], {900: 10000, 901: 500})
-    assert (untied.verdict, len(untied.numbers["covered_if_untied"])) == ("WARN", 1)
-    assert MODEL in untied.detail
-    assert judge([], {900: 10000, 901: 4000}).verdict == "FAIL"
-    elsewhere = judge([_spawn(950, MODEL)], {900: 10000, 901: 500})
-    assert (elsewhere.verdict, len(elsewhere.numbers["covered_by_release"])) == (
-        "WARN", 1)
+        return verdict.verdict, [row["model"] for row
+                                 in verdict.numbers["covered_without_spawn_line"]]
+    assert judge([], {900: 10000, 901: 500}) == ("WARN", [MODEL])
+    assert judge([], {900: 10000, 901: 4000}) == ("FAIL", [])
+    assert judge([_spawn(950, MODEL)], {900: 10000, 901: 500}) == ("WARN", [MODEL])
+    # 901 grows 4000 MiB while another process frees 6000.
+    assert judge([], {900: 10000, 901: 10000}, 2000) == ("WARN", [MODEL])
+    assert judge([_spawn(901, "other/model")], {900: 10000, 901: 10000},
+                 2000) == ("FAIL", [])
+    assert judge([], {901: 500}, 5500,
+                 before=_worker_sample(99.8, {901: 6000}, 0)) == ("WARN", [MODEL])
 
 
 def test_grant_safety_leaves_cpu_grants_to_the_ledger():
@@ -723,15 +735,16 @@ def test_grant_safety_decides_a_zero_grant_without_a_sample():
 
 
 def test_oracle_agreement_skips_the_samples_while_no_job_ran():
-    """From `job_end`, or the hog stop, to the next `job_start`, the idle
-    gateway keeps its last figure until something asks it to refresh."""
+    """From a drained `job_end`, or the hog stop, to the next `job_start`,
+    the idle gateway keeps its last figure until something asks it to
+    refresh. A job cut at the cap is still running."""
     legs = {"events": [
         {"event": "job_start", "iso": "1970-01-01T00:01:39Z"},
-        {"event": "job_end", "iso": "1970-01-01T00:01:40.5Z"},
+        {"event": "job_end", "iso": "1970-01-01T00:01:40.5Z", "outcome": "drained"},
         {"event": "job_start", "iso": "1970-01-01T00:01:42Z"},
-        {"event": "job_end", "iso": "1970-01-01T00:01:43Z"},
+        {"event": "job_end", "iso": "1970-01-01T00:01:43Z", "outcome": "cap_exceeded"},
         {"event": "hog_stop_requested", "iso": "1970-01-01T00:01:44Z"}]}
-    assert analyze._idle_spans(legs) == [(100.5, 102.0), (103.0, math.inf)]
+    assert analyze._idle_spans(legs) == [(100.5, 102.0), (104.0, math.inf)]
     procs = [_proc(900, 1000, "inferio-worker")]
     stale = {**_health_sample(14000), "t_wall": 101.0}
     ctx = _context(vramrec=[_vram_sample(procs, used_mb=1000)],
@@ -758,51 +771,67 @@ def _ledger(t_wall, external_mb, age_ms=0):
 
 
 def _agreement(vramrec, healthrec, hog=()):
-    ctx = _context(vramrec=vramrec, healthrec=healthrec)
-    ctx.hog = list(hog)
-    ctx.__post_init__()
-    return analyze.check_oracle_agreement(ctx)
+    return analyze.check_oracle_agreement(analyze.Context(
+        args=_args(), vramrec=vramrec, healthrec=healthrec, hog=list(hog),
+        log=[], before=None, after=None, jobs=None, probes=[]))
 
 
 def test_oracle_agreement_skips_samples_while_a_release_leaves_used():
-    """`used` shows a free after the process figure does: 40 ms per GiB, or
-    until `used` has fallen. A ledger figure read in that time stays wrong
-    until the ledger reads again. A disagreement outside it still FAILs."""
+    """`used` may show a free after the process figure does: for 40 ms per
+    GiB, or until `used` has fallen. A ledger figure read, or an oracle
+    sample taken, in that time is skipped. A release under the allowance, or
+    the skew where larger, is taken off the difference; a disagreement
+    outside it still FAILs."""
     def used_and_procs(t):
         if t <= 100.0:
             return 12020, {900: 12000}
-        if t <= 100.25:  # 11000 MiB freed, `used` not yet
-            return 12020, {900: 1000}
+        if t <= 100.25:  # 11000 MiB freed, `used` at once
+            return 1020, {900: 1000}
         if 110.0 < t <= 112.0:  # 901 exited, `used` drains slower than 40 ms/GiB
             return 7020, {900: 1000}
         if t <= 110.0:
             return 7020, {900: 1000, 901: 6000}
-        return 1020, {900: 1000}
+        if t <= 112.5:
+            return 1020, {900: 1000}
+        return 1020, {900: 100}  # 900 MiB freed, `used` not yet
 
     vramrec = [_row(t, *used_and_procs(t))
                for t in (100.0 + 0.25 * step for step in range(53))]
-    healthrec = [_ledger(100.25, 0), _ledger(101.0, 20),
+    # The process read failed, or 901's figure is unpriced: no release.
+    vramrec[3]["gpus"][0].update(procs=[], error="process query failed")
+    vramrec[39]["gpus"][0]["procs"][1]["used_mb"] = None
+    vramrec[51]["gpus"][0]["skew_mb"] = 500
+    healthrec = [_ledger(100.25, 0), _ledger(100.5, 11000), _ledger(101.0, 20),
                  _ledger(102.0, 11000, age_ms=1800),
-                 _ledger(110.0, 20), _ledger(111.5, 0), _ledger(112.5, 20)]
+                 _ledger(110.0, 20), _ledger(111.5, 0),
+                 _ledger(112.5, 20, age_ms=3000), _ledger(112.75, 2720)]
     verdict = _agreement(vramrec, healthrec)
     assert (verdict.verdict, verdict.numbers["joined"],
-            verdict.numbers["releasing_samples"]) == ("PASS", 3, 3)
-    assert _agreement(vramrec, healthrec + [_ledger(113.0, 11000)]).verdict == "FAIL"
+            verdict.numbers["releasing_samples"],
+            verdict.numbers["read_age_samples"],
+            verdict.numbers["read_age_worst_mb"]) == ("PASS", 4, 4, 1, 10980)
+    for extra in (_ledger(113.0, 11000), _ledger(112.75, 3020)):
+        assert _agreement(vramrec, healthrec + [extra]).verdict == "FAIL"
 
 
 def test_oracle_agreement_skips_samples_while_the_hog_moved():
     """The ledger read free before the hog took 8 GiB: not yet a
-    disagreement. Read after it and still missing it is one."""
-    hog = [{"kind": "header", "target": "gpu", "gpu_uuid": GPU}] + [
-        {"kind": "state", "t_wall": t, "held_mb": 8192 if t >= 100.5 else 0}
-        for t in (99.0, 99.5, 100.0, 100.5, 101.0, 101.5, 102.0)]
-    vramrec = [_row(t, 20 + (8192 if t >= 100.5 else 0),
-                    {4: 8192} if t >= 100.5 else {})
-               for t in (100.0 + 0.25 * step for step in range(9))]
-    verdict = _agreement(vramrec, [_ledger(101.0, 20, age_ms=1000)], hog)
-    assert (verdict.verdict, verdict.numbers["hog_moving_samples"]) == ("SKIP", 1)
-    assert _agreement(vramrec, [_ledger(102.0, 8212)], hog).verdict == "PASS"
-    assert _agreement(vramrec, [_ledger(102.0, 20)], hog).verdict == "FAIL"
+    disagreement. Read after it and still missing it is one. A fill writes
+    its state row when done, after the ledger read."""
+    def judge(ledger, held, rows=(99.0, 99.5, 100.0, 100.5, 101.0, 101.5, 102.0)):
+        hog = [{"kind": "header", "target": "gpu", "gpu_uuid": GPU}] + [
+            {"kind": "state", "t_wall": t, "held_mb": held(t)} for t in rows]
+        vramrec = [_row(t, 20 + held(t), {4: held(t)})
+                   for t in (100.0 + 0.25 * step for step in range(9))]
+        verdict = _agreement(vramrec, [ledger], hog)
+        return (verdict.verdict, verdict.numbers["hog_moving_samples"],
+                verdict.numbers["releasing_samples"])
+    step_up = lambda t: 8192 if t >= 100.5 else 0
+    assert judge(_ledger(101.0, 20, age_ms=1000), step_up) == ("SKIP", 1, 0)
+    assert judge(_ledger(102.0, 8212), step_up)[0] == "PASS"
+    assert judge(_ledger(102.0, 20), step_up)[0] == "FAIL"
+    assert judge(_ledger(101.0, 20), step_up,
+                 (99.0, 99.5, 100.0, 101.5)) == ("SKIP", 1, 0)
 
 
 def _learning_context(seed, queue_bound=7):

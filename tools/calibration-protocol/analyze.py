@@ -227,7 +227,7 @@ class Context:
     jobs: Optional[Any]
     probes: List[Dict[str, Any]]
     fds: List[Dict[str, Any]] = field(default_factory=list)
-    # When no job ran, from `legs.json`: each `job_end` to the next
+    # When no job ran, from `legs.json`: each drained `job_end` to the next
     # `job_start`, and the hog stop to the end of the recording.
     idle_spans: List[Tuple[float, float]] = field(default_factory=list)
     # Labels of the hog events `legs.py` marked `hog_event_void`.
@@ -249,17 +249,24 @@ class Context:
         self.worker_spawns = _worker_spawns(self.log)
         self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
         self._pid_first_seen: Optional[Dict[int, float]] = None
-        self._release_windows: Dict[str, List[Tuple[float, float, int]]] = {}
-        self.vram_tolerance = self._join_tolerance(self._vram_times)
-        self.hog_tolerance = self._join_tolerance(self._hog_times)
+        self._release_windows: Dict[str, List[Tuple[float, float, int, int]]] = {}
+        self.vram_tolerance = self._join_tolerance(self._vram_times, self.vramrec)
+        self.hog_tolerance = self._join_tolerance(self._hog_times, self.hog)
 
-    def _join_tolerance(self, times: List[float]) -> float:
+    def _join_tolerance(self, times: List[float],
+                        rows: List[Dict[str, Any]]) -> float:
         """`--join-tolerance`, else twice the median gap between the
-        recorder's samples."""
+        recorder's samples, else twice its header's `interval_s`, else 1.5 s."""
         if getattr(self.args, "join_tolerance", None) is not None:
             return self.args.join_tolerance
         gaps = sorted(later - earlier for earlier, later in zip(times, times[1:]))
-        return 2.0 * gaps[len(gaps) // 2] if gaps else 0.0
+        if gaps:
+            return 2.0 * gaps[len(gaps) // 2]
+        header = next((row for row in rows if row.get("kind") == "header"), {})
+        interval = header.get("interval_s")
+        if isinstance(interval, (int, float)) and interval > 0:
+            return 2.0 * interval
+        return 1.5
 
     def vram_at(self, t_wall: float) -> Optional[Dict[str, Any]]:
         return _nearest(self.vram_samples, self._vram_times, t_wall,
@@ -279,46 +286,54 @@ class Context:
         return _nearest(self.hog_samples, self._hog_times, t_wall,
                         self.hog_tolerance)
 
-    def released_mb(self, uuid: str, start: float, end: float) -> int:
-        """MiB freed on this GPU whose release window meets `[start, end]`.
-
-        A window opens at the oracle sample before a fall in any process's
-        figure (a process that exited counts all it held) and lasts until
-        `used` has dropped it too: the later of `RELEASE_LAG_S_PER_GIB` per
-        GiB after the sample that showed the fall, and the first sample whose
-        memory no process holds (`used` less every process) is back within
-        the allowance of its level before the fall. A recording that ends
-        before that keeps the first bound.
-        """
+    def released_mb(self, uuid: str, start: float, end: float,
+                    readings: Tuple[float, ...]) -> int:
+        """MiB freed on this GPU that `used` may not have shown yet: another
+        process's release window meeting `[start, end]`, or one of our workers'
+        holding one of `readings`. The README's oracle_agreement row says how
+        long a window lasts."""
         windows = self._release_windows.get(uuid)
         if windows is None:
             rows = [(sample["t_wall"], gpu) for sample in self.vram_samples
                     for gpu in [self.oracle_gpu(sample, uuid)]
-                    if gpu is not None and gpu.get("used_mb") is not None]
-            unheld = [_unheld_mb(gpu) for _, gpu in rows]
+                    if gpu is not None and gpu.get("used_mb") is not None
+                    and not gpu.get("error") and not gpu.get("unreadable_pids")]
+            unattributed = [_unattributed_mb(gpu) for _, gpu in rows]
             windows = []
             for index in range(1, len(rows)):
                 (t_before, before), (t_shown, shown) = rows[index - 1], rows[index]
-                held, now = _procs_mb(before), _procs_mb(shown)
-                freed = sum(max(0, mb - now.get(pid, 0)) for pid, mb in held.items())
-                if freed <= 0:
+                now = {proc["pid"]: proc.get("used_mb")
+                       for proc in shown.get("procs") or []}
+                ours = others = 0
+                for proc in before.get("procs") or []:
+                    held, later = proc.get("used_mb"), now.get(proc["pid"], 0)
+                    if held is None or later is None or later >= held:
+                        continue
+                    if self.is_ours(proc):
+                        ours += int(held) - int(later)
+                    else:
+                        others += int(held) - int(later)
+                if ours + others <= 0:
                     continue
-                end_t = t_shown + freed / 1024 * RELEASE_LAG_S_PER_GIB
-                level = unheld[index - 1] + allowance_mb(shown.get("total_mb"))
+                end_t = t_shown + (ours + others) / 1024 * RELEASE_LAG_S_PER_GIB
+                level = unattributed[index - 1] + allowance_mb(shown.get("total_mb"))
                 drained = next((rows[later][0] for later in range(index, len(rows))
-                                if unheld[later] <= level), None)
-                windows.append((t_before, max(end_t, drained or 0.0), freed))
+                                if unattributed[later] <= level), None)
+                windows.append((t_before, max(end_t, drained or 0.0), ours, others))
             self._release_windows[uuid] = windows
-        return sum(mb for opened, closed, mb in windows
-                   if opened < end and closed >= start)
+        return sum(others for opened, closed, _, others in windows
+                   if opened < end and closed >= start) + sum(
+            ours for opened, closed, ours, _ in windows
+            if any(opened < t <= closed for t in readings))
 
     def hog_moved_mb(self, uuid: str, start: float, end: float) -> int:
-        """How far what hog.py held on this GPU moved over `[start, end]`."""
+        """How far what hog.py held on this GPU moved over `[start, end]`,
+        counting the first row after `end`: a fill writes its row when done."""
         header = next((row for row in self.hog if row.get("kind") == "header"), {})
         if header.get("target", "gpu") != "gpu" or header.get("gpu_uuid") != uuid:
             return 0
         first = max(0, bisect.bisect_left(self._hog_times, start) - 1)
-        last = bisect.bisect_right(self._hog_times, end)
+        last = bisect.bisect_right(self._hog_times, end) + 1
         held = [row.get("held_mb") or 0 for row in self.hog_samples[first:last]]
         return max(held) - min(held) if held else 0
 
@@ -594,14 +609,10 @@ def _pid_mb(gpu: Dict[str, Any], pid: int) -> Optional[int]:
     return None
 
 
-def _procs_mb(gpu: Dict[str, Any]) -> Dict[int, int]:
-    return {proc["pid"]: int(proc.get("used_mb") or 0)
-            for proc in gpu.get("procs") or []}
-
-
-def _unheld_mb(gpu: Dict[str, Any]) -> int:
+def _unattributed_mb(gpu: Dict[str, Any]) -> int:
     """`used` less every process the oracle lists on this GPU."""
-    return int(gpu["used_mb"]) - sum(_procs_mb(gpu).values())
+    return int(gpu["used_mb"]) - sum(int(proc.get("used_mb") or 0)
+                                     for proc in gpu.get("procs") or [])
 
 
 def allowance_mb(total_mb: Any) -> float:
@@ -765,12 +776,8 @@ def _source_counts(sources: Dict[str, int]) -> str:
 def check_oracle_agreement(ctx: Context) -> Verdict:
     """`external_mb` vs (GPU used - our workers' NVML usage): +/-1 GiB or 2%.
 
-    Both figures must describe the same memory: a GPU-sample is skipped when,
-    between the ledger's free reading (`external_sample_age_ms` before the
-    health sample) and the oracle sample, a release was still leaving `used`
-    or the hog moved by more than the allowance; a smaller amount is taken
-    off the difference. Samples while no job ran are skipped: the idle
-    gateway keeps its last figure until something asks it to refresh."""
+    Skipped while no job ran, or while a release or hog move larger than the
+    allowance lies between the ledger's free reading and the oracle sample."""
     if not ctx.health_samples or not ctx.vram_samples:
         return Verdict("oracle_agreement", "SKIP",
                        "needs both healthrec.jsonl and vramrec.jsonl")
@@ -785,6 +792,9 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     skewed = 0
     releasing = 0
     hog_moving = 0
+    # Of those two, skipped only because the ledger read before both samples.
+    read_age = 0
+    read_age_worst = 0
     for sample in ctx.health_samples:
         health = sample.get("health") or {}
         if not health.get("ok"):
@@ -820,22 +830,28 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             if skew > allowance:
                 skewed += 1
                 continue
-            age = gpu.get("external_sample_age_ms")
-            read_t = sample["t_wall"] - (age or 0) / 1000.0
-            span = (min(read_t, vram["t_wall"]),
-                    max(sample["t_wall"], vram["t_wall"]))
-            released = ctx.released_mb(uuid, *span)
-            if released > allowance:
-                releasing += 1
-                continue
-            moved = ctx.hog_moved_mb(uuid, *span)
-            if moved > allowance:
-                hog_moving += 1
-                continue
             ours, _ = ctx.our_pids_mb(oracle)
             oracle_external = max(0, int(oracle["used_mb"]) - ours)
-            delta = max(0, abs(int(gpu.get("external_mb") or 0)
-                               - oracle_external) - skew - released - moved)
+            raw = abs(int(gpu.get("external_mb") or 0) - oracle_external)
+            # From the ledger's free reading, or the earlier sample, to the later one.
+            age = gpu.get("external_sample_age_ms")
+            read_t = sample["t_wall"] - (age or 0) / 1000.0
+            first = min(sample["t_wall"], vram["t_wall"])
+            last = max(sample["t_wall"], vram["t_wall"])
+            released = ctx.released_mb(uuid, min(read_t, first), last,
+                                       (vram["t_wall"], read_t))
+            moved = ctx.hog_moved_mb(uuid, min(read_t, first), last)
+            if max(released, moved) > allowance:
+                if released > allowance:
+                    releasing += 1
+                else:
+                    hog_moving += 1
+                if max(ctx.released_mb(uuid, first, last, (vram["t_wall"], first)),
+                       ctx.hog_moved_mb(uuid, first, last)) <= allowance:
+                    read_age += 1
+                    read_age_worst = max(read_age_worst, raw)
+                continue
+            delta = max(0, raw - max(skew, released, moved))
             joined += 1
             per_gpu[uuid] = max(per_gpu.get(uuid, 0.0), float(delta))
             if delta > worst:
@@ -856,9 +872,12 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
         f"; {count} GPU-samples {why} were skipped" for count, why in (
             (skewed, "read while GPU used moved past the allowance"),
             (releasing, "read while a release was still leaving GPU used"),
-            (hog_moving, "read while the hog moved")) if count)
+            (hog_moving, "read while the hog moved")) if count) + (
+        f" ({read_age} of them only because the ledger read free before both "
+        f"samples; worst difference {read_age_worst} MiB)" if read_age else "")
     excluded = {"idle_samples": idle, "skewed_samples": skewed,
-                "releasing_samples": releasing, "hog_moving_samples": hog_moving}
+                "releasing_samples": releasing, "hog_moving_samples": hog_moving,
+                "read_age_samples": read_age, "read_age_worst_mb": read_age_worst}
     if joined == 0 and unpriced:
         return Verdict(
             "oracle_agreement", "SKIP",
@@ -1368,16 +1387,17 @@ def _released_mb(before: Dict[str, Any], after: Dict[str, Any],
 def _requesters(ctx: Context, model: Any,
                 rows: List[Dict[str, Any]]) -> List[Set[int]]:
     """The PIDs in `rows` that may have asked for this grant: ours spawned as
-    `model` when a spawn line names it; else, one choice each, none of them
-    or any one of ours that no spawn line ties to another model."""
+    `model` when one is on the GPU; else, one choice each, none of them or
+    any one of ours that no spawn line ties to another model."""
     ours = {proc["pid"] for row in rows for proc in row.get("procs") or []
             if ctx.is_ours(proc)}
     named = {spawn["pid"] for spawn in ctx.worker_spawns
              if spawn["model"] == str(model)}
-    if named:
+    if named & ours:
         return [named & ours]
-    tied = {spawn["pid"] for spawn in ctx.worker_spawns if spawn["model"]}
-    return [set()] + [{pid} for pid in sorted(ours - tied)]
+    other = {spawn["pid"] for spawn in ctx.worker_spawns
+             if spawn["model"] and spawn["model"] != str(model)}
+    return [set()] + [{pid} for pid in sorted(ours - other)]
 
 
 def check_grant_safety(ctx: Context) -> Verdict:
@@ -1387,8 +1407,8 @@ def check_grant_safety(ctx: Context) -> Verdict:
     latest `vramrec.jsonl` sample at or before it and asks whether it exceeded
     the GPU's *live* free memory. Over it is a FAIL, or a WARN when the next
     sample shows a release by other processes that covers the shortfall: the
-    release may have come first, and the recording cannot say. With no spawn
-    line naming the model the release is computed for each possible
+    release may have come first, and the recording cannot say. Without the
+    model's spawned PID on the GPU the release is computed for each possible
     requester, and covered under some but not all is a WARN too.
     Without that file the check reports WARN, never PASS -- the priced-headroom
     clause alone only re-checks the ledger's arithmetic against itself.
@@ -1401,7 +1421,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
     over_headroom = []
     over_free = []
     covered = []
-    untied = []
+    without_spawn_line = []
     joined = 0
     undecided = 0
     on_cpu = 0
@@ -1447,13 +1467,13 @@ def check_grant_safety(ctx: Context) -> Verdict:
                 covered.append({**row, "released_mb": min(released)})
                 continue
             if max(released) >= shortfall:
-                untied.append({**row, "released_mb": max(released)})
+                without_spawn_line.append({**row, "released_mb": max(released)})
                 continue
         over_free.append(row)
     zero_mb = sum(1 for event in grants if event["fields"].get("mb") == 0)
     if over_headroom or over_free:
         verdict = "FAIL"
-    elif joined == 0 or covered or untied or undecided:
+    elif joined == 0 or covered or without_spawn_line or undecided:
         # A grant the oracle could not clear keeps the leg from PASS.
         verdict = "WARN"
     else:
@@ -1473,12 +1493,13 @@ def check_grant_safety(ctx: Context) -> Verdict:
                                f"{row['own_pool_mb']:.0f} pool, "
                                f"{row['released_mb']} released"
                                for row in covered[:10]))
-    if untied:
-        models = sorted({str(row["model"]) for row in untied})
-        detail += (f"  -- {len(untied)} are covered by the release for some "
-                   "of the workers that may have asked for them and not for "
-                   "others: no `spawned an inferio worker` line names "
-                   f"{', '.join(models)} (RUST_LOG=info,panoptikon::inferio=trace)")
+    if without_spawn_line:
+        models = sorted({str(row["model"]) for row in without_spawn_line})
+        detail += (f"  -- {len(without_spawn_line)} are covered by the release "
+                   "for some of the workers that may have asked for them and "
+                   "not for others: no `spawned an inferio worker` line names "
+                   f"{', '.join(models)} (RUST_LOG=info,panoptikon::inferio=trace), "
+                   "or the PID it names is not among the GPU's processes")
     if joined == 0:
         detail += ("  -- ORACLE CLAUSE NOT RUN: "
                    + ("no vramrec.jsonl in the scenario (record it with "
@@ -1492,7 +1513,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
         "grant_safety", verdict, detail,
         {"grants": len(grants), "over_headroom": over_headroom[:10],
          "over_free": over_free[:10], "covered_by_release": covered[:10],
-         "covered_if_untied": untied[:10],
+         "covered_without_spawn_line": without_spawn_line[:10],
          "zero_mb_grants": zero_mb, "joined": joined, "undecided": undecided,
          "cpu_grants": on_cpu, "vramrec_samples": len(ctx.vram_samples),
          "oracle_clause_ran": joined > 0},
@@ -2099,15 +2120,16 @@ def check_persistence(ctx: Context) -> Verdict:
 
 
 def _idle_spans(legs: Optional[Dict[str, Any]]) -> List[Tuple[float, float]]:
-    """From each `job_end` (or the hog stop) to the next `job_start`, else to
-    the end of the recording."""
+    """From each drained `job_end` (or the hog stop) to the next `job_start`,
+    else to the end of the recording. A job cut at `--job-cap` still runs."""
     spans: List[Tuple[float, float]] = []
     opened: Optional[float] = None
     for event in (legs or {}).get("events") or []:
         t_wall = _iso_epoch(str(event.get("iso", "")))
         if t_wall is None:
             continue
-        if event.get("event") in ("job_end", "hog_stop_requested"):
+        if event.get("event") == "hog_stop_requested" or (
+                event.get("event") == "job_end" and event.get("outcome") == "drained"):
             opened = t_wall if opened is None else opened
         elif event.get("event") == "job_start" and opened is not None:
             spans.append((opened, t_wall))

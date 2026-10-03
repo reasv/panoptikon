@@ -656,15 +656,16 @@ clause**, which joins every `issued a memory grant` line to the latest
 granted batch) and compares the grant with the GPU's *live free memory* at that
 instant. A grant over that free memory is a FAIL, unless the next sample,
 within `--join-tolerance` of the grant (default: twice the median gap
-between `vramrec.py`'s samples), shows a release that covers the shortfall:
+between `vramrec.py`'s samples; with one sample, twice its header's
+`interval_s`, else 1.5 s), shows a release that covers the shortfall:
 the release may have come first, so the grant is listed and the check reads
 **WARN**. Only processes other than the requester that are still alive count
 as releasing; the requester emptying its cache after an out-of-memory error,
 or a worker that died, is a consequence of the grant. When no spawn line names
-the grant's model, the release is computed once with no requester and once
-with each of our workers no spawn line ties to another model; covered under
-some of them and not all is a WARN naming the model, uncovered under all a
-FAIL. A
+the grant's model, or the PID it names is not on the GPU (another PID
+namespace), the release is computed once with no requester and once with each
+of our workers no spawn line ties to another model; covered under some of them
+and not all is a WARN naming the model, uncovered under all a FAIL. A
 grant with no sample within `--join-tolerance` before it is not decidable, and
 also keeps the check at WARN. Grants on the CPU device are left out: the oracle
 records GPUs only. That
@@ -793,7 +794,7 @@ that move them are in `analyze.py --help`.
 
 | check | compares | threshold | tiers |
 |---|---|---|---|
-| `oracle_agreement` | the ledger's `external_mb` against (GPU `used` − the NVML usage of our own worker PIDs), except from a `job_end` (or the hog stop) in `legs.json` to the next `job_start`, where the idle gateway keeps its last figure; a ROCm sample whose `used` moved past the allowance during its per-process scan (`skew_mb`) is skipped, and so is one where, between the ledger's free reading (`external_sample_age_ms` old) and the oracle sample, a release was still leaving `used` (from a fall in any process's figure until `used` fell too: at least 40 ms per GiB, the slowest amdgpu lag measured) or the hog moved; each by more than the allowance, a smaller amount is taken off the difference | ±1 GiB or 2 % | PASS/FAIL, SKIP without both recordings **and SKIP where the oracle priced no PID** (WDDM: subtracting nothing would report our own footprint as the disagreement) |
+| `oracle_agreement` | the ledger's `external_mb` against (GPU `used` − the NVML usage of our own worker PIDs). Skipped from a drained `job_end` (or the hog stop) in `legs.json` to the next `job_start`: the idle gateway keeps its last figure. Skipped where `used` moved past the allowance during a ROCm per-process scan (`skew_mb`). Skipped where a release was still leaving `used` or the hog moved, by more than the allowance, between the ledger's free reading (`external_sample_age_ms` old) and the oracle sample. A release window runs from the oracle sample before a fall in a process's figure until `used` fell too, and at least 40 ms per GiB (the slowest amdgpu lag measured). Another process's window counts when it meets that span; one of our workers' only when it holds the oracle sample or the ledger's reading. A row with a failed process read opens no window. Below the allowance, the largest of skew, release and move is taken off the difference. The detail counts the samples skipped only because the ledger read before both samples (`read_age_samples`) | ±1 GiB or 2 % | PASS/FAIL, SKIP without both recordings **and SKIP where the oracle priced no PID** (WDDM: subtracting nothing would report our own footprint as the disagreement) |
 | `base_accuracy` | a replica's reported `base_mb` against the oracle's per-process reading for *its* process | ±10 % (`nvml` method, or `fdinfo` against `amdgpu-kfd`; one oracle source per window, KFD preferred) | PASS/FAIL; INFO when the window is empty or the pair is neither |
 | `footprint_agreement` | per GPU, `footprints_mb` against the summed NVML usage of our PIDs | ±1 GiB or 2 % | PASS/FAIL |
 | `slope_accuracy` | the persisted slope against `ceiling_probe.py`'s **allocated** slope (`fit` where `fit.basis` names it, else the probe's whole-batch `peak_allocated_mb` rows refitted here) | −30 % .. +100 % | PASS/FAIL; WARN (FAIL under `--learning`) when no store was written; SKIP when no probe was passed, or when no probe names a model the store holds |
@@ -807,7 +808,7 @@ that move them are in `analyze.py --help`.
 | `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) unless the leg declared it, and so does a job `legs.json` shows did not drain (`job_end` outcome other than `drained`, e.g. cut at `--job-cap`, or no `job_end`) | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs), `--expect-empty-setters` | PASS/FAIL |
 | `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | FAIL on an `over_grant` breach, WARN on a `limit_fell` one |
 | `peak_fds` | peak open descriptors and sockets against the process's own limit | — | INFO; SKIP when nothing recorded them |
-| `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form; SKIP when `legs.json` marks a hog event `hog_event_void` (it asked for no memory beyond what the hog held) |
+| `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form; SKIP when `legs.json` marks a hog event `hog_event_void` (a leave-free target at or under what the hog held, or a hold that left the target where it was) |
 | `ramp_progress` | `unit_budget` / `fit_samples` / the working size over time | — | INFO |
 | `calibration_learned` | the same three numbers, as a verdict | see below | FAIL only under `--learning` |
 | `batch_coverage` | the `seq` of each replica's `recent_batches` across health samples: a number no sample showed is a lost batch; batches a worker runs after its last sample are not counted, so PASS means no gap between samples, not that every batch was seen | none lost | PASS/WARN |
