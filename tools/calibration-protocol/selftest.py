@@ -290,6 +290,8 @@ def rocm_reason(on_rocm: str) -> str:
 
 def _fdinfo_reason(memory: Any) -> str:
     """Why the fdinfo base tier returned nothing."""
+    if not _safe(lambda: memory._is_hip(memory._torch())):
+        return "the worker's torch is not a ROCm build"
     own_mb = memory.fdinfo_own_vram_mb()
     if own_mb is not None:
         return f"fdinfo read {own_mb} MiB; the worker rejected it as implausible"

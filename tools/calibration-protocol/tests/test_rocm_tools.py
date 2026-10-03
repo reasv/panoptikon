@@ -546,34 +546,41 @@ def test_selftest_pins_like_the_spawner(tmp_path):
 
 
 def test_selftest_reasons_name_what_is_missing(tmp_path, monkeypatch):
+    def fdinfo(own_mb, hip=True):
+        return types.SimpleNamespace(fdinfo_own_vram_mb=lambda: own_mb,
+                                     _torch=lambda: None,
+                                     _is_hip=lambda torch: hip)
+
+    sysfs = types.SimpleNamespace(device_bdf=lambda: None)
     host = Host(tmp_path)
     gpu_nodes = selftest.rocm_sysfs.gpu_nodes
     monkeypatch.setattr(selftest.rocm_sysfs, "gpu_nodes",
                         lambda *roots: gpu_nodes(host.roots))
     assert selftest.rocm_reason("tier") == "not a ROCm host"
+    assert selftest._fdinfo_reason(fdinfo(None)) == (
+        "no DRM fdinfo VRAM figure for this process: not a ROCm host")
+    assert selftest._free_tier_reason(sysfs, "amdgpu-sysfs") == (
+        "no amdgpu sysfs: not a ROCm host")
     host.gpu(1, 0x0300, openable=False)
     assert selftest.rocm_reason("tier") == (
         "KFD lists a GPU but this process cannot open its render node")
     host.gpu(2, 0x0C00)
     assert selftest.rocm_reason("tier") == "tier"
-
-    def fdinfo(own_mb):
-        return types.SimpleNamespace(fdinfo_own_vram_mb=lambda: own_mb)
-
+    assert selftest._fdinfo_reason(fdinfo(None, hip=False)) == (
+        "the worker's torch is not a ROCm build")
     assert selftest._fdinfo_reason(fdinfo(None)) == (
         "no DRM fdinfo VRAM figure for this process: "
         "no amdgpu fdinfo record of this device parsed")
     assert selftest._fdinfo_reason(fdinfo(900)) == (
         "fdinfo read 900 MiB; the worker rejected it as implausible")
-    sysfs = types.SimpleNamespace(device_bdf=lambda: None)
     assert selftest._free_tier_reason(sysfs, "amdgpu-sysfs") == (
         "no amdgpu sysfs: no GPU resolved for this device")
 
 
 def test_selftest_reads_free_until_it_settles():
     """On a discrete amdgpu GPU free rises over three reads after teardown,
-    then holds; a figure that never holds stops at the read bound. Any other
-    source is read once."""
+    then holds; a figure that never holds stops at the read bound. A unified
+    GPU or any other source is read once."""
     reads = iter([1000, 1500, 2000, 2000])
     memory = types.SimpleNamespace(
         free_total_mb=lambda: (next(reads), 24576, "amdgpu-sysfs"),
@@ -585,12 +592,14 @@ def test_selftest_reads_free_until_it_settles():
     reads = iter(range(1000, 2000))
     assert selftest.settled_free_mb(memory, lambda s: None, reads=5) == (
         1005, "amdgpu-sysfs", 1.25, False)
-    reads = iter([1000, 2000])
-    memory = types.SimpleNamespace(
-        free_total_mb=lambda: (next(reads), 4096, "ram"))
-    assert selftest.settled_free_mb(memory, sleeps.append) == (
-        1000, "ram", None, None)
-    assert next(reads) == 2000
+    for source, unified in (("ram", False), ("amdgpu-sysfs", True)):
+        reads = iter([1000, 2000])
+        memory = types.SimpleNamespace(
+            free_total_mb=lambda: (next(reads), 4096, source),
+            _unified_gpu=lambda: unified)
+        assert selftest.settled_free_mb(memory, sleeps.append) == (
+            1000, source, None, None)
+        assert next(reads) == 2000
 
 
 def test_newrun_records_the_gpu_nodes(tmp_path):
