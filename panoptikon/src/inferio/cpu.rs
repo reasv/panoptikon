@@ -16,11 +16,6 @@ use super::rocm::capacity_gb_up_4;
 /// must not start with `GPU-`, which marks a CUDA UUID.
 pub(super) const DEVICE_KEY: &str = "CPU";
 
-/// Default hard ceiling on the CPU device, as a fraction of RAM. Other
-/// devices default to no cap because their OOM is catchable; running out of
-/// RAM is an OS process kill. A config value overrides it.
-pub(super) const DEFAULT_CAP_FRACTION: f64 = 0.75;
-
 /// RAM the CPU device always keeps free for the kernel and other processes: a
 /// tenth of the machine, at most [`RAM_RESERVE_MAX_MB`] and at least
 /// [`RAM_RESERVE_MIN_MB`], or a quarter of a machine too small for that. A
@@ -121,8 +116,8 @@ pub(super) fn probe(roots: &MemRoots) -> Option<u64> {
     ram_total_mb(roots).filter(|mb| *mb > 0)
 }
 
-/// The CPU device for `ram_mb` MiB of RAM. `total_mb` is all of it;
-/// [`DEFAULT_CAP_FRACTION`] is applied as a budget, not a smaller total.
+/// The CPU device for `ram_mb` MiB of RAM. `total_mb` is all of it; the
+/// ledger keeps [`ram_reserve_mb`] of it free.
 pub(super) fn gpu(ram_mb: u64) -> GpuInfo {
     GpuInfo {
         index: 0,

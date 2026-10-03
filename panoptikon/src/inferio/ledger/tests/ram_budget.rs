@@ -113,8 +113,8 @@ fn a_small_host_still_runs_under_the_reserve() {
             let state = ledger.lock();
             assert_eq!(
                 ledger.refusal_room_locked(&state, cpu::DEVICE_KEY),
-                ram_mb * 3 / 4,
-                "a load is refused against the cap alone, as without a reserve"
+                ram_mb,
+                "a load is refused against the room with no reserve"
             );
         }
         let handle = cpu_worker(ram_mb, base_mb, base_mb);

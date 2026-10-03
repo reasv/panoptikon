@@ -418,24 +418,20 @@ impl From<VramBudget> for VramBudgets {
     }
 }
 
-/// Fill the CPU device's unset budget values with its shipped defaults (a
-/// `cap_fraction`, since running out of RAM gets a process killed, and a
-/// wider knee band). GPUs are untouched.
+/// Fill the CPU device's unset knee band with its wider shipped default.
+/// GPUs are untouched.
 fn with_shipped_gpu_defaults(inventory: &GpuInventory, mut budgets: VramBudgets) -> VramBudgets {
     for gpu in inventory.gpus().unwrap_or(&[]) {
         if gpu.uuid != super::cpu::DEVICE_KEY {
             continue;
         }
         let configured = budgets.for_gpu(&gpu.uuid);
-        if configured.cap_fraction.is_some() && configured.knee_max_bucket_dispersion.is_some() {
+        if configured.knee_max_bucket_dispersion.is_some() {
             continue;
         }
         budgets = budgets.with_gpu(
             gpu.uuid.clone(),
             VramBudget {
-                cap_fraction: configured
-                    .cap_fraction
-                    .or(Some(super::cpu::DEFAULT_CAP_FRACTION)),
                 knee_max_bucket_dispersion: configured
                     .knee_max_bucket_dispersion
                     .or(Some(super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION)),

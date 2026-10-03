@@ -225,12 +225,11 @@ fn with_cpu_device(mut host: HostGpus) -> HostGpus {
         uuid = %gpu.uuid,
         name = %gpu.name,
         total_mb = gpu.total_mb,
-        // A configured `cap_fraction` overrides this later, in the ledger.
-        default_cap_fraction = cpu::DEFAULT_CAP_FRACTION,
+        ram_reserve_mb = cpu::ram_reserve_mb(gpu.total_mb),
         accelerators = host.inventory.gpus().map_or(0, <[GpuInfo]>::len),
         "admitting batches from workers that run on the CPU against system \
          RAM (running out of it is an OS process kill rather than a catchable \
-         allocation failure, so the device ships with a default ceiling)"
+         allocation failure, so the device always keeps a RAM reserve free)"
     );
     host.inventory = host.inventory.with_cpu(ram_mb, roots);
     host

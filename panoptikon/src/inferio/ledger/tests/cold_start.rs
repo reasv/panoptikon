@@ -194,11 +194,12 @@ fn gpu_pair(headroom: u64, seeds: [u32; 2], percent: u64) -> (Arc<VramLedger>, V
 }
 
 /// `count` cold replicas on a 16 GB CPU-only host under the shipped budget
-/// (limit 12 000 MiB), `headroom` MiB over their bases. A seed batch grows
-/// the resident set by `percent` of its design cost and hands it back.
+/// (limit 13 952 MiB, RAM less its reserve), `headroom` MiB over their bases.
+/// A seed batch grows the resident set by `percent` of its design cost and
+/// hands it back.
 fn cpu_host(count: u64, headroom: u64, percent: u64) -> (Arc<VramLedger>, Vec<Cold>) {
     const RAM_MB: u64 = 16_000;
-    let base_mb = (12_000 - headroom) / count;
+    let base_mb = (RAM_MB - cpu::ram_reserve_mb(RAM_MB) - headroom) / count;
     let ledger = VramLedger::new(
         &GpuInventory::known_cpu(RAM_MB),
         VramBudget::default().into(),
@@ -248,11 +249,15 @@ fn mac(pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>) {
     const RAM_MB: u64 = 16_384;
     const RECOMMENDED_MAX_MB: u64 = RAM_MB / 4 * 3;
     const BASE_MB: u64 = 2500;
-    let ledger = VramLedger::new(
-        &GpuInventory::known_mps(RAM_MB),
-        VramBudget::default().into(),
-        None,
+    // The CPU device capped at Metal's three quarters: the same room on both.
+    let budgets = VramBudgets::default().with_gpu(
+        cpu::DEVICE_KEY,
+        VramBudget {
+            cap_fraction: Some(0.75),
+            ..VramBudget::default()
+        },
     );
+    let ledger = VramLedger::new(&GpuInventory::known_mps(RAM_MB), budgets, None);
     ledger.install_probe_stub(None);
     let mut replicas = Vec::new();
     for (model, device, handle) in [

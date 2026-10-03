@@ -574,12 +574,13 @@ carrying a footnote forever, and the footnote is the whole complaint.
   `CPU (64 GB)` (physical RAM rounded; the ISA/AVX level is captured
   indirectly by `platform` + `torch` in the key already). Backend key
   stays `"cpu"`.
-- **Total**: physical RAM. **DP-8 (decided) — default ceiling.** A RAM
+- **Total**: physical RAM. **DP-8 (decided) — no default ceiling.** A RAM
   OOM is a process kill, not a catchable exception, so the CPU device
-  ships with a default `cap_fraction = 0.75` rather than relying on
-  margin alone. Overridable like any GPU. It also keeps a reserve of a
+  keeps a reserve of a
   tenth of RAM (at most 16 GiB; at least 2 GiB, or a quarter of RAM under
-  8 GiB) that no setting lowers, the worker's clamp
+  8 GiB) that no setting lowers. `cap_fraction` is off by default, as on
+  every device; the reserve, live sizing and the shrink under pressure
+  already bound what we take. The worker's clamp
   keeps the same reserve, and on Linux workers are the kernel's first
   out-of-memory victim (docs/batch-calibration-design.md, "Host RAM on the
   CPU device").
@@ -721,13 +722,10 @@ carrying a footnote forever, and the footnote is the whole complaint.
   total is physical RAM, read from the kernel at probe time; the worker's
   psutil figure is a second reading of a settled fact, and letting it adopt
   would log a re-adoption every time the two rounded differently.
-- **DP-8's ceiling is a shipped GPU default, applied in the ledger.**
-  `VramLedger::new` fills `cap_fraction = 0.75` for the CPU device when — and
-  only when — the resolved configuration leaves it `None`, so both
+- **DP-8: a configured ceiling applies, none is shipped.** Both
   `[inference_local.vram] cap_fraction` and
-  `[inference_local.vram.gpu."CPU"] cap_fraction` win (on a CPU host they are
-  the same statement anyway, the CPU device being the only one). No shipped
-  TOML line, so absence keeps tracking the constant.
+  `[inference_local.vram.gpu."CPU"] cap_fraction` cap the CPU device (on a
+  CPU host they are the same statement, the CPU device being the only one).
 - **`windows-sys` gained one feature, and no new crate.**
   `Win32_System_SystemInformation` for `GlobalMemoryStatusEx`; the crate was
   already a direct Windows dependency for job objects and `LockFileEx`.
@@ -936,4 +934,4 @@ recommendation (amended in review).
 | 5 | Worker's unified-memory-device signal | Spawner env `PANOPTIKON_UNIFIED_GPU`; **as implemented** it carries the GPU's PCI address and the worker acts on it only when that is the GPU it resolved for itself |
 | 6 | RAM capacity in APU calibration name | Yes — `AMD gfx1151 APU (128 GB)` |
 | 7 | Price CPU at all | Yes, last |
-| 8 | CPU default ceiling | `cap_fraction = 0.75` on the CPU device |
+| 8 | CPU default ceiling | None; the RAM reserve is kept whatever the settings |

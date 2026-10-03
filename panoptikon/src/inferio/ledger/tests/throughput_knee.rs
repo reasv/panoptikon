@@ -207,11 +207,7 @@ fn the_cpu_device_ships_its_own_band_and_a_user_overrides_it() {
             .for_gpu(super::cpu::DEVICE_KEY)
             .knee_dispersion_in_force(),
         0.5,
-        "a configured band wins, and the shipped cap_fraction still lands"
-    );
-    assert_eq!(
-        configured.for_gpu(super::cpu::DEVICE_KEY).cap_fraction,
-        Some(super::cpu::DEFAULT_CAP_FRACTION)
+        "a configured band wins"
     );
 }
 

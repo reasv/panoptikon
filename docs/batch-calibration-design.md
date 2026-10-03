@@ -639,8 +639,8 @@ and on a Mac the Metal device and the CPU exist side by side. So the device
 model is per replica, not per host:
 
 - **Every inventory carries the CPU device** (`cpu.rs`: key `CPU`, total =
-  physical RAM bounded by the cgroup limit in force, the shipped
-  `cap_fraction = 0.75`, a reserve of at least a tenth of RAM; see "Host RAM
+  physical RAM bounded by the cgroup limit in force, a reserve of at least
+  a tenth of RAM; see "Host RAM
   on the CPU device"), appended after whatever accelerators the probe
   found. A host with no accelerator at all is the degenerate case of that,
   not a separate world.
@@ -699,7 +699,7 @@ at grant time and needs no frame for: each device's `external_mb` nets the
 *pair's* footprints out of its free reading rather than only its own, and each
 device's headroom subtracts the pair's charges and load reservations. `limit_mb`
 stays per device — it is that allocator's own ceiling, `recommended_max_memory()`
-on Metal and `cap_fraction × RAM` on the CPU device — and the shared room is
+on Metal and RAM on the CPU device — and the shared room is
 enforced in `headroom_mb`, so on either device `headroom + Σ charges` stays
 inside `memsize − external`. The ledger lock serialises grant issuance, which
 is what makes "the other device's headroom drops immediately" true rather than
@@ -742,10 +742,10 @@ therefore differs from a GPU in six ways.
   It scales with the machine because what it covers does: the kernel's
   watermarks, slab, and other processes' short-lived growth. So on this
   device `margin = 0` and `cap_fraction = 1.0` do not mean "all of RAM": the
-  floor is still kept. The cap
-  (`cap_fraction`, 0.75) limits how much of an idle machine we take; it does
-  nothing once other processes hold more than a quarter of RAM, and there
-  the reserve is the only margin. A load is refused against the room with no
+  floor is still kept. No `cap_fraction` is set by default: the reserve, the
+  live free reading and the worker's per-batch clamp already bound what a
+  batch takes, and a fixed share of RAM would only idle memory on a machine
+  nothing else uses. A configured cap applies on top of the reserve. A load is refused against the room with no
   reserve deducted, so the reserve refuses no load. A replica left with less
   headroom than one unit still runs, one unit per batch, unpriced.
 - **The worker keeps the same reserve.** The grant carries it

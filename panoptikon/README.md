@@ -489,11 +489,9 @@ set, the admission budget is the smaller:
   again as other processes use rather than being read as "10 %".
 - **`cap_fraction`** (default off) — a hard ceiling as a fraction of the
   GPU's total VRAM. This is the server lever, for partitioning one card
-  between services. If you set it, leave `margin` alone. One GPU ships with
-  it **on**: the `CPU` device (see the table below) defaults to `0.75`, because
-  running the machine out of RAM is an OS process kill rather than a catchable
-  allocation failure. Setting it — here or under
-  `[inference_local.vram.gpu."CPU"]` — replaces that default.
+  between services. If you set it, leave `margin` alone. On the `CPU` device
+  (see the table below) it caps the share of RAM, on top of the reserve
+  described below.
 - **`knee_max_bucket_dispersion`** (default `0.20`, or `0.35` on the `CPU`
   device) — how far the throughput measurements inside one batch-size bucket
   may disagree, as a relative median absolute deviation, before the
@@ -512,7 +510,7 @@ Host RAM is budgeted more carefully than VRAM, because running out of it
 kills a process instead of failing an allocation. The `CPU` device always
 keeps a tenth of the machine's RAM free (at most 16 GiB; at least 2 GiB, or
 a quarter of RAM on a machine under 8 GiB): `margin` can raise that reserve,
-never lower it, and its `cap_fraction` (0.75 by default) still applies. So
+never lower it. So
 under `[inference_local.vram.gpu."CPU"]`, `margin = 0` and
 `cap_fraction = 1.0` do not hand over all of RAM: the reserve is still kept.
 On Linux, reclaimable kernel slab is not counted as free RAM, and inference
@@ -589,7 +587,7 @@ scope* means we do not ship a torch build for it at all.
 | AMD discrete GPU, ROCm (Linux) | calibrated | `GPU-<unique_id>` / `GPU-BDF-…` |
 | AMD APU / iGPU, ROCm (Linux) | calibrated (carve-out + GTT) | `GPU-<unique_id>` / `GPU-BDF-…` |
 | Apple Silicon, MPS | calibrated | `GPU-MPS` |
-| No accelerator (CPU) | calibrated (system RAM, default `cap_fraction = 0.75`) | `CPU` |
+| No accelerator (CPU) | calibrated (system RAM) | `CPU` |
 | Ambient `*_VISIBLE_DEVICES` restriction, Slurm-managed hosts | backstopped only | — |
 | Partitioned GPUs (MI300-class CPX/NPS) | backstopped only | — |
 | Unknown inventory (no/failed `nvidia-smi`, unreadable sysfs, or a CPU host whose total RAM could not be read) | backstopped only | — |

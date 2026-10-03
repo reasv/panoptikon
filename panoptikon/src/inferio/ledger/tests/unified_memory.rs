@@ -866,28 +866,22 @@ fn metals_pool_ratio_is_learned_whole_where_cudas_ceiling_would_cut_it() {
     assert!((on_heap - POOL_MARGIN_MAX_CUDA).abs() < 1e-9, "{on_heap}");
 }
 
-/// The CPU device ships with a hard ceiling at 75 % of RAM, where every other
-/// GPU ships with the cap off.
+/// The CPU device ships with the cap off, like every other device: with no
+/// external usage its limit is RAM less its reserve.
 #[test]
-fn the_cpu_device_ships_with_a_default_ceiling() {
+fn the_cpu_device_ships_without_a_ceiling() {
     let cpu = cpu_ledger(no_margin());
     let gpu = &cpu.health()[0];
     assert_eq!(gpu.gpu_uuid, "CPU");
     assert_eq!(gpu.gpu_name, "CPU (64 GB)");
     assert_eq!(gpu.total_mb, CPU_RAM_MB, "the total is RAM itself");
-    assert_eq!(gpu.cap_fraction, Some(0.75));
-    assert_eq!(
-        gpu.limit_mb,
-        (CPU_RAM_MB as f64 * 0.75).floor() as u64,
-        "with no external usage the cap is what binds"
-    );
-
-    // A discrete GPU is untouched: the default is per-backend, not a new global.
-    assert_eq!(ledger(100_000, no_margin()).health()[0].cap_fraction, None);
+    assert_eq!(gpu.cap_fraction, None);
+    assert_eq!(gpu.reserve_mb, cpu::ram_reserve_mb(CPU_RAM_MB));
+    assert_eq!(gpu.limit_mb, CPU_RAM_MB - gpu.reserve_mb);
 }
 
-/// The CPU default yields to a configured value, from the per-GPU override
-/// or the section-wide one alike.
+/// A configured cap applies to the CPU device, from the per-GPU override or
+/// the section-wide one alike.
 #[test]
 fn a_configured_ceiling_overrides_the_cpu_default() {
     let per_gpu = cpu_ledger(
@@ -906,6 +900,7 @@ fn a_configured_ceiling_overrides_the_cpu_default() {
         ),
     );
     assert_eq!(per_gpu.health()[0].cap_fraction, Some(0.5));
+    assert_eq!(per_gpu.health()[0].limit_mb, CPU_RAM_MB / 2);
 
     let section_wide = cpu_ledger(VramBudget {
         margin: Some(0.0),
@@ -986,15 +981,16 @@ fn a_cpu_replica_is_priced_beside_the_gpus_of_a_cuda_host() {
 
     // Each device keeps its own regime.
     assert_eq!(device("CPU").total_mb, CPU_RAM_MB);
-    assert_eq!(device("CPU").cap_fraction, Some(0.75));
+    assert_eq!(device("CPU").reserve_rule, RESERVE_RULE_RAM_FLOOR);
     assert_eq!(device("CPU").external_source.as_deref(), Some("ram"));
     assert!(
-        device("CPU").limit_mb <= (CPU_RAM_MB as f64 * 0.75) as u64 && device("CPU").limit_mb > 0,
+        device("CPU").limit_mb <= CPU_RAM_MB - cpu::ram_reserve_mb(CPU_RAM_MB)
+            && device("CPU").limit_mb > 0,
         "limit {}",
         device("CPU").limit_mb
     );
     for card in ["GPU-1a2b", "GPU-3c4d"] {
-        assert_eq!(device(card).cap_fraction, None, "{card}");
+        assert_ne!(device(card).reserve_rule, RESERVE_RULE_RAM_FLOOR, "{card}");
     }
     assert_eq!(device("GPU-3c4d").total_mb, 100_000);
     assert_eq!(device("GPU-3c4d").external_source.as_deref(), Some("nvml"));
