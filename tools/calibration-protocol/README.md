@@ -1393,22 +1393,33 @@ so it cannot be driven by a job), `poison`, `poisonmix`, `pixmix`, `ocr` and
 test) drives the real ledger window by window: a synthetic rate curve or a
 recorded trace says how long each batch takes, and the ledger sizes the next
 window. The test stands in for the dispatcher (window taken within the
-ledger's window target, the queue's counts passed with the grant) and for the
-worker (packing, the live memory clamp, the pool release, memory reported as
-that device's worker reports it). Every restart reads the calibration store
-back from disk. It writes one line per process start. Traces come from
-archived real runs and stay outside the repository.
+ledger's window target, the queue's counts passed with the grant, the queue
+found dry when a window took all the caller had queued and wanted more) and
+for the worker (packing, the live memory clamp, the pool release, a memory
+sample with every reply, as that device's worker reports it). A batch
+allocates `pu` MiB a unit and the pool grows to `ratio` times that; host RAM
+grows `rsspu` a unit, within ±`rsssd` per batch. Every restart reads the
+calibration store back from disk. It writes one line per process start.
+
+Traces come from archived real runs and stay outside the repository; a
+manifest in the archive (`sizing-manifest.json`) says which runs feed which
+trace. Each run's batches are divided by its speed level before pooling, and
+each replayed start draws one recorded run's level for all its sizes. Within
+a start, each size replays its own recorded series, so the host's level
+changes within a run are there but not shared between sizes; a separate table
+adds them shared, on top (two levels held for an exponential time, measured
+from the runs, in `models.txt`).
 
 ```bash
 # Traces from ~/panoptikon-archive into ~/panoptikon-archive/sizing-traces (needs `zstd`)
 python3 tools/calibration-protocol/sizing_traces.py
 # The test binary (its path is the "Executable" line)
 cargo test -p panoptikon --bin panoptikon sizing_sim --no-run
-# The acceptance tables, per device class and sizing mode (CPU only; 8 seeds, 12 jobs)
+# The acceptance tables, per device class and sizing mode, CUDA on both days' traces
 python3 tools/calibration-protocol/sizing_table.py --bin target/debug/deps/panoptikon-<hash> --jobs 12
 # Real jobs of the sizing code under test beside their replay
 python3 tools/calibration-protocol/sizing_table.py --bin ... --set fidelity --seeds 40
-# The batches behind each traced size; the earlier study's trace-replay cells
+# The batches behind each traced size and the gains per doubling; the earlier study's cells
 python3 tools/calibration-protocol/sizing_table.py --bin ... --set traces
 python3 tools/calibration-protocol/sizing_table.py --bin ... --set reference --seeds 100
 ```
@@ -1417,13 +1428,23 @@ The gains a larger batch must show per doubling are parameters (`--gpu`,
 `--strict` for CPU and unified memory, `--throughput`); they set the
 "step-rule W" columns: the size a rule that doubles only on that gain settles
 at, from the model's seed, on the fixed-size rates. Fixed-size rows run one
-size every window without asking the ledger. The scenario keys are listed on
-`Scenario` in the test; a scenario that panics fails the table.
+size every window without asking the ledger. A size resting on fewer than 30
+recorded batches is marked and left out of the best fixed size and the
+step-rule W; the fixed-size table gives each rate a block-bootstrap interval.
+The scenario keys are listed on `Scenario` in the test; a scenario that panics
+fails the table.
 
-Limits of a replay: a size between traced sizes takes the nearest one's
-rates; above the largest it takes the largest one's rate per unit, and the
-window time outside the batches grows in proportion. A series shorter than
-the job loops. `--set traces` shows how many batches stand behind each size.
-The ledger's own clocks run in real time; the simulator ages the grant, idle
-and trim clocks by each window's simulated time, so results still vary by a
-few tenths of a percent between runs.
+Limits of a replay:
+- A size between traced sizes takes the nearest one's rates; above the
+  largest it takes the largest one's rate per unit, and the window time
+  outside the batches grows in proportion. A series shorter than the job
+  loops.
+- The daily rows have no real short job behind them: they rest on the traces'
+  first-batch and warm-up figures until a real daily job is replayed against
+  them.
+- No archived run measured a rate curve on the CPU device: its rows run
+  synthetic curves with the real noise of the CPU device's windows.
+- Host RAM per batch varies only where a run measured it (docTR).
+- The ledger's own clocks run in real time; the simulator ages the grant, idle
+  and trim clocks by each window's simulated time, so results still vary by a
+  few tenths of a percent between runs.
