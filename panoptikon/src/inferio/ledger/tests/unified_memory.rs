@@ -883,7 +883,7 @@ fn the_cpu_device_ships_without_a_ceiling() {
 /// A configured cap applies to the CPU device, from the per-GPU override or
 /// the section-wide one alike.
 #[test]
-fn a_configured_ceiling_overrides_the_cpu_default() {
+fn a_configured_ceiling_caps_the_cpu_device() {
     let per_gpu = cpu_ledger(
         VramBudgets::uniform(VramBudget {
             margin: Some(0.0),
@@ -1174,7 +1174,7 @@ pub(super) fn push_basis(
 fn mac_ledger(ram_mb: u64, recommended_max_mb: u64) -> Arc<VramLedger> {
     let ledger = VramLedger::for_test_gpus(
         &[(MPS_GPU, "Apple Silicon", recommended_max_mb, None)],
-        // The shipped default: no user margin, so a capped 1 024 MiB reserve.
+        // The shipped default: no user margin, so the RAM floor as reserve.
         VramBudget::default(),
         None,
     );

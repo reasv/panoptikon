@@ -482,7 +482,7 @@ async fn a_replica_alone_on_its_card_is_not_cut_for_another_cards_replicas() {
 /// cold CPU replica asking beside it is cut to what is left, here one unit.
 #[test]
 fn a_gpu_replicas_ram_booking_cuts_a_cold_cpu_replicas_batch() {
-    // 8080 MiB of RAM: a 6060 MiB limit under the shipped cap.
+    // 8080 MiB of RAM: a 6060 MiB limit, RAM less its reserve.
     const RAM_MB: u64 = 8080;
     let ledger = host_with_ram(&[GPU], None, RAM_MB);
     let (_handle, admission) = gpu_replica(&ledger, "g/on-gpu", GPU, 256);

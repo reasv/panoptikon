@@ -2,9 +2,9 @@
 # Calibration configuration C6 — Docker CPU image, cgroup-limited.
 #
 # The CPU unified-memory device: no GPU at all, so the orchestrator prices work
-# against system RAM (`CPU` device key, `ram`/`rss` tiers, cap_fraction 0.75,
-# death-as-negative). The cgroup limit is what keeps the experiment off the
-# host's own OOM killer while the scenario deliberately starves the worker.
+# against system RAM (`CPU` device key, `ram`/`rss` tiers, death-as-negative).
+# The cgroup limit is what keeps the experiment off the host's own OOM killer
+# while the scenario deliberately starves the worker.
 #
 # Copied from the repo root docker-compose.yml. Deviations, all marked CALIB:
 #

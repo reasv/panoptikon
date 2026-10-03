@@ -617,8 +617,10 @@ pub struct Grant {
     /// Host RAM a GPU replica's window may add to its resident set: its
     /// booking on the CPU device less the growth it already holds; 0 if none.
     pub ram_mb: u64,
-    /// Free host RAM the worker's live clamp leaves alone: the CPU device's
-    /// reserve, for a replica priced or booked in host RAM; 0 otherwise.
+    /// Free host RAM the worker's live clamp leaves alone: the reserve of the
+    /// grant's device when that device is host RAM (the CPU device, or the
+    /// Mac GPU against `hw.memsize`), otherwise the CPU device's reserve for
+    /// a RAM booking; 0 when neither.
     pub ram_reserve_mb: u64,
 }
 

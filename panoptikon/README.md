@@ -490,8 +490,8 @@ set, the admission budget is the smaller:
 - **`cap_fraction`** (default off) — a hard ceiling as a fraction of the
   GPU's total VRAM. This is the server lever, for partitioning one card
   between services. If you set it, leave `margin` alone. On the `CPU` device
-  (see the table below) it caps the share of RAM, on top of the reserve
-  described below.
+  (see the table below) it caps the share of RAM: the limit is the smaller of
+  the cap and what is left after the reserve described below.
 - **`knee_max_bucket_dispersion`** (default `0.20`, or `0.35` on the `CPU`
   device) — how far the throughput measurements inside one batch-size bucket
   may disagree, as a relative median absolute deviation, before the
@@ -508,11 +508,11 @@ when VRAM has room.
 
 Host RAM is budgeted more carefully than VRAM, because running out of it
 kills a process instead of failing an allocation. The `CPU` device, and on a
-Mac the GPU, always keep a tenth of the machine's RAM free (at most 16 GiB; at least 2 GiB, or
-a quarter of RAM on a machine under 8 GiB): `margin` can raise that reserve,
-never lower it. So
-under `[inference_local.vram.gpu."CPU"]`, `margin = 0` and
-`cap_fraction = 1.0` do not hand over all of RAM: the reserve is still kept.
+Mac the GPU, always keep a tenth of the machine's RAM free (at most 16 GiB;
+at least 2 GiB, or a quarter of RAM on a machine under 8 GiB): `margin` can
+raise that reserve, never lower it. So under
+`[inference_local.vram.gpu."CPU"]`, `margin = 0` and `cap_fraction = 1.0` do
+not hand over all of RAM: the reserve is still kept.
 On Linux, reclaimable kernel slab is not counted as free RAM, and inference
 workers are the first processes the kernel kills if RAM does run out, so
 other programs are spared and the job re-queues the affected items. A model

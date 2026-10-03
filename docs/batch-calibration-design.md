@@ -640,10 +640,9 @@ model is per replica, not per host:
 
 - **Every inventory carries the CPU device** (`cpu.rs`: key `CPU`, total =
   physical RAM bounded by the cgroup limit in force, a reserve of at least
-  a tenth of RAM; see "Host RAM
-  on the CPU device"), appended after whatever accelerators the probe
-  found. A host with no accelerator at all is the degenerate case of that,
-  not a separate world.
+  a tenth of RAM; see "Host RAM on the CPU device"), appended after whatever
+  accelerators the probe found. A host with no accelerator at all is the
+  degenerate case of that, not a separate world.
 - **The memory backend is per device.** The accelerators keep the host's
   backend exactly as before — NVML/nvidia-smi, amdgpu sysfs, Metal — and the
   CPU device reads the machine's RAM statistics wherever it lives. One
@@ -745,9 +744,11 @@ therefore differs from a GPU in six ways.
   floor is still kept. No `cap_fraction` is set by default: the reserve, the
   live free reading and the worker's per-batch clamp already bound what a
   batch takes, and a fixed share of RAM would only idle memory on a machine
-  nothing else uses. A configured cap applies on top of the reserve. A load is refused against the room with no
-  reserve deducted, so the reserve refuses no load. A replica left with less
-  headroom than one unit still runs, one unit per batch, unpriced.
+  nothing else uses. With a cap configured, the limit is the smaller of the
+  cap and what is left after the reserve. A load is refused against all of
+  RAM less the floor (at most the cap), not against the free reading. A
+  replica left with less headroom than one unit still runs, one unit per
+  batch, unpriced.
 - **The worker keeps the same reserve.** The grant carries it
   (`ram_reserve_mb`) and the worker's per-batch clamp spends
   `free − reserve + pool`. Without it the clamp would size the batch to all
@@ -2200,7 +2201,7 @@ reserve = ceil(external × margin)                          # margin configured
 reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
 reserve = max(reserve, min(1024 MiB, 3 % of total))        # unset, any GPU but Apple's
 reserve = 1024 MiB                                         # unset, CUDA GPU that spills
-reserve = max(reserve, clamp(total / 10, min(2 GiB, total / 4), 16 GiB))  # the CPU device, always
+reserve = max(reserve, clamp(total / 10, min(2 GiB, total / 4), 16 GiB))  # CPU device and Mac GPU (total = hw.memsize), always
 limit   = min(total × cap_fraction, total − external − reserve)
 ```
 

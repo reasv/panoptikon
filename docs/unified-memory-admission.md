@@ -706,9 +706,10 @@ carrying a footnote forever, and the footnote is the whole complaint.
   currency (16 units after 32 reported a delta of 545 MiB against 289 on the
   way up, with live RSS unmoved). The mitigation is in the worker's spawn
   environment: `MALLOC_MMAP_THRESHOLD_=131072` and
-  `MALLOC_TRIM_THRESHOLD_=131072` in the CPU arm of `accelerator_env.rs` pin
-  the threshold so large blocks stay on `mmap`, where freeing returns the
-  pages — with them the floor held at 678 MiB and every size reproduced to
+  `MALLOC_TRIM_THRESHOLD_=131072` in the CPU arm of `accelerator_env.rs`,
+  each unless the operator set it, pin the threshold so large blocks stay on
+  `mmap`, where freeing returns the pages — with them the floor held at
+  678 MiB and every size reproduced to
   within 4 MiB. It is Linux/glibc only; other platforms ignore both. Where the
   pinning does not reach (musl, Windows, macOS, an allocator the impl brings
   itself) the residue is an over-read — the safe direction — and the fit's
