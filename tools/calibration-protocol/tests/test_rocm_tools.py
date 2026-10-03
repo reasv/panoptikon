@@ -206,6 +206,17 @@ def test_a_descriptor_inherited_across_fork_counts_once(tmp_path):
         "fdinfo", {700: 150}, [])
 
 
+def test_one_pasid_on_two_gpus_counts_on_each(tmp_path):
+    host = Host(tmp_path, kfd_proc=False).gpu(1, 0x0300).gpu(2, 0x0C00)
+    host.fdinfo(700, 3, _fd(BDF_03, None, 100 * 1024, "memory", pasid=32769))
+    host.fdinfo(700, 4, _fd(BDF_0C, None, 200 * 1024, "memory", pasid=32769),
+                target="/dev/dri/renderD129")
+    first, second = rocm_sysfs.inventory(host.roots)
+    assert rocm_sysfs.process_vram_mb(host.roots, [first, second]) == {
+        first.key: ("fdinfo", {700: 100}, []),
+        second.key: ("fdinfo", {700: 200}, [])}
+
+
 def test_a_pasid_reused_after_the_kfd_list_is_read_is_left_out(tmp_path,
                                                                monkeypatch):
     host = Host(tmp_path, host_pid_ns=False).gpu(1, 0x0300)
