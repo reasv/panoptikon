@@ -545,44 +545,52 @@ def test_selftest_pins_like_the_spawner(tmp_path):
     assert selftest.rocm_pin(5, {}, host.roots) == {}
 
 
-def test_selftest_says_not_a_rocm_host_only_without_a_kfd_gpu(tmp_path,
-                                                             monkeypatch):
+def test_selftest_reasons_name_what_is_missing(tmp_path, monkeypatch):
     host = Host(tmp_path)
-    inventory = selftest.rocm_sysfs.inventory
-    monkeypatch.setattr(selftest.rocm_sysfs, "inventory",
-                        lambda *roots: inventory(host.roots))
-    memory = types.SimpleNamespace(
-        device_bdf=lambda: None, _ram_currency=lambda: False,
-        _nvml_own_process_mb=lambda holding_mb: None,
-        _fdinfo_base_mb=lambda reserved, delta: None,
-        _mps_call=lambda name: None, _mb=lambda value: None,
-        _free_mb=lambda source=None: (None, None),
-        _free_delta=lambda before, after: None,
-        context_allowance_mb=lambda: (0, "default"), IMPLAUSIBLE_SLACK_MB=0)
+    gpu_nodes = selftest.rocm_sysfs.gpu_nodes
+    monkeypatch.setattr(selftest.rocm_sysfs, "gpu_nodes",
+                        lambda *roots: gpu_nodes(host.roots))
+    assert selftest.rocm_reason("tier") == "not a ROCm host"
+    host.gpu(1, 0x0300, openable=False)
+    assert selftest.rocm_reason("tier") == (
+        "KFD lists a GPU but this process cannot open its render node")
+    host.gpu(2, 0x0C00)
+    assert selftest.rocm_reason("tier") == "tier"
 
-    def reasons():
-        base = {row["tier"]: row["reason"] for row in
-                selftest.probe_base_tiers(memory, {}, None, None, None)}
-        return [selftest._free_tier_reason(memory, "amdgpu-sysfs"),
-                base["fdinfo"]]
+    def fdinfo(own_mb):
+        return types.SimpleNamespace(fdinfo_own_vram_mb=lambda: own_mb)
 
-    assert all("not a ROCm host" in reason for reason in reasons())
-    host.gpu(1, 0x0300)
-    assert not any("not a ROCm host" in reason for reason in reasons())
+    assert selftest._fdinfo_reason(fdinfo(None)) == (
+        "no DRM fdinfo VRAM figure for this process: "
+        "no amdgpu fdinfo record of this device parsed")
+    assert selftest._fdinfo_reason(fdinfo(900)) == (
+        "fdinfo read 900 MiB; the worker rejected it as implausible")
+    sysfs = types.SimpleNamespace(device_bdf=lambda: None)
+    assert selftest._free_tier_reason(sysfs, "amdgpu-sysfs") == (
+        "no amdgpu sysfs: no GPU resolved for this device")
 
 
 def test_selftest_reads_free_until_it_settles():
-    """Free rises over three reads after teardown, then holds; a figure that
-    never holds stops at the read bound."""
+    """On a discrete amdgpu GPU free rises over three reads after teardown,
+    then holds; a figure that never holds stops at the read bound. Any other
+    source is read once."""
     reads = iter([1000, 1500, 2000, 2000])
     memory = types.SimpleNamespace(
-        free_total_mb=lambda: (next(reads), 24576, "amdgpu-sysfs"))
-    free, source, _, settled = selftest.settled_free_mb(memory, lambda s: None)
-    assert (free, source, settled) == (2000, "amdgpu-sysfs", True)
+        free_total_mb=lambda: (next(reads), 24576, "amdgpu-sysfs"),
+        _unified_gpu=lambda: False)
+    sleeps = []
+    assert selftest.settled_free_mb(memory, sleeps.append) == (
+        2000, "amdgpu-sysfs", 0.75, True)
+    assert sleeps == [0.25] * 3
     reads = iter(range(1000, 2000))
-    free, _, _, settled = selftest.settled_free_mb(memory, lambda s: None,
-                                                   reads=5)
-    assert (free, settled) == (1005, False)
+    assert selftest.settled_free_mb(memory, lambda s: None, reads=5) == (
+        1005, "amdgpu-sysfs", 1.25, False)
+    reads = iter([1000, 2000])
+    memory = types.SimpleNamespace(
+        free_total_mb=lambda: (next(reads), 4096, "ram"))
+    assert selftest.settled_free_mb(memory, sleeps.append) == (
+        1000, "ram", None, None)
+    assert next(reads) == 2000
 
 
 def test_newrun_records_the_gpu_nodes(tmp_path):

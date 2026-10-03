@@ -258,26 +258,43 @@ def probe_free_tiers(memory: Any) -> List[Dict[str, Any]]:
 
 def settled_free_mb(memory: Any, sleep: Callable[[float], None] = time.sleep,
                     interval_s: float = 0.25, reads: int = 40
-                    ) -> Tuple[Optional[int], Optional[str], float, bool]:
-    """Device free once two reads `interval_s` apart agree, at most `reads`
-    more reads: amdgpu lowers its used counter some time after a release.
-    Returns `(free_mb, source, seconds, settled)`."""
-    started = time.monotonic()
+                    ) -> Tuple[Optional[int], Optional[str], Optional[float],
+                               Optional[bool]]:
+    """Device free after teardown, as `(free_mb, source, seconds, settled)`.
+    amdgpu lowers a discrete GPU's VRAM used counter some time after a
+    release, so there free is read until two reads `interval_s` apart agree,
+    at most `reads` more reads. Any other source is read once, and `seconds`
+    and `settled` are None."""
     free_mb, _, source = memory.free_total_mb()
-    settled = False
-    for _ in range(reads):
+    if source != "amdgpu-sysfs" or _safe(memory._unified_gpu):
+        return free_mb, source, None, None
+    for taken in range(1, reads + 1):
         sleep(interval_s)
         again, _, source = memory.free_total_mb()
-        settled, free_mb = again == free_mb, again
-        if settled:
-            break
-    return free_mb, source, round(time.monotonic() - started, 2), settled
+        if again == free_mb:
+            return free_mb, source, taken * interval_s, True
+        free_mb = again
+    return free_mb, source, reads * interval_s, False
 
 
 def rocm_reason(on_rocm: str) -> str:
-    """`on_rocm` where KFD lists a GPU this process can open, else "not a
-    ROCm host"."""
-    return on_rocm if rocm_sysfs.inventory() else "not a ROCm host"
+    """`on_rocm` where this process can open a GPU KFD lists; otherwise
+    "not a ROCm host" when KFD lists no GPU, or that none can be opened."""
+    nodes = rocm_sysfs.gpu_nodes()
+    if not nodes:
+        return "not a ROCm host"
+    if not any(node["openable"] for node in nodes):
+        return "KFD lists a GPU but this process cannot open its render node"
+    return on_rocm
+
+
+def _fdinfo_reason(memory: Any) -> str:
+    """Why the fdinfo base tier returned nothing."""
+    own_mb = memory.fdinfo_own_vram_mb()
+    if own_mb is not None:
+        return f"fdinfo read {own_mb} MiB; the worker rejected it as implausible"
+    return "no DRM fdinfo VRAM figure for this process: " + rocm_reason(
+        "no amdgpu fdinfo record of this device parsed")
 
 
 def _free_tier_reason(memory: Any, tier: str) -> str:
@@ -346,9 +363,9 @@ def probe_base_tiers(
     except Exception as exc:  # pragma: no cover - defensive
         row("nvml", None, f"raised {type(exc).__name__}: {exc}"[:200])
     try:
-        row("fdinfo", memory._fdinfo_base_mb(reserved_mb, reserved_delta),
-            "no DRM fdinfo VRAM figure for this process: " + rocm_reason(
-                "no amdgpu fdinfo record of this device parsed"))
+        value = memory._fdinfo_base_mb(reserved_mb, reserved_delta)
+        row("fdinfo", value, _fdinfo_reason(memory)
+            if value is None or value <= 0 else "")
     except Exception as exc:  # pragma: no cover - defensive
         row("fdinfo", None, f"raised {type(exc).__name__}: {exc}"[:200])
     try:
@@ -1124,9 +1141,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     document["verdict"] = line
 
     print_document(document, sys.stdout)
+    settle = "" if settled is None else (
+        f", {'settled' if settled else 'still changing'} after {settle_s} s")
     print(f"device free after teardown: {free_after_mb} MiB "
-          f"({free_after_source}), "
-          f"{'settled' if settled else 'still changing'} after {settle_s} s")
+          f"({free_after_source}){settle}")
     if args.json_path:
         path = Path(args.json_path)
         path.parent.mkdir(parents=True, exist_ok=True)
