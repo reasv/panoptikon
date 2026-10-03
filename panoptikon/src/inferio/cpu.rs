@@ -237,18 +237,33 @@ mod sys {
     }
 
     pub(super) fn available_mb() -> Option<u64> {
-        status().map(|status| {
-            super::windows_deliverable(status.ullAvailPhys, status.ullAvailPageFile) / MIB
-        })
+        status().map(|status| available_bytes(&status) / MIB)
     }
-}
 
-/// Bytes Windows could deliver now: free physical memory, bounded by the
-/// commit the process can still make, since an allocation past the commit
-/// limit fails whatever is physically free.
-#[cfg(any(target_os = "windows", test))]
-fn windows_deliverable(avail_phys: u64, avail_commit: u64) -> u64 {
-    avail_phys.min(avail_commit)
+    /// Free physical memory, bounded by the commit available at the
+    /// pagefile's current size (RAM plus pagefile), which is lower than what
+    /// Windows delivers when the pagefile can grow.
+    fn available_bytes(status: &MEMORYSTATUSEX) -> u64 {
+        status.ullAvailPhys.min(status.ullAvailPageFile)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Free RAM is the lower of free physical memory and available commit.
+        #[test]
+        fn free_ram_is_the_lower_of_physical_and_commit() {
+            let gib = 1024 * 1024 * 1024;
+            let status = |phys, commit| MEMORYSTATUSEX {
+                ullAvailPhys: phys,
+                ullAvailPageFile: commit,
+                ..Default::default()
+            };
+            assert_eq!(available_bytes(&status(12 * gib, 3 * gib)), 3 * gib);
+            assert_eq!(available_bytes(&status(12 * gib, 40 * gib)), 12 * gib);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -385,15 +400,6 @@ mod tests {
         )
         .expect("write meminfo");
         assert_eq!(ram_available_mb(&limited), Some(10 * 1024));
-    }
-
-    /// Windows free RAM is free physical memory bounded by the commit the
-    /// process can still make: with a small pagefile commit runs out first.
-    #[test]
-    fn windows_free_ram_is_bounded_by_available_commit() {
-        let gib = 1024 * 1024 * 1024;
-        assert_eq!(windows_deliverable(12 * gib, 3 * gib), 3 * gib);
-        assert_eq!(windows_deliverable(12 * gib, 40 * gib), 12 * gib);
     }
 
     /// Fixture roots for one cgroup layout: `files` is written under a

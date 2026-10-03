@@ -2613,14 +2613,14 @@ def test_linux_free_ram_leaves_out_reclaimable_slab(
 
 
 def test_windows_free_ram_is_bounded_by_available_commit() -> None:
-    # With a small pagefile commit runs out before physical memory, and an
-    # allocation past the commit limit fails whatever is physically free.
     with cpu_host(FakeRam(total_mb=64 * 1024, available_mb=40 * 1024)):
         for phys_mb, commit_mb, free_mb in (
             (12_288, 3_072, 3_072),
             (12_288, 40_960, 12_288),
         ):
-            status = (phys_mb * MIB, commit_mb * MIB)
+            status = memory._MemoryStatusEx(
+                ullAvailPhys=phys_mb * MIB, ullAvailPageFile=commit_mb * MIB
+            )
             with mock.patch.object(
                 memory, "_windows_memory_status", return_value=status
             ):

@@ -9,6 +9,7 @@ the device reports no `base_mb` rather than 0. Imports are stdlib only.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import re
@@ -1246,46 +1247,45 @@ def _reclaimable_slab_bytes() -> int:
 
 def windows_available_bytes() -> int | None:
     """RAM a new allocation could get on Windows, or None off it: free
-    physical memory bounded by the commit the process can still make, since
-    an allocation past the commit limit fails whatever is physically free.
-    Same as `cpu.rs::windows_deliverable`.
+    physical memory, bounded by the commit available at the pagefile's
+    current size (RAM plus pagefile), which is lower than what Windows
+    delivers when the pagefile can grow. Same as `cpu.rs`.
     """
     status = _windows_memory_status()
     if status is None:
         return None
-    avail_phys, avail_commit = status
-    return min(avail_phys, avail_commit)
+    return min(status.ullAvailPhys, status.ullAvailPageFile)
 
 
-def _windows_memory_status() -> tuple[int, int] | None:
-    """`(ullAvailPhys, ullAvailPageFile)` from `GlobalMemoryStatusEx`, or None
-    off Windows or on error."""
+class _MemoryStatusEx(ctypes.Structure):
+    """`MEMORYSTATUSEX`."""
+
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def _windows_memory_status() -> _MemoryStatusEx | None:
+    """`GlobalMemoryStatusEx`, or None off Windows or on error."""
     if sys.platform != "win32":
         return None
+    status = _MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(_MemoryStatusEx)
     try:
-        import ctypes
-
-        class MemoryStatusEx(ctypes.Structure):
-            _fields_ = [
-                ("dwLength", ctypes.c_ulong),
-                ("dwMemoryLoad", ctypes.c_ulong),
-                ("ullTotalPhys", ctypes.c_ulonglong),
-                ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong),
-                ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong),
-                ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-            ]
-
-        status = MemoryStatusEx()
-        status.dwLength = ctypes.sizeof(MemoryStatusEx)
         if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
             return None
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Windows memory status unreadable: %s", exc)
         return None
-    return (int(status.ullAvailPhys), int(status.ullAvailPageFile))
+    return status
 
 
 def _ram_bounds_bytes(root: str | None = None) -> tuple[int | None, int | None]:

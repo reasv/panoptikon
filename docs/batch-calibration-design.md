@@ -758,9 +758,10 @@ therefore differs from a GPU in six ways.
   time under a fast allocation. The reading is low by at most
   `min(SReclaimable / 2, low watermark)`, the part `MemAvailable` already
   leaves out. Shared memory is in neither figure. Windows reads
-  `min(ullAvailPhys, ullAvailPageFile)`: an allocation past the commit limit
-  (RAM plus pagefile) fails whatever is physically free. macOS reads RAM less
-  wired, compressed and anonymous pages, as before.
+  `min(ullAvailPhys, ullAvailPageFile)`: free physical memory bounded by the
+  commit available at the pagefile's current size (RAM plus pagefile), which
+  is lower than what Windows delivers when the pagefile can grow. macOS reads
+  RAM less wired, compressed and anonymous pages, as before.
 - **A replica's footprint is the memory it holds now.** A CPU worker reports
   its lifetime peak resident set as `reserved` (the knee's warm/high-water
   split needs it), and its heap is trimmed after every batch, so the peak is
