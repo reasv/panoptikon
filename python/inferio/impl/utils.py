@@ -299,24 +299,33 @@ def select_ct2_compute_type(
 
 OOM_BATCH1_PREFIX = "INFERENCE_OOM_BATCH_SIZE_1:"
 
+# The same for a failure to allocate host RAM (`packing.OOM_HOST_RAM_PREFIX`).
+OOM_HOST_RAM_PREFIX = "INFERENCE_OOM_HOST_RAM:"
+
 
 class InferenceOOMError(RuntimeError):
-    """Out of GPU memory on a single input after cache-clearing retries.
+    """Out of memory on a single input after cache-clearing retries.
 
-    str() starts with OOM_BATCH1_PREFIX: the worker's error frame carries
-    only the message string, so the prefix is what the orchestrator (and
-    future dispatch-side classification) can recognise the condition by.
+    str() starts with OOM_BATCH1_PREFIX, or OOM_HOST_RAM_PREFIX when host RAM
+    ran out: the worker's error frame carries only the message string, so the
+    prefix is what the orchestrator recognises the condition by.
     """
 
 
 _oom_retry_generation = 0
 _last_oom_retry: "tuple[int, int, int] | None" = None
 _total_oom_halvings = 0
+_total_host_ram_halvings = 0
 
 
 def total_oom_halvings() -> int:
     """OOM halvings across every `run_with_oom_retry` call in this process."""
     return _total_oom_halvings
+
+
+def total_host_ram_halvings() -> int:
+    """The part of `total_oom_halvings` that host RAM caused."""
+    return _total_host_ram_halvings
 
 
 def last_oom_retry():
@@ -353,6 +362,18 @@ def looks_like_oom(exc: BaseException) -> bool:
         text = str(error)
         lowered = text.lower()
         if "out of memory" in lowered or "INFERENCE_OOM" in text:
+            return True
+    return looks_like_host_ram(exc)
+
+
+def looks_like_host_ram(exc: BaseException) -> bool:
+    """Whether a failure is a host RAM allocation's: `MemoryError` or the CPU
+    allocator's text, anywhere in the chain."""
+    for error in _exception_chain(exc):
+        if isinstance(error, MemoryError):
+            return True
+        lowered = str(error).lower()
+        if "enforce fail at alloc_cpu.cpp" in lowered:
             return True
         if "defaultcpuallocator" in lowered and "allocate memory" in lowered:
             return True
@@ -399,8 +420,9 @@ def run_with_oom_retry(
     are concatenated in input order. On OOM the torch cache is cleared and
     the same position is retried at half the size — never re-grown within
     a call, since the dispatcher forms fresh full batches on the next
-    request anyway. An OOM with a single item raises InferenceOOMError;
-    any other exception propagates untouched.
+    request anyway. An OOM with a single item raises InferenceOOMError,
+    naming host RAM when that ran out; any other exception propagates
+    untouched.
 
     An OOM is the CUDA/HIP exception type, `MemoryError`, or `looks_like_oom`
     text. A 32-bit index ceiling also halves but counts as an index-limit
@@ -408,6 +430,7 @@ def run_with_oom_retry(
     `oom_exceptions` overrides the caught types (used by torch-free tests).
     """
     global _oom_retry_generation, _last_oom_retry, _total_oom_halvings
+    global _total_host_ram_halvings
 
     log = logger or logging.getLogger(__name__)
     _oom_retry_generation += 1
@@ -435,11 +458,9 @@ def run_with_oom_retry(
         try:
             out = list(process_chunk(chunk))
         except Exception as err:
-            if not (
-                isinstance(err, oom_exceptions)
-                or isinstance(err, MemoryError)
-                or looks_like_oom(err)
-            ):
+            device = isinstance(err, oom_exceptions)
+            host_ram = not device and looks_like_host_ram(err)
+            if not (device or host_ram or looks_like_oom(err)):
                 if not looks_like_index_limit(err):
                     raise
                 # Not a memory event: no OOM count, no `clear_cache()`.
@@ -458,16 +479,23 @@ def run_with_oom_retry(
                 continue
             clear_cache()
             if len(chunk) == 1:
+                prefix, what = (
+                    (OOM_HOST_RAM_PREFIX, "host RAM")
+                    if host_ram
+                    else (OOM_BATCH1_PREFIX, "GPU memory")
+                )
                 raise InferenceOOMError(
-                    f"{OOM_BATCH1_PREFIX} out of GPU memory on a single "
-                    f"input: {err}"
+                    f"{prefix} out of {what} on a single input: {err}"
                 ) from err
             chunk_size = max(1, len(chunk) // 2)
             halvings += 1
             _total_oom_halvings += 1
+            if host_ram:
+                _total_host_ram_halvings += 1
             _last_oom_retry = (generation, largest, halvings)
             log.warning(
-                "GPU OOM on a chunk of %d inputs; retrying at %d.",
+                "out of %s on a chunk of %d inputs; retrying at %d.",
+                "host RAM" if host_ram else "GPU memory",
                 len(chunk),
                 chunk_size,
             )

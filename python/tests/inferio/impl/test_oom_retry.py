@@ -8,14 +8,17 @@ import pytest
 
 from inferio.impl.utils import (
     OOM_BATCH1_PREFIX,
+    OOM_HOST_RAM_PREFIX,
     InferenceOOMError,
     last_oom_retry,
     looks_like_index_limit,
     looks_like_oom,
     run_with_oom_retry,
+    total_host_ram_halvings,
     total_index_limit_events,
     total_oom_halvings,
 )
+from inferio_worker import packing
 
 
 class FakeOOM(Exception):
@@ -79,13 +82,29 @@ def test_halves_on_oom_and_preserves_order():
 
 
 def test_batch1_oom_raises_classified_error():
-    process = _raiser(FakeOOM("CUDA out of memory"))
-    with mock.patch("inferio.impl.utils.clear_cache") as cache:
-        with pytest.raises(InferenceOOMError) as excinfo:
-            run_with_oom_retry(process, ["only"], oom_exceptions=(FakeOOM,))
-    assert str(excinfo.value).startswith(OOM_BATCH1_PREFIX)
-    assert isinstance(excinfo.value.__cause__, FakeOOM)
-    assert cache.call_count == 1, "cleared once per failed attempt"
+    """At one item the error names what ran out: GPU memory, or host RAM for a
+    `MemoryError` or the CPU allocator, whose halvings are counted apart."""
+    cpu_allocator = RuntimeError(
+        "[enforce fail at alloc_cpu.cpp:114] data. DefaultCPUAllocator: not "
+        "enough memory: you tried to allocate 8589934592 bytes."
+    )
+    for failure, prefix in (
+        (FakeOOM("CUDA out of memory"), OOM_BATCH1_PREFIX),
+        (MemoryError(), OOM_HOST_RAM_PREFIX),
+        (cpu_allocator, OOM_HOST_RAM_PREFIX),
+    ):
+        host_before = total_host_ram_halvings()
+        with mock.patch("inferio.impl.utils.clear_cache") as cache:
+            with pytest.raises(InferenceOOMError) as excinfo:
+                run_with_oom_retry(
+                    _raiser(failure), ["a", "b"], oom_exceptions=(FakeOOM,)
+                )
+        assert str(excinfo.value).startswith(prefix), failure
+        assert excinfo.value.__cause__ is failure
+        assert cache.call_count == 2, "cleared once per failed attempt"
+        host_ram = prefix == OOM_HOST_RAM_PREFIX
+        assert total_host_ram_halvings() == host_before + host_ram, failure
+    assert OOM_HOST_RAM_PREFIX == packing.OOM_HOST_RAM_PREFIX
 
 
 def test_a_non_oom_exception_propagates_untouched():
