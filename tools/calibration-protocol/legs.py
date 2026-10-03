@@ -683,9 +683,16 @@ def unsampled(paths: Sequence[Path], timeout: float) -> List[str]:
     returns the names of those that still hold none."""
     def sampled(path: Path) -> bool:
         try:
-            return '"kind": "sample"' in path.read_text(encoding="utf-8")
+            lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
             return False
+        for line in lines:
+            try:
+                if json.loads(line).get("kind") == "sample":
+                    return True
+            except ValueError:  # a partly written last line
+                pass
+        return False
 
     wait_for(lambda: all(map(sampled, paths)), timeout, interval=0.1)
     return [path.name for path in paths if not sampled(path)]
@@ -910,6 +917,15 @@ class Leg:
 
     def path(self, name: str) -> Path:
         return self.directory / name
+
+    def wait_for_recorders(self, timeout: float = RECORDER_START_S) -> None:
+        """Waits up to `timeout` for both recordings to hold a sample; marks
+        `recorder_sample_timeout` with those that still hold none."""
+        missing = unsampled([self.path("vramrec.jsonl"),
+                             self.path("healthrec.jsonl")], timeout)
+        if missing:
+            self.mark("recorder_sample_timeout", files=missing,
+                      waited_s=timeout)
 
     # -- the job API --------------------------------------------------------
 
@@ -2059,11 +2075,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             health_argv.append("--full")
         leg.supervisor.start("healthrec", health_argv)
         leg.mark("healthrec_started")
-        missing = unsampled([leg.path("vramrec.jsonl"),
-                             leg.path("healthrec.jsonl")], RECORDER_START_S)
-        if missing:
-            leg.mark("recorder_sample_timeout", files=missing,
-                     waited_s=RECORDER_START_S)
+        leg.wait_for_recorders()
 
         gateway = leg.start_gateway()
         fds = FdRecorder(gateway.pid, leg.path("fds.jsonl"))
