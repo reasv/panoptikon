@@ -232,6 +232,9 @@ class Context:
     # How far the wall clock stepped during the first job, the one jobs.json
     # records, from `legs.json`.
     clock_step: Optional[float] = None
+    # `legs.json`'s jobs that did not drain: each `job_end` outcome other
+    # than `drained`, and "no job_end" for a job the leg never saw end.
+    unfinished_jobs: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.vram_samples = [row for row in self.vramrec if row.get("kind") == "sample"]
@@ -1848,8 +1851,21 @@ def check_persistence(ctx: Context) -> Verdict:
                     "regressions": regressions})
 
 
+def _unfinished_jobs(legs: Optional[Dict[str, Any]]) -> List[str]:
+    events = (legs or {}).get("events") or []
+    ends = [str(event.get("outcome")) for event in events
+            if event.get("event") == "job_end"]
+    starts = sum(1 for event in events if event.get("event") == "job_start")
+    return ([outcome for outcome in ends if outcome != "drained"]
+            + ["no job_end"] * max(0, starts - len(ends)))
+
+
 def check_job_outcome(ctx: Context) -> Verdict:
-    """Jobs must complete; item failures only where the scenario poisoned them."""
+    """Jobs must complete; item failures only where the scenario poisoned them.
+
+    A job legs.py stopped waiting for (`--job-cap`) or never saw end is in
+    neither jobs.json nor the queue outcomes, so `legs.json` is read too."""
+    unfinished = ctx.unfinished_jobs
     records = _log_records(ctx.jobs)
     queue_outcomes: List[Dict[str, Any]] = []
     if isinstance(ctx.jobs, dict) and isinstance(ctx.jobs.get("outcomes"), list):
@@ -1860,7 +1876,7 @@ def check_job_outcome(ctx: Context) -> Verdict:
         outcomes = (sample.get("queue") or {}).get("outcomes")
         if outcomes:
             queue_outcomes = outcomes
-    if not records and not queue_outcomes:
+    if not records and not queue_outcomes and not unfinished:
         if ctx.jobs is None:
             return Verdict("job_outcome", "SKIP",
                            "no jobs.json and no queue outcomes")
@@ -1896,8 +1912,8 @@ def check_job_outcome(ctx: Context) -> Verdict:
     # report `job_outcome FAIL` for doing exactly what it set out to do.
     expected_bad = ctx.args.expect_failed_jobs
     over_jobs = len(bad_outcomes) > expected_bad
-    verdict = ("FAIL" if (over or over_jobs or (empty and not expected_empty))
-               else "PASS")
+    verdict = ("FAIL" if (over or over_jobs or unfinished
+                          or (empty and not expected_empty)) else "PASS")
     return Verdict(
         "job_outcome", verdict,
         f"{len(records)} job record(s): {completed} completed, "
@@ -1910,10 +1926,13 @@ def check_job_outcome(ctx: Context) -> Verdict:
            if empty and expected_empty else
            f"; NO ITEMS: {', '.join(empty)} ran on 0 items, so nothing here "
            f"measures anything - check the corpus and, for a derived setter, "
-           f"that its source setter ran first" if empty else ""),
+           f"that its source setter ran first" if empty else "")
+        + (f"; legs.py saw {len(unfinished)} job(s) not drain: "
+           f"{', '.join(unfinished)}" if unfinished else ""),
         {"completed": completed, "failed": failed, "errors": errors,
          "outcomes": queue_outcomes, "records": len(records),
          "failed_jobs": len(bad_outcomes), "empty_jobs": empty,
+         "unfinished_jobs": unfinished,
          "expected_failed_jobs": expected_bad,
          "expected_empty_setters": expected_empty},
     )
@@ -2635,6 +2654,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         fds=read_fds(pick(None, "fds.jsonl")) or read_fds(pick(None, "fdrec.txt")),
         teardown_t=_iso_epoch(hog_stop) if hog_stop else None,
         clock_step=None if args.jobs else _clock_step(legs),
+        unfinished_jobs=_unfinished_jobs(legs),
     )
 
     selected = (

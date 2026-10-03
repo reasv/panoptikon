@@ -814,3 +814,26 @@ def test_deflation_that_never_recovers_passes_only_when_declared():
     assert (verdict.verdict, verdict.numbers["source"]) == ("FAIL", "healthrec")
     ctx.args.expect_deflated = True
     assert analyze.check_deflation_recovery(ctx).verdict == "PASS"
+
+
+# --- job_outcome and legs.json -------------------------------------------------
+
+
+def test_job_outcome_fails_a_job_legs_did_not_see_drain():
+    """Cut at `--job-cap`, or never ended: neither is in jobs.json."""
+    legs = {"events": [{"event": "job_start"},
+                       {"event": "job_end", "outcome": "drained"},
+                       {"event": "job_start"},
+                       {"event": "job_end", "outcome": "cap_exceeded"},
+                       {"event": "job_start"}]}
+    unfinished = analyze._unfinished_jobs(legs)
+    assert unfinished == ["cap_exceeded", "no job_end"]
+    record = {"setter": MODEL, "total_segments": 5, "completed": 1}
+    for jobs in ({"history": [record]}, None):
+        ctx = _utilization_context([])
+        ctx.args.expect_failures = ctx.args.expect_failed_jobs = 0
+        ctx.jobs = jobs
+        if jobs is not None:
+            assert analyze.check_job_outcome(ctx).verdict == "PASS"
+        ctx.unfinished_jobs = unfinished
+        assert analyze.check_job_outcome(ctx).verdict == "FAIL"
