@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import struct
 import sys
 import threading
 import time
@@ -1042,7 +1043,6 @@ def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
     try:
         import ctypes
         import ctypes.util
-        import struct
 
         libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
         size = struct.calcsize(_VM_STATISTICS64)
@@ -1056,19 +1056,24 @@ def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
         )
         if failed:
             return None
-        stats = struct.unpack(_VM_STATISTICS64, buffer.raw[:size])
+        wired, compressed, anonymous, swapouts = _vm_statistics(buffer.raw)
         page = os.sysconf("SC_PAGE_SIZE")
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("macOS memory counters unreadable: %s", exc)
         return None
     if not isinstance(page, int) or page <= 0:
         return None
+    return (ram, wired * page, compressed * page, anonymous * page, pressure, swapouts)
+
+
+def _vm_statistics(raw: bytes) -> tuple[int, int, int, int]:
+    """`(wire_count, compressor_page_count, internal_page_count, swapouts)`
+    from a packed `vm_statistics64_data_t`."""
+    stats = struct.unpack(_VM_STATISTICS64, raw[: struct.calcsize(_VM_STATISTICS64)])
     return (
-        ram,
-        stats[_VM_WIRE] * page,
-        stats[_VM_COMPRESSOR] * page,
-        stats[_VM_INTERNAL] * page,
-        pressure,
+        stats[_VM_WIRE],
+        stats[_VM_COMPRESSOR],
+        stats[_VM_INTERNAL],
         stats[_VM_SWAPOUTS],
     )
 

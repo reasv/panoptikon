@@ -13,6 +13,7 @@ import inspect
 import logging
 import os
 import platform
+import struct
 import sys
 import threading
 import time
@@ -2170,6 +2171,46 @@ def test_the_swap_out_counter_is_followed_at_every_pressure_level() -> None:
     with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
         assert available(0, 1, 500) == 40 * 1024 * MIB
         assert available(5, 2, 700) == 0
+
+
+def test_the_vm_statistics_fields_are_read_by_name() -> None:
+    # `vm_statistics64_data_t` in <mach/vm_statistics.h> order, each field
+    # holding its own position, so a wrong index or layout reads another.
+    fields = (
+        ("free_count", "I"),
+        ("active_count", "I"),
+        ("inactive_count", "I"),
+        ("wire_count", "I"),
+        ("zero_fill_count", "Q"),
+        ("reactivations", "Q"),
+        ("pageins", "Q"),
+        ("pageouts", "Q"),
+        ("faults", "Q"),
+        ("cow_faults", "Q"),
+        ("lookups", "Q"),
+        ("hits", "Q"),
+        ("purges", "Q"),
+        ("purgeable_count", "I"),
+        ("speculative_count", "I"),
+        ("decompressions", "Q"),
+        ("compressions", "Q"),
+        ("swapins", "Q"),
+        ("swapouts", "Q"),
+        ("compressor_page_count", "I"),
+        ("throttled_count", "I"),
+        ("external_page_count", "I"),
+        ("internal_page_count", "I"),
+        ("total_uncompressed_pages_in_compressor", "Q"),
+    )
+    layout = "@" + "".join(code for _, code in fields)
+    raw = struct.pack(layout, *range(1, len(fields) + 1))
+    position = {name: index + 1 for index, (name, _) in enumerate(fields)}
+    assert memory._vm_statistics(raw) == (
+        position["wire_count"],
+        position["compressor_page_count"],
+        position["internal_page_count"],
+        position["swapouts"],
+    )
 
 
 def test_an_unreadable_pressure_level_counts_as_normal() -> None:
