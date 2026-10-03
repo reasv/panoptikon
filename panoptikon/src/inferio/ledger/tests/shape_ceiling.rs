@@ -230,42 +230,32 @@ fn a_batch_that_ran_wider_uncut_retires_the_shape_ceiling() {
     assert_eq!(ledger.health()[0].workers[0].shape_ceiling_units, Some(16));
 }
 
-/// **The third brake.** The ramp takes no step past the ceiling.
+/// **The third brake.** No batch size is earned past the ceiling.
 #[test]
-fn the_ramp_takes_no_step_past_the_shape_ceiling() {
-    // Control: no ceiling, and the ramp climbs one step per measured window.
+fn no_size_is_earned_past_the_shape_ceiling() {
+    let rising = |units: u64| units as f64;
+    // Control: no ceiling, and a rate that rises earns a size per window.
     let (ledger, handle, admission) = clippable(4);
-    for _ in 0..4 {
-        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        let granted = token.grant().unit_budget;
-        handle
-            .lock()
-            .unwrap()
-            .record_measurements(vec![measurement(granted, 1000, 1100)]);
-        token.finish(WindowOutcome::Responded { oom: None });
-    }
-    assert_eq!(ledger.health()[0].workers[0].ramp_step, 4);
+    let budgets: Vec<u64> = (0..7)
+        .map(|_| window_at_the_rate(&handle, &admission, rising))
+        .collect();
+    assert_eq!(budgets, [4, 4, 8, 16, 32, 64, 128]);
+    assert_eq!(ledger.health()[0].workers[0].trial_units, Some(256));
     drop(admission);
 
-    // The same four windows under a ceiling of 16: the ramp climbs *to*
-    // it — 4, 8, 16 — and stops.
+    // The same windows under a ceiling of 16: the size climbs *to* it, 4,
+    // 8, 16, and stops.
     let (ledger, handle, admission) = clippable(4);
     clipped_window(&handle, &admission, 16);
-    for _ in 0..4 {
-        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        let granted = token.grant().unit_budget;
+    for _ in 0..7 {
+        let granted = window_at_the_rate(&handle, &admission, rising);
         assert!(granted <= 16, "granted {granted}");
-        handle
-            .lock()
-            .unwrap()
-            .record_measurements(vec![measurement(granted, 1000, 1100)]);
-        token.finish(WindowOutcome::Responded { oom: None });
     }
     let worker = &ledger.health()[0].workers[0];
     assert_eq!(
-        worker.ramp_step, 2,
-        "4 → 8 → 16, and then the ceiling: no doublings are spent against \
-         a wall"
+        (worker.knee_units, worker.trial_units),
+        (Some(16), None),
+        "the trial of 32 never ran, so 32 was never earned"
     );
     assert_eq!(worker.unit_budget, 16);
 
@@ -360,50 +350,33 @@ fn an_index_limit_clamp_produces_no_negative_sample() {
     );
 }
 
-/// **A clipped run is not a plateau**: a flat rate against a rising budget
-/// that the impl clipped is not a knee.
+/// **A clipped run is no measurement**: batches the impl cut never reach the
+/// throughput ring, so they neither start a trial nor move the working size.
 #[test]
-fn a_run_of_clipped_windows_is_never_read_as_a_throughput_plateau() {
+fn a_run_of_clipped_windows_is_never_read_as_a_throughput_measurement() {
     let (ledger, handle, admission) = knee_capped(15);
     assert_eq!(ledger.health()[0].workers[0].unit_budget, 15);
-    // The impl's own ceiling, below the knee.
+    // The impl's own ceiling, below the working size.
     clipped_window(&handle, &admission, 8);
     assert_eq!(ledger.health()[0].workers[0].unit_budget, 8);
     let samples_before = ledger.health()[0].workers[0].throughput_samples;
-    // That first window *was* knee-bound — the ceiling did not exist when it was
-    // granted — so it earned its one window of credit honestly.
-    let credit_before = ledger.knee_expiry_for_test("g/a", GPU).0;
-    assert_eq!(credit_before, 1);
-
-    for _ in 0..(KNEE_EXPIRY_CLEAN_WINDOWS * 2) {
+    for _ in 0..(RETEST_WINDOWS * 2) {
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         let granted = token.grant().unit_budget;
-        assert_eq!(granted, 8, "held at the ceiling, not at the knee");
+        assert_eq!(granted, 8, "held at the ceiling");
         handle
             .lock()
             .unwrap()
             .record_measurements(vec![clipped_batch(granted, 15, 90.0)]);
         token.finish(WindowOutcome::Responded { oom: None });
     }
-
     assert_eq!(
         ledger.health()[0].workers[0].throughput_samples,
         samples_before,
-        "not one clipped batch reached the ring, so no bucket, no \
-         frontier and no plateau can be built out of them"
+        "not one clipped batch reached the ring"
     );
-    assert_eq!(
-        ledger.knee_expiry_for_test("g/a", GPU).0,
-        credit_before,
-        "and none of those windows counts as a window run *at the knee*: \
-         the knee is not what held them down — two full expiry periods \
-         later the counter has not moved"
-    );
-    assert_eq!(
-        ledger.health()[0].workers[0].knee_units,
-        Some(15),
-        "so the knee neither widened nor moved on clipped evidence"
-    );
+    assert_eq!(ledger.trial_for_test("g/a", GPU).0, None);
+    assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
 }
 
 /// **Runtime-only.** The ceiling depends on this corpus's padded dims and the
@@ -437,12 +410,13 @@ fn a_shape_ceiling_never_survives_a_restart() {
             residual_mb: last.residual_mb,
             samples: last.samples,
             knee_units: last.knee_units,
+            knee_trials: last.knee_trials,
+            knee_rates: Vec::new(),
             local: true,
             fit_is_local: true,
             exact_torch: true,
             max_units_measured: last.max_units_measured,
             local_samples: last.local_samples,
-            knee_clean_windows: last.knee_clean_windows,
             ring: last.ring.clone(),
         }),
         ..FakeProfiles::default()

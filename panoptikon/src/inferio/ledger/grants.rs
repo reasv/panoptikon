@@ -39,15 +39,15 @@ impl VramLedger {
         let Some(entry) = state.workers.get(&worker) else {
             return 1;
         };
-        // The knee caps the batch; a window is still several batches deep.
-        Self::budget_locked(&state, entry, Self::knee_locked(&state, entry))
+        // A window is several batches deep.
+        Self::budget_locked(&state, entry)
             .saturating_mul(WINDOW_DEPTH_MULTIPLIER)
             .max(1)
     }
 
     /// Items the dispatcher may put in one window. Under an item cap
     /// ([`Self::item_cap_locked`]) that is [`WINDOW_DEPTH_MULTIPLIER`]
-    /// batches of it, whatever the ramp's budget, and one item while the cap
+    /// batches of it, whatever the unit budget, and one item while the cap
     /// is one, the replica's first window; else no bound.
     pub(super) fn window_item_bound(&self, worker: WorkerId) -> usize {
         let state = self.lock();
@@ -97,12 +97,12 @@ impl VramLedger {
         };
         let signed_headroom = self.overdraft_with_margin_locked(&state, &gpu, margin);
         let headroom = signed_headroom.max(0) as u64;
-        // The ramp value, and what of it the window's content asks for. An
+        // The batch size, and what of it the window's content asks for. An
         // item cap (the user's included) limits the content like a short
         // queue: for a count-priced model it is a unit count.
-        let (capped, wanted, item_cap) = {
+        let (size_asked, capped, wanted, item_cap) = {
             let entry = state.workers.get(&worker)?;
-            let capped = Self::budget_locked(&state, entry, Self::knee_locked(&state, entry));
+            let capped = Self::budget_locked(&state, entry);
             let item_cap = Self::item_cap_locked(&state, entry)
                 .map(|cap| user_cap_items.map_or(cap, |user| cap.min(user)));
             let content = match item_cap {
@@ -111,7 +111,12 @@ impl VramLedger {
                 }
                 _ => window_units,
             };
-            (capped, capped.min(content.max(1)).max(1), item_cap)
+            (
+                Self::size_locked(&state, entry),
+                capped,
+                capped.min(content.max(1)).max(1),
+                item_cap,
+            )
         };
         let share = self.share_locked(&state, worker, signed_headroom, wanted);
         let (
@@ -122,8 +127,6 @@ impl VramLedger {
             canvas_pixels,
             max_tokens,
             squeezed,
-            knee_bound,
-            ample_headroom,
             queue_bound,
             ram_mb,
             ram_bound,
@@ -132,17 +135,9 @@ impl VramLedger {
         ) = {
             let entry = state.workers.get(&worker)?;
             let price = Self::grant_price_locked(&state, entry);
-            // The knee decided this window's size: it bit (compared with the
-            // shape ceiling still applied) and the work in hand reached it.
-            let knee_bound =
-                capped < Self::budget_locked(&state, entry, None) && wanted >= capped && capped > 0;
-            // Room for a batch `RATCHET_FACTOR` × the appetite's, measured
-            // against the requester's own room (its pool included).
-            let ample_headroom =
-                (share.room as f64) >= self.appetite_mb_locked(&state, entry, RATCHET_FACTOR);
             let mut units = wanted;
             let mut mb = share.mb;
-            // Memory, not the ramp, ratchet or queue, held this window back.
+            // Memory, not the batch size, ratchet or queue, held this window back.
             let squeezed = if let Some(price) = price {
                 // Post-fit the unit budget is what the share affords.
                 let affordable = price.units(share.mb).max(1);
@@ -151,7 +146,7 @@ impl VramLedger {
                 mb = price.cost_mb(units);
                 squeezed
             } else {
-                // Pre-fit the ramp value is the unit budget; with no share at
+                // Pre-fit the batch size is the unit budget; with no share at
                 // all, one unit, as post-fit.
                 if share.mb == 0 {
                     units = 1;
@@ -186,6 +181,17 @@ impl VramLedger {
                     mb = price.cost_mb(units);
                 }
             }
+            // A trial's look-ahead is run in full or not at all.
+            if units < wanted
+                && (squeezed || ram_bound)
+                && let Some(working) = Self::look_ahead_from_locked(&state, entry)
+                && working < units
+            {
+                units = working;
+                if let Some(price) = price {
+                    mb = price.cost_mb(units);
+                }
+            }
             let ram_cost = ram.and_then(|ram| ram.cost);
             let ram_mb = ram_cost.map_or(0, |cost| cost.booking_mb(units));
             let ram_mb_per_unit = ram_cost.map(|cost| cost.mb_per_unit);
@@ -197,12 +203,7 @@ impl VramLedger {
                 entry.canvas_pixels,
                 entry.max_tokens,
                 squeezed,
-                knee_bound,
-                ample_headroom
-                    && !squeezed
-                    && !ram_bound
-                    && pressure == mps::MemoryPressure::Normal,
-                // queue_bound: less work in hand than the ramp admits.
+                // queue_bound: less work in hand than the batch size admits.
                 wanted < capped,
                 ram_mb,
                 ram_bound,
@@ -247,11 +248,11 @@ impl VramLedger {
                     room: share.room,
                     requests: window_requests,
                     unit_budget,
+                    size_asked,
+                    granted_at: Instant::now(),
                     squeezed,
                     room_bound,
                     peak_occupants: 0,
-                    knee_bound,
-                    ample_headroom,
                     queue_bound,
                     byte_bound,
                     ram_mb,
@@ -279,16 +280,15 @@ impl VramLedger {
             0
         };
         let issued = state.workers.get(&worker).map(|entry| {
-            let anchor = Self::anchor_locked(&state, entry);
             (
                 entry.inference_id.clone(),
-                entry.effective_ramp_step(anchor),
+                Self::knee_locked(&state, entry).unwrap_or(0),
                 entry.deflation,
                 Self::pricing_fit_locked(&state, entry).is_none(),
             )
         });
         drop(state);
-        if let Some((model, ramp_step, deflation, pre_fit)) = issued {
+        if let Some((model, working_units, deflation, pre_fit)) = issued {
             let canvas = canvas_log_field(canvas_pixels);
             tracing::debug!(
                 model = %model,
@@ -303,7 +303,7 @@ impl VramLedger {
                 reserve_mb,
                 reserve_rule,
                 pre_fit,
-                ramp_step,
+                working_units,
                 deflation,
                 squeezed,
                 window_requests,
@@ -401,9 +401,6 @@ impl VramLedger {
         if let Some(death) = settled.death {
             death.emit();
         }
-        if let Some(expiry) = settled.knee_expiry {
-            expiry.emit();
-        }
         // Ceiling and OOM tier lines precede the window line they explain.
         if let Some(ceiling) = settled.shape_ceiling {
             ceiling.emit();
@@ -444,7 +441,6 @@ impl VramLedger {
         // Pressure that began while the window was out counts as well.
         let charge = entry.grants.remove(&grant_id).map(|charge| GrantCharge {
             pressure: charge.pressure.max(pressure),
-            ample_headroom: charge.ample_headroom && pressure == mps::MemoryPressure::Normal,
             ..charge
         });
         if let Some(charge) = charge {
@@ -470,7 +466,6 @@ impl VramLedger {
         if ingested.alloc_retries.is_some_and(|retries| retries > 0) {
             Self::flag_starved_neighbours_locked(&mut state, worker);
         }
-        let mut knee_expiry: Option<KneeExpired> = None;
         let mut responded_negative = false;
         let frame_oom = match outcome {
             WindowOutcome::Responded { oom } => oom,
@@ -479,84 +474,31 @@ impl VramLedger {
         if let WindowOutcome::Responded { oom } = outcome {
             let negative = ingested.negative || oom.is_some();
             responded_negative = negative;
-            // Read after the ingest, which may move both.
-            let (anchor, ceiling) = match state.workers.get(&worker) {
-                Some(entry) => (
-                    Self::anchor_locked(&state, entry),
-                    Self::batch_ceiling_locked(&state, entry),
-                ),
-                None => (0, None),
-            };
-            // A binding knee stops the exponent too, or doublings would bank
-            // under it and be spent at once when it is withdrawn.
-            let gate = self.ramp_gate_locked(&state, worker, anchor);
-            let knee_binds = Self::knee_binds_locked(&state, worker);
-            // A step the ring cannot judge waits one window for a sample.
-            let awaits_sample = gate.gains
-                && !knee_binds
-                && !negative
-                && Self::awaits_knee_sample_locked(&mut state, worker, charge, &ingested);
-            let may_grow = gate.gains && !knee_binds && !awaits_sample;
-            // An uncertified hold (no knee in force, anchor > 0) is held at the
-            // largest batch this GPU ran, else the seed; never at the conferred
-            // anchor. See docs/batch-calibration-design.md, "Throughput knee:
-            // the fit itself" ("And the stop is durable").
-            let reached_here = state
+            // Read after the ingest, which may move it.
+            let anchor = state
                 .workers
                 .get(&worker)
-                .and_then(|entry| cal_locked(&state, entry))
-                .map(|cal| cal.max_units_measured_here)
-                .unwrap_or(0);
-            let seed_units = state
-                .workers
-                .get(&worker)
-                .map(|entry| entry.seed_units)
-                .unwrap_or(0);
-            let rung = if reached_here > 0 {
-                reached_here
-            } else {
-                seed_units
-            };
-            let hold_rung = if awaits_sample {
-                charge.map(|charge| charge.unit_budget)
-            } else {
-                (anchor > 0 && !gate.gains && !gate.certified && !knee_binds).then_some(rung)
-            };
+                .map_or(0, |entry| Self::anchor_locked(&state, entry));
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
                     entry.note_negative_sample(anchor);
                 } else {
-                    entry.note_clean_window(
-                        ingested.fit_samples > 0,
-                        ingested.at_budget,
-                        anchor,
-                        ceiling,
-                        may_grow,
-                        hold_rung,
-                    );
-                    // A knee or a measured plateau certifies the hold.
-                    entry.held_certified = entry.ramp_held && (gate.certified || knee_binds);
-                    entry.windows_queue_bound = if ingested.at_budget {
-                        0
-                    } else {
-                        entry.windows_queue_bound.saturating_add(1)
-                    };
+                    entry.note_clean_window();
                 }
             }
             if let Some(charge) = charge {
                 let filled = !negative && ingested.filled;
                 Self::note_pressure_size_locked(&mut state, worker, charge, filled);
             }
-            Self::reprobe_hold_locked(&mut state, worker, charge, negative);
-            if !awaits_sample {
-                Self::log_ramp_hold_locked(&mut state, worker, gate, knee_binds);
-            }
-            knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
         }
         let died = matches!(outcome, WindowOutcome::WorkerDied);
         let death = died
             .then(|| Self::note_death_locked(&mut state, worker, charge))
             .flatten();
+        if !matches!(outcome, WindowOutcome::Aborted) {
+            let failed = responded_negative || died;
+            self.note_gain_locked(&mut state, worker, charge, ingested.at_budget, failed);
+        }
         // Any OOM or death lowers a seeded anchor, unless the unified-memory
         // death path already halved it.
         if death.is_none() && (frame_oom.is_some() || ingested.oom || died) {
@@ -579,7 +521,6 @@ impl VramLedger {
             matches!(outcome, WindowOutcome::Responded { .. }) && !responded_negative,
         );
         Self::refit_locked(&mut state, worker);
-        self.refit_knee_locked(&mut state, worker);
         // No store, no write policy: it would move `cal.persisted` for nothing.
         let update = self
             .profiles
@@ -611,7 +552,7 @@ impl VramLedger {
             },
             fit_samples: ingested.fit_samples,
             throughput_samples: ingested.throughput_samples,
-            ramp_step: entry.ramp_step,
+            working_units: Self::knee_locked(&state, entry).unwrap_or(0),
             deflation: entry.deflation,
             clean_windows: entry.clean_windows,
             max_units_measured: Self::anchor_locked(&state, entry),
@@ -636,7 +577,6 @@ impl VramLedger {
         Settled {
             update,
             death,
-            knee_expiry,
             window,
             oom,
             shape_ceiling: ingested.shape_ceiling,
@@ -667,8 +607,8 @@ pub struct Grant {
     /// Per-item token cap; `None` = uncapped. The `token`-unit twin of
     /// [`Self::canvas_pixels`].
     pub max_tokens: Option<u32>,
-    /// Memory (the GPU's or host RAM), not the ramp, ratchet or queue, held
-    /// this window back.
+    /// Memory (the GPU's or host RAM), not the batch size, ratchet or queue,
+    /// held this window back.
     pub squeezed: bool,
     /// The part of `mb` a batch costs whatever its size; 0 pre-fit.
     pub fixed_mb: u64,
@@ -694,6 +634,20 @@ pub struct GrantToken {
 impl GrantToken {
     pub fn grant(&self) -> &Grant {
         &self.grant
+    }
+
+    /// Make the grant `ms` older, as if its window had been out that long.
+    #[cfg(test)]
+    pub(super) fn age_for_test(&self, ms: f64) {
+        let mut state = self.ledger.lock();
+        let charge = state
+            .workers
+            .get_mut(&self.worker)
+            .and_then(|entry| entry.grants.get_mut(&self.grant_id));
+        if let Some(charge) = charge {
+            let age = Duration::from_secs_f64(ms / 1000.0);
+            charge.granted_at = charge.granted_at.checked_sub(age).expect("a recent boot");
+        }
     }
 
     /// Release the grant and record the window's outcome. `Some` when this

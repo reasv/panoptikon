@@ -396,8 +396,9 @@ healthrec.py [--base http://127.0.0.1:6342] --out DIR/healthrec.jsonl
 ```
 
 Flattens `vram[]` into `vram` and `workers` (`external_mb`, `limit_mb`,
-`headroom_mb`, `grants_mb`, `unit_budget`, `ramp_step`, `deflation`,
-`clean_windows`, `max_units_measured`, `knee_units`, `local_samples`,
+`headroom_mb`, `grants_mb`, `unit_budget`, `deflation`,
+`clean_windows`, `max_units_measured`, `knee_units`, `knee_is_local`,
+`trial_units`, `retest_after_windows`, `local_samples`,
 `effective_margin`, `fit_*`) and `models[]` into a compact per-replica view.
 `--full` also keeps the untouched payload under `health.raw`. A refused
 connection is a sample with `ok: false`, never a crash. That per-GPU list was
@@ -781,7 +782,7 @@ that move them are in `analyze.py --help`.
 | `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | FAIL on an `over_grant` breach, WARN on a `limit_fell` one |
 | `peak_fds` | peak open descriptors and sockets against the process's own limit | — | INFO; SKIP when nothing recorded them |
 | `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form |
-| `ramp_progress` | `ramp_step` / `unit_budget` / `fit_samples` over time | — | INFO |
+| `ramp_progress` | `unit_budget` / `fit_samples` / the working size over time | — | INFO |
 | `calibration_learned` | the same three numbers, as a verdict | see below | FAIL only under `--learning` |
 
 `ledger_invariant` has two forms and reports both. The strict form — Σ charges
@@ -826,25 +827,23 @@ value recorded. The third reads the first health sample as the seed — at
 healthrec's default 500 ms that is within a sample of admission, and a leg
 that ramps at all leaves it far behind (an S2 leg: 8 → 1024).
 
-**A knee is not a stall.** The seed is a starting guess, not a floor: rule 4
-stops the ramp where throughput stops improving, so a model whose knee sits
-below its seed ends *under* it on purpose and then holds there, widening the
-probe every N clean windows to re-test the plateau. A model with a learned
-`knee_units` is therefore never counted as "never left the seed"; the detail
-instead names the seed, the knee it first learned, how many times the knee
-widened and how low the budget actually ran, and `ramp_progress` withholds its
-`REQUEST_UNIT_BUDGET` note for the same models. The case this fixes, on an
-MPS S4a leg: seed 64, knee first learned at 3 and widened up to 15,
-budget as low as 2 — reported as "NOTHING WAS LEARNED: peak unit_budget never
-left the seed" while the brake was working exactly as designed.
+**A working size a trial left in place is not a stall.** The seed is a
+starting guess, not a floor: the batch size is the smallest whose rate is
+within 5 % of the best a trial measured, so a model that gains nothing from
+larger batches ends *under* its seed on purpose and stays there, trying the
+sizes next to it every so often. A model whose `knee_units` `/health` marks
+`knee_is_local` is therefore never counted as "never left the seed"; the
+detail instead names the seed, the size a trial first left in place, how many
+times it moved and how low the budget actually ran, and `ramp_progress`
+withholds its `REQUEST_UNIT_BUDGET` note for the same models.
 
-**A hold is a stall unless the ring certified it.** Before any knee fits, the
-throughput brake holds the ramp at the rung it reached, and `/health` says
-which kind of hold that is: `held_certified` is true for a knee or a measured
-plateau — evidence, and not a stall — and false for a rung the ring cannot yet
-certify, which is the leg having measured nothing at all. Only the first
-clears "never left the seed"; the second is named in the detail as the rung
-the ring never certified.
+**A size no trial has left in place is a stall.** `knee_units` alone is not
+evidence: it is set the moment a replica opens, and it may come from a shipped
+profile. `knee_is_local` is false for both; a leg that ends that way at its
+seed has measured nothing and is
+named as "never left the seed". `utilization` reads the same flag: only a size
+a trial left in place lowers its denominator from the probe boundary to the
+largest batch that ran.
 
 `peak_fds` is report-only and exists because, with local
 inference every in-flight predict is loopback HTTP inside one process and so

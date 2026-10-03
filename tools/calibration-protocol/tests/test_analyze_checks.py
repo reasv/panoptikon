@@ -304,20 +304,21 @@ def test_utilization_falls_back_to_the_published_budget_and_says_so():
     assert "no grant lines" in verdict.detail
 
 
-# --- utilization and a held knee -------------------------------------------
+# --- utilization and a working size a trial left in place ------------------
 #
-# Rule 4 stops the ramp where throughput stops paying, so S2/S3/S4b/S4c legs
-# can reach 64 units against a 512-unit probe boundary and score
-# 0.12 — a FAIL for obeying the design, while `calibration_learned` on the
-# same recording reads the knee as learning.
+# A batch grows only while its rate does, so a leg can stop at 64 units
+# against a 512-unit probe boundary and score 0.12 — a FAIL for obeying the
+# design, while `calibration_learned` on the same recording reads the size a
+# trial left in place as learning.
 
 
-def _knee_fit(knee_units):
+def _trial_over(units, moved=False):
     return {"ts": "2026-09-07T03:33:40.929674Z", "t_wall": 100.0,
-            "level": "DEBUG", "target": "panoptikon::inferio::ledger",
-            "message": "fitted a throughput knee; batches larger than this "
-                       "are no longer admitted however much memory is free",
-            "fields": {"model": MODEL, "gpu": GPU, "knee_units": knee_units},
+            "level": "INFO", "target": "panoptikon::inferio::ledger::ramp",
+            "message": "a batch size trial is over",
+            "fields": {"model": MODEL, "gpu": GPU, "units": units,
+                       "moved": moved, "largest_units": 64,
+                       "retest_after_windows": 12},
             "line": ""}
 
 
@@ -330,11 +331,11 @@ def _settle(max_units_measured):
             "line": ""}
 
 
-def test_utilization_scores_a_knee_held_leg_against_the_rung_it_held_at():
-    """windows/S2-final: 64 issued, knee 3, rung 64, probe boundary 512."""
+def test_utilization_scores_a_size_left_in_place_against_the_largest_it_ran():
+    """64 issued, working size 3, largest batch 64, probe boundary 512."""
     ctx = _utilization_context(
         [_worker_health(64)],
-        log=[_budget_grant(64), _knee_fit(3), _settle(64)],
+        log=[_budget_grant(64), _trial_over(3), _settle(64)],
         probes=[_bisect_probe(512)])
     verdict = analyze.check_utilization(ctx)
     assert verdict.verdict == "PASS"
@@ -344,8 +345,8 @@ def test_utilization_scores_a_knee_held_leg_against_the_rung_it_held_at():
     assert "held at knee_units=3, rung 64" in verdict.detail
 
 
-def test_a_free_ramp_that_stopped_short_of_the_boundary_still_fails():
-    """The same numbers with no knee anywhere: nothing held it back."""
+def test_a_batch_size_that_stopped_short_of_the_boundary_still_fails():
+    """The same numbers with no trial to show for them."""
     ctx = _utilization_context([_worker_health(64)],
                                log=[_budget_grant(64), _settle(64)],
                                probes=[_bisect_probe(512)])
@@ -357,10 +358,10 @@ def test_a_free_ramp_that_stopped_short_of_the_boundary_still_fails():
     assert "held at" not in verdict.detail
 
 
-def test_a_knee_resumed_from_the_store_is_read_from_health_alone():
-    """S3's second process refits nothing: the knee is only in `/health`."""
+def test_a_size_resumed_from_the_store_is_read_from_health_alone():
+    """A second process may run no trial: the size is only in `/health`."""
     health = _worker_health(31)
-    health["health"]["workers"][0]["knee_units"] = 7
+    health["health"]["workers"][0].update(knee_units=7, knee_is_local=True)
     ctx = _utilization_context([health], log=[_budget_grant(31), _settle(64)],
                                probes=[_bisect_probe(512)])
     verdict = analyze.check_utilization(ctx)
@@ -368,10 +369,26 @@ def test_a_knee_resumed_from_the_store_is_read_from_health_alone():
     assert verdict.numbers["models"][0]["denominator_units"] == 64
 
 
-def test_the_knee_denominator_never_exceeds_the_probe_boundary():
-    """A rung above the OOM boundary would score against absent memory."""
+def test_a_size_no_trial_left_in_place_is_scored_against_the_boundary():
+    """`knee_units` without `knee_is_local` (the size a replica opened at, a
+    shipped one, or one a trial just moved) lowers no bar: a replica stuck at
+    2 units is a FAIL, as is a trial that moved the size."""
+    health = _worker_health(2)
+    health["health"]["workers"][0].update(knee_units=2, knee_is_local=False)
+    ctx = _utilization_context([health],
+                               log=[_budget_grant(2), _trial_over(2, True),
+                                    _settle(4)],
+                               probes=[_bisect_probe(512)])
+    verdict = analyze.check_utilization(ctx)
+    assert verdict.verdict == "FAIL"
+    row = verdict.numbers["models"][0]
+    assert (row["knee_units"], row["denominator_units"]) == (None, 512)
+
+
+def test_the_denominator_never_exceeds_the_probe_boundary():
+    """A size above the OOM boundary would score against absent memory."""
     ctx = _utilization_context([_worker_health(64)],
-                               log=[_budget_grant(64), _knee_fit(3),
+                               log=[_budget_grant(64), _trial_over(3),
                                     _settle(4096)],
                                probes=[_bisect_probe(512)])
     row = analyze.check_utilization(ctx).numbers["models"][0]
@@ -380,9 +397,9 @@ def test_the_knee_denominator_never_exceeds_the_probe_boundary():
         analyze.check_utilization(ctx).detail
 
 
-def test_a_knee_with_no_settle_line_falls_back_to_the_knees_own_cap():
+def test_a_size_with_no_settle_line_falls_back_to_itself():
     ctx = _utilization_context([_worker_health(8)],
-                               log=[_budget_grant(8), _knee_fit(15)],
+                               log=[_budget_grant(8), _trial_over(15)],
                                probes=[_bisect_probe(512)])
     verdict = analyze.check_utilization(ctx)
     row = verdict.numbers["models"][0]
@@ -390,9 +407,9 @@ def test_a_knee_with_no_settle_line_falls_back_to_the_knees_own_cap():
     assert "held at knee_units=15 =" in verdict.detail
 
 
-def test_the_probeless_leg_still_skips_with_a_knee_in_force():
+def test_the_probeless_leg_still_skips_with_a_size_left_in_place():
     ctx = _utilization_context([_worker_health(64)],
-                               log=[_budget_grant(64), _knee_fit(3),
+                               log=[_budget_grant(64), _trial_over(3),
                                     _settle(64)])
     verdict = analyze.check_utilization(ctx)
     assert verdict.verdict == "SKIP"

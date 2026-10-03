@@ -80,7 +80,8 @@ pub struct CalibrationProfile {
     /// Marginal cost in MiB per unit. Zero means no fit.
     #[serde(default)]
     pub slope_mb_per_unit: f64,
-    /// Throughput knee, when one was fitted.
+    /// The working batch size, when one was measured: the largest size that
+    /// measured faster than the one below it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knee_units: Option<u64>,
     #[serde(default)]
@@ -103,10 +104,19 @@ pub struct CalibrationProfile {
     /// Local clean high-water samples; also the confirmation gate.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub local_samples: u32,
-    /// Clean windows run at `knee_units` since the knee last moved, persisted
-    /// so a stored knee still expires across restarts.
+    /// When the next batch size trial is due ([`TrialCadence`]), so a
+    /// restart continues the wait.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub knee_clean_windows: u32,
+    pub knee_trials_failed: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub knee_retest_after: u32,
+    /// What a batch size trial had measured when its run ended, as parallel
+    /// arrays: a batch of `knee_rate_units[i]` units ran at `knee_rates[i]`
+    /// units a second. The next start goes on from them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub knee_rate_units: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub knee_rates: Vec<f64>,
     /// The fit sample ring as parallel arrays: `sample_units[i]` units
     /// allocated `sample_delta_mb[i]` MiB over `allocated_at_load`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -161,7 +171,10 @@ impl CalibrationProfile {
     /// can be copied into the baseline directory unedited.
     fn strip_local_authority(&mut self) {
         self.local_samples = 0;
-        self.knee_clean_windows = 0;
+        self.knee_trials_failed = 0;
+        self.knee_retest_after = 0;
+        self.knee_rate_units.clear();
+        self.knee_rates.clear();
         self.sample_units.clear();
         self.sample_delta_mb.clear();
     }
@@ -270,6 +283,15 @@ pub struct ProfileQuery<'a> {
     pub dtype: Option<&'a str>,
 }
 
+/// When the next trial of the batch sizes next to the working size is due.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrialCadence {
+    /// Trials in a row that left the working size in place.
+    pub failed: u32,
+    /// Windows at the working size still to run before the next trial.
+    pub retest_after: u32,
+}
+
 /// What a matched profile seeds in the ledger.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProfileSeed {
@@ -277,8 +299,13 @@ pub struct ProfileSeed {
     pub slope_mb_per_unit: f64,
     pub residual_mb: f64,
     pub samples: usize,
-    /// The throughput knee, when the matched entry carries one.
+    /// The working batch size, when the matched entry carries one.
     pub knee_units: Option<u64>,
+    /// Zero unless `local`.
+    pub knee_trials: TrialCadence,
+    /// An unfinished trial's observations, `(units, units/sec)`. Empty
+    /// unless `local`.
+    pub knee_rates: Vec<(u64, f64)>,
     /// True only for an entry from the local store.
     pub local: bool,
     /// Whether the fit fields came from a local entry; differs from `local`
@@ -290,8 +317,6 @@ pub struct ProfileSeed {
     pub max_units_measured: u64,
     /// Local clean samples accrued so far. Zero unless `local`.
     pub local_samples: u32,
-    /// The knee's expiry progress. Zero unless `local`.
-    pub knee_clean_windows: u32,
     /// The high-water sample ring behind the fit. Empty unless `local`.
     pub ring: Vec<FitSample>,
 }
@@ -315,13 +340,14 @@ pub struct ProfileUpdate {
     pub slope_mb_per_unit: f64,
     pub residual_mb: f64,
     pub samples: usize,
+    /// `None` leaves the stored working size as it is.
     pub knee_units: Option<u64>,
-    /// The persisted knee has expired and is withdrawn. Separate from
-    /// `knee_units`, where `None` means "no knee fitted this time".
-    pub knee_withdrawn: bool,
+    pub knee_trials: TrialCadence,
+    /// An unfinished trial's observations, `(units, units/sec)`; replaces
+    /// the stored ones.
+    pub knee_rates: Vec<(u64, f64)>,
     pub max_units_measured: u64,
     pub local_samples: u32,
-    pub knee_clean_windows: u32,
     pub ring: Vec<FitSample>,
 }
 
@@ -610,7 +636,6 @@ impl CalibrationStore {
         {
             let mut state = self.lock();
             self.load_local_locked(&mut state, true);
-            let update_withdrew_knee = update.knee_withdrawn;
             let mut ring = update.ring;
             if ring.len() > SAMPLE_RING {
                 ring.drain(..ring.len() - SAMPLE_RING);
@@ -633,7 +658,10 @@ impl CalibrationStore {
                 dtype_method: update.dtype_method,
                 slope_mb_per_unit: update.slope_mb_per_unit,
                 knee_units: update.knee_units,
-                knee_clean_windows: update.knee_clean_windows,
+                knee_trials_failed: update.knee_trials.failed,
+                knee_retest_after: update.knee_trials.retest_after,
+                knee_rate_units: update.knee_rates.iter().map(|(units, _)| *units).collect(),
+                knee_rates: update.knee_rates.iter().map(|(_, rate)| *rate).collect(),
                 samples: update.samples.min(u32::MAX as usize) as u32,
                 residual_mb: update.residual_mb,
                 measured_at: now_rfc3339(),
@@ -655,10 +683,8 @@ impl CalibrationStore {
                     profile.max_units_measured =
                         profile.max_units_measured.max(slot.max_units_measured);
                     profile.local_samples = profile.local_samples.max(slot.local_samples);
-                    // `None` keeps the stored knee; only a withdrawal erases it.
-                    if !update_withdrew_knee {
-                        profile.knee_units = profile.knee_units.or(slot.knee_units);
-                    }
+                    // `None` keeps the stored working size.
+                    profile.knee_units = profile.knee_units.or(slot.knee_units);
                     if profile.slope_mb_per_unit <= 0.0 && profile.samples == 0 {
                         // No fit in this update: keep the stored one.
                         profile.slope_mb_per_unit = slot.slope_mb_per_unit;
@@ -849,12 +875,24 @@ impl CalibrationProfiles for CalibrationStore {
                 .profile
                 .knee_units
                 .or_else(|| donor.and_then(|donor| donor.profile.knee_units)),
+            knee_trials: if best.local {
+                TrialCadence {
+                    failed: best.profile.knee_trials_failed,
+                    retest_after: best.profile.knee_retest_after,
+                }
+            } else {
+                TrialCadence::default()
+            },
+            knee_rates: {
+                let profile = &best.profile;
+                let rates = profile.knee_rates.iter().copied();
+                profile.knee_rate_units.iter().copied().zip(rates).collect()
+            },
             local: best.local,
             fit_is_local: donor.is_some_and(|donor| donor.local),
             exact_torch: best.exact_torch,
             max_units_measured: best.profile.max_units_measured,
             local_samples: best.profile.local_samples,
-            knee_clean_windows: best.profile.knee_clean_windows,
             ring: best.profile.ring(),
         })
     }
@@ -883,7 +921,7 @@ pub struct KnownProfile {
     pub samples: u32,
     pub local_samples: u32,
     pub max_units_measured: u64,
-    /// Throughput knee, when this entry carries one.
+    /// The working batch size, when this entry carries one.
     pub knee_units: Option<u64>,
 }
 
@@ -1190,10 +1228,10 @@ mod tests {
             residual_mb: 96.0,
             samples: 38,
             knee_units: None,
-            knee_withdrawn: false,
+            knee_trials: Default::default(),
+            knee_rates: Vec::new(),
             max_units_measured: 1024,
             local_samples: 12,
-            knee_clean_windows: 0,
             ring: (1..=4).map(|k| sample(k * 8)).collect(),
         }
     }
@@ -2219,72 +2257,23 @@ sample_delta_mb = [80, 160]
         approx(store.local_entries()[0].slope_mb_per_unit, 1.5);
         assert_eq!(store.local_entries()[0].samples, 40);
 
-        // The knee merges the same way and for the same reason as the anchor:
-        // the ledger sends one only when *this* machine fitted it, so an
-        // update carrying `None` is "nothing new to say", never "the knee is
-        // gone" — an erase that would otherwise hide in an update that carries
-        // a fit, skipping the fitless branch above entirely. The one signal
-        // that *does* erase it is the ledger reporting that the knee it wrote
-        // has expired past the point of capping anything.
-        let record = |knee_units, knee_withdrawn, slope| {
+        // The working size merges the same way and for the same reason as
+        // the anchor: the ledger sends one only when *this* machine measured
+        // it, so an update carrying `None` is "nothing new to say".
+        let record = |knee_units, slope| {
             store.record(ProfileUpdate {
                 knee_units,
-                knee_withdrawn,
                 ..update("clip/vit", "fp16", slope)
             });
             store.local_entries()[0].knee_units
         };
-        assert_eq!(record(Some(15), false, 1.5), Some(15));
+        assert_eq!(record(Some(15), 1.5), Some(15));
         assert_eq!(
-            record(None, false, 2.0),
+            record(None, 2.0),
             Some(15),
-            "a persisted knee survives updates that carry none"
+            "a stored one survives updates that carry none"
         );
-        assert_eq!(
-            record(Some(31), false, 2.0),
-            Some(31),
-            "a freshly fitted one replaces it"
-        );
-        assert_eq!(
-            record(None, true, 2.0),
-            None,
-            "and an explicit withdrawal drops it"
-        );
-    }
-
-    /// And the withdrawal has to survive the process that decided it: a knee
-    /// the run retired but the file keeps is seeded straight back on the next
-    /// start, capping the model again before it has run a single window.
-    #[test]
-    fn a_withdrawn_knee_does_not_come_back_after_a_restart() {
-        let root = tempfile::tempdir().unwrap();
-        {
-            let store = store(root.path());
-            let record = |knee_units, knee_withdrawn| {
-                store.record(ProfileUpdate {
-                    knee_units,
-                    knee_withdrawn,
-                    ..update("clip/vit", "fp16", 0.79)
-                });
-                store.write_pending();
-            };
-            record(Some(15), false);
-            record(None, true);
-        }
-
-        // A second store over the same directory: exactly what the next run
-        // reads, and the only state a restart can see.
-        let store = store(root.path());
-        assert_eq!(
-            store.local_entries()[0].knee_units,
-            None,
-            "the withdrawal reached the file, not just the run that made it"
-        );
-        let seed = lookup(&store, "clip/vit").expect("the entry still matches its own key");
-        assert_eq!(
-            seed.knee_units, None,
-            "so nothing reseeds the retired cap into the new run"
-        );
+        assert_eq!(record(Some(31), 2.0), Some(31), "a new one replaces it");
     }
 
     /// `dtype_method` is stored, round-trips, and is **ignored by matching and
@@ -2322,34 +2311,46 @@ sample_delta_mb = [80, 160]
         assert!(seed.local);
     }
 
-    /// The knee's expiry counter is persisted and read back, and — being local
-    /// authority like the anchor — is stripped when the same file is imported
-    /// as a shipped baseline.
+    /// The working size is read back by the next run and, like the anchor,
+    /// travels when the same file is imported as a shipped baseline. The wait
+    /// for the next trial and an unfinished trial's observations are read
+    /// back too, and stay local.
     #[test]
-    fn the_knee_expiry_counter_round_trips_and_is_local_only() {
+    fn the_working_size_round_trips_and_travels_into_a_baseline() {
         let root = tempfile::tempdir().unwrap();
         let store = store(root.path());
+        let knee_trials = TrialCadence {
+            failed: 3,
+            retest_after: 84,
+        };
+        let knee_rates = vec![(15, 41.5), (30, 43.25), (15, 40.0)];
         store.record(ProfileUpdate {
             knee_units: Some(15),
-            knee_clean_windows: 7,
+            knee_trials,
+            knee_rates: knee_rates.clone(),
             ..update("clip/vit", "fp16", 0.79)
         });
-        assert_eq!(store.local_entries()[0].knee_clean_windows, 7);
         let seed = lookup(&store, "clip/vit").expect("the entry matches its own key");
         assert!(seed.local);
-        assert_eq!(seed.knee_units, Some(15));
-        assert_eq!(
-            seed.knee_clean_windows, 7,
-            "a restart resumes the expiry where the last run left it"
-        );
+        assert_eq!((seed.knee_units, seed.knee_trials), (Some(15), knee_trials));
+        assert_eq!(seed.knee_rates, knee_rates);
 
-        // The same rows, read as a shipped baseline: the knee travels (it can
-        // only ever make a grant smaller) and the progress towards retiring it
-        // does not, because those windows ran on somebody else's GPU.
         let mut profile = store.local_entries().remove(0);
         profile.strip_local_authority();
         assert_eq!(profile.knee_units, Some(15));
-        assert_eq!(profile.knee_clean_windows, 0);
+        assert_eq!(
+            (profile.knee_trials_failed, profile.knee_retest_after),
+            (0, 0)
+        );
+        assert!(profile.knee_rate_units.is_empty() && profile.knee_rates.is_empty());
+
+        // The next update replaces the trial's observations: none are left.
+        store.record(ProfileUpdate {
+            knee_units: Some(15),
+            ..update("clip/vit", "fp16", 0.79)
+        });
+        let seed = lookup(&store, "clip/vit").expect("still there");
+        assert!(seed.knee_rates.is_empty());
         assert_eq!(profile.max_units_measured, 1024, "the anchor travels too");
     }
 

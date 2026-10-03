@@ -8931,14 +8931,12 @@
           "grants_mb",
           "pending_requests",
           "seed_units",
-          "ramp_step",
           "deflation",
           "clean_windows",
           "unit_budget",
-          "ramp_held",
-          "held_certified",
           "max_units_measured",
           "knee_is_local",
+          "retest_after_windows",
           "throughput_samples",
           "local_samples",
           "effective_margin",
@@ -9028,24 +9026,12 @@
             "type": "integer",
             "minimum": 0
           },
-          "held_certified": {
-            "type": "boolean",
-            "description": "Whether the knee ring certified the held rung; `false` when not held."
-          },
-          "held_units": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "minimum": 0
-          },
           "inference_id": {
             "type": "string"
           },
           "knee_is_local": {
             "type": "boolean",
-            "description": "Whether the knee was fitted here rather than seeded from a profile."
+            "description": "A trial on this machine measured the sizes next to `knee_units` and\nmoved to it or left it in place, in this run or the one that stored\nit. `false` for a size seeded from a shipped profile and one this\nreplica opened at."
           },
           "knee_units": {
             "type": [
@@ -9053,7 +9039,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Throughput knee: the largest batch size admitted whatever memory allows.",
+            "description": "The working batch size: the smallest whose rate measured within 5 %\nof the best, or the size this replica opened at until a trial has\nmeasured the sizes next to it.",
             "minimum": 0
           },
           "last_regrow_batch_ms": {
@@ -9137,16 +9123,6 @@
             "description": "A GPU replica's host RAM, booked on the CPU device: its resident set\n(absent when its RAM is not booked), the MiB per unit its grants book\n(absent until a batch measured it), what its outstanding grants hold\nbooked, and whether host RAM capped its last grant.",
             "minimum": 0
           },
-          "ramp_held": {
-            "type": "boolean",
-            "description": "The ramp is held (reported once a window ran at its budget), and the\nrung it is held at."
-          },
-          "ramp_step": {
-            "type": "integer",
-            "format": "int32",
-            "description": "Doublings earned by clean windows.",
-            "minimum": 0
-          },
           "reserved_at_load_mb": {
             "type": [
               "integer",
@@ -9162,6 +9138,12 @@
               "null"
             ],
             "format": "int64",
+            "minimum": 0
+          },
+          "retest_after_windows": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Full windows at `knee_units` still to run before the next trial.",
             "minimum": 0
           },
           "seed_units": {
@@ -9180,13 +9162,22 @@
           },
           "throughput_samples": {
             "type": "integer",
-            "description": "Samples in the knee ring (all occupancies); runtime-only.",
+            "description": "Throughput observations held (all occupancies); runtime-only.",
+            "minimum": 0
+          },
+          "trial_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The batch size the trial in progress runs next; absent between trials.",
             "minimum": 0
           },
           "unit_budget": {
             "type": "integer",
             "format": "int64",
-            "description": "The ramp+ratchet-bounded unit budget as of this snapshot.",
+            "description": "The unit budget as of this snapshot: the batch size under the ratchet.",
             "minimum": 0
           }
         }
