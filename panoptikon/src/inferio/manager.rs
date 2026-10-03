@@ -849,6 +849,7 @@ impl ModelManager {
         let sweep_interval = cfg.sweep_interval;
         let prewarm = PrewarmPool::new(cfg.spawn.clone(), cfg.prewarm.clone(), cfg.gpus.clone());
         let ledger = VramLedger::new(&cfg.gpus, cfg.vram.clone(), cfg.calibration.clone());
+        ledger.set_death_verdict_lapse(cfg.loads.cooldown_max);
         let manager = Arc::new(Self {
             cfg,
             registry,
@@ -3767,6 +3768,23 @@ metadata.cost.seed_units = 1000000
             .expect("load task")
             .expect("the slow load lands");
         manager.shutdown().await;
+    }
+
+    /// A death verdict refuses loads for as long as the load-failure
+    /// cooldown's ceiling, which this manager arms on the same verdict.
+    #[tokio::test]
+    async fn the_death_verdict_lapses_with_the_cooldown_ceiling() {
+        let setup = test_manager_with(ManagerOpts {
+            loads: LoadPolicy {
+                cooldown_max: Duration::from_secs(60),
+                ..LoadPolicy::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(
+            setup.manager.ledger.death_verdict_lapse_for_test(),
+            Duration::from_secs(60)
+        );
     }
 
     /// The gate is keyed by **GPU** and is `max_concurrent_loads` permits wide,

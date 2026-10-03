@@ -149,11 +149,6 @@ pub const CLEAN_WINDOWS_TO_RESTORE: u32 = 3;
 /// after which a replica is declared unable to run on this GPU.
 pub const OOM_WINDOWS_AT_FLOOR: u32 = CLEAN_WINDOWS_TO_RESTORE;
 
-/// How long a verdict reached by worker deaths refuses the model's loads; the
-/// strike count outlives it, so one more death at one unit refuses it again.
-/// The default ceiling of the load-failure cooldown.
-pub const DEATH_VERDICT_LAPSE: Duration = Duration::from_secs(300);
-
 /// Wall time that repays one level of deflation, for a replica too idle to
 /// earn clean windows.
 pub const DEFLATION_REPAY_SECS: Duration = TRIM_DEBOUNCE;
@@ -1425,10 +1420,14 @@ struct LedgerState {
     /// The least an unrunnable replica showed a (model, GPU) needs for one
     /// item; later loads are refused against it until a clean window clears it.
     remembered_working_sets: HashMap<(String, String), u64>,
-    /// When a (model, GPU)'s worker last died its [`OOM_WINDOWS_AT_FLOOR`]th
-    /// time in a row at one unit; its loads are refused for
-    /// [`DEATH_VERDICT_LAPSE`] from then, or until a clean window.
+    /// When a (model, GPU)'s worker was last killed its
+    /// [`OOM_WINDOWS_AT_FLOOR`]th time in a row at one item; its loads are
+    /// refused for `death_verdict_lapse` from then, or until a clean window.
+    /// The strike count outlives the refusal, so one more kill refuses again.
     death_verdicts: HashMap<(String, String), Instant>,
+    /// The load-failure cooldown's ceiling
+    /// ([`VramLedger::set_death_verdict_lapse`]).
+    death_verdict_lapse: Duration,
     /// Trims waiting for the manager to route to dispatchers.
     pending_trims: Vec<TrimRequest>,
     /// Once-per-(model, GPU) guard on the free-sample total mismatch WARN.
@@ -1545,6 +1544,9 @@ impl VramLedger {
                 gpus: rows(inventory.gpus().unwrap_or(&[])),
                 adoptable: rows(inventory.adoptable()),
                 inventory: inventory.clone(),
+                death_verdict_lapse: Duration::from_secs(
+                    crate::config::InferenceLocalConfig::default().load_failure_cooldown_max_secs,
+                ),
                 ..LedgerState::default()
             }),
             memory_query: inventory.memory_query(),
@@ -1559,6 +1561,13 @@ impl VramLedger {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    /// How long a verdict reached by memory kills refuses the model's loads:
+    /// the load-failure cooldown's ceiling, which the manager arms on the same
+    /// verdict.
+    pub fn set_death_verdict_lapse(&self, lapse: Duration) {
+        self.lock().death_verdict_lapse = lapse;
     }
 
     /// One GPU's architecture, once known.

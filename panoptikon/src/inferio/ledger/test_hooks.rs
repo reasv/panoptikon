@@ -287,6 +287,12 @@ impl VramLedger {
         }
     }
 
+    /// How long a death verdict refuses loads.
+    #[cfg(test)]
+    pub(crate) fn death_verdict_lapse_for_test(&self) -> Duration {
+        self.lock().death_verdict_lapse
+    }
+
     /// Age this replica's deflation repayment clock by `by`.
     #[cfg(test)]
     pub(super) fn age_deflation_clock_for_test(&self, worker: WorkerId, by: Duration) {

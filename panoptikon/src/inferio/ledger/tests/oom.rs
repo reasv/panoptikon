@@ -428,13 +428,15 @@ fn seed_window(
 }
 
 /// A verdict reached by deaths says the worker died, with no memory figure,
-/// and refuses loads for [`DEATH_VERDICT_LAPSE`] only. The strike count
-/// outlives it: the next death at one unit refuses the model again at once,
-/// and a clean window clears everything.
+/// and refuses loads for the load-failure cooldown's ceiling only. The strike
+/// count outlives it: the next death at one unit refuses the model again at
+/// once, and a clean window clears everything.
 #[tokio::test]
 async fn a_verdict_reached_by_deaths_says_so_and_lapses() {
+    const LAPSE: Duration = Duration::from_secs(60);
     let mut ledger = cpu_ledger(no_margin());
     Arc::get_mut(&mut ledger).unwrap().probe_external = false;
+    ledger.set_death_verdict_lapse(LAPSE);
     let died = || seed_window(&ledger, 1, WindowOutcome::WorkerDied(DeathKind::MemoryKill));
     let load = || ledger.reserve_load("g/a", item_cost(1), "CPU", None);
     assert!(died().is_none() && died().is_none());
@@ -445,15 +447,17 @@ async fn a_verdict_reached_by_deaths_says_so_and_lapses() {
     let refusal = load().await.err().expect("refused");
     assert!(refusal.died);
     assert_eq!(refusal.needs_mb, 0);
+    assert_eq!((verdict.lapse_secs, refusal.lapse_secs), (60, 60));
     for text in [verdict.to_string(), refusal.to_string()] {
         assert!(
             text.contains("died 3 times in a row running a single item on GPU CPU"),
             "{text}"
         );
+        assert!(text.contains(" 60 s"), "{text}");
         assert!(!text.contains("MiB") && !text.contains("memory"), "{text}");
     }
 
-    ledger.age_death_verdicts_for_test(DEATH_VERDICT_LAPSE - Duration::from_secs(1));
+    ledger.age_death_verdicts_for_test(LAPSE - Duration::from_secs(1));
     assert!(load().await.is_err(), "one second short");
     ledger.age_death_verdicts_for_test(Duration::from_secs(1));
     assert!(load().await.is_ok(), "one attempt");

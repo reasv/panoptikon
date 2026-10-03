@@ -131,13 +131,14 @@ impl VramLedger {
             let measured = remembered.flatten().into_iter().chain(from_profile).max();
             // A death verdict lapses; the strike count is kept.
             if let Some(died_at) = state.death_verdicts.get(&key).copied() {
-                if died_at.elapsed() < DEATH_VERDICT_LAPSE {
+                if died_at.elapsed() < state.death_verdict_lapse {
                     return Err(OversizedLoad {
                         inference_id: inference_id.to_owned(),
                         gpu: gpu.to_owned(),
                         needs_mb: 0,
                         room_mb: self.refusal_room_locked(&state, gpu),
                         died: true,
+                        lapse_secs: state.death_verdict_lapse.as_secs(),
                     });
                 }
                 state.death_verdicts.remove(&key);
@@ -158,6 +159,7 @@ impl VramLedger {
                         needs_mb,
                         room_mb,
                         died: false,
+                        lapse_secs: 0,
                     });
                 }
             }
@@ -243,9 +245,11 @@ pub struct OversizedLoad {
     /// What is left after other processes, before the reserve and our own
     /// residents.
     pub room_mb: u64,
-    /// Refused because its worker kept dying at one item
-    /// ([`UnrunnableReplica::died`]), not for its size: `needs_mb` is 0.
+    /// Refused because its worker kept being killed at one item
+    /// ([`UnrunnableReplica::died`]), not for its size: `needs_mb` is 0 and
+    /// the refusal lapses `lapse_secs` after the last kill.
     pub died: bool,
+    pub lapse_secs: u64,
 }
 
 impl std::fmt::Display for OversizedLoad {
@@ -256,10 +260,7 @@ impl std::fmt::Display for OversizedLoad {
                 "the worker of model {} died {} times in a row running a \
                  single item on GPU {}; not loading it there again until {} s \
                  after the last of those deaths",
-                self.inference_id,
-                OOM_WINDOWS_AT_FLOOR,
-                self.gpu,
-                DEATH_VERDICT_LAPSE.as_secs()
+                self.inference_id, OOM_WINDOWS_AT_FLOOR, self.gpu, self.lapse_secs
             );
         }
         write!(

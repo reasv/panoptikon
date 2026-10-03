@@ -135,6 +135,7 @@ impl VramLedger {
                 base_mb,
                 needs_mb: 0,
                 died: true,
+                lapse_secs: state.death_verdict_lapse.as_secs(),
             });
         }
         // A lower bound: base plus more than the failed window's room, and
@@ -152,6 +153,7 @@ impl VramLedger {
             base_mb,
             needs_mb,
             died: false,
+            lapse_secs: 0,
         })
     }
 
@@ -303,8 +305,9 @@ pub struct UnrunnableReplica {
     /// against; the refusal room and `needs_mb` leave the reserve out.
     pub room_mb: u64,
     /// The last strike was a memory kill, not an out-of-memory error:
-    /// `needs_mb` is 0 and the refusal lapses ([`DEATH_VERDICT_LAPSE`]).
+    /// `needs_mb` is 0 and the refusal lapses after `lapse_secs`.
     pub died: bool,
+    pub lapse_secs: u64,
 }
 
 impl std::fmt::Display for UnrunnableReplica {
@@ -314,10 +317,7 @@ impl std::fmt::Display for UnrunnableReplica {
                 f,
                 "the worker of model {} died {} times in a row running a \
                  single item on GPU {}; it is not loaded there again for {} s",
-                self.inference_id,
-                OOM_WINDOWS_AT_FLOOR,
-                self.gpu,
-                DEATH_VERDICT_LAPSE.as_secs()
+                self.inference_id, OOM_WINDOWS_AT_FLOOR, self.gpu, self.lapse_secs
             );
         }
         write!(
