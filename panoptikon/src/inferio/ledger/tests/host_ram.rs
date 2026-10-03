@@ -119,6 +119,8 @@ fn forget_gpu_side(ledger: &Arc<VramLedger>, model: &str, gpu: &str) {
             ram_cost: ram.ram_cost,
             ram_startup_mb: ram.ram_startup_mb,
             ram_first_units: ram.ram_first_units,
+            ram_first_peak_mb: ram.ram_first_peak_mb,
+            ram_kept_share: ram.ram_kept_share,
             ..ModelCalibration::default()
         },
     );
@@ -783,7 +785,7 @@ fn a_gpu_replica_reuses_the_ram_it_kept() {
 #[test]
 fn the_ram_cost_is_the_fixed_part_plus_an_upper_per_unit_cost() {
     let cost = |samples: &[(u64, u64)]| {
-        ram_cost(&ram_samples(samples), 0, 0).map(|cost| {
+        ram_cost(&ram_samples(samples), 0, 0, 0).map(|cost| {
             (
                 cost.fixed_mb,
                 cost.mb_per_unit,
@@ -839,7 +841,7 @@ fn past_the_largest_batch_the_booking_covers_its_whole_growth() {
         (512, 1_200 + 55 * 512),
         (1_024, 1_200 + 45 * 1_024),
     ];
-    let cost = ram_cost(&ram_samples(&alternating), 0, 0).expect("a cost");
+    let cost = ram_cost(&ram_samples(&alternating), 0, 0, 0).expect("a cost");
     assert!(cost.fixed_mb > 2_000.0);
     for units in 1_025..=2_048 {
         assert!(
@@ -849,7 +851,7 @@ fn past_the_largest_batch_the_booking_covers_its_whole_growth() {
     }
     // Two and four items after a first batch of one fit 223 MiB + 40 per
     // unit, where 192 items cost 100 + 50 per unit.
-    let cost = ram_cost(&ram_samples(&[(2, 303), (4, 383)]), 1, 0).expect("a cost");
+    let cost = ram_cost(&ram_samples(&[(2, 303), (4, 383)]), 1, 0, 0).expect("a cost");
     assert_eq!((cost.fixed_mb, cost.mb_per_unit), (223.0, 40.0));
     for units in 5..=8 {
         assert!(cost.booking_mb(units) >= 100 + 50 * units, "{units} units");
@@ -874,7 +876,7 @@ fn no_size_books_less_than_a_smaller_batch_measured() {
         (256, 1_200 + 45 * 256),
         (512, 1_200 + 55 * 512),
     ]);
-    let cost = ram_cost(&alternating, 0, 0).expect("a cost");
+    let cost = ram_cost(&alternating, 0, 0, 0).expect("a cost");
     assert!(cost.fixed_mb < 1_200.0);
     for units in 1..=512 {
         let floor = alternating
@@ -885,13 +887,13 @@ fn no_size_books_less_than_a_smaller_batch_measured() {
         assert!(Some(cost.booking_mb(units)) >= floor, "{units} units");
     }
     // Two items after a first batch of one that kept 8 900 MiB of start-up.
-    let one = ram_cost(&ram_samples(&[(2, 1_300)]), 1, 8_900).expect("a cost");
+    let one = ram_cost(&ram_samples(&[(2, 1_300)]), 1, 8_900, 0).expect("a cost");
     assert_eq!(
         [1, 2, 3].map(|units| one.booking_mb(units)),
         [1_300, 1_300, 2_600]
     );
     // 100 MiB over three units.
-    let thirds = ram_cost(&ram_samples(&[(3, 100)]), 0, 0).expect("a cost");
+    let thirds = ram_cost(&ram_samples(&[(3, 100)]), 0, 0, 0).expect("a cost");
     assert_eq!(thirds.booking_mb(4), 134);
     assert_eq!((thirds.units_within(0.0), thirds.booking_mb(1)), (1, 100));
 }
@@ -2086,4 +2088,85 @@ fn a_first_large_window_priced_from_cheap_small_batches_covers_its_pages() {
         "{pages} pages"
     );
     assert!(OTHERS + level + need <= CPU_RAM_MB, "{pages} pages");
+}
+
+/// A cold replica's 40 windows of pages costing 45–130 MiB each in random
+/// order, beside other processes using 1–3 GB of a `ram_mb`
+/// host, with a worker that keeps every page it decoded (`retain`) or none.
+/// With `anchored` a stored working size opens the first uncapped window far
+/// past the item-capped sizes. Returns the most a batch's peak exceeded what
+/// the CPU device charged for it, and whether any peak passed the host's RAM.
+fn varying_pages(ram_mb: u64, anchored: bool, retain: bool, seed: u64) -> (u64, bool) {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+    const STARTUP: u64 = 700;
+    const TRANSIENT: u64 = 200;
+    let profiles = anchored.then(|| {
+        Arc::new(FakeProfiles {
+            seed: Some(seeded_anchor(1_024, true)),
+            ..FakeProfiles::default()
+        })
+    });
+    let ledger = host_with_ram(&[GPU], profiles, ram_mb);
+    let (handle, admission) = cold_gpu_replica(&ledger, "g/pages", GPU, item_cost(32));
+    let mut rng = StdRng::seed_from_u64(seed);
+    let others = rng.random_range(1_000..3_000);
+    let (mut kept, mut worst, mut overran) = (0, 0, false);
+    for window in 0..40 {
+        let level = RSS_AT_LOAD_MB + if window > 0 { STARTUP } else { 0 } + kept;
+        ledger.record_free_for_test(cpu::DEVICE_KEY, ram_mb.saturating_sub(others + level));
+        let queued = if rng.random_bool(0.4) {
+            rng.random_range(1..5)
+        } else {
+            u64::MAX
+        };
+        let token = admission
+            .request_grant(queued.min(admission.window_item_bound() as u64), None, 1, 0)
+            .expect("granted");
+        let grant = *token.grant();
+        let pages = grant
+            .unit_budget
+            .min(grant.user_cap_items.map_or(u64::MAX, u64::from))
+            .min(queued);
+        let charged = cpu_row(&ledger).charges_mb;
+        let need = TRANSIENT + (0..pages).map(|_| rng.random_range(45..=130)).sum::<u64>();
+        let peak = RSS_AT_LOAD_MB + STARTUP + kept.max(need);
+        if window > 0 {
+            worst = worst.max(peak.saturating_sub(charged));
+        }
+        overran |= others + peak > ram_mb;
+        if retain {
+            kept = kept.max(need);
+        }
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                duration_ms: Some(pages as f64 * 1000.0 / ladder_rate(&RISING, pages)),
+                ..ram_batch(pages, peak, RSS_AT_LOAD_MB + STARTUP + kept)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        admission.earn_next_size();
+    }
+    (worst, overran)
+}
+
+/// Pages whose cost varies with the input, with the worker keeping what it
+/// decoded or not: no batch exceeds its booking by the RAM the host keeps
+/// free (2 GiB on an 8 GB host), and none runs the host out of RAM.
+#[test]
+fn pages_of_varying_cost_stay_inside_the_reserve() {
+    for ram_mb in [8 * 1024, 64 * 1024] {
+        for (anchored, retain) in [(false, false), (false, true), (true, false), (true, true)] {
+            for seed in 0..40 {
+                let (excess, overran) = varying_pages(ram_mb, anchored, retain, seed);
+                let case =
+                    format!("{ram_mb} MiB, anchored {anchored}, retain {retain}, seed {seed}");
+                assert!(!overran, "{case}");
+                assert!(
+                    excess < cpu::ram_reserve_mb(ram_mb),
+                    "{case}: {excess} MiB over"
+                );
+            }
+        }
+    }
 }

@@ -1258,6 +1258,10 @@ struct ModelCalibration {
     ram_startup_mb: u64,
     /// The largest first batch, in units ([`measurements::ram_cost`]).
     ram_first_units: u64,
+    /// The most a first batch grew the resident set at its peak.
+    ram_first_peak_mb: u64,
+    /// The largest share of its growth a later batch left resident.
+    ram_kept_share: f64,
 }
 
 /// A batch size the impl itself reported it cannot run at this corpus's
