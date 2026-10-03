@@ -81,6 +81,7 @@ impl VramLedger {
     /// Condemning remembers the model's working set on this GPU: the next load
     /// is refused while the refusal room ([`Self::refusal_room_locked`],
     /// reserve not deducted) is below it.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn note_floor_oom_locked(
         &self,
         state: &mut LedgerState,
