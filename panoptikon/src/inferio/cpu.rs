@@ -3,9 +3,9 @@
 //! Total is physical RAM (`MemTotal`, `ullTotalPhys`, `hw.memsize`) and free
 //! is what the OS could deliver now (`MemAvailable − SReclaimable`,
 //! `min(ullAvailPhys, ullAvailPageFile)`, macOS RAM less wired, compressed
-//! and anonymous pages), matching the worker's `"ram"` reading. On Linux both are bounded by the
-//! cgroup memory limit, since `/proc/meminfo` is not namespaced. See
-//! docs/unified-memory-admission.md "Backend C: CPU".
+//! and anonymous pages), matching the worker's `"ram"` reading. On Linux
+//! both are bounded by the cgroup memory limit, since `/proc/meminfo` is not
+//! namespaced. See docs/unified-memory-admission.md "Backend C: CPU".
 
 use std::path::PathBuf;
 
@@ -251,7 +251,6 @@ mod sys {
     mod tests {
         use super::*;
 
-        /// Free RAM is the lower of free physical memory and available commit.
         #[test]
         fn free_ram_is_the_lower_of_physical_and_commit() {
             let gib = 1024 * 1024 * 1024;
