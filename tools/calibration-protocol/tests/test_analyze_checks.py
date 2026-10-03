@@ -672,22 +672,33 @@ def test_calibration_learned_cannot_judge_a_seed_no_window_reached():
 
 
 def test_batch_coverage_counts_every_batch_from_each_workers_seq_1():
-    def coverage(*rings, check=analyze.check_batch_coverage):
-        recording = [{"kind": "sample", "t_wall": 100.0, "health": {"models": [
-            {"inference_id": MODEL, "generation": 1, "replicas": [
-                {"recent_batches": [{"seq": seq} for seq in ring]}]}]}}
-            for ring in rings]
+    def coverage(*samples, check=analyze.check_batch_coverage):
+        """Each sample is one replica's ring or a list of rings, one per
+        replica; an empty list is a sample without the model."""
+        recording = []
+        for rings in samples:
+            rings = rings if isinstance(rings, list) else [rings]
+            models = [{"inference_id": MODEL, "generation": 1, "replicas": [
+                {"recent_batches": [{"seq": seq} for seq in ring]}
+                for ring in rings]}] if rings else []
+            recording.append({"kind": "sample", "t_wall": 100.0,
+                              "health": {"ok": True, "models": models}})
         verdict = check(_context(healthrec=recording))
-        return (verdict.verdict, verdict.numbers.get("seen"),
-                verdict.numbers.get("missed"))
+        return (verdict.verdict, *(verdict.numbers.get(key) for key
+                                   in ("seen", "missed", "missed_per_model")))
 
     # First seen busy at 7-10: 1-6 were never shown.
-    assert coverage(range(7, 11)) == ("WARN", 4, 6)
+    assert coverage(range(7, 11)) == ("WARN", 4, 6, {MODEL: 6})
     # A repeated and an overlapping ring count each batch once.
-    assert coverage(range(1, 5), range(1, 5)) == ("PASS", 4, 0)
-    assert coverage(range(1, 5), range(3, 7)) == ("PASS", 6, 0)
+    assert coverage(range(1, 5), range(1, 5)) == ("PASS", 4, 0, {})
+    assert coverage(range(1, 5), range(3, 7)) == ("PASS", 6, 0, {})
     # A seq that goes back is a new worker, counted from its seq 1.
-    assert coverage(range(1, 5), (2, 3)) == ("WARN", 6, 1)
+    assert coverage(range(1, 5), (2, 3)) == ("WARN", 6, 1, {MODEL: 1})
+    # Each replica is its own series.
+    assert coverage([range(1, 5), (1, 3)]) == ("WARN", 6, 1, {MODEL: 1})
+    # A model missing from a sample was unloaded: the worker that loads it
+    # again at the same key counts from its own seq 1.
+    assert coverage(range(1, 4), [], range(4, 8)) == ("WARN", 7, 3, {MODEL: 3})
     assert coverage((), (), check=analyze.CHECKS["batch_coverage"])[0] == "SKIP"
 
 

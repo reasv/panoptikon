@@ -2323,7 +2323,9 @@ def check_alloc_retries(ctx: Context) -> Verdict:
 
 def check_batch_coverage(ctx: Context) -> Verdict:
     """`seq` numbers each worker's batches from 1, so a number no health sample
-    showed is a lost batch, and a seq that goes back starts a new worker."""
+    showed is a lost batch, and a seq that goes back starts a new worker.
+    Batches a worker runs after its last health sample are not counted, so
+    PASS means no gap between samples, not that every batch was seen."""
     if not ctx.health_samples:
         return Verdict("batch_coverage", "SKIP", "no healthrec.jsonl")
     held: Dict[Tuple[Any, ...], Set[int]] = {}
@@ -2340,17 +2342,24 @@ def check_batch_coverage(ctx: Context) -> Verdict:
             missed[str(key[0])] = missed.get(str(key[0]), 0) + lost
 
     for sample in ctx.health_samples:
-        for model in (sample.get("health") or {}).get("models") or []:
+        health = sample.get("health") or {}
+        present: Set[Tuple[Any, ...]] = set()
+        for model in health.get("models") or []:
             for index, replica in enumerate(model.get("replicas") or []):
                 seqs = {batch.get("seq") for batch
                         in replica.get("recent_batches") or []
                         if isinstance(batch.get("seq"), int)}
                 top = max(seqs, default=0)
                 key = (model.get("inference_id"), model.get("generation"), index)
+                present.add(key)
                 if top < highest.get(key, 0):
                     close(key)
                 held.setdefault(key, set()).update(seqs)
                 highest[key] = max(highest.get(key, 0), top)
+        # /health lists loaded models only; a later worker may reuse the key.
+        if health.get("ok"):
+            for key in set(held) - present:
+                close(key)
     for key in list(held):
         close(key)
     if not seen:
