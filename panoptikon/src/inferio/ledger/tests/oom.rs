@@ -482,9 +482,10 @@ fn seed_window(
 }
 
 /// A verdict reached by deaths says the worker died, with no memory figure,
-/// and refuses loads for the load-failure cooldown's ceiling only. The strike
-/// count outlives it: the next death at one unit refuses the model again at
-/// once, and a clean window clears everything.
+/// and refuses loads for the load-failure cooldown's ceiling only, also when
+/// the loads report no base. The strike count outlives it: the next death at
+/// one item refuses the model again at once, and a clean window clears
+/// everything.
 #[tokio::test]
 async fn a_verdict_reached_by_deaths_says_so_and_lapses() {
     const LAPSE: Duration = Duration::from_secs(60);
@@ -497,6 +498,8 @@ async fn a_verdict_reached_by_deaths_says_so_and_lapses() {
     let verdict = died().expect("the third death in a row");
     assert_eq!(verdict.needs_mb, 0);
 
+    let key = ("g/a".to_owned(), "CPU".to_owned());
+    ledger.lock().remembered_bases.insert(key, None);
     let refusal = load().await.err().expect("refused");
     assert_eq!(refusal.needs_mb, 0);
     assert_eq!(

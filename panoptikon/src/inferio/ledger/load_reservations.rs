@@ -77,7 +77,7 @@ impl VramLedger {
             Ok(None)
         };
         // Snapshot under a short lock: the store query below does file I/O.
-        let (gpu_arch, dtype, remembered) = {
+        let (gpu_arch, dtype, no_base) = {
             let state = self.lock();
             let Some(gpu_ledger) = state.gpus.get(gpu) else {
                 return Ok(None);
@@ -86,10 +86,12 @@ impl VramLedger {
             let dtype = dtype
                 .map(str::to_owned)
                 .or_else(|| state.remembered_dtypes.get(&key).cloned());
-            let remembered = state.remembered_bases.get(&key).copied();
-            (gpu_arch, dtype, remembered)
+            // Nothing to reserve, but a death verdict still refuses below.
+            let no_base = matches!(state.remembered_bases.get(&key), Some(None))
+                && !state.death_verdicts.contains_key(&key);
+            (gpu_arch, dtype, no_base)
         };
-        if matches!(remembered, Some(None)) {
+        if no_base {
             return no_footprint();
         }
         // No architecture, no profile query.
@@ -122,13 +124,9 @@ impl VramLedger {
             Self::refresh_pools_locked(&mut state);
             // Re-read: a load may have finished while the lock was dropped.
             let remembered = state.remembered_bases.get(&key).copied();
-            if matches!(remembered, Some(None)) {
-                return no_footprint();
-            }
             if !state.gpus.contains_key(gpu) {
                 return Ok(None);
             }
-            let measured = remembered.flatten().into_iter().chain(from_profile).max();
             // A death verdict lapses; the strike count is kept.
             if let Some(died_at) = state.death_verdicts.get(&key).copied() {
                 if died_at.elapsed() < state.death_verdict_lapse {
@@ -142,6 +140,10 @@ impl VramLedger {
                 }
                 state.death_verdicts.remove(&key);
             }
+            if matches!(remembered, Some(None)) {
+                return no_footprint();
+            }
+            let measured = remembered.flatten().into_iter().chain(from_profile).max();
             // Refusal uses only known figures: a condemned working set, else
             // this run's base, else the profile's.
             let needs = state
