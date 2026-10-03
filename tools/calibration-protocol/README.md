@@ -660,7 +660,11 @@ between `vramrec.py`'s samples), shows a release that covers the shortfall:
 the release may have come first, so the grant is listed and the check reads
 **WARN**. Only processes other than the requester that are still alive count
 as releasing; the requester emptying its cache after an out-of-memory error,
-or a worker that died, is a consequence of the grant. A
+or a worker that died, is a consequence of the grant. When no spawn line names
+the grant's model, the release is computed once with no requester and once
+with each of our workers no spawn line ties to another model; covered under
+some of them and not all is a WARN naming the model, uncovered under all a
+FAIL. A
 grant with no sample within `--join-tolerance` before it is not decidable, and
 also keeps the check at WARN. Grants on the CPU device are left out: the oracle
 records GPUs only. That

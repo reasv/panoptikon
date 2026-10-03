@@ -683,6 +683,25 @@ def test_grant_safety_counts_only_releases_by_other_live_processes():
     assert verdicts == ["FAIL", "FAIL", "WARN"]
 
 
+def test_grant_safety_without_a_spawn_line_tries_each_possible_requester():
+    """No spawn line names the model: 901 freeing 5500 MiB covers the grant
+    unless 901 asked for it, so WARN; 2000 MiB covers it under no choice, so
+    FAIL. A model whose spawned PID is not on the GPU has no requester there."""
+    before = _worker_sample(99.8, {900: 10000, 901: 6000})
+    def judge(log, workers):
+        return analyze.check_grant_safety(analyze.Context(
+            args=_args(), vramrec=[before, _worker_sample(100.1, workers)],
+            healthrec=[], hog=[], log=log + [_room_grant(100.0, 5000, 5000)],
+            before=None, after=None, jobs=None, probes=[]))
+    untied = judge([], {900: 10000, 901: 500})
+    assert (untied.verdict, len(untied.numbers["covered_if_untied"])) == ("WARN", 1)
+    assert MODEL in untied.detail
+    assert judge([], {900: 10000, 901: 4000}).verdict == "FAIL"
+    elsewhere = judge([_spawn(950, MODEL)], {900: 10000, 901: 500})
+    assert (elsewhere.verdict, len(elsewhere.numbers["covered_by_release"])) == (
+        "WARN", 1)
+
+
 def test_grant_safety_leaves_cpu_grants_to_the_ledger():
     """The oracle records GPUs only: a host-RAM grant is not undecided."""
     cpu = {**_room_grant(100.0, 160970, 160970), "fields": {

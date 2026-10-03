@@ -1275,15 +1275,19 @@ def _released_mb(before: Dict[str, Any], after: Dict[str, Any],
     return released
 
 
-def _requester_pids(ctx: Context, model: Any,
-                    rows: List[Dict[str, Any]]) -> Set[int]:
-    """Our worker PIDs in `rows` that may have asked for this grant: those
-    spawned as `model`, else every one of ours when the log ties none to it."""
+def _requesters(ctx: Context, model: Any,
+                rows: List[Dict[str, Any]]) -> List[Set[int]]:
+    """The PIDs in `rows` that may have asked for this grant: ours spawned as
+    `model` when a spawn line names it; else, one choice each, none of them
+    or any one of ours that no spawn line ties to another model."""
     ours = {proc["pid"] for row in rows for proc in row.get("procs") or []
             if ctx.is_ours(proc)}
     named = {spawn["pid"] for spawn in ctx.worker_spawns
              if spawn["model"] == str(model)}
-    return (named & ours) or ours
+    if named:
+        return [named & ours]
+    tied = {spawn["pid"] for spawn in ctx.worker_spawns if spawn["model"]}
+    return [set()] + [{pid} for pid in sorted(ours - tied)]
 
 
 def check_grant_safety(ctx: Context) -> Verdict:
@@ -1293,7 +1297,9 @@ def check_grant_safety(ctx: Context) -> Verdict:
     latest `vramrec.jsonl` sample at or before it and asks whether it exceeded
     the GPU's *live* free memory. Over it is a FAIL, or a WARN when the next
     sample shows a release by other processes that covers the shortfall: the
-    release may have come first, and the recording cannot say.
+    release may have come first, and the recording cannot say. With no spawn
+    line naming the model the release is computed for each possible
+    requester, and covered under some but not all is a WARN too.
     Without that file the check reports WARN, never PASS -- the priced-headroom
     clause alone only re-checks the ledger's arithmetic against itself.
     """
@@ -1305,6 +1311,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
     over_headroom = []
     over_free = []
     covered = []
+    untied = []
     joined = 0
     undecided = 0
     on_cpu = 0
@@ -1344,16 +1351,19 @@ def check_grant_safety(ctx: Context) -> Verdict:
                <= ctx.vram_tolerance else None)
         if (nxt and nxt.get("used_mb") is not None
                 and oracle.get("used_mb") is not None):
-            released = _released_mb(oracle, nxt, _requester_pids(
-                ctx, fields.get("model"), [oracle, nxt]))
-            if released >= shortfall:
-                covered.append({**row, "released_mb": released})
+            released = [_released_mb(oracle, nxt, pids) for pids in _requesters(
+                ctx, fields.get("model"), [oracle, nxt])]
+            if min(released) >= shortfall:
+                covered.append({**row, "released_mb": min(released)})
+                continue
+            if max(released) >= shortfall:
+                untied.append({**row, "released_mb": max(released)})
                 continue
         over_free.append(row)
     zero_mb = sum(1 for event in grants if event["fields"].get("mb") == 0)
     if over_headroom or over_free:
         verdict = "FAIL"
-    elif joined == 0 or covered or undecided:
+    elif joined == 0 or covered or untied or undecided:
         # A grant the oracle could not clear keeps the leg from PASS.
         verdict = "WARN"
     else:
@@ -1373,6 +1383,12 @@ def check_grant_safety(ctx: Context) -> Verdict:
                                f"{row['own_pool_mb']:.0f} pool, "
                                f"{row['released_mb']} released"
                                for row in covered[:10]))
+    if untied:
+        models = sorted({str(row["model"]) for row in untied})
+        detail += (f"  -- {len(untied)} are covered by the release for some "
+                   "of the workers that may have asked for them and not for "
+                   "others: no `spawned an inferio worker` line names "
+                   f"{', '.join(models)} (RUST_LOG=info,panoptikon::inferio=trace)")
     if joined == 0:
         detail += ("  -- ORACLE CLAUSE NOT RUN: "
                    + ("no vramrec.jsonl in the scenario (record it with "
@@ -1386,6 +1402,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
         "grant_safety", verdict, detail,
         {"grants": len(grants), "over_headroom": over_headroom[:10],
          "over_free": over_free[:10], "covered_by_release": covered[:10],
+         "covered_if_untied": untied[:10],
          "zero_mb_grants": zero_mb, "joined": joined, "undecided": undecided,
          "cpu_grants": on_cpu, "vramrec_samples": len(ctx.vram_samples),
          "oracle_clause_ran": joined > 0},
