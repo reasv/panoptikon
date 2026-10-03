@@ -891,9 +891,11 @@ def test_the_batch_memory_frames_capability_is_read_off_the_handshake() -> None:
         assert negotiated(batch_memory_frames=hostile) == (True, False), hostile
 
 
-def test_a_granted_window_states_each_batch(worker: WorkerProcess) -> None:
-    """A granted window on a host with no accelerator: one frame per batch
-    with its units and no sample, then the `ok`."""
+def test_a_predict_is_acknowledged_and_states_each_batch(
+    worker: WorkerProcess,
+) -> None:
+    """A granted window on a host with no accelerator: the receipt, then one
+    frame per batch with its units and no sample, then the `ok`."""
     worker.send({**handshake_msg(req_id=1), "batch_memory_frames": True})
     assert worker.recv()["type"] == "ok"
     worker.send(configure_msg(req_id=2))
@@ -912,6 +914,7 @@ def test_a_granted_window_states_each_batch(worker: WorkerProcess) -> None:
             },
         }
     )
+    assert worker.recv() == {"type": "memory", "id": 4}
     for _ in range(4):
         assert worker.recv() == {"type": "memory", "id": 4, "units": 1}
     resp = worker.recv()

@@ -1307,8 +1307,8 @@ impl Worker {
                 .await);
         }
         // Not `Unreachable`: this request did not kill it.
-        if (!self.exit_hidden() && matches!(self.child.try_wait(), Ok(Some(_))))
-            || leader_is_unwinding(self.pid)
+        if !self.exit_hidden()
+            && (matches!(self.child.try_wait(), Ok(Some(_))) || leader_is_unwinding(self.pid))
         {
             let why = format!("the worker process had exited before this {request_type} request");
             return Err(self.fatal(why, FatalCause::ExitedIdle).await);
@@ -1340,6 +1340,9 @@ impl Worker {
         let stdin = &mut self.stdin;
         let stdout = &mut self.stdout;
         let telemetry = &self.telemetry;
+        // A worker acknowledges a `predict` with a `memory` frame on reading
+        // it: one that dies before that did not die running it.
+        let mut acknowledged = false;
         let cycle = async {
             send_bytes(stdin, &bytes).await?;
             // Skip this request's `memory` frames; any other frame falls
@@ -1349,6 +1352,7 @@ impl Worker {
                 if !is_batch_memory_frame(&frame, id) {
                     return Ok(frame);
                 }
+                acknowledged = true;
                 record_memory_frame(telemetry, &frame);
             }
         };
@@ -1361,6 +1365,11 @@ impl Worker {
         };
         let value = match outcome {
             Ok(value) => value,
+            Err(err) if request_type == "predict" && !acknowledged => {
+                let why =
+                    format!("{request_type} request failed before the worker read it: {err:#}");
+                return Err(self.fatal(why, FatalCause::ExitedIdle).await);
+            }
             Err(err) => {
                 return Err(self
                     .fatal_request(
@@ -1619,7 +1628,8 @@ impl Worker {
     }
 
     /// Test hook: make the pre-signal `try_wait` blind, standing in for the
-    /// kernel's `delay_group_leader`.
+    /// kernel's `delay_group_leader`, and the check before a request is sent
+    /// blind, as on an OS whose exit status lags the exit.
     #[cfg(test)]
     pub(crate) fn hide_exit_for_test(&mut self) {
         self.hide_exit_for_test = true;
@@ -2711,7 +2721,8 @@ mod tests {
     /// A worker the kernel killed whose thread-group leader is not reapable
     /// yet: `waitpid(WNOHANG)` refuses to report it, so it must be attributed
     /// `Dying` rather than to the gateway. The hook stands in for that kernel
-    /// state; the process is really killed from outside.
+    /// state, and for an OS that shows the exit only through its status; the
+    /// process is really killed from outside.
     #[tokio::test]
     async fn a_kernel_kill_is_not_blamed_on_the_gateway_when_the_leader_reaps_late() {
         let mut worker = loaded("test/echo", "echo_test").await;
@@ -2730,13 +2741,9 @@ mod tests {
         let death = worker.last_death().expect("the fatal path recorded it");
         assert_eq!(death.attribution, DeathAttribution::Dying, "{death}");
         assert!(!death.attribution.killed_by_gateway());
-        // `/proc` alone showed it gone before the request was sent, so it
+        // The request was sent, but the worker never acknowledged it, so it
         // did not die running it.
-        #[cfg(target_os = "linux")]
-        {
-            assert!(death.why.contains("had exited before"), "{}", death.why);
-            assert!(worker.take_death().is_none());
-        }
+        assert!(worker.take_death().is_none());
     }
 
     /// The fatal path kills the worker's whole process group, also after the

@@ -2545,15 +2545,17 @@ def test_the_emitter_is_bound_to_the_request_in_flight():
 
     stream = io.BytesIO()
     emit = worker_main._memory_frame_emitter(stream, 7, True)
+    emit()
     emit(4, {"free_mb": 10, "reserved_mb": 3})
     stream.seek(0)
+    assert protocol.read_frame(stream) == {"type": "memory", "id": 7}
     assert protocol.read_frame(stream) == {
         "type": "memory",
         "id": 7,
         "units": 4,
         "memory": {"free_mb": 10, "reserved_mb": 3},
     }
-    assert protocol.read_frame(stream) is None, "exactly one frame"
+    assert protocol.read_frame(stream) is None, "exactly two frames"
 
 
 # --- Spill-capable hosts (Windows display driver) ---

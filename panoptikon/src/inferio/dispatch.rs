@@ -2600,24 +2600,32 @@ mod tests {
     /// A replica that had already exited when its window was handed to it
     /// (killed while idle, before the liveness sweep found it) did not die
     /// running that window: the model goes down and the request fails as for
-    /// any death, but the window settles as an abort.
+    /// any death, but the window settles as an abort. Also when the handle
+    /// cannot see the exit yet and sends the request: the worker never
+    /// acknowledged it.
     #[tokio::test]
     async fn a_worker_that_died_idle_settles_its_next_window_as_an_abort() {
-        let mut worker = echo_worker().await;
-        worker.kill_child_externally_for_test().await;
-        let (request, answer) = lone_request();
+        for exit_hidden in [false, true] {
+            let mut worker = echo_worker().await;
+            worker.kill_child_externally_for_test().await;
+            if exit_hidden {
+                worker.hide_exit_for_test();
+            }
+            let (request, answer) = lone_request();
 
-        let (batch, window) = run_single("test/echo", &mut worker, request, None, None, None).await;
-        assert!(matches!(batch, BatchOutcome::Fatal(_)));
-        assert_eq!(window, WindowOutcome::Aborted);
-        let err = answer
-            .await
-            .expect("the caller was answered")
-            .expect_err("the request fails");
-        assert!(
-            err.downcast_ref::<Unattempted>().is_some(),
-            "and is re-queued like any other the worker never ran: {err:#}"
-        );
+            let (batch, window) =
+                run_single("test/echo", &mut worker, request, None, None, None).await;
+            assert!(matches!(batch, BatchOutcome::Fatal(_)));
+            assert_eq!(window, WindowOutcome::Aborted, "exit hidden: {exit_hidden}");
+            let err = answer
+                .await
+                .expect("the caller was answered")
+                .expect_err("the request fails");
+            assert!(
+                err.downcast_ref::<Unattempted>().is_some(),
+                "and is re-queued like any other the worker never ran: {err:#}"
+            );
+        }
     }
 
     /// The other half: a replica that dies with the window in flight really

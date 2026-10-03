@@ -795,9 +795,11 @@ therefore differs from a GPU in six ways.
   deflation are untouched, and the gain rule sees a failed window (the trial
   ends). A window the gateway tore down itself (a cancel) and the death of an
   idle replica cap nothing; the latter includes a replica that had already
-  exited when the next request reached it, which the worker handle checks
-  before it sends a frame. A window the queue sized (fewer units in hand than
-  the model is admitted for) caps nothing either: one failed search query
+  exited, or was still being torn down, when the next request reached it.
+  The worker acknowledges a request as soon as it reads it, and a death
+  before that acknowledgement is an idle one on every operating system. A
+  window the queue sized (fewer units in hand than the model is admitted
+  for) caps nothing either: one failed search query
   must not hold a model that ran 256 at one unit. An item-capped cold-start
   window is sized by its cap and does count. A kill while the Mac pages sets
   the pressure cap at half the dying batch instead, and that cap lifts as the
@@ -828,11 +830,6 @@ Known limits:
   slab-free RAM reading, but keeps the GPU reserve. Its RAM enters inside
   the free reading (`min(GTT free, RAM)`), so a RAM floor taken off the
   device's limit would also withhold GTT that RAM is not short for.
-- On macOS and Windows only the exit status tells that an idle worker is
-  gone. A request that arrives while a killed worker is still being torn
-  down (0.4 to 2 s for a process of several GiB) still reads as a death in
-  the middle of its window. On Linux the leader's zombie state shows it
-  within a millisecond.
 - Windows refuses an allocation at the commit limit (RAM plus pagefile),
   whatever is physically free. Free RAM there is `ullAvailPhys` alone, so
   with a small pagefile a batch can fail to allocate while the reserve is
