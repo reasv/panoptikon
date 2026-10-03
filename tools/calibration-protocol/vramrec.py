@@ -31,7 +31,8 @@ Line 1 is a `"kind": "header"` object: argv, interval, host, an `"nvml"` block
                 "type": "compute"|"graphics", "gone", "rss_mb", "vmhwm_mb",
                 "env": {"CUDA_VISIBLE_DEVICES": str, ...}}]}],
      "mem":   {"mem_total_mb", "mem_available_mb", "mem_free_mb",
-               "swap_free_mb", "cached_mb", "source" (macOS only)},
+               "swap_free_mb", "cached_mb", "s_reclaimable_mb", "shmem_mb",
+               "source" (macOS only)},
      "procs": [{"pid", "cmdline", "comm", "rss_mb", "vmhwm_mb", "gone",
                 "env"}]}
 
@@ -334,6 +335,9 @@ _MEMINFO_KEYS = {
     "Cached": "cached_mb",
     "SwapFree": "swap_free_mb",
     "SwapTotal": "swap_total_mb",
+    # The product's free host RAM is MemAvailable less SReclaimable.
+    "SReclaimable": "s_reclaimable_mb",
+    "Shmem": "shmem_mb",
 }
 
 

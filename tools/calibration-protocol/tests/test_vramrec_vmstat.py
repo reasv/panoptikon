@@ -99,6 +99,18 @@ def test_swap_is_not_invented_from_vm_stat():
     assert got["swap_free_mb"] is None and got["swap_total_mb"] is None
 
 
+def test_linux_meminfo_records_reclaimable_slab_and_shmem(monkeypatch):
+    monkeypatch.setattr(vramrec, "_read_text", lambda path: (
+        "MemTotal: 131737460 kB\nMemAvailable: 31339520 kB\n"
+        "Shmem: 2097152 kB\nSReclaimable: 6144000 kB\n"))
+    got = vramrec.meminfo()
+    assert (got["mem_available_mb"], got["s_reclaimable_mb"],
+            got["shmem_mb"]) == (30605, 6000, 2048)
+    # `vm_stat` has neither counter.
+    assert vramrec.parse_vm_stat(CAPTURED, total_bytes=MEMSIZE)[
+        "s_reclaimable_mb"] is None
+
+
 def test_unparseable_output_yields_nulls_not_zeros():
     got = vramrec.parse_vm_stat("vm_stat: command not found\n")
     assert set(got.values()) == {None}

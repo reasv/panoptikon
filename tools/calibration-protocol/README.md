@@ -237,7 +237,7 @@ Per sample: every GPU's `total/used/free`, every NVML compute/graphics
 process on it (`pid`, `used_mb`, cmdline, `comm`, RSS, VmHWM and the
 `CUDA_VISIBLE_DEVICES` / `PANOPTIKON_DEVICE_PIN` / `INFERIO_*` /
 `PANOPTIKON_*` variables from `/proc/<pid>/environ`), `/proc/meminfo`
-(`MemAvailable`, `MemFree`, `Cached`, swap), and the RSS/VmHWM of every process
+(`MemAvailable`, `MemFree`, `Cached`, swap, `SReclaimable`, `Shmem`), and the RSS/VmHWM of every process
 whose cmdline matches `--filter`. Runs until SIGINT/SIGTERM or `--duration`.
 A per-process `used_mb` of `null` means NVML answered N/A (WDDM, or a container
 without `--pid=host`) — it is never silently turned into 0.
