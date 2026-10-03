@@ -335,8 +335,8 @@ impl std::fmt::Display for UnrunnableReplica {
             "model {} ran out of memory on GPU {} at a one-item batch {} \
              windows running: its base is {} MiB of the {} MiB this GPU lends \
              a window after its reserve, and one item on top of it did not \
-             fit; the next load of it here is refused unless the card has {} \
-             MiB free before the reserve",
+             fit; the next load of it here is refused until this GPU has room \
+             for {} MiB",
             self.inference_id,
             self.gpu,
             OOM_WINDOWS_AT_FLOOR,
