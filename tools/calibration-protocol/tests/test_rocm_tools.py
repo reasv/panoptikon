@@ -189,9 +189,13 @@ def test_in_a_container_kfd_is_found_by_the_fdinfo_pasid(tmp_path):
     (gpu,) = rocm_sysfs.inventory(host.roots)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
         "kfd", {700: 300}, [])
-    host.fdinfo(701, 3, _fd(BDF_03, 14, 64 * 1024, pasid=99))
+    host.kfd(4243, 1, 500 * MIB, pasid=32771)
+    host.fdinfo(701, 3, _fd(BDF_03, 12, 200 * 1024, pasid=32771))
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
-        "fdinfo", {700: 150, 701: 64}, [])
+        "kfd", {700: 300, 701: 500}, [])
+    host.fdinfo(702, 3, _fd(BDF_03, 14, 64 * 1024, pasid=99))
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
+        "fdinfo", {700: 150, 701: 200, 702: 64}, [])
 
 
 def test_a_descriptor_inherited_across_fork_counts_once(tmp_path):
