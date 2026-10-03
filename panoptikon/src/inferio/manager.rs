@@ -3538,6 +3538,7 @@ metadata.cost.seed_units = 1000000
     /// third single-item kill, each after a reload, on a GPU with nothing
     /// booked and on the CPU device: the cooldown arms, and once it has run
     /// out the ledger still refuses the load for `cooldown_max`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_model_killed_on_every_input_is_condemned_after_three_reloads() {
         for (gpus, device) in [

@@ -1557,7 +1557,7 @@ impl VramLedger {
                 adoptable: rows(inventory.adoptable()),
                 inventory: inventory.clone(),
                 death_verdict_lapse: Duration::from_secs(
-                    crate::config::InferenceLocalConfig::default().load_failure_cooldown_max_secs,
+                    crate::config::default_load_failure_cooldown_max_secs(),
                 ),
                 ..LedgerState::default()
             }),

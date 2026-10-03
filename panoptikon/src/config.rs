@@ -193,7 +193,9 @@ pub struct InferenceLocalConfig {
     /// doubles per consecutive failure. Default 2; **0 disables it**.
     #[serde(default = "default_load_failure_cooldown_secs")]
     pub load_failure_cooldown_secs: u64,
-    /// Ceiling on that window, in seconds. Default: 300.
+    /// Ceiling on that window, in seconds. Default: 300. A model condemned by
+    /// worker deaths is also refused for this long, whatever
+    /// `load_failure_cooldown_secs` is.
     #[serde(default = "default_load_failure_cooldown_max_secs")]
     pub load_failure_cooldown_max_secs: u64,
     /// Optional worker lifecycle deadline overrides (protocol doc defaults:
@@ -383,7 +385,7 @@ fn default_load_failure_cooldown_secs() -> u64 {
     2
 }
 
-fn default_load_failure_cooldown_max_secs() -> u64 {
+pub(crate) fn default_load_failure_cooldown_max_secs() -> u64 {
     300
 }
 
