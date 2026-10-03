@@ -359,8 +359,13 @@ def looks_like_oom(exc: BaseException) -> bool:
     return False
 
 
-# Lower-cased messages of a kernel whose 32-bit index overflowed (not an OOM).
-INDEX_LIMIT_MARKERS = ("integer out of range", "canuse32bitindexmath")
+# Lower-cased messages of a kernel whose 32-bit index overflowed, or of an MPS
+# array over 2^32 bytes before macOS 15 (not an OOM).
+INDEX_LIMIT_MARKERS = (
+    "integer out of range",
+    "canuse32bitindexmath",
+    "total bytes of ndarray > 2**32",
+)
 
 _total_index_limit_events = 0
 

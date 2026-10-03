@@ -17,6 +17,7 @@ from unittest import mock
 
 import pytest
 
+from inferio.impl import utils as impl_utils
 from inferio_worker import memory, packing
 from inferio_worker.inputs import PredictionInput
 from test_memory import FakeRam, cpu_host, isolated, mps_host
@@ -128,6 +129,8 @@ class FakeOomRetryUtils:
 
     def total_index_limit_events(self):
         return self.index_limits
+
+    looks_like_index_limit = staticmethod(impl_utils.looks_like_index_limit)
 
 
 @pytest.fixture(autouse=True)
@@ -2396,6 +2399,40 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
     assert failed["clamped"]["reason"] == "index_limit"
     assert failed["clamped"]["to_units"] == 1
     assert "oom" not in failed, "`classify_oom` is right to refuse it"
+
+    # A ceiling the impl raises without cutting the batch itself (an MPS array
+    # over 2^32 bytes before macOS 15): the harness halves the batch and the
+    # window's other items run. One item alone still fails the window.
+    class Raising:
+        def __init__(self, limit):
+            self.limit = limit
+            self.batches = []
+
+        def predict(self, inputs):
+            self.batches.append(len(inputs))
+            if len(inputs) > self.limit:
+                raise RuntimeError(
+                    "[MPSNDArray initWithDevice:descriptor:] Error: total bytes "
+                    "of NDArray > 2**32"
+                )
+            return [item.data for item in inputs]
+
+    impl = Raising(2)
+    payload = packing.run_window(impl, items(5), grant(unit_budget=5))
+    assert payload["outputs"] == [0, 1, 2, 3, 4]
+    assert impl.batches == [5, 2, 2, 1]
+    split = payload["measurements"][0]
+    assert split["clamped"] == {
+        "from_units": 5,
+        "to_units": 2,
+        "reason": "index_limit",
+        "free_mb": 8000,
+    }
+    assert "units" not in split and "oom" not in split
+    alone = Raising(0)
+    with pytest.raises(packing.WindowFailure):
+        packing.run_window(alone, items(3), grant(unit_budget=3))
+    assert alone.batches == [3, 1]
 
 
 def test_an_impl_that_executed_nothing_in_one_call_reports_zero_not_the_batch(

@@ -1125,6 +1125,19 @@ def _utils_total(name: str) -> int:
         return 0
 
 
+def _index_limit(exc: BaseException) -> bool:
+    """`inferio.impl.utils.looks_like_index_limit(exc)` via `sys.modules`;
+    False when unavailable."""
+    utils = sys.modules.get("inferio.impl.utils")
+    probe = getattr(utils, "looks_like_index_limit", None) if utils is not None else None
+    if probe is None:
+        return False
+    try:
+        return bool(probe(exc))
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def _executed_shape(
     before: tuple[int, int, int] | None, planned: int
 ) -> tuple[int | None, int]:
@@ -1377,14 +1390,20 @@ def run_window(
                 )
                 oom_class = classify_oom(exc, absorbed)
                 oom = oom_class is not None
-                if not oom:
+                impl_cut = _utils_total("total_index_limit_events") > index_limits_before
+                # A shape ceiling the impl did not cut itself: the rest of the
+                # window runs at half this batch's items.
+                split = not (oom or impl_cut) and len(batch) > 1 and _index_limit(exc)
+                if split:
+                    executed = len(batch) // 2
+                elif not oom:
                     logger.debug(
                         "a batch of %d inputs failed with %s, which is not an "
                         "out-of-memory condition; reporting it without the oom flag",
                         len(batch),
                         type(exc).__name__,
                     )
-                if _utils_total("total_index_limit_events") > index_limits_before:
+                if impl_cut or split:
                     clamped = executed_clamp(
                         clamped, batch, executed, units, aggregation, priced,
                         live.free_mb,
@@ -1401,6 +1420,17 @@ def run_window(
                         clamped=clamped,
                     )
                 )
+                if split:
+                    cap_items = executed
+                    logger.warning(
+                        "a batch of %d inputs exceeded a kernel's size limit "
+                        "(%s); running the rest of this window at %d. This is "
+                        "a shape ceiling, not an out-of-memory condition",
+                        len(batch),
+                        exc,
+                        executed,
+                    )
+                    continue
                 message = str(exc)
                 if oom and len(batch) > 1 and OOM_WINDOW_PREFIX not in message:
                     # The whole-window OOM signal; batch-1 has its own prefix.
