@@ -571,16 +571,17 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
     `calibration_learned`, so they agree.
 
     The working size is read here because a budget can be *deliberately* low:
-    it is the smallest size whose rate is within 5 % of the best a trial
-    measured, and a worker at it tries the sizes next to it every so often.
-    Without it those samples look exactly like a batch size that never left
-    the seed.
+    a batch grows only on a measured gain, so a model that gains nothing
+    from larger batches stays at a small size, and a worker there tries the
+    sizes next to it every so often. Without it those samples look exactly
+    like a batch size that never left the seed.
 
     Only a working size `/health` marks `knee_is_local` counts: a trial on
     this machine measured the sizes next to it and moved to it or left it in
-    place. The size
-    a replica merely opened at, or one seeded from a shipped profile, is "not
-    measured yet", which is a leg that learned nothing.
+    place. The size a replica merely opened at, or one seeded from a shipped
+    profile, is "not measured yet". `knee_from_start` is 1 when the worker's
+    first sample already carried a local size: one this machine's store
+    resumed, which this leg did not measure.
     """
     series: Dict[str, List[int]] = {}
     fits: Dict[str, int] = {}
@@ -592,10 +593,11 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
             series.setdefault(key, []).append(budget)
             if worker.get("fit_samples"):
                 fits[key] = max(fits.get(key, 0), int(worker["fit_samples"]))
-            row = knees.setdefault(key, {"knee": 0, "knee_first": 0,
-                                         "knee_moves": 0, "_last": 0})
             knee = (int(worker.get("knee_units") or 0)
                     if worker.get("knee_is_local") else 0)
+            row = knees.setdefault(key, {"knee": 0, "knee_first": 0,
+                                         "knee_moves": 0, "_last": 0,
+                                         "knee_from_start": int(knee > 0)})
             if knee:
                 if not row["knee_first"]:
                     row["knee_first"] = knee
@@ -616,7 +618,9 @@ def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
                 "low": min(values), "fit_samples": fits.get(model, 0),
                 "knee": knees.get(model, {}).get("knee", 0),
                 "knee_first": knees.get(model, {}).get("knee_first", 0),
-                "knee_moves": knees.get(model, {}).get("knee_moves", 0)}
+                "knee_moves": knees.get(model, {}).get("knee_moves", 0),
+                "knee_from_start": knees.get(model, {}).get("knee_from_start",
+                                                            0)}
         for model, values in series.items()
     }
 
@@ -2196,14 +2200,15 @@ def check_calibration_learned(ctx: Context) -> Verdict:
     == 0` for some model, no `[[profile]]` in `calibration.after.toml`, a peak
     `unit_budget` no higher than the first recorded. See the README's "Checks".
 
-    **A working size a trial left in place is learning.** The seed is a
-    starting guess, not a floor: the batch size is the smallest whose rate is
-    within 5 % of the best measured, so a model that gains nothing from
-    larger batches ends *under* its seed on purpose. A worker deliberately
-    running at 3-7 units would otherwise read "peak unit_budget never left
-    the seed (seed 64, peak 64)" and FAIL for doing exactly the right thing.
-    Only a size `/health` marks `knee_is_local` counts: the size a replica
-    opened at, with no trial to show for it, is still "stuck".
+    **A trial that ended is learning.** The seed is a starting guess, not a
+    floor: a batch grows only on a measured gain, so a model that gains
+    nothing from larger batches stays at or *under* its seed on purpose. A
+    worker deliberately running at 3-7 units would otherwise read "peak
+    unit_budget never left the seed (seed 64, peak 64)" and FAIL for doing
+    exactly the right thing. What counts is a `a batch size trial is over`
+    line, or a size `/health` marks `knee_is_local` that this leg measured:
+    one present from the worker's first sample, and never moved, was resumed
+    from the store. The size a replica opened at is still "stuck".
     """
     learning = _declared_learning(ctx)
     profiles = (ctx.after or {}).get("profile") or []
@@ -2222,8 +2227,13 @@ def check_calibration_learned(ctx: Context) -> Verdict:
                         if row["fit_samples"] == 0)
         if no_fit:
             reasons.append("fit samples == 0 for " + ", ".join(no_fit))
+        trials = {str(event["fields"].get("model"))
+                  for event in ctx.log_events("a batch size trial is over")}
+        measured = {model for model, row in rows.items()
+                    if model in trials or row["knee_moves"]
+                    or (row["knee"] and not row["knee_from_start"])}
         flat = [model for model, row in rows.items()
-                if row["peak"] <= row["first"] and not row["knee"]]
+                if row["peak"] <= row["first"] and model not in measured]
         # The budget steps up only after a window measured at it: a job that
         # formed every window short of the budget for want of queued work,
         # and whose largest window stayed under the seed, cannot show it
@@ -2263,7 +2273,7 @@ def check_calibration_learned(ctx: Context) -> Verdict:
             f"{rows[model]['knee_first']}, moved "
             f"{rows[model]['knee_moves']} time(s), at most "
             f"{rows[model]['knee']}, ran as low as {rows[model]['low']})"
-            for model in rows
+            for model in measured
             if rows[model]["knee"] and
             rows[model]["peak"] <= rows[model]["first"])
         if braked:

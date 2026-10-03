@@ -3,9 +3,9 @@ learned, not nothing.
 
 The check reads "peak `unit_budget` no higher than the first recorded" as
 "nothing was learned". That is right for a batch size that never left the
-seed and wrong for a model that ends *below* its seed on purpose: the batch
-size is the smallest whose rate is within 10 % of the best a trial measured,
-and the worker stays there, trying the sizes next to it every so often.
+seed and wrong for a model that ends *below* its seed on purpose: a batch
+grows only on a measured gain, and the worker stays at the size a trial left
+in place, trying the sizes next to it every so often.
 
 The case below: seed 64, a size first left in place at 3 and later at 7 and
 15, budget running as low as 3 — which would read `NOTHING WAS LEARNED: peak
@@ -148,3 +148,14 @@ def test_a_ramp_that_never_started_fails_without_any_working_size():
     verdict = analyze.check_calibration_learned(_context([(64, None)] * 20))
     assert verdict.verdict == "FAIL"
     assert "peak unit_budget never left the seed" in verdict.detail
+
+
+def test_a_size_resumed_from_the_store_is_learned_only_with_a_trial():
+    """`knee_is_local` from the first sample is this machine's store, not
+    this leg: it needs a `a batch size trial is over` line."""
+    ctx = _context([(64, 64)] * 20)
+    assert analyze.check_calibration_learned(ctx).verdict == "FAIL"
+    ctx.log = [{"ts": "", "t_wall": 110.0, "level": "INFO", "target": "",
+                "message": "a batch size trial is over", "line": "",
+                "fields": {"model": MODEL, "units": 64, "moved": False}}]
+    assert analyze.check_calibration_learned(ctx).verdict == "PASS"
