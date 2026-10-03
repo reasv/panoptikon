@@ -75,21 +75,25 @@ impl VramLedger {
         queued_behind: usize,
         byte_bound: bool,
     ) -> Option<GrantToken> {
+        let pressure = self.memory_pressure();
         // Fold in neighbours' per-batch pool growth before pricing, or it reads
         // as external usage. Before the probe, which reads the same clock.
-        {
+        let (gpu, ram_side) = {
             let mut state = self.lock();
             Self::refresh_pools_locked(&mut state);
+            let entry = state.workers.get(&worker)?;
+            (entry.gpu.clone(), entry.has_ram_side())
+        };
+        // While macOS pages, the worker's last reading may predate it.
+        if pressure.paging() {
+            self.refresh_host_ram_now(&gpu);
         }
         self.maybe_refresh_external(worker);
-        self.refresh_host_ram_now(worker);
-        let pressure = self.memory_pressure();
+        if ram_side {
+            self.refresh_host_ram_now(cpu::DEVICE_KEY);
+        }
         let mut state = self.lock();
         Self::repay_deflation_locked(&mut state, worker);
-        let gpu = state.workers.get(&worker)?.gpu.clone();
-        if pressure.paging() {
-            Self::nothing_available_locked(&mut state, &gpu);
-        }
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.pending_requests = window_requests.saturating_add(queued_behind);
         }
@@ -433,7 +437,13 @@ impl VramLedger {
     }
 
     fn settle_locked(&self, worker: WorkerId, grant_id: u64, outcome: WindowOutcome) -> Settled {
-        let pressure = self.memory_pressure();
+        let granted_at = self
+            .lock()
+            .workers
+            .get(&worker)
+            .and_then(|entry| entry.grants.get(&grant_id))
+            .map(|charge| charge.granted_at);
+        let pressure = granted_at.map(|at| self.memory_pressure_since(at));
         let mut state = self.lock();
         // Time repayment first, whatever the outcome.
         Self::repay_deflation_locked(&mut state, worker);
@@ -441,9 +451,10 @@ impl VramLedger {
             return Settled::default();
         };
         // This window's requests leave the demand signal on every outcome.
-        // Pressure that began while the window was out counts as well.
+        // The pressure at settle counts as well, as does paging any time
+        // since the grant.
         let charge = entry.grants.remove(&grant_id).map(|charge| GrantCharge {
-            pressure: charge.pressure.max(pressure),
+            pressure: charge.pressure.max(pressure.unwrap_or_default()),
             ..charge
         });
         if let Some(charge) = charge {

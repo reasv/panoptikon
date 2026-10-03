@@ -953,6 +953,7 @@ def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]
     `run_window` does before a growing batch), and a window whose pool ends
     above NVML's used memory is flagged `spilled` and the pool released.
     """
+    memory.count_paging_from_last_reading(False)
     spill_host = memory.spill_capable()
     largest = max(map(_input_size, inputs), default=0) if spill_host else 0
     if spill_host and memory.outgrows_pool(largest, "largest_input"):
@@ -1313,6 +1314,7 @@ def run_window(
 
     # Reactive shrink: the one point where nothing is in flight.
     trimmed = maybe_shrink(grant_mb)
+    memory.count_paging_from_last_reading(False)
 
     # Priced once, outside every timed section.
     canvas = resolve_canvas_pixels(grant, instance, unit)
@@ -1386,6 +1388,7 @@ def run_window(
             reading = memory.free_total_reading()
             live = live._replace(free_mb=reading.free_mb, free_source=reading.source)
 
+        memory.count_paging_from_last_reading(True)
         state = memory.begin_batch()
         # The `finally` stops this batch's sampler on any raise.
         try:

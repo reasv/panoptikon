@@ -20,7 +20,15 @@ import pytest
 from inferio.impl import utils as impl_utils
 from inferio_worker import memory, packing
 from inferio_worker.inputs import PredictionInput
-from test_memory import FakeMpsAllocator, FakeRam, cpu_host, isolated, mps_host
+from test_memory import (
+    NO_SWAPOUTS_SEEN,
+    FakeMpsAllocator,
+    FakeRam,
+    cpu_host,
+    fake_mps_torch_module,
+    isolated,
+    mps_host,
+)
 
 MIB = 1024 * 1024
 
@@ -966,6 +974,42 @@ def test_an_mps_worker_credits_the_metal_pool():
         assert (free_mb, source) == (8_000, "mps")
         assert packing.clamp_to_live_memory(4, 8_100).units == 4, "8200 spendable"
         assert packing.clamp_to_live_memory(4, 20_000).units == 2, "8200/20000"
+
+
+def test_paging_during_a_long_batch_cuts_the_next_one():
+    """Swap-outs 5 s into a 90 s batch and none for its last 85 s: the next
+    batch's reading counts them, since they came after the reading the batch
+    was sized from, so that batch fits the 2000 MiB pool held. The batch
+    after it saw no rise during the one before and is not cut, nor is the
+    first batch of a window after swap-outs in the idle time before it."""
+    clock = [0.0]
+
+    def counters():
+        swapouts = 500 + 100 * (clock[0] >= 5) + 100 * (clock[0] >= 300)
+        return (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 2, swapouts)
+
+    class Slow:
+        def predict(self, inputs):
+            clock[0] += 90
+            return [item.data for item in inputs]
+
+    mps = FakeMpsAllocator()
+    mps.allocate(1000, driver_mb=3000)
+    with (
+        isolated(fake_mps_torch_module(mps)),
+        mock.patch.object(memory, "_mac_memory_counters", side_effect=counters),
+        mock.patch("time.monotonic", side_effect=lambda: 1000.0 + clock[0]),
+        mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN),
+    ):
+        payload = packing.run_window(Slow(), items(16), grant(unit_budget=8, mb=4000))
+        clock[0] = 400
+        next_window = packing.run_window(Slow(), items(8), grant(unit_budget=8, mb=4000))
+    first, cut, after = payload["measurements"]
+    assert (first["items"], cut["items"], after["items"]) == (8, 4, 4)
+    assert cut["free_mb"] == 0
+    assert cut["clamped"] == {"from_units": 8, "to_units": 4, "free_mb": 0}
+    assert after["free_mb"] == 40 * 1024 and "clamped" not in after
+    assert next_window["measurements"][0]["free_mb"] == 40 * 1024
 
 
 def test_a_rocm_worker_uses_the_cuda_arm_of_the_credit(fake_rocm_torch):

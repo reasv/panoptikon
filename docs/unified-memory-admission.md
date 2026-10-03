@@ -272,20 +272,20 @@ Single synthetic device:
   4 critical). Warning means a large share of memory is held compressed; it
   does not mean anything is being paged out now (an idle neighbour that was
   compressed minutes ago keeps the level at warning with GiBs free). So the
-  reading asks a second question, **is the kernel paging**: the `swapouts`
-  counter of the same `vm_statistics64` rose since the previous reading or
-  within the 10 s before this one (`PAGING_WINDOW` / `MAC_PAGING_SECONDS`,
-  one remembered counter per process). The gateway and every worker also
-  read the counter on a background thread every 2 s (`SWAPOUT_TICK` /
-  `MAC_SWAPOUT_TICK_SECONDS`), so a rise is dated within one tick however far
-  apart the readings memory is priced from are: a batch longer than the
-  window still sees paging that began during it, and an idle worker's first
-  batch of a new job does not read "paging" from swap-outs that happened
-  while it sat idle. A first reading cannot tell, and neither can one whose
-  predecessor is more than 5 s old (`PAGING_STALE` /
-  `MAC_PAGING_STALE_SECONDS`; the process had just started or was
-  suspended). While the gateway reads paging, a grant takes the device's
-  free reading as 0 whatever the worker last reported, since that report
+  reading asks a second question, **is the kernel paging**, of the
+  `swapouts` counter of the same `vm_statistics64` (one remembered counter
+  per process). A rise is dated by the earlier reading of the pair
+  that saw it, since it happened after that reading. Paging is a rise within
+  the 10 s before now (`PAGING_WINDOW` / `MAC_PAGING_SECONDS`) or after a
+  given instant: the gateway settles a window with the instant it was
+  granted, and a worker reads before each batch with the reading its
+  window's previous batch started from, so a batch longer than 10 s still
+  counts paging that began during it and a window's first batch does not
+  count swap-outs from the idle time before it. The gateway also reads the
+  counter on a background thread every 2 s (`SWAPOUT_TICK`), so its first
+  grant after an idle time dates a rise just before it within one tick.
+  While the gateway reads paging, a grant or a load re-reads the device
+  from the host instead of pricing from the worker's last report, which
   may predate the paging. `MemoryPressure` is the two facts together:
   `Normal`, `Warning`, `Paging` (warning while paging), `Critical`.
   - **Paging or critical: `ram_available` is 0.** macOS keeps file-backed

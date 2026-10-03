@@ -2139,68 +2139,59 @@ def test_nothing_is_available_while_the_mac_pages_under_pressure() -> None:
         assert available == expected, (level, paging)
 
 
-NO_SWAPOUTS_SEEN = {"count": None, "read_at": None, "rose_at": None}
+NO_SWAPOUTS_SEEN = {"count": None, "read_at": None, "rose_after": None, "since": None}
 
 
-def test_paging_is_a_swap_out_counter_that_rose_recently() -> None:
-    """Since the previous reading, or within `MAC_PAGING_SECONDS` before this
-    one. A first reading has nothing to compare with, nor has one whose
-    predecessor is older than `MAC_PAGING_STALE_SECONDS`."""
-    readings = [  # (seconds, swap-out counter, paging)
-        (0, 500, False),
-        (1, 500, False),
-        (2, 501, True),
-        (12, 501, True),
-        (13, 501, False),
-        (18, 600, True),  # 5 s after the last reading
-        (29, 600, False),
-        (35, 900, False),  # 6 s: too old to compare with
-        (36, 901, True),
-        (50, 100, False),  # a counter that fell is not a rise
-        (51, 100, False),
-    ]
+def paging_at(seconds: float, swapouts: int) -> bool:
+    """`_mac_paging` read `seconds` into a fake clock."""
+    with mock.patch("time.monotonic", return_value=1000.0 + seconds):
+        return memory._mac_paging(swapouts)
+
+
+def test_paging_is_a_rise_within_the_window_or_after_a_batch_started() -> None:
+    """A rise is dated by the earlier reading of the pair that saw it. Paging
+    is a rise within `MAC_PAGING_SECONDS` before now, or one after the
+    reading the window's previous batch started from, however long that
+    batch ran. Mirrors `mps.rs`."""
     with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
-        for seconds, swapouts, paging in readings:
-            with mock.patch("time.monotonic", return_value=1000.0 + seconds):
-                assert memory._mac_paging(swapouts) is paging, seconds
+        # Two 90 s batches while the counter rises through both.
+        assert not paging_at(0, 500), "one reading cannot tell"
+        memory.count_paging_from_last_reading(True)
+        assert paging_at(90, 900), "rose after batch 1 started"
+        memory.count_paging_from_last_reading(False)
+        assert not paging_at(90, 900), "without it the rise is dated 90 s ago"
+        memory.count_paging_from_last_reading(True)
+        assert paging_at(180, 1300), "rose after batch 2 started"
+        memory.count_paging_from_last_reading(True)
+        paging_at(181, 100)
+        assert not paging_at(200, 100), "a counter that fell did not rise"
+    with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
+        # A burst 20-24 s into a 45 s batch.
+        paging_at(0, 500)
+        memory.count_paging_from_last_reading(True)
+        assert paging_at(45, 504), "rose after the batch started"
+        memory.count_paging_from_last_reading(False)
+        assert not paging_at(45, 504), "without it the rise is dated 45 s ago"
 
 
-def test_background_readings_date_a_rise_within_one_tick() -> None:
-    """However far apart the readings batches are sized from: swap-outs
-    rising through a 90 s batch, or at the end of a 120 s idle wait, are
-    paging at the next batch; a rise 50 s before a job is not paging at its
-    first batch. Without the background readings none of these is judged."""
-    clock = [0.0]
-
-    def now() -> float:
-        return 1000.0 + clock[0]
-
-    def judged(count, seconds: int, background: bool) -> bool:
-        def counters():
-            return (0, 0, 0, 0, 1, count(clock[0]))
-
-        def wait(tick: float) -> bool:
-            clock[0] += tick
-            return not background or clock[0] >= seconds
-
-        clock[0] = 0.0
-        with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
-            with mock.patch("time.monotonic", side_effect=now):
-                memory._mac_paging(count(0))
-                with mock.patch.object(
-                    memory, "_mac_memory_counters", counters
-                ):
-                    memory._follow_swapouts(wait)
-                clock[0] = seconds
-                return memory._mac_paging(count(seconds))
-
-    for count, seconds, paging in [
-        (lambda at: 500 + int(at), 90, True),
-        (lambda at: 600 if at >= 115 else 500, 120, True),
-        (lambda at: 600 if at >= 5 else 500, 55, False),
-    ]:
-        assert judged(count, seconds, True) is paging, seconds
-        assert judged(count, seconds, False) is False, seconds
+def test_a_windows_first_reading_counts_only_a_recent_rise() -> None:
+    """No batch of the window comes before its first reading, so a rise
+    counts there only within `MAC_PAGING_SECONDS`. One at the end of a 120 s
+    idle wait is dated at the reading before the wait; the gateway reads the
+    counter every 2 s, which dates it 6 s before its grant. A rise 50 s
+    before a job is never paging for it."""
+    with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
+        paging_at(0, 500)
+        assert not paging_at(120, 600), "dated at the reading 120 s before"
+    with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
+        for seconds in range(0, 120, 2):
+            paging_at(seconds, 600 if seconds >= 115 else 500)
+        assert paging_at(120, 600), "readings 2 s apart date it 6 s before"
+    with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
+        paging_at(0, 500)
+        assert not paging_at(55, 600), "dated 55 s before, outside the window"
+        memory.count_paging_from_last_reading(True)
+        assert not paging_at(65, 600), "the rise came before batch 1 started"
 
 
 def test_the_swap_out_counter_is_followed_at_every_pressure_level() -> None:

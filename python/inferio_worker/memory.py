@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from functools import lru_cache
 from types import ModuleType
 from typing import Any, NamedTuple
@@ -982,46 +982,29 @@ def _mac_available(facts: tuple[int, int, int, int, int, int]) -> int:
 
 
 def _mac_paging(swapouts: int) -> bool:
-    """Whether macOS swapped pages out between the previous reading and this
-    one, or within `MAC_PAGING_SECONDS` before it. A first reading, or one
-    whose predecessor is older than `MAC_PAGING_STALE_SECONDS`, has nothing
-    to compare with and is not paging.
+    """Whether macOS swapped pages out within `MAC_PAGING_SECONDS` before
+    now, or after `_swapouts["since"]` (`count_paging_from_last_reading`).
+    A rise is dated by the earlier reading of the pair that saw it: it
+    happened after that reading. Same as `mps.rs::Swapouts`.
     """
     now = time.monotonic()
-    with _swapouts_lock:
-        previous, read_at = _swapouts["count"], _swapouts["read_at"]
-        _swapouts["count"], _swapouts["read_at"] = swapouts, now
-        if (
-            previous is not None
-            and swapouts > previous
-            and now - read_at <= MAC_PAGING_STALE_SECONDS
-        ):
-            _swapouts["rose_at"] = now
-        rose_at = _swapouts["rose_at"]
-    return rose_at is not None and now - rose_at <= MAC_PAGING_SECONDS
+    if _swapouts["count"] is not None and swapouts > _swapouts["count"]:
+        _swapouts["rose_after"] = _swapouts["read_at"]
+    _swapouts["count"], _swapouts["read_at"] = swapouts, now
+    rose_after, since = _swapouts["rose_after"], _swapouts["since"]
+    return rose_after is not None and (
+        now - rose_after <= MAC_PAGING_SECONDS
+        or (since is not None and rose_after >= since)
+    )
 
 
-def _follow_swapouts(
-    wait: Callable[[float], bool] = threading.Event().wait,
-) -> None:
-    """Feed `_mac_paging` a reading every `MAC_SWAPOUT_TICK_SECONDS` until
-    `wait` returns True (the default waits on an event nobody sets)."""
-    while not wait(MAC_SWAPOUT_TICK_SECONDS):
-        facts = _mac_memory_counters()
-        if facts is not None:
-            _mac_paging(facts[5])
-
-
-def _start_following_swapouts() -> None:
-    """Start `_follow_swapouts` for the life of the process, once."""
-    global _swapouts_thread
-    with _swapouts_lock:
-        if _swapouts_thread is not None:
-            return
-        _swapouts_thread = threading.Thread(
-            target=_follow_swapouts, name="inferio-swapouts", daemon=True
-        )
-    _swapouts_thread.start()
+def count_paging_from_last_reading(counted: bool) -> None:
+    """While `counted`, a swap-out rise after the latest reading is paging
+    however long ago it was (`_mac_paging`). Set as each batch of a window
+    starts, so the next batch's reading counts paging during this one, and
+    cleared as a window starts, so its first reading does not count paging
+    from the idle time before it."""
+    _swapouts["since"] = _swapouts["read_at"] if counted else None
 
 
 # `vm_statistics64_data_t` (<mach/vm_statistics.h>) layout and the flavour
@@ -1038,21 +1021,15 @@ MAC_PRESSURE_NORMAL, MAC_PRESSURE_WARNING, MAC_PRESSURE_CRITICAL = 1, 2, 4
 # Must match `mps.rs::PAGING_WINDOW`.
 MAC_PAGING_SECONDS = 10.0
 
-# How often a background thread reads the swap-out counter
-# (`_follow_swapouts`), so a rise is dated within one tick however far apart
-# the readings batches are sized from are. Must match `mps.rs::SWAPOUT_TICK`.
-MAC_SWAPOUT_TICK_SECONDS = 2.0
-
-# The oldest previous reading a rise is still judged against: an older one
-# cannot say when the counter rose (the process had just started, or was
-# suspended). Two ticks and a late wake-up. Must match `mps.rs::PAGING_STALE`.
-MAC_PAGING_STALE_SECONDS = 5.0
-
-# The swap-out counter at the previous reading, when that was, and when the
-# counter was last seen to rise; the lock also guards starting the thread.
-_swapouts: dict[str, Any] = {"count": None, "read_at": None, "rose_at": None}
-_swapouts_lock = threading.Lock()
-_swapouts_thread: threading.Thread | None = None
+# The swap-out counter at the last reading and when that was; the time of the
+# earlier reading of the most recent pair whose counter rose; and the instant
+# after which a rise counts as paging however long ago it was.
+_swapouts: dict[str, Any] = {
+    "count": None,
+    "read_at": None,
+    "rose_after": None,
+    "since": None,
+}
 
 
 def _mac_pressure_level() -> int:
@@ -1093,7 +1070,6 @@ def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
         return None
     if not isinstance(page, int) or page <= 0:
         return None
-    _start_following_swapouts()
     return (ram, wired * page, compressed * page, anonymous * page, pressure, swapouts)
 
 

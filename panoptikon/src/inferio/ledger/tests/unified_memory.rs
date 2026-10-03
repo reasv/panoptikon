@@ -1652,17 +1652,23 @@ fn pressure_cap(ledger: &Arc<VramLedger>) -> Option<PressureCap> {
     ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].pressure_cap
 }
 
-/// `windows` windows while macOS pages: the worker holds 180 MiB of pool,
-/// which is 8 units, and its last reading, from before the paging, still
-/// shows 90 000 MiB available. The ledger's own reading says nothing is.
+/// `windows` windows while macOS pages at `pressure`: the worker holds
+/// 180 MiB of pool, which is 8 units, and its last reading, from before the
+/// paging, still shows 90 000 MiB available. The host reads none.
 fn paging_windows(
     ledger: &Arc<VramLedger>,
     handle: &TelemetryHandle,
     admission: &Admission,
+    pressure: mps::MemoryPressure,
     windows: usize,
 ) {
-    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
+    ledger.set_memory_pressure_for_test(pressure);
     push_ram(handle, MAC_TOTAL_MB, 90_000, 180, 0);
+    ledger.install_probe_stub(Some(vec![GpuMemory {
+        uuid: MPS_GPU.to_owned(),
+        total_mb: MAC_RAM_MB,
+        free_mb: 0,
+    }]));
     for window in 0..windows {
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
@@ -1722,40 +1728,70 @@ fn ramp_windows(handle: &TelemetryHandle, admission: &Admission, windows: usize)
         .collect()
 }
 
-/// While the Mac pages the reading leaves nothing available, so a grant is
-/// cut to the pool the replica holds. Those windows earn no ramp step, feed
-/// no knee and deflate nothing. At normal the batch grows back from the size
-/// it ran at by doubling, not in one jump.
+/// While the Mac pages, a grant re-reads the host, which leaves nothing
+/// available, so it is cut to the pool the replica holds whatever the
+/// worker last reported. Those windows earn no ramp step, feed no knee and
+/// deflate nothing. At normal the batch grows back from the size it ran at
+/// by doubling, not in one jump.
 #[test]
 fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
-    let (ledger, handle, admission) = ramped_mac_replica();
-    let (_, _, samples, budget) = ramp_figures(&ledger);
-    assert_eq!(budget, 128, "the trial's next size");
-    paging_windows(&ledger, &handle, &admission, 3);
-    let (size_during, deflation, samples_during, _) = ramp_figures(&ledger);
-    assert_eq!(
-        size_during,
-        Some(64),
-        "the trial is put off at the size it had measured; no paging window earned one"
-    );
-    assert_eq!(deflation, 0, "no collapse was counted");
-    assert!(
-        samples_during <= samples,
-        "no rate reached the throughput ring"
-    );
+    for pressure in [mps::MemoryPressure::Paging, mps::MemoryPressure::Critical] {
+        let (ledger, handle, admission) = ramped_mac_replica();
+        let (_, _, samples, budget) = ramp_figures(&ledger);
+        assert_eq!(budget, 128, "the trial's next size");
+        paging_windows(&ledger, &handle, &admission, pressure, 3);
+        let (size_during, deflation, samples_during, _) = ramp_figures(&ledger);
+        assert_eq!(
+            size_during,
+            Some(64),
+            "the trial is put off at the size it had measured; no paging window earned one"
+        );
+        assert_eq!(deflation, 0, "no collapse was counted");
+        assert!(
+            samples_during <= samples,
+            "no rate reached the throughput ring"
+        );
 
-    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
-    push_ram(&handle, MAC_TOTAL_MB, 90_000, 180, 0);
-    // A window the queue sized did not fill the size, so it earns no doubling.
-    queued_window_at_the_rate(&handle, &admission, 3, |_| 100.0);
-    assert_eq!(ramp_figures(&ledger).3, 8);
-    assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 64]);
-    assert_eq!(pressure_cap(&ledger), None, "back at the working size");
-    assert_eq!(
-        ramp_windows(&handle, &admission, 2),
-        [64, 64],
-        "the trial that was put off waits its twelve windows"
-    );
+        ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
+        push_ram(&handle, MAC_TOTAL_MB, 90_000, 180, 0);
+        // A window the queue sized did not fill the size, so it earns no
+        // doubling.
+        queued_window_at_the_rate(&handle, &admission, 3, |_| 100.0);
+        assert_eq!(ramp_figures(&ledger).3, 8);
+        assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 64]);
+        assert_eq!(pressure_cap(&ledger), None, "back at the working size");
+        assert_eq!(
+            ramp_windows(&handle, &admission, 2),
+            [64, 64],
+            "the trial that was put off waits its twelve windows"
+        );
+    }
+}
+
+/// While the Mac pages, a load re-reads the host too, and is priced against
+/// what it reads rather than a reading taken before the paging.
+#[tokio::test]
+async fn while_the_mac_pages_a_load_is_priced_from_a_fresh_reading() {
+    for (pressure, over_headroom, probes) in [
+        (mps::MemoryPressure::Normal, false, 0),
+        (mps::MemoryPressure::Paging, true, 1),
+    ] {
+        let ledger = mps_ledger();
+        ledger.set_memory_pressure_for_test(pressure);
+        ledger.record_free_for_test(MPS_GPU, 90_000);
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: MPS_GPU.to_owned(),
+            total_mb: MAC_RAM_MB,
+            free_mb: 0,
+        }]));
+        let (_reservation, exceeds) = ledger
+            .reserve_load_signalling("g/a", item_cost(4), MPS_GPU, None)
+            .await
+            .expect("no refusal")
+            .expect("a reservation");
+        assert_eq!(exceeds, over_headroom, "{pressure:?}");
+        assert_eq!(ledger.probe_calls(), probes, "{pressure:?}");
+    }
 }
 
 /// At warning, once the paging has stopped, the batch grows back by doubling
@@ -1765,14 +1801,14 @@ fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
 fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() {
     use mps::MemoryPressure::{Normal, Warning};
     let (ledger, handle, admission) = ramped_mac_replica();
-    paging_windows(&ledger, &handle, &admission, 2);
+    paging_windows(&ledger, &handle, &admission, mps::MemoryPressure::Paging, 2);
     ledger.set_memory_pressure_for_test(Warning);
     assert_eq!(
         ramp_windows(&handle, &admission, 5),
         [8, 16, 32, 64, 64],
         "half of the 128 in force when the paging began"
     );
-    paging_windows(&ledger, &handle, &admission, 2);
+    paging_windows(&ledger, &handle, &admission, mps::MemoryPressure::Paging, 2);
     ledger.set_memory_pressure_for_test(Warning);
     assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 32]);
     assert_eq!(
@@ -1793,7 +1829,7 @@ fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() 
 fn a_warning_or_an_episode_before_the_batch_is_back_keeps_the_bound() {
     use mps::MemoryPressure::{Normal, Warning};
     let (ledger, handle, admission) = ramped_mac_replica();
-    paging_windows(&ledger, &handle, &admission, 1);
+    paging_windows(&ledger, &handle, &admission, mps::MemoryPressure::Paging, 1);
     ledger.set_memory_pressure_for_test(Normal);
     assert_eq!(ramp_windows(&handle, &admission, 2), [8, 16]);
     ledger.set_memory_pressure_for_test(Warning);
@@ -1806,10 +1842,10 @@ fn a_warning_or_an_episode_before_the_batch_is_back_keeps_the_bound() {
     ledger.set_memory_pressure_for_test(Normal);
     assert_eq!(ramp_windows(&handle, &admission, 1), [64]);
     assert_eq!(pressure_cap(&ledger), None, "back at what the ramp admits");
-    paging_windows(&ledger, &handle, &admission, 1);
+    paging_windows(&ledger, &handle, &admission, mps::MemoryPressure::Paging, 1);
     ledger.set_memory_pressure_for_test(Normal);
     assert_eq!(ramp_windows(&handle, &admission, 1), [8]);
-    paging_windows(&ledger, &handle, &admission, 1);
+    paging_windows(&ledger, &handle, &admission, mps::MemoryPressure::Paging, 1);
     ledger.set_memory_pressure_for_test(Warning);
     assert_eq!(
         ramp_windows(&handle, &admission, 4),
@@ -1853,7 +1889,7 @@ fn the_bound_of_a_one_unit_batch_is_one_unit() {
 #[test]
 fn a_reloaded_replica_inherits_the_size_paging_left() {
     let (ledger, handle, admission) = ramped_mac_replica();
-    paging_windows(&ledger, &handle, &admission, 1);
+    paging_windows(&ledger, &handle, &admission, mps::MemoryPressure::Paging, 1);
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
     let reloaded = loaded_mps(Some(MAC_TOTAL_MB));
     let _admission = ledger
@@ -1974,7 +2010,7 @@ fn a_window_under_pressure_at_either_end_earns_no_step() {
 #[test]
 fn a_death_cap_and_a_paging_cap_hold_the_smaller_batch() {
     let (ledger, handle, admission) = ramped_mac_replica();
-    paging_windows(&ledger, &handle, &admission, 2);
+    paging_windows(&ledger, &handle, &admission, mps::MemoryPressure::Paging, 2);
     let paged = pressure_cap(&ledger).expect("capped by the paging windows");
     assert_eq!(paged.units, 8);
 
