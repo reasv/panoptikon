@@ -227,8 +227,9 @@ class Context:
     jobs: Optional[Any]
     probes: List[Dict[str, Any]]
     fds: List[Dict[str, Any]] = field(default_factory=list)
-    # When `legs.py` asked the hog to stop: the gateway is idle from then on.
-    teardown_t: Optional[float] = None
+    # When no job ran, from `legs.json`: each `job_end` to the next
+    # `job_start`, and the hog stop to the end of the recording.
+    idle_spans: List[Tuple[float, float]] = field(default_factory=list)
     # Labels of the hog events `legs.py` marked `hog_event_void`.
     void_hog_events: List[str] = field(default_factory=list)
     # How far the wall clock stepped during the first job, the one jobs.json
@@ -709,16 +710,16 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     unpriced = 0
     unpriced_sources: Dict[str, int] = {}
     per_gpu: Dict[str, float] = {}
-    teardown = 0
+    idle = 0
     skewed = 0
     for sample in ctx.health_samples:
         health = sample.get("health") or {}
         if not health.get("ok"):
             continue
-        # Once the hog is stopped the idle gateway keeps its last external
-        # figure until something asks it to refresh: not a disagreement.
-        if ctx.teardown_t is not None and sample["t_wall"] >= ctx.teardown_t:
-            teardown += 1
+        # The idle gateway keeps its last figure until something asks it to
+        # refresh: not a disagreement.
+        if any(start <= sample["t_wall"] < end for start, end in ctx.idle_spans):
+            idle += 1
             continue
         vram = ctx.vram_at(sample["t_wall"])
         if vram is None:
@@ -793,11 +794,11 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
         f"GPU-samples; {breaches} outside the allowance"
         + (f"; {unpriced} further samples priced no PID and were skipped"
            if unpriced else "")
-        + (f"; {teardown} health samples after the hog stop were not joined"
-           if teardown else "")
+        + (f"; {idle} health samples while no job ran were not joined"
+           if idle else "")
         + skipped,
         {"joined": joined, "breaches": breaches, "worst_mb": worst,
-         "unpriced_samples": unpriced, "teardown_samples": teardown,
+         "unpriced_samples": unpriced, "idle_samples": idle,
          "skewed_samples": skewed,
          "per_gpu_worst_mb": per_gpu, "worst_sample": worst_row},
     )
@@ -2010,6 +2011,25 @@ def check_persistence(ctx: Context) -> Verdict:
                     "regressions": regressions})
 
 
+def _idle_spans(legs: Optional[Dict[str, Any]]) -> List[Tuple[float, float]]:
+    """From each `job_end` (or the hog stop) to the next `job_start`, else to
+    the end of the recording."""
+    spans: List[Tuple[float, float]] = []
+    opened: Optional[float] = None
+    for event in (legs or {}).get("events") or []:
+        t_wall = _iso_epoch(str(event.get("iso", "")))
+        if t_wall is None:
+            continue
+        if event.get("event") in ("job_end", "hog_stop_requested"):
+            opened = t_wall if opened is None else opened
+        elif event.get("event") == "job_start" and opened is not None:
+            spans.append((opened, t_wall))
+            opened = None
+    if opened is not None:
+        spans.append((opened, math.inf))
+    return spans
+
+
 def _unfinished_jobs(legs: Optional[Dict[str, Any]]) -> List[str]:
     events = (legs or {}).get("events") or []
     ends = [str(event.get("outcome")) for event in events
@@ -2800,8 +2820,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             probes.append(payload)
 
     legs = read_json(pick(None, "legs.json"))
-    hog_stop = next((event.get("iso") for event in (legs or {}).get("events") or []
-                     if event.get("event") == "hog_stop_requested"), None)
     ctx = Context(
         args=args,
         vramrec=read_jsonl(pick(args.vramrec, "vramrec.jsonl")),
@@ -2813,7 +2831,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         jobs=read_json(pick(args.jobs, "jobs.json")),
         probes=probes,
         fds=read_fds(pick(None, "fds.jsonl")) or read_fds(pick(None, "fdrec.txt")),
-        teardown_t=_iso_epoch(hog_stop) if hog_stop else None,
+        idle_spans=_idle_spans(legs),
         void_hog_events=[str(event.get("label")) for event
                          in (legs or {}).get("events") or []
                          if event.get("event") == "hog_event_void"],

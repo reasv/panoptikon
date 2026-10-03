@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -721,16 +722,24 @@ def test_grant_safety_decides_a_zero_grant_without_a_sample():
     assert (verdict.numbers["joined"], verdict.numbers["undecided"]) == (1, 0)
 
 
-def test_oracle_agreement_skips_the_samples_after_the_hog_stop():
-    """The idle gateway keeps the hog's last figure until the next refresh."""
+def test_oracle_agreement_skips_the_samples_while_no_job_ran():
+    """From `job_end`, or the hog stop, to the next `job_start`, the idle
+    gateway keeps its last figure until something asks it to refresh."""
+    legs = {"events": [
+        {"event": "job_start", "iso": "1970-01-01T00:01:39Z"},
+        {"event": "job_end", "iso": "1970-01-01T00:01:40.5Z"},
+        {"event": "job_start", "iso": "1970-01-01T00:01:42Z"},
+        {"event": "job_end", "iso": "1970-01-01T00:01:43Z"},
+        {"event": "hog_stop_requested", "iso": "1970-01-01T00:01:44Z"}]}
+    assert analyze._idle_spans(legs) == [(100.5, 102.0), (103.0, math.inf)]
     procs = [_proc(900, 1000, "inferio-worker")]
     stale = {**_health_sample(14000), "t_wall": 101.0}
     ctx = _context(vramrec=[_vram_sample(procs, used_mb=1000)],
                    healthrec=[_health_sample(0), stale])
     assert analyze.check_oracle_agreement(ctx).verdict == "FAIL"
-    ctx.teardown_t = 100.5
+    ctx.idle_spans = analyze._idle_spans(legs)
     verdict = analyze.check_oracle_agreement(ctx)
-    assert (verdict.verdict, verdict.numbers["teardown_samples"]) == ("PASS", 1)
+    assert (verdict.verdict, verdict.numbers["idle_samples"]) == ("PASS", 1)
 
 
 def _learning_context(seed, queue_bound=7):
