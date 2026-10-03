@@ -7,7 +7,9 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
@@ -41,28 +43,20 @@ fn logs_file_path(settings: &Settings) -> Option<PathBuf> {
     }
 }
 
-fn open_logs_file(settings: &Settings) -> Option<(PathBuf, fs::File)> {
-    let path = logs_file_path(settings)?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && let Err(err) = fs::create_dir_all(parent)
-    {
-        eprintln!(
-            "failed to create log directory {}: {err}; file logging disabled",
-            parent.display()
-        );
-        return None;
-    }
-    match fs::OpenOptions::new().append(true).create(true).open(&path) {
-        Ok(file) => Some((path, file)),
-        Err(err) => {
-            eprintln!(
-                "failed to open log file {}: {err}; file logging disabled",
-                path.display()
-            );
-            None
-        }
-    }
+/// Opens the log file for appending. A failure names another user owning,
+/// or a read-only filesystem holding, the file or the folder it is made in.
+fn open_logs_file(path: &Path) -> anyhow::Result<fs::File> {
+    let folder = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let opened = fs::create_dir_all(folder)
+        .with_context(|| format!("failed to create log directory {}", folder.display()))
+        .and_then(|()| {
+            let file = fs::OpenOptions::new().append(true).create(true).open(path);
+            file.with_context(|| format!("failed to open log file {}", path.display()))
+        });
+    opened.map_err(|err| crate::ownership::explain_create(err, folder, path))
 }
 
 /// Initializes tracing with a console layer and, unless disabled, an appending
@@ -78,7 +72,14 @@ pub(crate) fn init(settings: &Settings) -> Option<WorkerGuard> {
         .with(env_filter(&settings.logging.level))
         .with(console_layer);
 
-    match open_logs_file(settings) {
+    let file = logs_file_path(settings).and_then(|path| match open_logs_file(&path) {
+        Ok(file) => Some((path, file)),
+        Err(err) => {
+            eprintln!("{err:#}; file logging disabled");
+            None
+        }
+    });
+    match file {
         Some((path, file)) => {
             let (writer, guard) = tracing_appender::non_blocking(file);
             let file_layer = tracing_subscriber::fmt::layer()
@@ -128,6 +129,23 @@ base_url = "http://127.0.0.1:6342"
         settings.logging = logging;
         settings.data_folder = PathBuf::from(data_folder);
         settings
+    }
+
+    /// A log file that cannot be opened names another user owning its folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_log_folder_another_user_owns_is_named() {
+        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        let Some((folder, owner)) = foreign_folder(false) else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let link = root.path().join("logs");
+        std::os::unix::fs::symlink(folder, &link).unwrap();
+        let error = open_logs_file(&link.join("panoptikon.log")).unwrap_err();
+        let error = format!("{error:#}");
+        let expected = owned_by_another_user(&link, owner, folder);
+        assert!(error.starts_with(&expected), "{error}");
     }
 
     /// `[logging].file` resolution preserves the old LOGS_FILE semantics:
