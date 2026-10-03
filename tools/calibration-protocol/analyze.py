@@ -250,6 +250,7 @@ class Context:
         self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
         self._pid_first_seen: Optional[Dict[int, float]] = None
         self._release_windows: Dict[str, List[Tuple[float, float, int, int]]] = {}
+        self.hog_pids = {row["pid"] for row in self.hog if row.get("pid") is not None}
         self.vram_tolerance = self._join_tolerance(self._vram_times, self.vramrec)
         self.hog_tolerance = self._join_tolerance(self._hog_times, self.hog)
 
@@ -307,7 +308,8 @@ class Context:
                 ours = others = 0
                 for proc in before.get("procs") or []:
                     held, later = proc.get("used_mb"), now.get(proc["pid"], 0)
-                    if held is None or later is None or later >= held:
+                    if (proc["pid"] in self.hog_pids or held is None or later is None
+                            or later >= held):
                         continue
                     if self.is_ours(proc):
                         ours += int(held) - int(later)

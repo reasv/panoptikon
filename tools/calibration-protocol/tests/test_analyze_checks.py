@@ -815,11 +815,11 @@ def test_oracle_agreement_skips_samples_while_a_release_leaves_used():
 
 
 def test_oracle_agreement_skips_samples_while_the_hog_moved():
-    """The ledger read free before the hog took 8 GiB: not yet a
-    disagreement. Read after it and still missing it is one. A fill writes
-    its state row when done, after the ledger read."""
+    """The ledger read free before the hog, PID 4, took or gave back 8 GiB:
+    not yet a disagreement, and no release. Read after it and still missing
+    it is one. A fill writes its state row when done, after the ledger read."""
     def judge(ledger, held, rows=(99.0, 99.5, 100.0, 100.5, 101.0, 101.5, 102.0)):
-        hog = [{"kind": "header", "target": "gpu", "gpu_uuid": GPU}] + [
+        hog = [{"kind": "header", "target": "gpu", "gpu_uuid": GPU, "pid": 4}] + [
             {"kind": "state", "t_wall": t, "held_mb": held(t)} for t in rows]
         vramrec = [_row(t, 20 + held(t), {4: held(t)})
                    for t in (100.0 + 0.25 * step for step in range(9))]
@@ -828,6 +828,8 @@ def test_oracle_agreement_skips_samples_while_the_hog_moved():
                 verdict.numbers["releasing_samples"])
     step_up = lambda t: 8192 if t >= 100.5 else 0
     assert judge(_ledger(101.0, 20, age_ms=1000), step_up) == ("SKIP", 1, 0)
+    assert judge(_ledger(101.0, 8212, age_ms=1000),
+                 lambda t: 8192 - step_up(t)) == ("SKIP", 1, 0)
     assert judge(_ledger(102.0, 8212), step_up)[0] == "PASS"
     assert judge(_ledger(102.0, 20), step_up)[0] == "FAIL"
     assert judge(_ledger(101.0, 20), step_up,
