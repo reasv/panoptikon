@@ -341,10 +341,17 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Creates an executable script from a child process, so no forked test
+    /// child inherits a write descriptor on it (ETXTBSY).
     fn install(dir: &Path, name: &str, script: &str) -> PathBuf {
         let path = dir.join(name);
-        fs::write(&path, script).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let write = r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#;
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", write, "sh", script])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not write {}", path.display());
         path
     }
 
