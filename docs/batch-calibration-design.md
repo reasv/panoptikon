@@ -782,14 +782,14 @@ therefore differs from a GPU in six ways.
   own SIGKILL of a live worker settles as an abort. A crash says nothing
   about memory and is accounted as an aborted window: no cap, no anchor
   change, no failed trial. A memory kill with a granted window in flight caps
-  its (model, device) at half that window's unit budget, at least one item's
-  units. (A unified-memory device also halves the anchor, but the next
-  replica is admitted for twice the anchor, which is the batch that died, and
-  deflation is lost with the replica.) The cap holds for the life of the
-  server process, halves again at each further kill, and stops the ramp like
-  a shape ceiling; `/health` shows it as `death_cap_units`. It applies on
-  every device. On a GPU with its own memory the kill was for host RAM,
-  whether or not the window had any booked: the GPU's anchor, margin and
+  its (model, device) at half that window's unit budget, at least the dying
+  window's smallest item. (A unified-memory device also halves the anchor,
+  but the next replica is admitted for twice the anchor, which is the batch
+  that died, and deflation is lost with the replica.) The cap holds for the
+  life of the server process, halves again at each further kill, and stops
+  the ramp like a shape ceiling; `/health` shows it as `death_cap_units`. It
+  applies on every device. On a GPU with its own memory the kill was for host
+  RAM, whether or not the window had any booked: the GPU's anchor, margin and
   deflation are untouched, and the gain rule sees a failed window (the trial
   ends). A window the gateway tore down itself (a cancel) and the death of an
   idle replica cap nothing; the latter includes a replica that had already
@@ -800,15 +800,15 @@ therefore differs from a GPU in six ways.
   window is sized by its cap and does count. A kill while the Mac pages sets
   the pressure cap at half the dying batch instead, and that cap lifts as the
   batch grows back at normal pressure. A model that cannot run one item is
-  still condemned as before, and a memory kill of a window of one item (one
-  item in the window, or a budget under two of its smallest items, whatever
+  still condemned as before, and a memory kill of a window of one item (an
+  item cap of one, or a budget under two of its smallest items, whatever
   the cost unit) counts toward that verdict whatever room the ledger saw: the
   batch cannot shrink further. Three such kills in a row (a clean window
   clears the count, which passes from a dead replica to the next; an abort, a
-  crash or a window while the Mac pages neither counts nor clears it) refuse
-  the model's next load and arm the load cooldown instead of reloading it for
-  ever. A verdict reached by kills names no memory figure: it and the load
-  refusal say that the worker died three times in a row running a single
+  crash or a failed window while the Mac pages neither counts nor clears it)
+  refuse the model's next load and arm the load cooldown instead of reloading
+  it for ever. A verdict reached by kills names no memory figure: it and the
+  load refusal say that the worker died three times in a row running a single
   item. Such a verdict lapses after `load_failure_cooldown_max_secs` (the
   load-failure cooldown's ceiling) while the strike count is kept: the model
   gets one load attempt per lapse, one more kill at one item refuses it again

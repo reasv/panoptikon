@@ -227,7 +227,7 @@ impl VramLedger {
     /// (`charge`).
     ///
     /// The (model, device) is capped at half that window's unit budget, at
-    /// least one item's units: for the life of this process, or, while macOS
+    /// least its smallest item: for the life of this process, or, while macOS
     /// was paging, through the [`PressureCap`], which lifts as the batch grows
     /// back at normal pressure. Without the cap the next replica is admitted
     /// for the batch that died, and dies again. A window the queue sized sets
