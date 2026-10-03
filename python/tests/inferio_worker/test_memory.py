@@ -2152,16 +2152,50 @@ def test_paging_is_a_swap_out_counter_that_rose_recently() -> None:
         (2, 501, True),
         (12, 501, True),
         (13, 501, False),
-        (73, 600, True),  # 60 s after the last reading
-        (134, 900, False),  # 61 s: too old to compare with
-        (135, 901, True),
-        (150, 100, False),  # a counter that fell is not a rise
-        (151, 100, False),
+        (18, 600, True),  # 5 s after the last reading
+        (29, 600, False),
+        (35, 900, False),  # 6 s: too old to compare with
+        (36, 901, True),
+        (50, 100, False),  # a counter that fell is not a rise
+        (51, 100, False),
     ]
     with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
         for seconds, swapouts, paging in readings:
             with mock.patch("time.monotonic", return_value=1000.0 + seconds):
                 assert memory._mac_paging(swapouts) is paging, seconds
+
+
+def test_background_readings_date_a_rise_within_one_tick() -> None:
+    """However far apart the readings batches are sized from: swap-outs
+    rising through a 90 s batch, or at the end of a 120 s idle wait, are
+    paging at the next batch; a rise 50 s before a job is not paging at its
+    first batch. Without the background readings none of these is judged."""
+    clock = [0.0]
+
+    def judged(count, seconds: int, background: bool) -> bool:
+        def counters():
+            return (0, 0, 0, 0, 1, count(clock[0]))
+
+        def wait(tick: float) -> bool:
+            clock[0] += tick
+            return not background or clock[0] >= seconds
+
+        clock[0] = 0.0
+        with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
+            with mock.patch("time.monotonic", side_effect=lambda: 1000.0 + clock[0]):
+                memory._mac_paging(count(0))
+                with mock.patch.object(memory, "_mac_memory_counters", counters):
+                    memory._follow_swapouts(wait)
+                clock[0] = seconds
+                return memory._mac_paging(count(seconds))
+
+    for count, seconds, paging in [
+        (lambda at: 500 + int(at), 90, True),
+        (lambda at: 600 if at >= 115 else 500, 120, True),
+        (lambda at: 600 if at >= 5 else 500, 55, False),
+    ]:
+        assert judged(count, seconds, True) is paging, seconds
+        assert judged(count, seconds, False) is False, seconds
 
 
 def test_the_swap_out_counter_is_followed_at_every_pressure_level() -> None:

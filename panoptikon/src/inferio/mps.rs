@@ -6,6 +6,7 @@
 //! `None`. See docs/unified-memory-admission.md "Backend A: MPS (Apple
 //! Silicon)".
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::gpu::{GpuInfo, GpuMemory};
@@ -176,12 +177,19 @@ pub(super) struct MemoryFacts {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const PAGING_WINDOW: Duration = Duration::from_secs(10);
 
-/// The oldest previous reading a rise is still judged against: an older one
-/// cannot say when the counter rose. Longer than [`PAGING_WINDOW`] so that a
-/// model whose batches take longer than that still sees the kernel paging.
-/// Must match `memory.py::MAC_PAGING_STALE_SECONDS`.
+/// How often a background thread reads the swap-out counter
+/// ([`follow_swapouts`]), so a rise is dated within one tick however far
+/// apart the readings memory is priced from are. Must match
+/// `memory.py::MAC_SWAPOUT_TICK_SECONDS`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const PAGING_STALE: Duration = Duration::from_secs(60);
+const SWAPOUT_TICK: Duration = Duration::from_secs(2);
+
+/// The oldest previous reading a rise is still judged against: an older one
+/// cannot say when the counter rose (the process had just started, or was
+/// suspended). Two ticks and a late wake-up. Must match
+/// `memory.py::MAC_PAGING_STALE_SECONDS`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const PAGING_STALE: Duration = Duration::from_secs(5);
 
 /// The swap-out counter at the previous reading, when that was, and when the
 /// counter was last seen to rise.
@@ -210,12 +218,57 @@ impl Swapouts {
     }
 }
 
+/// Feed `swapouts` a reading every [`SWAPOUT_TICK`] until `wait` returns
+/// true. `read` answers the counter and when it was read, or `None`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn follow_swapouts(
+    swapouts: &Mutex<Swapouts>,
+    mut read: impl FnMut() -> Option<(u64, Instant)>,
+    mut wait: impl FnMut(Duration) -> bool,
+) {
+    while !wait(SWAPOUT_TICK) {
+        if let Some((count, at)) = read()
+            && let Ok(mut swapouts) = swapouts.lock()
+        {
+            swapouts.paging(count, at);
+        }
+    }
+}
+
 /// This process's [`Swapouts`].
 #[cfg(target_os = "macos")]
-static SWAPOUTS: std::sync::Mutex<Swapouts> = std::sync::Mutex::new(Swapouts {
+static SWAPOUTS: Mutex<Swapouts> = Mutex::new(Swapouts {
     last: None,
     rose_at: None,
 });
+
+/// Start [`follow_swapouts`] on [`SWAPOUTS`] for the life of the process,
+/// once.
+#[cfg(target_os = "macos")]
+fn start_following_swapouts() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("swap-outs".to_owned())
+            .spawn(|| {
+                follow_swapouts(
+                    &SWAPOUTS,
+                    || sys::swapouts().map(|count| (count, Instant::now())),
+                    |tick| {
+                        std::thread::sleep(tick);
+                        false
+                    },
+                );
+            });
+        if let Err(err) = spawned {
+            tracing::warn!(
+                error = %err,
+                "could not start reading the swap-out counter in the background; \
+                 paging is judged only from readings taken close together"
+            );
+        }
+    });
+}
 
 /// RAM a new allocation could get: RAM minus wired, compressed and anonymous
 /// pages (Activity Monitor's "used"). File cache counts as available. Must
@@ -335,7 +388,7 @@ mod sys {
     // `mach_host_self` is deprecated in libc in favour of `mach2`; one call
     // does not earn a dependency.
     #[allow(deprecated)]
-    pub(super) fn memory_facts() -> Option<super::MemoryFacts> {
+    fn vm_statistics() -> Option<libc::vm_statistics64> {
         // SAFETY: zeroed is a valid `vm_statistics64` (plain integers), and
         // the kernel overwrites it wholesale on success.
         let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
@@ -350,9 +403,17 @@ mod sys {
                 &mut count,
             )
         };
-        if result != 0 {
-            return None;
-        }
+        (result == 0).then_some(stats)
+    }
+
+    /// Pages swapped out since boot.
+    pub(super) fn swapouts() -> Option<u64> {
+        vm_statistics().map(|stats| stats.swapouts)
+    }
+
+    pub(super) fn memory_facts() -> Option<super::MemoryFacts> {
+        super::start_following_swapouts();
+        let stats = vm_statistics()?;
         // SAFETY: sysconf takes a name and returns a long; no pointers.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page = u64::try_from(page).ok().filter(|page| *page > 0)?;
@@ -516,17 +577,59 @@ mod tests {
             !swapouts.paging(501, at(13)),
             "flat for longer than the window"
         );
-        // A reading 60 s after the last still sees the rise between them; a
+        // A reading 5 s after the last still sees the rise between them; a
         // later one does not, and is the reading the next is compared with.
-        assert!(swapouts.paging(600, at(73)), "60 s after the last reading");
+        assert!(swapouts.paging(600, at(18)), "5 s after the last reading");
+        assert!(!swapouts.paging(600, at(29)), "flat");
         assert!(
-            !swapouts.paging(900, at(134)),
-            "61 s: too old to compare with"
+            !swapouts.paging(900, at(35)),
+            "6 s: too old to compare with"
         );
-        assert!(swapouts.paging(901, at(135)));
+        assert!(swapouts.paging(901, at(36)));
         // A counter that fell is not a rise.
-        assert!(!swapouts.paging(100, at(150)));
-        assert!(!swapouts.paging(100, at(151)));
+        assert!(!swapouts.paging(100, at(50)));
+        assert!(!swapouts.paging(100, at(51)));
+    }
+
+    /// The background readings date a rise within one tick, however far
+    /// apart the readings memory is priced from. Swap-outs rising through a
+    /// 90 s batch, or at the end of a 120 s idle wait, are paging when the
+    /// next grant is priced; a rise 50 s before a job is not paging at its
+    /// first batch. Without the background readings none of these is judged.
+    #[test]
+    fn background_readings_date_a_rise_within_one_tick() {
+        let start = Instant::now();
+        // The reading `secs` in, after one at 0 and background readings
+        // between them (or none), of a counter that reads `count(secs)`.
+        let priced = |count: &dyn Fn(u64) -> u64, secs: u64, background: bool| {
+            let swapouts = Mutex::new(Swapouts {
+                last: None,
+                rose_at: None,
+            });
+            swapouts.lock().unwrap().paging(count(0), start);
+            let clock = std::cell::Cell::new(Duration::ZERO);
+            follow_swapouts(
+                &swapouts,
+                || Some((count(clock.get().as_secs()), start + clock.get())),
+                |tick| {
+                    clock.set(clock.get() + tick);
+                    !background || clock.get() >= Duration::from_secs(secs)
+                },
+            );
+            let at = start + Duration::from_secs(secs);
+            swapouts.lock().unwrap().paging(count(secs), at)
+        };
+        let rising = |secs: u64| 500 + secs;
+        let rose_at_115 = |secs: u64| if secs >= 115 { 600 } else { 500 };
+        let rose_at_5 = |secs: u64| if secs >= 5 { 600 } else { 500 };
+        for (count, secs, paging) in [
+            (&rising as &dyn Fn(u64) -> u64, 90, true),
+            (&rose_at_115, 120, true),
+            (&rose_at_5, 55, false),
+        ] {
+            assert_eq!(priced(count, secs, true), paging, "{secs} s");
+            assert!(!priced(count, secs, false), "{secs} s, no background");
+        }
     }
 
     /// A recorded trace of a process holding 61 440 MiB for 167.5 s and

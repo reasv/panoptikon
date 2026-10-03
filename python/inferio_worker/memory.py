@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from functools import lru_cache
 from types import ModuleType
 from typing import Any, NamedTuple
@@ -988,16 +988,38 @@ def _mac_paging(swapouts: int) -> bool:
     to compare with and is not paging.
     """
     now = time.monotonic()
-    previous, read_at = _swapouts["count"], _swapouts["read_at"]
-    _swapouts["count"], _swapouts["read_at"] = swapouts, now
-    if (
-        previous is not None
-        and swapouts > previous
-        and now - read_at <= MAC_PAGING_STALE_SECONDS
-    ):
-        _swapouts["rose_at"] = now
-    rose_at = _swapouts["rose_at"]
+    with _swapouts_lock:
+        previous, read_at = _swapouts["count"], _swapouts["read_at"]
+        _swapouts["count"], _swapouts["read_at"] = swapouts, now
+        if (
+            previous is not None
+            and swapouts > previous
+            and now - read_at <= MAC_PAGING_STALE_SECONDS
+        ):
+            _swapouts["rose_at"] = now
+        rose_at = _swapouts["rose_at"]
     return rose_at is not None and now - rose_at <= MAC_PAGING_SECONDS
+
+
+def _follow_swapouts(wait: Callable[[float], bool] = threading.Event().wait) -> None:
+    """Feed `_mac_paging` a reading every `MAC_SWAPOUT_TICK_SECONDS` until
+    `wait` returns True (the default waits on an event nobody sets)."""
+    while not wait(MAC_SWAPOUT_TICK_SECONDS):
+        facts = _mac_memory_counters()
+        if facts is not None:
+            _mac_paging(facts[5])
+
+
+def _start_following_swapouts() -> None:
+    """Start `_follow_swapouts` for the life of the process, once."""
+    global _swapouts_thread
+    with _swapouts_lock:
+        if _swapouts_thread is not None:
+            return
+        _swapouts_thread = threading.Thread(
+            target=_follow_swapouts, name="inferio-swapouts", daemon=True
+        )
+    _swapouts_thread.start()
 
 
 # `vm_statistics64_data_t` (<mach/vm_statistics.h>) layout and the flavour
@@ -1014,15 +1036,21 @@ MAC_PRESSURE_NORMAL, MAC_PRESSURE_WARNING, MAC_PRESSURE_CRITICAL = 1, 2, 4
 # Must match `mps.rs::PAGING_WINDOW`.
 MAC_PAGING_SECONDS = 10.0
 
+# How often a background thread reads the swap-out counter
+# (`_follow_swapouts`), so a rise is dated within one tick however far apart
+# the readings batches are sized from are. Must match `mps.rs::SWAPOUT_TICK`.
+MAC_SWAPOUT_TICK_SECONDS = 2.0
+
 # The oldest previous reading a rise is still judged against: an older one
-# cannot say when the counter rose. Longer than `MAC_PAGING_SECONDS` so that
-# batches longer than that still see the kernel paging. Must match
-# `mps.rs::PAGING_STALE`.
-MAC_PAGING_STALE_SECONDS = 60.0
+# cannot say when the counter rose (the process had just started, or was
+# suspended). Two ticks and a late wake-up. Must match `mps.rs::PAGING_STALE`.
+MAC_PAGING_STALE_SECONDS = 5.0
 
 # The swap-out counter at the previous reading, when that was, and when the
-# counter was last seen to rise.
+# counter was last seen to rise; the lock also guards starting the thread.
 _swapouts: dict[str, Any] = {"count": None, "read_at": None, "rose_at": None}
+_swapouts_lock = threading.Lock()
+_swapouts_thread: threading.Thread | None = None
 
 
 def _mac_pressure_level() -> int:
@@ -1063,6 +1091,7 @@ def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
         return None
     if not isinstance(page, int) or page <= 0:
         return None
+    _start_following_swapouts()
     return (ram, wired * page, compressed * page, anonymous * page, pressure, swapouts)
 
 
