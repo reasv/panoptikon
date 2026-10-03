@@ -859,38 +859,54 @@ booked centrally on the CPU device. It is never a throughput signal.
   start-up (libraries, kernels, allocator set-up): it is added to the load
   level and gives no sample, since priced per unit it would hold a small
   host at one unit.
-  A batch books a fixed part plus MiB per unit. The fixed part is the
-  Theil–Sen intercept once two sizes ran: the growth that does not scale
-  with units. Per unit it books an upper estimate,
-  since the host cost varies with the input (doctr's per page by about 3×
-  with page resolution): the largest cost above the fixed part among the
-  batches within `RATCHET_FACTOR` of the largest, or the slope if higher.
+  Every size books an upper bound, since the host cost varies with the
+  input (doctr's per page by about 3× with page resolution), and never less
+  than the costliest batch measured at a size no larger, nor, below the
+  smallest size measured, than that batch. Up to the largest batch measured
+  it books the fit once two sizes ran: the Theil–Sen intercept (the growth
+  that does not scale with units) plus per unit the largest cost above it
+  among the batches within `RATCHET_FACTOR` of the largest, or the slope if
+  higher. Each of those batches is also extended from its own growth at its
+  whole growth per unit (nothing taken out as fixed), and the booking is the
+  highest of them: a fit can read part of the per-unit cost as fixed
+  (alternating 45 and 55 MiB per unit over 1 200 of start-up fit 2 251
+  fixed, and priced twice the largest 3.2 GB short), and a batch as costly
+  per unit as any measured near the largest can run at any size. This
+  over-books by at most the fixed part times `units / measured − 1` for the
+  smaller batch it is extended from: three times it at twice the largest.
+  Past twice the largest, where a few small batches price a far larger one
+  (an uncapped window after the 2- and 4-item batches of a cold start), the
+  rate is at least the one-size rate below. That window over-books, up to
+  about `2 + fixed / per unit` times its growth when priced from two items
+  after one, and the next is priced from the batch it ran.
   The first batch's kept memory may still be partly its own per-unit memory
   (a worker that keeps what it freed, as where the heap trim does nothing),
-  which would make later samples read low by that much. So batches no larger
-  than a first batch are left out, and with one size measured, per unit is
-  the lower of the batch's growth plus what the first batch kept, over its
-  units, and its growth over the units beyond the first batch's (the fixed
-  part priced per unit either way). Both bound the cost only when every
-  input costs the same: a costly first input kept in the level makes cheaper
-  later ones read near zero. So a one-size cost prices only item-capped
-  windows (below) and at most twice the size it was measured at; from two
-  sizes the slope does not depend on what the first batch kept. With the
-  baseline following the resident set down, every kept sample shows a
-  positive cost; a per-unit cost of 0 would still count as unknown (the
-  seed), not as free. The ring keeps the costlier of
+  which later batches reuse, so their samples read low by that much. So
+  batches no larger than a first batch are left out, and what the first
+  batch grew to, in the largest share of their own growth later batches
+  kept (at most what it kept), is added back to each batch's growth. A
+  batch's one-size rate is the lower of its growth plus what the first batch
+  kept, over its units, and its growth over the units beyond the first
+  batch's: either bounds the cost per unit whichever the kept memory is,
+  when every input costs the same, and it is what covers a first large
+  window priced from small batches whose inputs were cheaper than the job's
+  (2 and 3 pages at 414 MiB each, then pages at 457). A one-size cost books
+  the growth it measured at every size up to that one and that rate per
+  further unit, and prices only item-capped windows (below) and at most
+  twice its size; from two sizes the slope does not depend on what the
+  first batch kept. With the baseline following the resident set down,
+  every kept sample shows a positive cost; a per-unit cost of 0 would still
+  count as unknown (the seed), not as free. The ring keeps the costlier of
   two batches at one size, but only one per size for its last 64 sizes, and
-  only sizes within `RATCHET_FACTOR` of the largest count: the booking is as
-  high as the costliest inputs measured there, and a window of costlier
-  inputs can exceed it until its batches are measured. A fit from small
-  batches can also read part of the per-unit cost as fixed (two and four
-  items gave 223 MiB + 40 per unit where 192 items cost 50 per unit). So
-  the fitted figures price at most `RATCHET_FACTOR` × the largest batch
-  measured; a larger batch books `fixed + units × whole`, where `whole` is
-  the largest growth per unit, with no fixed part taken out, among the same
-  batches. The figure is runtime-only: no profile row, no calibration
-  change.
-- **Booking.** Each grant books `fixed + units × MiB per unit` on the CPU
+  only sizes within `RATCHET_FACTOR` of the largest are extended. A window
+  of inputs costlier on average than any measured near its size still
+  exceeds the booking: with pages costing 45–130 MiB each in random order,
+  kept by the worker or not, the most a batch exceeded it in simulation was
+  445 MiB on an 8 GB host (2 GiB reserve) and 2.7 GB on a 64 GB host
+  (6.4 GB reserve); the excess grows with the square root of the batch, the
+  reserve with RAM. The figure is runtime-only: no profile row, no
+  calibration change.
+- **Booking.** Each grant books that figure for its units on the CPU
   device, held until the grant settles. There the replica's resident set
   counts as our footprint, not as external usage, and its charge is
   `max(resident, resident at load) + max(0, bookings − resident growth since
@@ -903,13 +919,11 @@ booked centrally on the CPU device. It is never a throughput signal.
   after a window), that reading is carried forward by the change, once per
   window, as it is credited when a replica departs; otherwise the kept
   memory would read as free until the next probe and be booked twice.
-- **Grant.** The GPU side is sized as before, then capped at
-  `floor((room − fixed) / MiB per unit)`, at least one unit, where room is
-  the CPU device's headroom plus the replica's own resident growth no
-  booking claims. Past `RATCHET_FACTOR` × the largest batch measured the cap
-  is `floor((room − fixed) / whole)` if that is larger, so with RAM to spare
-  the batch size is unchanged and under tight RAM it can still double each
-  window. The grant also tells the worker the CPU device's reserve and the
+- **Grant.** The GPU side is sized as before, then capped at the largest
+  batch whose booking fits the room, at least one unit, where room is the
+  CPU device's headroom plus the replica's own resident growth no booking
+  claims. With RAM to spare the batch size is unchanged, and under tight RAM
+  it can still double each window. The grant also tells the worker the CPU device's reserve and the
   RAM the booking needs beyond what the replica holds (`ram_reserve_mb`,
   `ram_mb`); before each batch the worker shrinks it in proportion if free
   RAM above the reserve is less. It is recomputed at every grant from the host's free
@@ -938,7 +952,7 @@ booked centrally on the CPU device. It is never a throughput signal.
   unknown, and further windows stay item-capped with the cap doubling after
   each window whose batch filled it: 2, 4, …; a short window leaves it.
   They book nothing until a
-  batch larger than the first grows RAM, then book at that one-size estimate
+  batch larger than the first grows RAM, then book from that one size
   until a second size gives the slope, when capping ends. So a one-size
   estimate that is wrong for costlier inputs costs at most one capped batch.
   The cost lives as long as the process, so a reload books from it at once,
