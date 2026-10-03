@@ -66,6 +66,7 @@ impl VramLedger {
     /// Reserve headroom for one window and hand back the grant.
     /// `window_units` is the dispatcher's estimate; safety does not depend on
     /// it, since the worker packs within the grant using exact counts.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn request_grant(
         self: &Arc<Self>,
         worker: WorkerId,
