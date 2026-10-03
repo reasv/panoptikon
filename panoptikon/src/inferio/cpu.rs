@@ -2,8 +2,8 @@
 //!
 //! Total is physical RAM (`MemTotal`, `ullTotalPhys`, `hw.memsize`) and free
 //! is what the OS could deliver now (`MemAvailable − SReclaimable`,
-//! `min(ullAvailPhys, ullAvailPageFile)`, macOS free+inactive pages),
-//! matching the worker's `"ram"` reading. On Linux both are bounded by the
+//! `min(ullAvailPhys, ullAvailPageFile)`, macOS RAM less wired, compressed
+//! and anonymous pages), matching the worker's `"ram"` reading. On Linux both are bounded by the
 //! cgroup memory limit, since `/proc/meminfo` is not namespaced. See
 //! docs/unified-memory-admission.md "Backend C: CPU".
 

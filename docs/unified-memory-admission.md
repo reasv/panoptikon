@@ -113,8 +113,9 @@ dGPU. No ledger changes are needed for this — it is a property of the
 free reading, produced where the reading is produced (worker samples and
 the orchestrator's staleness refresh).
 
-`ram_available` sources: `psutil.virtual_memory().available` worker-side
-(psutil is already a base dependency); orchestrator-side
+`ram_available` sources: worker-side, the same per-platform figure as the
+orchestrator (docs/inferio-worker-protocol.md, "`"ram"` is the CPU-priced
+host's reading"); orchestrator-side
 `host_statistics64` via `libc` on macOS, `sysinfo`-free reads of
 `/proc/meminfo` (`MemAvailable`; the CPU device subtracts `SReclaimable`
 on both sides) on Linux, `GlobalMemoryStatusEx` via
