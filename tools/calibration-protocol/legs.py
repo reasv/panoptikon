@@ -1194,8 +1194,7 @@ class Leg:
                           error=str(exc))
                 continue
             self.mark("hog_event_ack", label=event["label"])
-            # The reply is the state before the hog's next tick applies the
-            # change: a later `seq` carries the new target.
+            # A state at the reply's `seq` + 2 has resolved the new target.
             try:
                 before = json.loads(reply)
             except ValueError:
@@ -1214,7 +1213,7 @@ class Leg:
                           free_mb=state.get("free_mb"))
                 target = state.get("target_mb") or 0
                 held = state.get("held_mb") or 0
-                if state.get("seq", 0) <= before.get("seq", -1):
+                if state.get("seq", 0) < before.get("seq", -2) + 2:
                     time.sleep(1.0)
                     continue
                 applied = state
@@ -1223,12 +1222,15 @@ class Leg:
                 if target and held >= target - 256:
                     break
                 time.sleep(1.0)
-            # An event meant to add pressure that asked for no more than the
-            # hog already held (free was already under `leave_free`).
-            if (applied is not None
-                    and ("leave_free_mb" in event or event.get("mb", 0) > 0)
-                    and (applied.get("target_mb") or 0)
-                    <= (before.get("held_mb") or 0)):
+            # An event meant to add pressure that asked for nothing: a
+            # leave-free target at or under what the hog held, or a hold that
+            # left the target where it was. A step-down is a release.
+            resolved = (applied or {}).get("target_mb") or 0
+            if applied is not None and (
+                    resolved <= (before.get("held_mb") or 0)
+                    if "leave_free_mb" in event else
+                    event.get("mb", 0) > 0
+                    and resolved == (before.get("target_mb") or 0)):
                 self.mark("hog_event_void", label=event["label"],
                           held_mb=before.get("held_mb"),
                           target_mb=applied.get("target_mb"))

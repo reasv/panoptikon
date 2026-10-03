@@ -55,16 +55,22 @@ def test_the_leg_waits_for_both_recorders_and_marks_a_silent_one(tmp_path):
 
 def test_a_hog_event_that_asks_for_nothing_is_marked_and_skips_hog_tracking(
         monkeypatch, tmp_path):
-    """The spike's leave-free target is at or under what the hog held: void.
-    A release asks for nothing on purpose, and a state from before the
-    change took effect is not the answer."""
-    replies = iter([{"seq": 5, "held_mb": 0}, {"seq": 7, "held_mb": 0},
-                    {"seq": 9, "held_mb": 0}])
+    """The spike's leave-free target is at or under what the hog held, and a
+    hold leaves the target where it was: void. A release or a step-down asks
+    for nothing on purpose. The state one tick after the reply can still
+    carry the old target, so it is not the answer."""
+    replies = iter([{"seq": 5, "held_mb": 0, "target_mb": 0},
+                    {"seq": 7, "held_mb": 0, "target_mb": 0},
+                    {"seq": 9, "held_mb": 0, "target_mb": 0},
+                    {"seq": 11, "held_mb": 8192, "target_mb": 8192},
+                    {"seq": 13, "held_mb": 4096, "target_mb": 4096}])
     states = iter([{"seq": 5, "target_mb": 0, "held_mb": 0},
-                   {"seq": 6, "target_mb": 0, "held_mb": 0},
-                   {"seq": 8, "target_mb": 0, "held_mb": 0},
+                   {"seq": 7, "target_mb": 0, "held_mb": 0},
                    {"seq": 9, "target_mb": 0, "held_mb": 0},
-                   {"seq": 10, "target_mb": 4096, "held_mb": 4096}])
+                   {"seq": 10, "target_mb": 0, "held_mb": 0},
+                   {"seq": 11, "target_mb": 8192, "held_mb": 8192},
+                   {"seq": 13, "target_mb": 4096, "held_mb": 4096},
+                   {"seq": 15, "target_mb": 4096, "held_mb": 4096}])
     monkeypatch.setattr(legs, "request", lambda *_a, **_k: (
         200, json.dumps(next(replies)).encode()))
     monkeypatch.setattr(legs, "get_json", lambda *_a, **_k: next(states))
@@ -74,9 +80,11 @@ def test_a_hog_event_that_asks_for_nothing_is_marked_and_skips_hog_tracking(
     legs.Leg.drive_hog(leg, [
         {"at_s": 0, "label": "spike", "leave_free_mb": 2048},
         {"at_s": 0, "label": "release", "mb": 0},
-        {"at_s": 0, "label": "step up", "mb": 4096}], legs.time.monotonic())
+        {"at_s": 0, "label": "step up", "mb": 8192},
+        {"at_s": 0, "label": "step down", "mb": 4096},
+        {"at_s": 0, "label": "hold", "mb": 4096}], legs.time.monotonic())
     assert [event["label"] for event in leg.events
-            if event["event"] == "hog_event_void"] == ["spike"]
+            if event["event"] == "hog_event_void"] == ["spike", "hold"]
 
     analyze = _load("analyze")
     (tmp_path / "hog.jsonl").write_text(
