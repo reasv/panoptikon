@@ -961,7 +961,7 @@ def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]
             if released:
                 payload["memory"] = memory.device_memory_sample() or payload["memory"]
             after_mb = pool_off_device_mb(payload["memory"])
-            _log_spill(reserved_mb, off_device_mb, released, after_mb)
+            _log_spill(reserved_mb, off_device_mb, released, False, after_mb)
     return payload
 
 
@@ -1227,20 +1227,33 @@ def pool_off_device_mb(sample: dict[str, Any] | None) -> int | None:
 
 
 def _log_spill(
-    reserved_mb: Any, off_device_mb: int, released: bool, after_mb: int | None
+    reserved_mb: Any,
+    off_device_mb: int,
+    released: bool,
+    halved: bool,
+    after_mb: int | None,
 ) -> None:
     """Warn of a spill; debug once a spill has persisted (`_spill_persists`)."""
     global _spill_persists
     persists = after_mb is not None and after_mb > SPILL_TOLERANCE_MB
     level = logging.DEBUG if persists and _spill_persists else logging.WARNING
     _spill_persists = _spill_persists or persists
+    if not released:
+        action = "left the pool as it is"
+    elif halved:
+        action = (
+            "released the pool and halved the batch size for the rest of this "
+            "window"
+        )
+    else:
+        action = "released the pool"
     logger.log(
         level,
         "the %s MiB allocator pool is %d MiB more than NVML reports in use on "
         "the GPU, so part of it is in system memory; %s",
         reserved_mb,
         off_device_mb,
-        "released the pool" if released else "left the pool as it is",
+        action,
     )
 
 
@@ -1477,7 +1490,8 @@ def run_window(
             if released:
                 budget = max(1, min(budget, priced // 2))
                 sample = memory.device_memory_sample()
-            _log_spill(reserved_mb, off_device_mb, released, pool_off_device_mb(sample))
+            after_mb = pool_off_device_mb(sample)
+            _log_spill(reserved_mb, off_device_mb, released, released, after_mb)
         if emit_memory is not None and pending:
             if sample is None:
                 sample = memory.device_memory_sample()
