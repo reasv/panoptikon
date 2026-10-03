@@ -274,10 +274,10 @@ def _budget_grant(unit_budget):
             "line": ""}
 
 
-def _utilization_context(healthrec, log=(), probes=()):
+def _utilization_context(healthrec, log=(), probes=(), hog=()):
     ctx = analyze.Context(
         args=_args(utilization_floor=0.25), vramrec=[],
-        healthrec=list(healthrec), hog=[], log=list(log), before=None,
+        healthrec=list(healthrec), hog=list(hog), log=list(log), before=None,
         after=None, jobs=None, probes=list(probes))
     return ctx
 
@@ -398,6 +398,32 @@ def test_the_denominator_never_exceeds_the_probe_boundary():
     assert row["denominator_units"] == 512
     assert "capped at the probe boundary 512" in \
         analyze.check_utilization(ctx).detail
+
+
+def test_the_denominator_is_bounded_by_the_room_a_hog_leaves():
+    """Probe boundary 512 at 10 MiB a unit; a hog holding 4000 MiB while the
+    model ran leaves room for 112, so a 64-unit grant is 0.57, not 0.12. The
+    hog's fill before the job does not count, nor does a hog on another GPU
+    or in host RAM."""
+    probe = {**_bisect_probe(512),
+             "fit": {"basis": "peak_allocated_mb", "slope_mb_per_unit": 10.0}}
+
+    def utilization(gpu="GPU-0000", target="gpu"):
+        hog = [{"kind": "header", "target": target, "gpu_uuid": gpu},
+               {"kind": "state", "t_wall": 10.0, "held_mb": 0},
+               {"kind": "state", "t_wall": 50.0, "held_mb": 4000},
+               {"kind": "state", "t_wall": 150.0, "held_mb": 4000}]
+        return analyze.check_utilization(_utilization_context(
+            [_worker_health(64)], log=[_budget_grant(64)], probes=[probe],
+            hog=hog))
+
+    verdict = utilization()
+    row = verdict.numbers["models"][0]
+    assert (row["room_units"], row["denominator_units"]) == (112, 112)
+    assert verdict.verdict == "PASS"
+    for elsewhere in (utilization(gpu="GPU-1111"), utilization(target="ram")):
+        assert elsewhere.numbers["models"][0]["denominator_units"] == 512
+        assert elsewhere.verdict == "FAIL"
 
 
 def test_a_size_with_no_settle_line_falls_back_to_itself():

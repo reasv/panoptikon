@@ -1562,6 +1562,22 @@ def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
     return {model: entry for model, entry in rows.items() if entry["knee"]}
 
 
+def _hog_least_held_mb(ctx: Context,
+                       grants: List[Tuple[float, Any]]) -> int:
+    """The least MiB hog.py held on the GPU of `grants` (`(t_wall, gpu)`)
+    from the first to the last of them; 0 when any ran on another GPU or the
+    hog held host RAM."""
+    header = next((row for row in ctx.hog if row.get("kind") == "header"), {})
+    if (not grants or header.get("target") == "ram"
+            or any(gpu != header.get("gpu_uuid") for _, gpu in grants)):
+        return 0
+    times = sorted(t_wall for t_wall, _ in grants)
+    first = max(0, bisect.bisect_right(ctx._hog_times, times[0]) - 1)
+    last = bisect.bisect_right(ctx._hog_times, times[-1])
+    return min((int(row.get("held_mb") or 0)
+                for row in ctx.hog_samples[first:last]), default=0)
+
+
 def check_utilization(ctx: Context) -> Verdict:
     """The largest unit budget a grant actually carried, vs the probe's OOM
     boundary -- or, where a trial left the working size in place, vs the
@@ -1585,6 +1601,11 @@ def check_utilization(ctx: Context) -> Verdict:
     size no trial has left in place -- one stuck at the size it opened at
     included -- is scored against the probe boundary.
 
+    **A hog leaves less room than the probe had.** The probe boundary is
+    measured on a GPU with nothing else on it; the denominator is never above
+    that boundary less the least the hog held while the model ran, divided by
+    the probe's slope.
+
     Same split as `slope_accuracy`: "no worker was ever admitted" is a result,
     "no probe boundary was passed" a harness omission."""
     if not ctx.health_samples:
@@ -1592,18 +1613,25 @@ def check_utilization(ctx: Context) -> Verdict:
                        "no healthrec.jsonl in the scenario -- record the "
                        "gateway's own view with healthrec.py")
     published: Dict[str, int] = {}
+    # Per model, when and on which GPU it held a budget.
+    published_at: Dict[str, List[Tuple[float, Any]]] = {}
     for sample in ctx.health_samples:
         for worker in (sample.get("health") or {}).get("workers") or []:
             key = worker["inference_id"]
             published[key] = max(published.get(key, 0),
                                  int(worker.get("unit_budget") or 0))
+            published_at.setdefault(key, []).append(
+                (sample["t_wall"], worker.get("gpu_uuid")))
     issued: Dict[str, int] = {}
+    issued_at: Dict[str, List[Tuple[float, Any]]] = {}
     for event in ctx.log_events("issued a memory grant"):
         fields = event["fields"]
         model, budget = fields.get("model"), fields.get("unit_budget")
         if model is None or not isinstance(budget, (int, float)):
             continue
         issued[str(model)] = max(issued.get(str(model), 0), int(budget))
+        issued_at.setdefault(str(model), []).append(
+            (event["t_wall"], fields.get("gpu")))
     peak = {model: issued.get(model, value)
             for model, value in published.items()}
     if not peak:
@@ -1615,7 +1643,11 @@ def check_utilization(ctx: Context) -> Verdict:
                        {"health_samples": len(ctx.health_samples),
                         "learning": _declared_learning(ctx)})
     boundaries: Dict[str, Optional[int]] = {}
+    slopes: Dict[str, float] = {}
     for probe in ctx.probes:
+        fit, _ = _probe_allocated_fit(probe)
+        if fit and fit.get("slope_mb_per_unit"):
+            slopes.setdefault(probe.get("model"), fit["slope_mb_per_unit"])
         bisect_info = probe.get("bisect") or {}
         # The superseded `mpsprobe/1` writes `batches` as bare ints, so the
         # last entry is only a boundary when it is a `ceiling_probe/1` row.
@@ -1640,20 +1672,27 @@ def check_utilization(ctx: Context) -> Verdict:
         # The knee can only lower the bar: a cap above the OOM boundary would
         # be scoring the leg against memory the probe says is not there.
         allowed = min(boundary, knee["rung"] or knee["knee"]) if knee else 0
-        denominator = allowed or boundary
+        held = _hog_least_held_mb(
+            ctx, issued_at.get(model) or published_at.get(model, []))
+        room = (max(1, int(boundary - held / slopes[model]))
+                if held and model in slopes else None)
+        denominator = min(allowed or boundary, room or boundary)
         ratio = admitted / denominator
         ok = ratio >= threshold
         rows.append({**row, "boundary_units": boundary,
                      "knee_units": ((knee["knee_named"] or knee["knee"])
                                     if knee else None),
                      "held_rung_units": (knee["rung"] or None) if knee else None,
-                     "denominator_units": denominator,
+                     "room_units": room, "denominator_units": denominator,
                      "ratio": round(ratio, 4), "ok": ok})
         verdict = "PASS" if (verdict in ("INFO", "PASS") and ok) else "FAIL"
 
     def against(row: Dict[str, Any]) -> str:
         if not row.get("boundary_units"):
             return " (no probe boundary)"
+        if row["room_units"] == row["denominator_units"]:
+            return (f" / room under the hog {row['room_units']} (probe "
+                    f"boundary {row['boundary_units']}) = {row['ratio']:.2f}")
         if not row.get("knee_units"):
             return (f" / probe boundary {row['boundary_units']} = "
                     f"{row['ratio']:.2f}")
