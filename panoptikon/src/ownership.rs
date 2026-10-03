@@ -322,7 +322,8 @@ pub(crate) mod tests {
         let folder = Path::new(if writable { "/tmp" } else { "/usr" });
         let owner = folder.metadata().ok()?.uid();
         // SAFETY: geteuid has no preconditions and cannot fail.
-        let foreign = owner != unsafe { libc::geteuid() };
+        let foreign = owner != unsafe { libc::geteuid() }
+            && (writable || super::unix::access(folder) == Access::Denied { owner });
         (foreign && tempfile::tempfile_in(folder).is_ok() == writable).then_some((folder, owner))
     }
 
