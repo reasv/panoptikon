@@ -256,13 +256,25 @@ impl VramLedger {
             cal.death_cap_units = Some(held);
             cap = Some(held);
         }
-        let mut negative = None;
-        if let Some(ram_mb) = unified_ram_mb {
-            let entry = state.workers.get(&worker)?;
-            let anchor_before = Self::anchor_locked(state, entry);
-            if let Some(entry) = state.workers.get_mut(&worker) {
-                entry.note_negative_sample(anchor_before);
-            }
+        let anchor_before = Self::anchor_locked(state, state.workers.get(&worker)?);
+        if unified_ram_mb.is_some()
+            && let Some(entry) = state.workers.get_mut(&worker)
+        {
+            entry.note_negative_sample(anchor_before);
+        }
+        // Set after the negative and before the anchor halving, as on the
+        // paging out-of-memory path. The window was not sized by the queue,
+        // whatever `queue_bound` says.
+        if paging && let Some(units) = cap {
+            state.calibration.entry(key.clone()).or_default();
+            let halved = GrantCharge {
+                unit_budget: units,
+                queue_bound: false,
+                ..charge
+            };
+            Self::note_pressure_size_locked(state, worker, halved, false);
+        }
+        let negative = unified_ram_mb.map(|ram_mb| {
             // Floored at 1, since zero means "never measured" and turns the
             // ratchet ceiling off; an anchor that was already zero stays zero.
             let anchor_after = if anchor_before > 0 {
@@ -273,26 +285,14 @@ impl VramLedger {
             if let Some(cal) = state.calibration.get_mut(&key) {
                 cal.max_units_measured = anchor_after;
             }
-            negative = Some(DeathNegative {
+            DeathNegative {
                 inference_id: key.0.clone(),
                 gpu: key.1.clone(),
                 ram_mb,
                 anchor_before,
                 anchor_after,
-            });
-        }
-        // Set after the negative and the anchor halving, as on the paging
-        // out-of-memory path. The window was not sized by the queue, whatever
-        // `queue_bound` says.
-        if paging && let Some(units) = cap {
-            state.calibration.entry(key.clone()).or_default();
-            let halved = GrantCharge {
-                unit_budget: units,
-                queue_bound: false,
-                ..charge
-            };
-            Self::note_pressure_size_locked(state, worker, halved, false);
-        }
+            }
+        });
         if let Some(cap) = cap {
             tracing::warn!(
                 model = %key.0,

@@ -2003,8 +2003,8 @@ fn a_window_under_pressure_at_either_end_earns_no_step() {
 /// A memory kill while the Mac pages caps at half the batch that died, and
 /// leaves no cap for the life of the process: once the pressure is normal
 /// the reloaded model grows back by doubling until the cap lifts. A first
-/// kill may grow back to half the batch admitted after it halved the anchor
-/// and deflated the replica.
+/// kill may grow back as far as a paging out-of-memory error in the same
+/// state: half the batch admitted after it deflated the replica.
 #[test]
 fn a_kill_while_the_mac_pages_caps_until_the_batch_grows_back() {
     let (ledger, _handle, admission) = ramped_mac_replica();
@@ -2016,7 +2016,7 @@ fn a_kill_while_the_mac_pages_caps_until_the_batch_grows_back() {
     token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
     let first = PressureCap {
         units: 64,
-        regrow_to: 16,
+        regrow_to: 32,
         paging: true,
     };
     assert_eq!(pressure_cap(&ledger), Some(first));
