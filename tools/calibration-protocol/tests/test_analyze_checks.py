@@ -742,6 +742,69 @@ def test_oracle_agreement_skips_the_samples_while_no_job_ran():
     assert (verdict.verdict, verdict.numbers["idle_samples"]) == ("PASS", 1)
 
 
+def _row(t_wall, used_mb, procs):
+    """An oracle sample on a 32607 MiB GPU: allowance 1024 MiB. PID 4 is
+    not ours."""
+    sample = _vram_sample([_proc(pid, mb, None if pid == 4 else "inferio-worker")
+                           for pid, mb in procs.items()], used_mb, "amdgpu-kfd")
+    return {**sample, "t_wall": t_wall}
+
+
+def _ledger(t_wall, external_mb, age_ms=0):
+    sample = _health_sample(external_mb)
+    sample["t_wall"] = t_wall
+    sample["health"]["vram"][0]["external_sample_age_ms"] = age_ms
+    return sample
+
+
+def _agreement(vramrec, healthrec, hog=()):
+    ctx = _context(vramrec=vramrec, healthrec=healthrec)
+    ctx.hog = list(hog)
+    ctx.__post_init__()
+    return analyze.check_oracle_agreement(ctx)
+
+
+def test_oracle_agreement_skips_samples_while_a_release_leaves_used():
+    """`used` shows a free after the process figure does: 40 ms per GiB, or
+    until `used` has fallen. A ledger figure read in that time stays wrong
+    until the ledger reads again. A disagreement outside it still FAILs."""
+    def used_and_procs(t):
+        if t <= 100.0:
+            return 12020, {900: 12000}
+        if t <= 100.25:  # 11000 MiB freed, `used` not yet
+            return 12020, {900: 1000}
+        if 110.0 < t <= 112.0:  # 901 exited, `used` drains slower than 40 ms/GiB
+            return 7020, {900: 1000}
+        if t <= 110.0:
+            return 7020, {900: 1000, 901: 6000}
+        return 1020, {900: 1000}
+
+    vramrec = [_row(t, *used_and_procs(t))
+               for t in (100.0 + 0.25 * step for step in range(53))]
+    healthrec = [_ledger(100.25, 0), _ledger(101.0, 20),
+                 _ledger(102.0, 11000, age_ms=1800),
+                 _ledger(110.0, 20), _ledger(111.5, 0), _ledger(112.5, 20)]
+    verdict = _agreement(vramrec, healthrec)
+    assert (verdict.verdict, verdict.numbers["joined"],
+            verdict.numbers["releasing_samples"]) == ("PASS", 3, 3)
+    assert _agreement(vramrec, healthrec + [_ledger(113.0, 11000)]).verdict == "FAIL"
+
+
+def test_oracle_agreement_skips_samples_while_the_hog_moved():
+    """The ledger read free before the hog took 8 GiB: not yet a
+    disagreement. Read after it and still missing it is one."""
+    hog = [{"kind": "header", "target": "gpu", "gpu_uuid": GPU}] + [
+        {"kind": "state", "t_wall": t, "held_mb": 8192 if t >= 100.5 else 0}
+        for t in (99.0, 99.5, 100.0, 100.5, 101.0, 101.5, 102.0)]
+    vramrec = [_row(t, 20 + (8192 if t >= 100.5 else 0),
+                    {4: 8192} if t >= 100.5 else {})
+               for t in (100.0 + 0.25 * step for step in range(9))]
+    verdict = _agreement(vramrec, [_ledger(101.0, 20, age_ms=1000)], hog)
+    assert (verdict.verdict, verdict.numbers["hog_moving_samples"]) == ("SKIP", 1)
+    assert _agreement(vramrec, [_ledger(102.0, 8212)], hog).verdict == "PASS"
+    assert _agreement(vramrec, [_ledger(102.0, 20)], hog).verdict == "FAIL"
+
+
 def _learning_context(seed, queue_bound=7):
     health = _worker_health(seed)
     health["health"]["workers"][0].update(fit_samples=12, max_units_measured=6293)

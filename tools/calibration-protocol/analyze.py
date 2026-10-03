@@ -249,6 +249,7 @@ class Context:
         self.worker_spawns = _worker_spawns(self.log)
         self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
         self._pid_first_seen: Optional[Dict[int, float]] = None
+        self._release_windows: Dict[str, List[Tuple[float, float, int]]] = {}
         self.vram_tolerance = self._join_tolerance(self._vram_times)
         self.hog_tolerance = self._join_tolerance(self._hog_times)
 
@@ -277,6 +278,49 @@ class Context:
     def hog_at(self, t_wall: float) -> Optional[Dict[str, Any]]:
         return _nearest(self.hog_samples, self._hog_times, t_wall,
                         self.hog_tolerance)
+
+    def released_mb(self, uuid: str, start: float, end: float) -> int:
+        """MiB freed on this GPU whose release window meets `[start, end]`.
+
+        A window opens at the oracle sample before a fall in any process's
+        figure (a process that exited counts all it held) and lasts until
+        `used` has dropped it too: the later of `RELEASE_LAG_S_PER_GIB` per
+        GiB after the sample that showed the fall, and the first sample whose
+        memory no process holds (`used` less every process) is back within
+        the allowance of its level before the fall. A recording that ends
+        before that keeps the first bound.
+        """
+        windows = self._release_windows.get(uuid)
+        if windows is None:
+            rows = [(sample["t_wall"], gpu) for sample in self.vram_samples
+                    for gpu in [self.oracle_gpu(sample, uuid)]
+                    if gpu is not None and gpu.get("used_mb") is not None]
+            unheld = [_unheld_mb(gpu) for _, gpu in rows]
+            windows = []
+            for index in range(1, len(rows)):
+                (t_before, before), (t_shown, shown) = rows[index - 1], rows[index]
+                held, now = _procs_mb(before), _procs_mb(shown)
+                freed = sum(max(0, mb - now.get(pid, 0)) for pid, mb in held.items())
+                if freed <= 0:
+                    continue
+                end_t = t_shown + freed / 1024 * RELEASE_LAG_S_PER_GIB
+                level = unheld[index - 1] + allowance_mb(shown.get("total_mb"))
+                drained = next((rows[later][0] for later in range(index, len(rows))
+                                if unheld[later] <= level), None)
+                windows.append((t_before, max(end_t, drained or 0.0), freed))
+            self._release_windows[uuid] = windows
+        return sum(mb for opened, closed, mb in windows
+                   if opened < end and closed >= start)
+
+    def hog_moved_mb(self, uuid: str, start: float, end: float) -> int:
+        """How far what hog.py held on this GPU moved over `[start, end]`."""
+        header = next((row for row in self.hog if row.get("kind") == "header"), {})
+        if header.get("target", "gpu") != "gpu" or header.get("gpu_uuid") != uuid:
+            return 0
+        first = max(0, bisect.bisect_left(self._hog_times, start) - 1)
+        last = bisect.bisect_right(self._hog_times, end)
+        held = [row.get("held_mb") or 0 for row in self.hog_samples[first:last]]
+        return max(held) - min(held) if held else 0
 
     def oracle_gpu(self, sample: Dict[str, Any], uuid: str) -> Optional[Dict[str, Any]]:
         for gpu in sample.get("gpus", []):
@@ -550,6 +594,26 @@ def _pid_mb(gpu: Dict[str, Any], pid: int) -> Optional[int]:
     return None
 
 
+def _procs_mb(gpu: Dict[str, Any]) -> Dict[int, int]:
+    return {proc["pid"]: int(proc.get("used_mb") or 0)
+            for proc in gpu.get("procs") or []}
+
+
+def _unheld_mb(gpu: Dict[str, Any]) -> int:
+    """`used` less every process the oracle lists on this GPU."""
+    return int(gpu["used_mb"]) - sum(_procs_mb(gpu).values())
+
+
+def allowance_mb(total_mb: Any) -> float:
+    """How far `external_mb` and the oracle may disagree: 1 GiB or 2 %."""
+    return max(1024.0, 0.02 * int(total_mb or 0))
+
+
+#: How late amdgpu's `used` shows a free, per GiB freed: about 12 ms on
+#: gfx1030 and 40 ms on an MI100. The per-process figure falls at once, so in
+#: between `used` less our workers counts freed memory as another process's.
+RELEASE_LAG_S_PER_GIB = 0.040
+
 # How long a hog must hold, and how much, before `external_mb` not moving at
 # all is a fault rather than staleness. See the README's "Checks, one by one".
 HOG_STALL_SECONDS = 60.0
@@ -699,7 +763,14 @@ def _source_counts(sources: Dict[str, int]) -> str:
 
 
 def check_oracle_agreement(ctx: Context) -> Verdict:
-    """`external_mb` vs (GPU used - our workers' NVML usage): +/-1 GiB or 2%."""
+    """`external_mb` vs (GPU used - our workers' NVML usage): +/-1 GiB or 2%.
+
+    Both figures must describe the same memory: a GPU-sample is skipped when,
+    between the ledger's free reading (`external_sample_age_ms` before the
+    health sample) and the oracle sample, a release was still leaving `used`
+    or the hog moved by more than the allowance; a smaller amount is taken
+    off the difference. Samples while no job ran are skipped: the idle
+    gateway keeps its last figure until something asks it to refresh."""
     if not ctx.health_samples or not ctx.vram_samples:
         return Verdict("oracle_agreement", "SKIP",
                        "needs both healthrec.jsonl and vramrec.jsonl")
@@ -712,12 +783,12 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     per_gpu: Dict[str, float] = {}
     idle = 0
     skewed = 0
+    releasing = 0
+    hog_moving = 0
     for sample in ctx.health_samples:
         health = sample.get("health") or {}
         if not health.get("ok"):
             continue
-        # The idle gateway keeps its last figure until something asks it to
-        # refresh: not a disagreement.
         if any(start <= sample["t_wall"] < end for start, end in ctx.idle_spans):
             idle += 1
             continue
@@ -741,8 +812,7 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                 source = str(oracle.get("oracle_source"))
                 unpriced_sources[source] = unpriced_sources.get(source, 0) + 1
                 continue
-            total = int(gpu.get("total_mb") or oracle.get("total_mb") or 0)
-            allowance = max(1024.0, 0.02 * total)
+            allowance = allowance_mb(gpu.get("total_mb") or oracle.get("total_mb"))
             # `used` moved by up to `skew_mb` while the processes were read:
             # past the allowance the sample is skipped, below it the true
             # difference is at least the measured one less the skew.
@@ -750,10 +820,22 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             if skew > allowance:
                 skewed += 1
                 continue
+            age = gpu.get("external_sample_age_ms")
+            read_t = sample["t_wall"] - (age or 0) / 1000.0
+            span = (min(read_t, vram["t_wall"]),
+                    max(sample["t_wall"], vram["t_wall"]))
+            released = ctx.released_mb(uuid, *span)
+            if released > allowance:
+                releasing += 1
+                continue
+            moved = ctx.hog_moved_mb(uuid, *span)
+            if moved > allowance:
+                hog_moving += 1
+                continue
             ours, _ = ctx.our_pids_mb(oracle)
             oracle_external = max(0, int(oracle["used_mb"]) - ours)
             delta = max(0, abs(int(gpu.get("external_mb") or 0)
-                               - oracle_external) - skew)
+                               - oracle_external) - skew - released - moved)
             joined += 1
             per_gpu[uuid] = max(per_gpu.get(uuid, 0.0), float(delta))
             if delta > worst:
@@ -764,13 +846,19 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                     "oracle_external_mb": oracle_external,
                     "gpu_used_mb": oracle.get("used_mb"),
                     "our_pids_mb": ours,
-                    "skew_mb": skew,
+                    "skew_mb": skew, "released_mb": released,
+                    "hog_moved_mb": moved,
                     "allowance_mb": round(allowance),
                 }
             if delta > allowance:
                 breaches += 1
-    skipped = (f"; {skewed} GPU-samples read while GPU used moved past the "
-               "allowance were skipped" if skewed else "")
+    skipped = "".join(
+        f"; {count} GPU-samples {why} were skipped" for count, why in (
+            (skewed, "read while GPU used moved past the allowance"),
+            (releasing, "read while a release was still leaving GPU used"),
+            (hog_moving, "read while the hog moved")) if count)
+    excluded = {"idle_samples": idle, "skewed_samples": skewed,
+                "releasing_samples": releasing, "hog_moving_samples": hog_moving}
     if joined == 0 and unpriced:
         return Verdict(
             "oracle_agreement", "SKIP",
@@ -781,12 +869,12 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             "counter at all, or ROCm with a worker whose descriptors the "
             "oracle could not read), not a disagreement" + skipped,
             {"joined": 0, "unpriced_samples": unpriced,
-             "oracle_sources": unpriced_sources, "skewed_samples": skewed})
+             "oracle_sources": unpriced_sources, **excluded})
     if joined == 0:
         return Verdict("oracle_agreement", "SKIP",
                        "no health sample could be joined to a vramrec sample "
                        f"within {ctx.vram_tolerance:.2f}s" + skipped,
-                       {"joined": 0, "skewed_samples": skewed})
+                       {"joined": 0, **excluded})
     verdict = "PASS" if breaches == 0 else "FAIL"
     return Verdict(
         "oracle_agreement", verdict,
@@ -798,8 +886,7 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
            if idle else "")
         + skipped,
         {"joined": joined, "breaches": breaches, "worst_mb": worst,
-         "unpriced_samples": unpriced, "idle_samples": idle,
-         "skewed_samples": skewed,
+         "unpriced_samples": unpriced, **excluded,
          "per_gpu_worst_mb": per_gpu, "worst_sample": worst_row},
     )
 
