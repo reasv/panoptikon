@@ -591,7 +591,6 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLog {
 
 /// Everything `body` logs at INFO on this thread, and what it returned.
 fn logs_from<T>(body: impl FnOnce() -> T) -> (T, String) {
-    install_ask_every_event();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .with_ansi(false)

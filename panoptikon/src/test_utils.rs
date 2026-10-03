@@ -111,18 +111,19 @@ pub(crate) fn write_detect_outros_config(index_db: &str, detect_outros: bool) {
     std::fs::write(&path, format!("detect_outros = {detect_outros}\n")).unwrap();
 }
 
-/// Install, once per test process, a global subscriber that drops every event
-/// but answers `sometimes` for every callsite. tracing caches a callsite's
-/// interest process-wide at its first hit; without this, a thread with no
-/// capture can cache `never` and so drop the event for a thread capturing it.
-/// With it, every event asks the emitting thread's own subscriber.
-pub(crate) fn install_ask_every_event() {
+/// Installs, before any test thread starts, a global subscriber that drops
+/// every event but answers `sometimes` for every callsite. tracing caches a
+/// callsite's interest process-wide at its first hit; without this, a thread
+/// with no capture can cache `never` and so drop the event for a thread
+/// capturing it. With it, every event asks the emitting thread's own
+/// subscriber.
+// SAFETY: runs before `main`; it allocates, takes tracing's own locks and
+// sets its global dispatcher, none of which needs anything `main` sets up.
+#[ctor::ctor]
+unsafe fn install_ask_every_event() {
     use tracing_subscriber::layer::SubscriberExt;
-    static INSTALLED: std::sync::Once = std::sync::Once::new();
-    INSTALLED.call_once(|| {
-        let subscriber = tracing_subscriber::registry().with(AskEveryEvent);
-        tracing::subscriber::set_global_default(subscriber).expect("no global subscriber yet");
-    });
+    let subscriber = tracing_subscriber::registry().with(AskEveryEvent);
+    tracing::subscriber::set_global_default(subscriber).expect("no global subscriber yet");
 }
 
 struct AskEveryEvent;
@@ -142,4 +143,12 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AskEveryEvent {
     ) -> bool {
         false
     }
+}
+
+#[test]
+fn the_global_subscriber_answers_sometimes() {
+    let callsite = tracing::info_span!("probe").metadata().unwrap();
+    assert!(tracing::dispatcher::get_default(|d| d
+        .register_callsite(callsite)
+        .is_sometimes()));
 }

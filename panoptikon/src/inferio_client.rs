@@ -2937,7 +2937,6 @@ pub(crate) mod tests {
                 Ok(())
             }
         }
-        crate::test_utils::install_ask_every_event();
         let sink = Sink(Arc::new(StdMutex::new(Vec::new())));
         let writer = sink.clone();
         let subscriber = tracing_subscriber::fmt()

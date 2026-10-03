@@ -197,6 +197,8 @@ windows-sys = { version = "0.60", features = [
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+# Installs the tests' global tracing subscriber at load (test_utils.rs).
+ctor = "0.8"
 # atexit: removes the shared test data root at exit (test_utils.rs).
 libc = "0.2"
 # `test-util`: paused clocks for tests of timers.

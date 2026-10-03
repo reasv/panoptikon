@@ -3,7 +3,6 @@ use super::*;
 use crate::inferio::calibration::{CalibrationStore, StoreEnv, StorePaths};
 use crate::inferio::worker::{ClampReport, OomClass};
 use crate::inferio::worker::{LoadReport, MemorySample, Timestamped, WorkerTelemetry};
-use crate::test_utils::install_ask_every_event;
 
 use super::external_memory::{free_source_is_authoritative, refresh_due};
 use super::grants::{canvas_log_field, clamp_log_field};
@@ -360,7 +359,6 @@ impl tracing::field::Visit for MessageField<'_> {
 /// events, and return what it logged.
 fn captured_logs(body: impl FnOnce()) -> Vec<(tracing::Level, String)> {
     use tracing_subscriber::layer::SubscriberExt;
-    install_ask_every_event();
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::registry().with(logs.clone());
     tracing::subscriber::with_default(subscriber, body);
