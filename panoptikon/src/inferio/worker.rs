@@ -1490,9 +1490,10 @@ impl Worker {
         let mut status = None;
         if attribution == DeathAttribution::Dying {
             // One that exits within the grace died by itself and the status
-            // is its own; one still running after it dies by our kill.
+            // is its own; one still running after it dies by our kill. A
+            // zombie leader's status is already fixed, so it stays dying.
             status = self.reap(FATAL_REAP_GRACE).await;
-            if status.is_none() {
+            if status.is_none() && !leader_is_unwinding(self.pid) {
                 attribution = DeathAttribution::StillRunning;
             }
         }
@@ -2714,6 +2715,33 @@ mod tests {
         {
             assert!(death.why.contains("had exited before"), "{}", death.why);
             assert!(worker.take_death().is_none());
+        }
+    }
+
+    /// The fatal path kills the worker's whole process group, also after the
+    /// worker exited by itself and was reaped.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_fatal_path_kills_the_workers_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("sleeper.pid");
+        let mut spec = spec("dying_test");
+        spec.config_kwargs = json!({"exit_code": 5, "sleeper_pid_file": pid_file});
+        let mut worker = Worker::spawn_configured(&test_spawn_config(), "test/dying", &spec, None)
+            .await
+            .expect("spawn + handshake");
+        worker.load().await.expect("load ok");
+        worker
+            .predict(&one(json!(1)), None, None)
+            .await
+            .expect_err("the worker exits");
+
+        let sleeper = std::fs::read_to_string(&pid_file).expect("the sleeper wrote its pid");
+        let stat = format!("/proc/{}/stat", sleeper.trim());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !stat_reads_exited(std::fs::read_to_string(&stat)) {
+            assert!(Instant::now() < deadline, "the sleeper outlived the worker");
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 

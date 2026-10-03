@@ -1602,7 +1602,9 @@ either way, so a trim never races a batch.
     status is how the worker really died.
   - `dying` — the child was on its way down but not yet reapable, and
     exited by itself within a 5 s grace; one still running after the grace
-    is reported `still_running`. This one
+    is reported `still_running`, but on Linux a leader that is a zombie
+    after the grace keeps `dying`, because its status is already fixed.
+    This one
     exists because `waitpid(WNOHANG)` does **not** report a thread-group
     leader while any thread of the group is alive, and a CUDA worker's
     driver threads take hundreds of milliseconds (475 ms measured) to unwind

@@ -235,8 +235,8 @@ pub(crate) fn kill_process_group(child: &tokio::process::Child) {
     kill_process_group_pid(child.id());
 }
 
-/// [`kill_process_group`] by pid. A `std` child's `id()` survives reaping, so
-/// only call it while the child is unreaped.
+/// [`kill_process_group`] by pid. A group's id is not reused while the group
+/// has members, so this also works after the leader has been reaped.
 pub(crate) fn kill_process_group_pid(pid: Option<u32>) {
     #[cfg(unix)]
     if let Some(pid) = pid {

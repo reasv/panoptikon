@@ -2638,17 +2638,23 @@ mod tests {
     /// is a death, settles as one exactly once, and its exit status names the
     /// kind: a SIGKILL from outside (an out-of-memory killer, from this side
     /// of the pipe) is a memory kill, an exit code a crash, also when the
-    /// worker exits by itself after closing its output.
+    /// worker exits by itself after closing its output. One that closes its
+    /// output but outlives the grace dies by the gateway's kill: an abort.
     #[tokio::test]
     async fn a_worker_that_stopped_answering_settles_as_a_death() {
         use super::super::ledger::DeathKind;
+        use WindowOutcome::{Aborted, WorkerDied};
         let mut cases = vec![
-            (json!({}), DeathKind::Crash),
-            (json!({"exit_code": 5}), DeathKind::Crash),
+            (json!({}), WorkerDied(DeathKind::Crash)),
+            (json!({"exit_code": 5}), WorkerDied(DeathKind::Crash)),
+            (json!({"close_stdout_then_sleep": 7}), Aborted),
         ];
         #[cfg(unix)]
-        cases.push((json!({"signal": libc::SIGKILL}), DeathKind::MemoryKill));
-        for (config, kind) in cases {
+        cases.push((
+            json!({"signal": libc::SIGKILL}),
+            WorkerDied(DeathKind::MemoryKill),
+        ));
+        for (config, outcome) in cases {
             let cfg = super::super::worker::testing::test_spawn_config();
             let mut spec = super::super::worker::testing::spec("dying_test");
             spec.config_kwargs = config.clone();
@@ -2661,7 +2667,7 @@ mod tests {
             let (batch, window) =
                 run_single("test/dying", &mut worker, request, None, None, None).await;
             assert!(matches!(batch, BatchOutcome::Fatal(_)));
-            assert_eq!(window, WindowOutcome::WorkerDied(kind), "{config}");
+            assert_eq!(window, outcome, "{config}");
             assert!(answer.await.expect("the caller was answered").is_err());
 
             // The death is claimed, so a second window routed to the same
