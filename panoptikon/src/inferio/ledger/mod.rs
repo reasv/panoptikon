@@ -433,9 +433,7 @@ fn with_shipped_gpu_defaults(inventory: &GpuInventory, mut budgets: VramBudgets)
         budgets = budgets.with_gpu(
             gpu.uuid.clone(),
             VramBudget {
-                knee_max_bucket_dispersion: configured
-                    .knee_max_bucket_dispersion
-                    .or(Some(super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION)),
+                knee_max_bucket_dispersion: Some(super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION),
                 ..configured
             },
         );
