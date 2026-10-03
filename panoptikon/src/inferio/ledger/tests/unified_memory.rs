@@ -1215,12 +1215,19 @@ fn a_36gb_mac_admits_the_ram_that_is_free_and_not_the_leftovers_of_a_ceiling() {
         "priced out of hw.memsize and left there: 27 672, above the \
          device total, which the clip used to hide"
     );
-    assert_eq!(gpu.reserve_mb, 1_024, "the capped default reserve");
+    assert_eq!(gpu.reserve_mb, cpu::ram_reserve_mb(RAM), "the RAM floor");
     assert_eq!(
         gpu.limit_mb,
         available + 1_000 - gpu.reserve_mb,
         "the room the machine has, under a ceiling that is not binding"
     );
+    let token = admission.request_grant(1, None, 1, 0).expect("granted");
+    assert_eq!(
+        token.grant().ram_reserve_mb,
+        gpu.reserve_mb,
+        "the worker's clamp keeps it too"
+    );
+    token.finish(WindowOutcome::Responded { oom: None });
 }
 
 /// The limit is the RAM domain's room under the allocator's ceiling, not
@@ -1234,16 +1241,16 @@ fn the_limit_is_the_ram_domains_room_under_the_allocators_own_ceiling() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("registers");
-    // External 113 536 with a 99 968 MiB hog: the rest is macOS's own pages.
+    // External 101 453 with a 99 968 MiB hog: the rest is macOS's own pages.
     let ours = 1_000u64;
-    let available = MAC_RAM_MB - 113_536 - ours;
+    let available = MAC_RAM_MB - 101_453 - ours;
     push_basis(&handle, RECOMMENDED_MAX, MAC_RAM_MB, available, 0, 0);
     admission
         .request_grant(1, None, 1, 0)
         .expect("granted")
         .finish(WindowOutcome::Responded { oom: None });
     let gpu = &ledger.health()[0];
-    assert_eq!(gpu.external_mb, 113_536);
+    assert_eq!(gpu.external_mb, 101_453);
     assert_eq!(
         gpu.limit_mb, 16_512,
         "the RAM domain's room, not the 8 320 left short of the ceiling"
@@ -1255,7 +1262,8 @@ fn the_limit_is_the_ram_domains_room_under_the_allocators_own_ceiling() {
     );
     assert!(HOG < gpu.external_mb);
 
-    // The ceiling binds when more RAM is free than the allocator hands out.
+    // Idle, under a ceiling raised past RAM less its reserve: the reserve
+    // binds.
     push_basis(&handle, RECOMMENDED_MAX, MAC_RAM_MB, MAC_RAM_MB, 0, 0);
     admission
         .request_grant(1, None, 1, 0)
@@ -1263,8 +1271,8 @@ fn the_limit_is_the_ram_domains_room_under_the_allocators_own_ceiling() {
         .finish(WindowOutcome::Responded { oom: None });
     assert_eq!(
         ledger.health()[0].limit_mb,
-        RECOMMENDED_MAX,
-        "an idle Mac admits what Metal will give, never all of RAM"
+        MAC_RAM_MB - cpu::ram_reserve_mb(MAC_RAM_MB),
+        "an idle Mac keeps its RAM reserve free"
     );
 
     // The limit reaches 0 when the RAM domain runs out.
@@ -1289,8 +1297,9 @@ fn the_limit_is_the_ram_domains_room_under_the_allocators_own_ceiling() {
 #[test]
 fn the_unified_pair_charges_each_others_residents() {
     const RECMAX: u64 = MAC_RAM_MB / 4 * 3;
-    /// The machine's own pages when the Metal frame was taken.
-    const OTHERS: u64 = 20 * 1024;
+    /// The machine's own pages when the Metal frame was taken: few enough
+    /// that Metal's ceiling, not the RAM, bounds the limit.
+    const OTHERS: u64 = 18 * 1024;
     /// What the CPU replica grew to on top of its 1 000 MiB base.
     const CPU_GROWTH: u64 = 11_700;
 
@@ -1590,7 +1599,7 @@ fn the_pool_is_in_the_room_and_in_the_charge_so_only_free_ram_is_admitted() {
         .finish(WindowOutcome::Responded { oom: None });
     let gpu = &ledger.health()[0];
     assert_eq!(gpu.external_mb, EXTERNAL);
-    assert_eq!(gpu.reserve_mb, 1_024, "the capped default");
+    assert_eq!(gpu.reserve_mb, cpu::ram_reserve_mb(MAC_RAM_MB), "the RAM floor");
     assert_eq!(
         gpu.limit_mb,
         available + OURS - gpu.reserve_mb,
@@ -1649,7 +1658,7 @@ fn pressure_cap(ledger: &Arc<VramLedger>) -> Option<PressureCap> {
 }
 
 /// `windows` windows while macOS pages: the worker reads nothing available
-/// and holds 180 MiB of pool, which is 8 units.
+/// above the RAM reserve and holds 180 MiB of pool, which is 8 units.
 fn paging_windows(
     ledger: &Arc<VramLedger>,
     handle: &TelemetryHandle,
@@ -1657,7 +1666,7 @@ fn paging_windows(
     windows: usize,
 ) {
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
-    push_ram(handle, MAC_TOTAL_MB, 0, 180, 0);
+    push_ram(handle, MAC_TOTAL_MB, cpu::ram_reserve_mb(MAC_RAM_MB), 180, 0);
     for window in 0..windows {
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
@@ -1691,7 +1700,7 @@ fn an_out_of_memory_window_while_the_mac_pages_leaves_the_pool_margin() {
     ] {
         let (ledger, handle, admission) = ramped_mac_replica();
         ledger.set_memory_pressure_for_test(pressure);
-        push_ram(&handle, MAC_TOTAL_MB, 0, 180, 0);
+        push_ram(&handle, MAC_TOTAL_MB, cpu::ram_reserve_mb(MAC_RAM_MB), 180, 0);
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
@@ -1881,7 +1890,7 @@ fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
         "5 units of work, room for more"
     );
 
-    push_ram(&handle, MAC_TOTAL_MB, 0, 180, 0);
+    push_ram(&handle, MAC_TOTAL_MB, cpu::ram_reserve_mb(MAC_RAM_MB), 180, 0);
     let granted = queued_window_at_the_rate(&handle, &admission, 20, |_| 100.0);
     assert_eq!(granted, 8, "20 units of work, memory for 8");
     assert_eq!(pressure_cap(&ledger).map(|cap| cap.units), Some(8));
@@ -1920,7 +1929,7 @@ fn at_warning_without_paging_the_batch_size_is_held() {
     );
 
     // Memory for 8 units for one window, then room again.
-    push_ram(&handle, MAC_TOTAL_MB, 0, 180, 0);
+    push_ram(&handle, MAC_TOTAL_MB, cpu::ram_reserve_mb(MAC_RAM_MB), 180, 0);
     assert_eq!(ramp_window(&handle, &admission, &MINILM_M3_MAX), 8);
     assert_eq!(
         pressure_cap(&ledger),

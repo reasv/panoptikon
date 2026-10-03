@@ -148,8 +148,9 @@ pub struct GpuBudgetHealth {
     /// fraction, clamped), `"gpu_floor"` (3 % of the card, at most 1 GiB,
     /// where the default fraction gives less; not on Apple Silicon),
     /// `"flat_default"` (the cap itself, on a CUDA GPU that spills to system
-    /// RAM) or `"ram_floor"` (the CPU device's minimum: a tenth of RAM, at
-    /// most 16 GiB, at least 2 GiB or a quarter of RAM).
+    /// RAM) or `"ram_floor"` (the minimum on the CPU device and on Apple
+    /// Silicon: a tenth of RAM, at most 16 GiB, at least 2 GiB or a quarter
+    /// of RAM).
     pub reserve_rule: String,
     /// `limit − Σ charges − Σ load reservations`; on unified memory the
     /// charges of both devices sharing the RAM.

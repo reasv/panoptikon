@@ -487,8 +487,8 @@ fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
         );
     }
 
-    // The CPU device keeps its RAM floor. A GPU carved out of host RAM has
-    // the floor on Linux, and on a Mac the fraction alone.
+    // The CPU device and a Mac's GPU keep the RAM floor, whatever the margin.
+    // A GPU carved out of host RAM on Linux keeps the GPU floor.
     let host = VramLedger::for_test(
         &[
             (GPU, "TEST 9000", 24_576),
@@ -504,13 +504,20 @@ fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
             (6_553, RESERVE_RULE_RAM_FLOOR),
         ),
         (false, GPU, (737, RESERVE_RULE_GPU_FLOOR)),
-        (true, GPU, (17, RESERVE_RULE_CAPPED_DEFAULT)),
+        (true, GPU, (6_553, RESERVE_RULE_RAM_FLOOR)),
     ] {
         let mut state = host.lock();
         state.metal_allocator = metal;
         assert_eq!(
             host.reserve_locked(&state, device, 165, DEFAULT_MARGIN),
             expected
+        );
+    }
+    for device in [super::cpu::DEVICE_KEY, GPU] {
+        assert_eq!(
+            host.reserve_locked(&host.lock(), device, 165, 0.0),
+            (6_553, RESERVE_RULE_RAM_FLOOR),
+            "{device} on a Mac with a margin of 0"
         );
     }
 

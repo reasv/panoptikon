@@ -293,8 +293,21 @@ fn mac(pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>) {
             open: None,
         });
     }
-    // Nothing else holds RAM: both bases are ours.
-    ledger.record_free_for_test(MPS_GPU, RECOMMENDED_MAX_MB - 2 * BASE_MB);
+    // Nothing else holds RAM: both bases are ours. The MPS reading carries
+    // its RAM domain, as every Metal reading does.
+    VramLedger::record_free_locked(
+        &mut ledger.lock(),
+        MPS_GPU,
+        RECOMMENDED_MAX_MB - 2 * BASE_MB,
+        "mps".to_owned(),
+        std::time::Instant::now(),
+        None,
+        None,
+        Some(RamBasis {
+            total_mb: RAM_MB,
+            available_mb: RAM_MB - 2 * BASE_MB,
+        }),
+    );
     ledger.record_free_for_test(cpu::DEVICE_KEY, RAM_MB - 2 * BASE_MB);
     assert_eq!(ledger.headroom_mb(MPS_GPU), 7288);
     assert_eq!(ledger.headroom_mb(cpu::DEVICE_KEY), 7288);

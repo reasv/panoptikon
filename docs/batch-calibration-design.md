@@ -815,7 +815,10 @@ therefore differs from a GPU in six ways.
 
 The reserve and the free reading apply to every replica whose host RAM is
 booked on the CPU device, GPU replicas included (next section), and to the
-CPU device on Windows and macOS. The MPS device keeps the GPU rule.
+CPU device on Windows and macOS. On a Mac the MPS device keeps the same
+reserve of `hw.memsize`, whatever the margin, and the grant carries it to
+the worker's clamp: both devices spend the same RAM, and unified memory is
+held to the RAM rule, not to the GPU's 1 GiB cap.
 
 Known limits:
 - A Linux unified-memory GPU (an APU) clamps its unclaimed GTT by the same
@@ -2228,9 +2231,8 @@ limit   = min(total × cap_fraction, total − external − reserve)
   - Once other processes hold 30 % of the card, a tenth of their usage is the
     larger figure and nothing changes. A flat 1 GiB would take 15–47 % of the
     room left on an 8 GB card shared with a 2–6 GB tenant.
-  - Not on the CPU device (its own floor, below) and not on Apple Silicon,
-    whose limit is counted in RAM, where other usage is never small, and
-    which has the memory-pressure rules.
+  - Not on the CPU device or Apple Silicon, whose memory is RAM: both keep
+    the RAM floor instead ("Host RAM on the CPU device").
   - A GPU carved out of host RAM on Linux (an APU) has the floor like a
     discrete card. That is by reasoning, not measurement: with RAM to
     spare its other usage reads small and a batch is granted to the last

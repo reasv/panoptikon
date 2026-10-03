@@ -507,8 +507,8 @@ device's budget, so its batch size stops growing where RAM runs out, even
 when VRAM has room.
 
 Host RAM is budgeted more carefully than VRAM, because running out of it
-kills a process instead of failing an allocation. The `CPU` device always
-keeps a tenth of the machine's RAM free (at most 16 GiB; at least 2 GiB, or
+kills a process instead of failing an allocation. The `CPU` device, and on a
+Mac the GPU, always keep a tenth of the machine's RAM free (at most 16 GiB; at least 2 GiB, or
 a quarter of RAM on a machine under 8 GiB): `margin` can raise that reserve,
 never lower it. So
 under `[inference_local.vram.gpu."CPU"]`, `margin = 0` and

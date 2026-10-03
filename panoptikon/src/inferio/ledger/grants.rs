@@ -268,8 +268,9 @@ impl VramLedger {
         // Logged after the lock is dropped.
         let external_mb = Self::external_locked(&state, &gpu).unwrap_or(0);
         let (reserve_mb, reserve_rule) = self.reserve_locked(&state, &gpu, external_mb, margin);
-        // The worker's clamp keeps the CPU device's reserve free.
-        let ram_reserve_mb = if gpu == cpu::DEVICE_KEY {
+        // The worker's clamp keeps the host RAM reserve free: its device's
+        // own when that is host RAM, else the CPU device's for a RAM booking.
+        let ram_reserve_mb = if Self::host_ram_mb_locked(&state, &gpu).is_some() {
             reserve_mb
         } else if ram_new_mb > 0 {
             let external = Self::external_locked(&state, cpu::DEVICE_KEY).unwrap_or(0);
