@@ -829,11 +829,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::write(&venv_node, "#!/bin/sh\necho v0.0.0-test\n").unwrap();
-            let mut perms = std::fs::metadata(&venv_node).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&venv_node, perms).unwrap();
+            crate::test_utils::write_executable(&venv_node, "#!/bin/sh\necho v0.0.0-test\n");
             assert_eq!(resolve_node(None, base.path()), venv_node);
         }
 

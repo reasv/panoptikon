@@ -110,6 +110,22 @@ pub(crate) async fn closed_port() -> std::net::SocketAddr {
     addr
 }
 
+/// Replaces `path` with a new file (a new inode, so a descriptor some child
+/// inherited on the old one does not matter) holding `contents`, executable.
+/// A child process writes it, so this process never holds a write descriptor
+/// on it: one open while another test thread forks is inherited by that child
+/// until its exec, and executing the file meanwhile fails with ETXTBSY.
+#[cfg(unix)]
+pub(crate) fn write_executable(path: &std::path::Path, contents: &str) {
+    let script = r#"rm -f "$2" && printf '%s' "$1" > "$2" && chmod 755 "$2""#;
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", script, "sh", contents])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "could not write {}", path.display());
+}
+
 /// Writes a per-database `config.toml` carrying only `detect_outros`, at the
 /// path `SystemConfigStore::from_env()` resolves for `index_db`.
 ///
@@ -164,4 +180,16 @@ fn the_global_subscriber_answers_sometimes() {
     assert!(tracing::dispatcher::get_default(|d| d
         .register_callsite(callsite)
         .is_sometimes()));
+}
+
+/// A script replacing a file this process still holds open for writing runs.
+#[cfg(unix)]
+#[test]
+fn a_written_executable_replaces_a_file_open_for_writing() {
+    use std::process::Command;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("script");
+    let _old = std::fs::File::create(&path).unwrap();
+    write_executable(&path, "#!/bin/sh\n");
+    assert!(Command::new(&path).status().unwrap().success());
 }
