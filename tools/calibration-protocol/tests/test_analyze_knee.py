@@ -24,6 +24,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 ANALYZE = Path(__file__).resolve().parents[1] / "analyze.py"
 
 
@@ -117,7 +119,7 @@ def test_a_ramp_that_did_climb_is_unaffected():
 
 def test_ramp_progress_does_not_blame_the_unit_budget_for_a_size_left_at_the_seed():
     """A model a trial left at 64 is not the REQUEST_UNIT_BUDGET symptom."""
-    braked_at_64 = [(64, 64)] * 10
+    braked_at_64 = [(64, None)] + [(64, 64)] * 9
     verdict = analyze.check_ramp_progress(_context(braked_at_64))
     assert "REQUEST_UNIT_BUDGET" not in verdict.detail
     assert "knee 64" in verdict.detail
@@ -150,12 +152,39 @@ def test_a_ramp_that_never_started_fails_without_any_working_size():
     assert "peak unit_budget never left the seed" in verdict.detail
 
 
-def test_a_size_resumed_from_the_store_is_learned_only_with_a_trial():
-    """`knee_is_local` from the first sample is this machine's store, not
-    this leg: it needs a `a batch size trial is over` line."""
-    ctx = _context([(64, 64)] * 20)
-    assert analyze.check_calibration_learned(ctx).verdict == "FAIL"
-    ctx.log = [{"ts": "", "t_wall": 110.0, "level": "INFO", "target": "",
-                "message": "a batch size trial is over", "line": "",
-                "fields": {"model": MODEL, "units": 64, "moved": False}}]
-    assert analyze.check_calibration_learned(ctx).verdict == "PASS"
+TRIAL = {"ts": "", "t_wall": 110.0, "level": "INFO", "target": "",
+         "message": "a batch size trial is over", "line": "",
+         "fields": {"model": MODEL, "units": 64, "moved": False}}
+
+
+@pytest.mark.parametrize("samples, trial, expected", [
+    # Fresh and flat, with a trial that placed no size (failed or put off).
+    ([{"A": None}] * 20, True, "FAIL"),
+    # Resumed from the store, with and without a trial.
+    ([{"A": 64}] * 20, True, "PASS"),
+    ([{"A": 64}] * 20, False, "FAIL"),
+    # Fresh, turned local mid-leg; resumed, then moved.
+    ([{"A": None}] * 10 + [{"A": 64}] * 10, False, "PASS"),
+    ([{"A": 64}] * 10 + [{"A": 32}] * 10, False, "PASS"),
+    # A second GPU's replica resuming a stored size later; two replicas
+    # resuming different stored sizes.
+    ([{"A": None}] * 10 + [{"A": None, "B": 32}] * 10, False, "FAIL"),
+    ([{"A": 64}] * 10 + [{"A": 64, "B": 32}] * 10, False, "FAIL"),
+])
+def test_a_size_resumed_from_the_store_is_learned_only_with_a_trial(
+        samples, trial, expected):
+    """A local size counts when this leg measured it: it moved, turned local
+    after its worker's first sample, or the model logged a trial. Each sample
+    is `{gpu: knee_units}`, at unit_budget 64."""
+    ctx = _context([])
+    ctx.health_samples = [
+        {"kind": "sample", "t_wall": 100.0 + index, "health": {"workers": [
+            {"inference_id": MODEL, "gpu_uuid": gpu, "unit_budget": 64,
+             "fit_samples": 10, "knee_units": knee,
+             "knee_is_local": knee is not None}
+            for gpu, knee in workers.items()]}}
+        for index, workers in enumerate(samples)]
+    ctx.log = [TRIAL] if trial else []
+    assert analyze.check_calibration_learned(ctx).verdict == expected
+    note = "REQUEST_UNIT_BUDGET" in analyze.check_ramp_progress(ctx).detail
+    assert note == (expected == "FAIL")

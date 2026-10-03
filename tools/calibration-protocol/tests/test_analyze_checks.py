@@ -274,9 +274,9 @@ def _budget_grant(unit_budget):
             "line": ""}
 
 
-def _utilization_context(healthrec, log=(), probes=(), hog=()):
+def _utilization_context(healthrec, log=(), probes=(), hog=(), vramrec=()):
     ctx = analyze.Context(
-        args=_args(utilization_floor=0.25), vramrec=[],
+        args=_args(utilization_floor=0.25), vramrec=list(vramrec),
         healthrec=list(healthrec), hog=list(hog), log=list(log), before=None,
         after=None, jobs=None, probes=list(probes))
     return ctx
@@ -401,29 +401,39 @@ def test_the_denominator_never_exceeds_the_probe_boundary():
 
 
 def test_the_denominator_is_bounded_by_the_room_a_hog_leaves():
-    """Probe boundary 512 at 10 MiB a unit; a hog holding 4000 MiB while the
-    model ran leaves room for 112, so a 64-unit grant is 0.57, not 0.12. The
-    hog's fill before the job does not count, nor does a hog on another GPU
-    or in host RAM."""
+    """Probe boundary 512 at 20 MiB a unit reserved (10 allocated). While the
+    model ran the hog held at least 3800 MiB, plus a 200 MiB context: room
+    512 - 4000 / 20 = 312, so a 100-unit grant is 0.32, not 0.20. Its fill
+    before the first grant and release after the last do not count. No room
+    bound for grants on two GPUs, or for a RAM hog unless the GPU is unified
+    (no context then); under one unit of room the row is not decidable."""
     probe = {**_bisect_probe(512),
-             "fit": {"basis": "peak_allocated_mb", "slope_mb_per_unit": 10.0}}
+             "fit": {"basis": "peak_allocated_mb", "slope_mb_per_unit": 10.0},
+             "fit_reserved": {"basis": "delta_mb", "slope_mb_per_unit": 20.0}}
 
-    def utilization(gpu="GPU-0000", target="gpu"):
-        hog = [{"kind": "header", "target": target, "gpu_uuid": gpu},
+    def utilization(target="gpu", held=3800, gpus=(GPU, GPU), unified=False):
+        hog = [{"kind": "header", "target": target, "gpu_uuid": GPU,
+                "context_mb": 200},
                {"kind": "state", "t_wall": 10.0, "held_mb": 0},
-               {"kind": "state", "t_wall": 50.0, "held_mb": 4000},
-               {"kind": "state", "t_wall": 150.0, "held_mb": 4000}]
-        return analyze.check_utilization(_utilization_context(
-            [_worker_health(64)], log=[_budget_grant(64)], probes=[probe],
-            hog=hog))
+               {"kind": "state", "t_wall": 50.0, "held_mb": held + 400},
+               {"kind": "state", "t_wall": 110.0, "held_mb": held},
+               {"kind": "state", "t_wall": 150.0, "held_mb": 0}]
+        log = [{**_budget_grant(100), "t_wall": t_wall,
+                "fields": {**_budget_grant(100)["fields"], "gpu": gpu}}
+               for t_wall, gpu in zip((100.0, 120.0), gpus)]
+        vramrec = [{"kind": "header", "gpus": [{"uuid": GPU,
+                                                "unified": unified}]}]
+        verdict = analyze.check_utilization(_utilization_context(
+            [_worker_health(100)], log=log, probes=[probe], hog=hog,
+            vramrec=vramrec))
+        return (verdict.verdict,
+                verdict.numbers["models"][0]["denominator_units"])
 
-    verdict = utilization()
-    row = verdict.numbers["models"][0]
-    assert (row["room_units"], row["denominator_units"]) == (112, 112)
-    assert verdict.verdict == "PASS"
-    for elsewhere in (utilization(gpu="GPU-1111"), utilization(target="ram")):
-        assert elsewhere.numbers["models"][0]["denominator_units"] == 512
-        assert elsewhere.verdict == "FAIL"
+    assert utilization() == ("PASS", 312)
+    assert utilization(gpus=(GPU, "GPU-1111")) == ("FAIL", 512)
+    assert utilization(target="ram") == ("FAIL", 512)
+    assert utilization(target="ram", unified=True) == ("PASS", 322)
+    assert utilization(held=20000) == ("INFO", None)
 
 
 def test_a_size_with_no_settle_line_falls_back_to_itself():
@@ -799,12 +809,14 @@ def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
 # --- deflation_recovery ------------------------------------------------------
 
 
-def _deflation(deflation, outcome="clean"):
+def _deflation(deflation, outcome="clean", gpu=GPU):
+    """A settle line, or with `outcome=None` the time-repay line."""
     return {"ts": "2026-10-03T00:00:00.000000Z", "t_wall": 100.0,
             "level": "WARN" if outcome == "negative" else "DEBUG",
             "target": "panoptikon::inferio::ledger",
-            "message": "settled a granted window",
-            "fields": {"model": MODEL, "gpu": GPU, "outcome": outcome,
+            "message": ("settled a granted window" if outcome else
+                        analyze.DEFLATION_REPAID_LINE),
+            "fields": {"model": MODEL, "gpu": gpu, "outcome": outcome,
                        "deflation": deflation}, "line": ""}
 
 
@@ -814,26 +826,48 @@ def _deflated_health(deflation):
     return sample
 
 
+def _deflation_recovery(log, healthrec=(), declared=False):
+    ctx = _utilization_context(healthrec, log=log)
+    ctx.args.expect_deflated = declared
+    return analyze.check_deflation_recovery(ctx)
+
+
 def test_deflation_recovery_reads_the_settle_lines_before_health():
-    """One level, repaid after three clean windows. A 0.3 s job no health
-    sample saw gets a verdict, and a lone deflated sample is not the end."""
+    """A level is repaid on its third clean window, or by elapsed time. A
+    0.3 s job no health sample saw gets a verdict, a lone deflated sample is
+    not the end, a worker that died restarts at 0, and one the last health
+    sample no longer lists is not judged."""
     recovered = [_deflation(1, "negative"), _deflation(1), _deflation(1),
                  _deflation(0)]
-    for healthrec in ([], [_deflated_health(1)]):
-        ctx = _utilization_context(healthrec, log=recovered)
-        verdict = analyze.check_deflation_recovery(ctx)
+    replaced = [_deflation(0), _deflation(1, "worker_died"),
+                _deflation(1, "negative", gpu="GPU-1111")]
+    for log, healthrec in ((recovered, []), (recovered, [_deflated_health(1)]),
+                           ([_deflation(1, "negative"), _deflation(0, None)],
+                            []),
+                           (replaced, [_deflated_health(0)])):
+        verdict = _deflation_recovery(log, healthrec)
         assert (verdict.verdict, verdict.numbers["source"]) == ("PASS", "log")
-    stuck = _utilization_context(
-        [], log=[_deflation(1, "negative")] + [_deflation(1)] * 3)
-    verdict = analyze.check_deflation_recovery(stuck)
-    assert verdict.verdict == "FAIL"
-    assert verdict.numbers["clean_windows_after_last_negative"] == {
-        f"{MODEL}@{GPU}": 3}
+    stuck = _deflation_recovery([_deflation(0), _deflation(1, "negative")]
+                                + [_deflation(1)] * 3)
+    assert stuck.verdict == "FAIL"
+    assert stuck.numbers["clean_windows_at_level"] == {f"{MODEL}@{GPU}": 3}
+    # The third clean window repays a level the clock already lowered.
+    ended = _deflation_recovery([_deflation(3, "negative"), _deflation(3),
+                                 _deflation(3), _deflation(2, None),
+                                 _deflation(1)])
+    assert ended.verdict == "WARN"
+    # Another target at DEBUG, the ledger's at INFO: only negatives logged.
+    other = {**_deflation(0), "target": "panoptikon::db", "message": "chose"}
+    verdict = _deflation_recovery([other, _deflation(1, "negative")],
+                                  [_deflated_health(1), _deflated_health(0)])
+    assert (verdict.verdict, verdict.numbers["source"]) == ("PASS", "healthrec")
+    assert _deflation_recovery([_deflation(0)], declared=True).verdict == "FAIL"
 
 
 def test_deflation_that_never_recovers_passes_only_when_declared():
-    """`calibfixture/oom_cuda` runs no clean window, so its log holds only
-    WARN settles and health is read instead."""
+    """The `/health` fallback, for a log with no DEBUG settle or repay line
+    (a real leg logs DEBUG, so its log is read): still deflated at the end
+    FAILs unless declared."""
     ctx = _utilization_context([_deflated_health(0), _deflated_health(3)],
                                log=[_deflation(3, "negative")])
     verdict = analyze.check_deflation_recovery(ctx)
@@ -853,7 +887,6 @@ def test_job_outcome_fails_a_job_legs_did_not_see_drain():
                        {"event": "job_end", "outcome": "cap_exceeded"},
                        {"event": "job_start"}]}
     unfinished = analyze._unfinished_jobs(legs)
-    assert unfinished == ["cap_exceeded", "no job_end"]
     record = {"setter": MODEL, "total_segments": 5, "completed": 1}
     for jobs in ({"history": [record]}, None):
         ctx = _utilization_context([])

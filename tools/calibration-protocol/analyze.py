@@ -579,13 +579,16 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
     Only a working size `/health` marks `knee_is_local` counts: a trial on
     this machine measured the sizes next to it and moved to it or left it in
     place. The size a replica merely opened at, or one seeded from a shipped
-    profile, is "not measured yet". `knee_from_start` is 1 when the worker's
-    first sample already carried a local size: one this machine's store
-    resumed, which this leg did not measure.
+    profile, is "not measured yet". A worker is a model on one GPU: a local
+    size its first sample already carried was resumed from this machine's
+    store, and `knee_late` is 1 when a worker's size turned local after its
+    first sample.
     """
     series: Dict[str, List[int]] = {}
     fits: Dict[str, int] = {}
     knees: Dict[str, Dict[str, int]] = {}
+    # Per worker: whether its first sample carried a local size, and its last.
+    workers: Dict[Tuple[str, Any], Dict[str, int]] = {}
     for sample in ctx.health_samples:
         for worker in (sample.get("health") or {}).get("workers") or []:
             key = worker["inference_id"]
@@ -596,31 +599,39 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
             knee = (int(worker.get("knee_units") or 0)
                     if worker.get("knee_is_local") else 0)
             row = knees.setdefault(key, {"knee": 0, "knee_first": 0,
-                                         "knee_moves": 0, "_last": 0,
-                                         "knee_from_start": int(knee > 0)})
+                                         "knee_moves": 0, "knee_late": 0})
+            seen = workers.setdefault((key, worker.get("gpu_uuid")),
+                                      {"from_start": int(knee > 0), "last": 0})
             if knee:
                 if not row["knee_first"]:
                     row["knee_first"] = knee
                 # A later trial moved it, up or down.
-                if knee != row["_last"] and row["_last"]:
+                if knee != seen["last"] and seen["last"]:
                     row["knee_moves"] += 1
+                if not seen["from_start"]:
+                    row["knee_late"] = 1
                 row["knee"] = max(row["knee"], knee)
-                row["_last"] = knee
-    for row in knees.values():
-        row.pop("_last", None)
+                seen["last"] = knee
     return series, fits, knees
 
 
 def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
+    """`_budget_series` per model. `measured` is 1 for a local size this leg
+    measured: it moved, turned local after its worker's first sample, or the
+    model logged `a batch size trial is over`. That line alone is not enough:
+    a failed or put-off trial logs it too and places no size."""
     series, fits, knees = _budget_series(ctx)
+    trials = {str(event["fields"].get("model"))
+              for event in ctx.log_events("a batch size trial is over")}
     return {
         model: {"first": values[0], "peak": max(values), "last": values[-1],
                 "low": min(values), "fit_samples": fits.get(model, 0),
-                "knee": knees.get(model, {}).get("knee", 0),
-                "knee_first": knees.get(model, {}).get("knee_first", 0),
-                "knee_moves": knees.get(model, {}).get("knee_moves", 0),
-                "knee_from_start": knees.get(model, {}).get("knee_from_start",
-                                                            0)}
+                "knee": knees[model]["knee"],
+                "knee_first": knees[model]["knee_first"],
+                "knee_moves": knees[model]["knee_moves"],
+                "measured": int(bool(knees[model]["knee"]) and bool(
+                    knees[model]["knee_moves"] or knees[model]["knee_late"]
+                    or model in trials))}
         for model, values in series.items()
     }
 
@@ -1427,56 +1438,106 @@ def check_failures(ctx: Context) -> Verdict:
     )
 
 
-def check_deflation_recovery(ctx: Context) -> Verdict:
-    """Deflation must return to 0 by the end of the recording.
+#: Consecutive clean windows that repay one level of deflation (the ledger's
+#: `CLEAN_WINDOWS_TO_RESTORE`).
+CLEAN_WINDOWS_TO_RESTORE = 3
 
-    Read from the log: every settle line carries the worker's `deflation`, and
-    so does the line that repays it by elapsed time. A log without DEBUG lines
-    lacks the clean settles, so `/health` samples stand in for it. A worker
-    still deflated at the end FAILs unless the leg declared that its model
-    never runs a clean window (`--expect-deflated`)."""
-    # Per worker: (deflation, settle outcome or None) in time order.
-    series: Dict[str, List[Tuple[int, Optional[str]]]] = {}
-    if any(event["level"] == "DEBUG" for event in ctx.log):
-        for event in ctx.log:
-            fields = event["fields"]
-            if "deflation" in fields and (
-                    event["message"] == "settled a granted window"
-                    or event["message"].startswith(DEFLATION_REPAID_LINE)):
-                series.setdefault(f"{fields.get('model')}@{fields.get('gpu')}",
-                                  []).append((int(fields["deflation"]),
-                                              fields.get("outcome")))
-    source = "log" if series else "healthrec"
-    for sample in ctx.health_samples if not series else []:
+
+def check_deflation_recovery(ctx: Context) -> Verdict:
+    """Deflation must be repaid: one level per `CLEAN_WINDOWS_TO_RESTORE`
+    consecutive clean windows, or one by elapsed time on a `/health` read.
+
+    Read from the log when it holds a DEBUG clean settle or the time-repay
+    line: both carry the worker's `deflation`. Otherwise `/health` samples
+    stand in, and only the end state is judged. A worker that died restarts
+    at 0, as its replacement registers undeflated without a line, and a
+    worker missing from the last health sample is not judged.
+
+    FAIL: a level outlasted `CLEAN_WINDOWS_TO_RESTORE` clean windows, or,
+    from `/health`, a worker is still deflated at the end. WARN: still
+    deflated when the recording ended. `--expect-deflated` declares a model
+    that OOMs on every batch: ending deflated is then its result, and never
+    deflating FAILs."""
+    settle = "settled a granted window"
+    from_log = any((event["level"] == "DEBUG" and event["message"] == settle)
+                   or event["message"].startswith(DEFLATION_REPAID_LINE)
+                   for event in ctx.log)
+    # Per worker: peak and final deflation, consecutive clean windows at the
+    # final level, and the last level that outlasted CLEAN_WINDOWS_TO_RESTORE.
+    rows: Dict[str, Dict[str, int]] = {}
+    for event in ctx.log if from_log else []:
+        fields = event["fields"]
+        if "deflation" not in fields or not (
+                event["message"] == settle
+                or event["message"].startswith(DEFLATION_REPAID_LINE)):
+            continue
+        row = rows.setdefault(f"{fields.get('model')}@{fields.get('gpu')}",
+                              {"peak": 0, "final": 0, "clean": 0, "held": 0})
+        value, outcome = int(fields["deflation"]), fields.get("outcome")
+        row["peak"] = max(row["peak"], value)
+        if outcome == "aborted":
+            continue  # it leaves the clean count as it was
+        if outcome == "worker_died":
+            value = 0
+        if outcome != "clean" or value != row["final"]:
+            row["clean"] = 0
+        if outcome == "clean":
+            row["clean"] += 1
+        row["final"] = value
+        if value and row["clean"] >= CLEAN_WINDOWS_TO_RESTORE:
+            row["held"] = value
+    source = "log" if rows else "healthrec"
+    for sample in ctx.health_samples if not rows else []:
         for worker in (sample.get("health") or {}).get("workers") or []:
-            series.setdefault(f"{worker['inference_id']}@{worker.get('gpu_uuid')}",
-                              []).append((int(worker.get("deflation") or 0), None))
-    if not series:
+            row = rows.setdefault(
+                f"{worker['inference_id']}@{worker.get('gpu_uuid')}",
+                {"peak": 0, "final": 0, "clean": 0, "held": 0})
+            row["final"] = int(worker.get("deflation") or 0)
+            row["peak"] = max(row["peak"], row["final"])
+    last = next((sample["health"]["workers"]
+                 for sample in reversed(ctx.health_samples)
+                 if isinstance((sample.get("health") or {}).get("workers"),
+                               list)), None)
+    if last is not None:
+        alive = {f"{worker['inference_id']}@{worker.get('gpu_uuid')}"
+                 for worker in last}
+        rows = {key: row for key, row in rows.items() if key in alive}
+    if not rows:
         return Verdict("deflation_recovery", "SKIP",
-                       "no settle line with DEBUG logging and no worker in "
-                       "any health sample")
-    peak = {key: max(value for value, _ in rows) for key, rows in series.items()}
-    final = {key: rows[-1][0] for key, rows in series.items()}
-    # Clean windows since each worker's last negative one.
-    clean = {}
-    for key, rows in series.items():
-        outcomes = [outcome for _, outcome in rows if outcome is not None]
-        last = max((index for index, outcome in enumerate(outcomes)
-                    if outcome == "negative"), default=-1)
-        clean[key] = outcomes[last + 1:].count("clean")
-    stuck = {key: value for key, value in final.items() if value > 0}
+                       "no DEBUG settle or repay line, and no worker in the "
+                       "last health sample")
     declared = bool(getattr(ctx.args, "expect_deflated", False))
-    verdict = "FAIL" if stuck and not declared else "PASS"
+    peak = max(row["peak"] for row in rows.values())
+    held = {key: row["held"] for key, row in rows.items() if row["held"]}
+    stuck = {key: row for key, row in rows.items() if row["final"] > 0}
+    if held or (declared and not peak) or (
+            stuck and source == "healthrec" and not declared):
+        verdict = "FAIL"
+    else:
+        verdict = "WARN" if stuck and not declared else "PASS"
+    detail = (
+        f"from the {source}: peak deflation {peak} ("
+        + ", ".join(f"{key}={row['peak']}" for key, row in rows.items()) + ")"
+        + "".join(f"; {key} held {level} through {CLEAN_WINDOWS_TO_RESTORE} "
+                  f"clean windows" for key, level in held.items())
+        + f"; at the end {len(stuck)} worker(s) still deflated"
+        + "".join(f"; {key} at {row['final']}"
+                  + (f" after {row['clean']} clean window(s) at that level"
+                     if source == "log" else "")
+                  for key, row in stuck.items()))
+    if declared:
+        detail += (" (declared: --expect-deflated)" if peak else
+                   "; declared --expect-deflated, but it never deflated")
+    elif verdict == "WARN":
+        detail += ": the recording ended before recovery"
     return Verdict(
-        "deflation_recovery", verdict,
-        f"from the {source}: peak deflation {max(peak.values())} "
-        f"({', '.join(f'{k}={v}' for k, v in peak.items())}); at the end "
-        f"{len(stuck)} worker(s) still deflated"
-        + "".join(f"; {key} at {value} after {clean[key]} clean window(s)"
-                  for key, value in stuck.items())
-        + (" (declared: --expect-deflated)" if stuck and declared else ""),
-        {"source": source, "peak": peak, "final": final,
-         "clean_windows_after_last_negative": clean, "declared": declared},
+        "deflation_recovery", verdict, detail,
+        {"source": source, "declared": declared, "held": held,
+         "peak": {key: row["peak"] for key, row in rows.items()},
+         "final": {key: row["final"] for key, row in rows.items()},
+         "clean_windows_at_level": ({key: row["clean"]
+                                     for key, row in rows.items()}
+                                    if source == "log" else None)},
     )
 
 
@@ -1566,20 +1627,38 @@ def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
     return {model: entry for model, entry in rows.items() if entry["knee"]}
 
 
+#: The orchestrator's device key for the single unified device (`mps.rs`).
+MPS_DEVICE_KEY = "GPU-MPS"
+
+
 def _hog_least_held_mb(ctx: Context,
                        grants: List[Tuple[float, Any]]) -> int:
     """The least MiB hog.py held on the GPU of `grants` (`(t_wall, gpu)`)
-    from the first to the last of them; 0 when any ran on another GPU or the
-    hog held host RAM."""
+    from the first to the last of them, with its GPU context; 0 when they ran
+    on more than one GPU or on one the hog did not fill. A host-RAM hog fills
+    a unified device (vramrec's `unified`, or the Mac's) and no other."""
     header = next((row for row in ctx.hog if row.get("kind") == "header"), {})
-    if (not grants or header.get("target") == "ram"
-            or any(gpu != header.get("gpu_uuid") for _, gpu in grants)):
+    gpus = {gpu for _, gpu in grants}
+    if len(gpus) != 1:
+        return 0
+    gpu = gpus.pop()
+    context = int(header.get("context_mb") or 0)
+    if header.get("target") == "ram":
+        meta = next((row for row in ctx.vramrec
+                     if row.get("kind") == "header"), {})
+        context = 0
+        if gpu != MPS_DEVICE_KEY and not any(
+                row.get("uuid") == gpu and row.get("unified")
+                for row in meta.get("gpus") or []):
+            return 0
+    elif gpu != header.get("gpu_uuid"):
         return 0
     times = sorted(t_wall for t_wall, _ in grants)
     first = max(0, bisect.bisect_right(ctx._hog_times, times[0]) - 1)
     last = bisect.bisect_right(ctx._hog_times, times[-1])
-    return min((int(row.get("held_mb") or 0)
+    held = min((int(row.get("held_mb") or 0)
                 for row in ctx.hog_samples[first:last]), default=0)
+    return held + context if held else 0
 
 
 def check_utilization(ctx: Context) -> Verdict:
@@ -1608,7 +1687,8 @@ def check_utilization(ctx: Context) -> Verdict:
     **A hog leaves less room than the probe had.** The probe boundary is
     measured on a GPU with nothing else on it; the denominator is never above
     that boundary less the least the hog held while the model ran, divided by
-    the probe's slope.
+    the probe's reserved slope (both are physical memory). A room under one
+    unit is not decidable, and the row says so.
 
     Same split as `slope_accuracy`: "no worker was ever admitted" is a result,
     "no probe boundary was passed" a harness omission."""
@@ -1649,8 +1729,13 @@ def check_utilization(ctx: Context) -> Verdict:
     boundaries: Dict[str, Optional[int]] = {}
     slopes: Dict[str, float] = {}
     for probe in ctx.probes:
-        fit, _ = _probe_allocated_fit(probe)
-        if fit and fit.get("slope_mb_per_unit"):
+        # Physical MiB per unit: `fit_reserved`, or a headline fit not on the
+        # allocated basis (an older file, or MPS's peak_reserved).
+        fit = probe.get("fit_reserved") or probe.get("fit") or {}
+        if (not probe.get("fit_reserved") and
+                str(fit.get("basis") or "").startswith("peak_allocated")):
+            fit = {}
+        if fit.get("slope_mb_per_unit"):
             slopes.setdefault(probe.get("model"), fit["slope_mb_per_unit"])
         bisect_info = probe.get("bisect") or {}
         # The superseded `mpsprobe/1` writes `batches` as bare ints, so the
@@ -1678,8 +1763,12 @@ def check_utilization(ctx: Context) -> Verdict:
         allowed = min(boundary, knee["rung"] or knee["knee"]) if knee else 0
         held = _hog_least_held_mb(
             ctx, issued_at.get(model) or published_at.get(model, []))
-        room = (max(1, int(boundary - held / slopes[model]))
+        room = (int(boundary - held / slopes[model])
                 if held and model in slopes else None)
+        if room is not None and room < 1:
+            rows.append({**row, "boundary_units": boundary,
+                         "room_units": room, "denominator_units": None})
+            continue
         denominator = min(allowed or boundary, room or boundary)
         ratio = admitted / denominator
         ok = ratio >= threshold
@@ -1694,6 +1783,9 @@ def check_utilization(ctx: Context) -> Verdict:
     def against(row: Dict[str, Any]) -> str:
         if not row.get("boundary_units"):
             return " (no probe boundary)"
+        if row["denominator_units"] is None:
+            return (f" / the hog left no room for one unit (probe boundary "
+                    f"{row['boundary_units']}): not decidable")
         if row["room_units"] == row["denominator_units"]:
             return (f" / room under the hog {row['room_units']} (probe "
                     f"boundary {row['boundary_units']}) = {row['ratio']:.2f}")
@@ -2177,7 +2269,7 @@ def check_ramp_progress(ctx: Context) -> Verdict:
     # A model whose working size a trial left at the seed can sit there
     # forever and be right, so it is not a candidate for the note below.
     stalled_at_64 = [model for model, row in rows.items()
-                     if row["peak"] == 64 and not row["knee"]]
+                     if row["peak"] == 64 and not row["measured"]]
     detail = "; ".join(
         f"{model}: unit_budget {row['first']} -> peak {row['peak']} "
         f"(last {row['last']}, fit samples {row['fit_samples']}"
@@ -2205,10 +2297,11 @@ def check_calibration_learned(ctx: Context) -> Verdict:
     nothing from larger batches stays at or *under* its seed on purpose. A
     worker deliberately running at 3-7 units would otherwise read "peak
     unit_budget never left the seed (seed 64, peak 64)" and FAIL for doing
-    exactly the right thing. What counts is a `a batch size trial is over`
-    line, or a size `/health` marks `knee_is_local` that this leg measured:
-    one present from the worker's first sample, and never moved, was resumed
-    from the store. The size a replica opened at is still "stuck".
+    exactly the right thing. What counts is a size `/health` marks
+    `knee_is_local` that this leg measured (`_budget_rows`' `measured`): one
+    present from the worker's first sample, never moved and with no trial
+    line, was resumed from the store. The size a replica opened at is still
+    "stuck".
     """
     learning = _declared_learning(ctx)
     profiles = (ctx.after or {}).get("profile") or []
@@ -2227,11 +2320,7 @@ def check_calibration_learned(ctx: Context) -> Verdict:
                         if row["fit_samples"] == 0)
         if no_fit:
             reasons.append("fit samples == 0 for " + ", ".join(no_fit))
-        trials = {str(event["fields"].get("model"))
-                  for event in ctx.log_events("a batch size trial is over")}
-        measured = {model for model, row in rows.items()
-                    if model in trials or row["knee_moves"]
-                    or (row["knee"] and not row["knee_from_start"])}
+        measured = {model for model, row in rows.items() if row["measured"]}
         flat = [model for model, row in rows.items()
                 if row["peak"] <= row["first"] and model not in measured]
         # The budget steps up only after a window measured at it: a job that
@@ -2274,8 +2363,7 @@ def check_calibration_learned(ctx: Context) -> Verdict:
             f"{rows[model]['knee_moves']} time(s), at most "
             f"{rows[model]['knee']}, ran as low as {rows[model]['low']})"
             for model in measured
-            if rows[model]["knee"] and
-            rows[model]["peak"] <= rows[model]["first"])
+            if rows[model]["peak"] <= rows[model]["first"])
         if braked:
             notes.append("at a working size a trial left in place: "
                          + ", ".join(braked))
@@ -2610,8 +2698,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "load-failure fixtures)")
     parser.add_argument("--expect-deflated", action="store_true",
                         help="this leg's model OOMs on every batch "
-                             "(`calibfixture/oom_cuda`), so no clean window "
-                             "ever repays its deflation")
+                             "(`calibfixture/oom_cuda`), so its deflation "
+                             "does not return to 0 within the leg's settle")
     parser.add_argument("--expect-empty-setters", action="store_true",
                         help="this leg's setters are meant to run on no "
                              "items (`calibfixture/dies_on_load_cuda` never "
