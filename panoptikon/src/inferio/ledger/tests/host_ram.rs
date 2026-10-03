@@ -783,11 +783,7 @@ fn a_gpu_replica_reuses_the_ram_it_kept() {
 #[test]
 fn the_ram_cost_is_the_fixed_part_plus_an_upper_per_unit_cost() {
     let cost = |samples: &[(u64, u64)]| {
-        let ring: Vec<FitSample> = samples
-            .iter()
-            .map(|&(units, delta_mb)| FitSample { units, delta_mb })
-            .collect();
-        ram_cost(&ring, 0, 0).map(|cost| {
+        ram_cost(&ram_samples(samples), 0, 0).map(|cost| {
             (
                 cost.fixed_mb,
                 cost.mb_per_unit,
@@ -821,40 +817,83 @@ fn the_ram_cost_is_the_fixed_part_plus_an_upper_per_unit_cost() {
     );
 }
 
-/// A fit from small batches prices at most twice the largest at its fitted
-/// figures. A larger batch books the measured batches' whole growth per
-/// unit, so a per-unit cost the fit read as fixed is not left out.
+/// `(units, growth)` pairs as RAM samples.
+fn ram_samples(pairs: &[(u64, u64)]) -> Vec<FitSample> {
+    pairs
+        .iter()
+        .map(|&(units, delta_mb)| FitSample { units, delta_mb })
+        .collect()
+}
+
+/// Past the largest batch measured, each batch near it is extended from its
+/// growth at its whole growth per unit, so a fixed part the fit read too high
+/// leaves no per-unit cost out, and no fixed part is added on top.
 #[test]
-fn a_fit_from_small_batches_does_not_price_a_far_larger_batch() {
-    let sample = |units, delta_mb| FitSample { units, delta_mb };
-    // Two and four items after a first batch of one: 223 MiB + 40 per unit.
-    let small = [sample(2, 303), sample(4, 383)];
-    let cost = ram_cost(&small, 1, 0).expect("a cost");
+fn past_the_largest_batch_the_booking_covers_its_whole_growth() {
+    // 1 200 MiB of start-up plus 55 or 45 per unit, alternating: the fit
+    // reads the fixed part high, yet up to twice the largest every size
+    // books what inputs as costly as the 512-unit batch's need.
+    let alternating = [
+        (128, 1_200 + 55 * 128),
+        (256, 1_200 + 45 * 256),
+        (512, 1_200 + 55 * 512),
+        (1_024, 1_200 + 45 * 1_024),
+    ];
+    let cost = ram_cost(&ram_samples(&alternating), 0, 0).expect("a cost");
+    assert!(cost.fixed_mb > 2_000.0);
+    for units in 1_025..=2_048 {
+        assert!(
+            cost.booking_mb(units) >= 1_200 + 55 * units,
+            "{units} units"
+        );
+    }
+    // Two and four items after a first batch of one fit 223 MiB + 40 per
+    // unit, where 192 items cost 100 + 50 per unit.
+    let cost = ram_cost(&ram_samples(&[(2, 303), (4, 383)]), 1, 0).expect("a cost");
     assert_eq!((cost.fixed_mb, cost.mb_per_unit), (223.0, 40.0));
-    assert_eq!((cost.fitted, cost.fitted_reach()), (true, 8));
-    assert_eq!(cost.whole_mb_per_unit, 151.5, "303 MiB over 2 units");
-    assert_eq!(cost.booking_mb(8), 223 + 8 * 40);
-    // 192 units that grow 9 700 MiB: 7 903 at the fitted figures.
-    assert_eq!(cost.booking_mb(192), 223 + 29_088);
-    // 10 000 MiB of room holds 64 units at the whole rate, not the 244 the
-    // fitted figures would admit; little room still holds the fitted reach.
-    assert_eq!(cost.units_within(10_000.0), 64);
-    assert_eq!(cost.units_within(700.0), 8);
-    assert_eq!(cost.units_within(100.0), 1);
-
-    // Measured at 192, the fitted figures reach 384.
-    let grown = [sample(2, 303), sample(4, 383), sample(192, 9_923)];
-    let cost = ram_cost(&grown, 1, 0).expect("a cost");
-    assert_eq!(cost.fitted_reach(), 384);
+    for units in 5..=8 {
+        assert!(cost.booking_mb(units) >= 100 + 50 * units, "{units} units");
+    }
     assert_eq!(
-        cost.booking_mb(384),
-        (cost.fixed_mb + 384.0 * cost.mb_per_unit).ceil() as u64
+        cost.booking_mb(192),
+        192 * 303 / 2,
+        "the two items' rate, nothing on top"
     );
-    assert!(cost.booking_mb(385) > 385 * 51);
+}
 
-    // One size: the fixed part is already priced per unit.
-    let one = ram_cost(&[sample(8, 280)], 0, 0).expect("a cost");
-    assert_eq!(one.whole_mb_per_unit, one.mb_per_unit);
+/// No size books less than the costliest batch measured at a size no larger,
+/// or below the smallest size than the smallest batch; a one-size cost books
+/// the size it measured at what it measured. Bookings round up, and a room
+/// below one unit still holds one.
+#[test]
+fn no_size_books_less_than_a_smaller_batch_measured() {
+    // Alternating costs whose fit reads the fixed part below the start-up.
+    let alternating = ram_samples(&[
+        (64, 1_200 + 45 * 64),
+        (128, 1_200 + 55 * 128),
+        (256, 1_200 + 45 * 256),
+        (512, 1_200 + 55 * 512),
+    ]);
+    let cost = ram_cost(&alternating, 0, 0).expect("a cost");
+    assert!(cost.fixed_mb < 1_200.0);
+    for units in 1..=512 {
+        let floor = alternating
+            .iter()
+            .filter(|sample| sample.units <= units.max(64))
+            .map(|sample| sample.delta_mb)
+            .max();
+        assert!(Some(cost.booking_mb(units)) >= floor, "{units} units");
+    }
+    // Two items after a first batch of one that kept 8 900 MiB of start-up.
+    let one = ram_cost(&ram_samples(&[(2, 1_300)]), 1, 8_900).expect("a cost");
+    assert_eq!(
+        [1, 2, 3].map(|units| one.booking_mb(units)),
+        [1_300, 1_300, 2_600]
+    );
+    // 100 MiB over three units.
+    let thirds = ram_cost(&ram_samples(&[(3, 100)]), 0, 0).expect("a cost");
+    assert_eq!(thirds.booking_mb(4), 134);
+    assert_eq!((thirds.units_within(0.0), thirds.booking_mb(1)), (1, 100));
 }
 
 /// Under tight host RAM the batch still grows window by window to what the
@@ -881,9 +920,11 @@ fn a_cost_measured_at_small_batches_does_not_stall_the_ramp() {
         drop(token);
         sizes.push(ram_window_costing(&handle, &admission, FIXED, RAM_PER_UNIT_MB).unit_budget);
     }
-    // 25 at the whole rate, then doubling (the ratchet over the largest
-    // batch run) up to what the RAM holds.
-    assert_eq!(sizes, [25, 50, 100, 200, 280, 280]);
+    // 27 at the two-unit batch's growth per unit, then doubling (the
+    // ratchet over the largest batch run), then up to what the RAM holds at
+    // the whole growth per unit of the batches near the largest: within the
+    // fixed part of the 280 units 200 MiB + 10 per unit leave room for.
+    assert_eq!(sizes, [27, 54, 108, 216, 253, 274]);
 }
 
 /// Start-up growth and cost per unit of the retention tests' model.
@@ -945,7 +986,7 @@ fn batches_run_in_kept_memory_say_nothing_about_the_cost() {
         .expect("granted");
     let need = RETAINED_INIT_MB + RETAINED_PER_UNIT_MB * token.grant().unit_budget;
     let booked = row(&ledger, "g/plateau").ram_booked_mb;
-    assert_eq!(booked, need, "booked exactly what it needs, no more");
+    assert!(booked >= need, "booked {booked} MiB for {need}");
     assert!(
         need <= kept + 24_750,
         "{need} MiB is more than is kept and free"
@@ -1250,7 +1291,8 @@ fn the_first_window_after_load_is_a_single_item() {
         (token.grant().unit_budget, token.grant().user_cap_items),
         (4, Some(4))
     );
-    assert_eq!(row(&ledger, "g/first").ram_booked_mb, 4 * 20);
+    // The two items' growth, and 20 per item beyond them.
+    assert_eq!(row(&ledger, "g/first").ram_booked_mb, 20 + 2 * 20);
     drop(token);
     let third = ram_window_kept(&handle, &admission, INIT);
     assert_eq!(third.unit_budget, 4);
@@ -1284,7 +1326,10 @@ fn ram_window_kept(handle: &TelemetryHandle, admission: &Admission, kept_mb: u64
 /// A model whose first call loads far more than its batches use (8 900 MiB
 /// of libraries and kernels, 90 MiB per unit) on a host with a few GB to
 /// spare: the start-up joins the load level, so the ceiling is room / 90
-/// within five windows, not held at one unit by start-up priced per unit. A
+/// within six windows, not held at one unit by start-up priced per unit. The
+/// first uncapped window, far past the two- and four-item batches, books per
+/// unit the two-item batch's growth over its second item (what the first
+/// item kept may be its own memory); the next books the batch it measured. A
 /// second one-item window (a short queue) measures nothing and does not
 /// double the item cap.
 #[test]
@@ -1329,7 +1374,12 @@ fn start_up_memory_does_not_hold_a_small_host_at_one_unit() {
         [1, 1, 2, 4],
         "item-capped: unbooked, then booked"
     );
-    assert_eq!(grants[4..], [ceiling; 4], "{grants:?}");
+    let first_large = 1 + ledger.headroom_mb(cpu::DEVICE_KEY) / (2 * PER_UNIT);
+    assert_eq!(
+        grants[4..],
+        [first_large, ceiling, ceiling, ceiling],
+        "{grants:?}"
+    );
     let startup = row(&ledger, "g/startup");
     assert_eq!(startup.ram_mb_per_unit, Some(PER_UNIT as f64));
     assert!(startup.ram_ceiling_binding);
@@ -1337,12 +1387,16 @@ fn start_up_memory_does_not_hold_a_small_host_at_one_unit() {
 
 /// On a small host a short window does not double the item cap, and a run
 /// of them does not end it while the cost is unknown: no window adds more
-/// than the RAM left after start-up.
+/// than the RAM left after start-up. The two items measured book what they
+/// measured, so the batch grows to what the room holds.
 #[test]
 fn a_short_window_does_not_double_the_item_cap() {
     const STARTUP: u64 = 8_900;
     const PER_UNIT: u64 = 650;
-    for (short, expected) in [(1, &[1, 1, 2][..]), (5, &[1, 1, 1, 1, 1, 1, 2][..])] {
+    for (short, expected) in [
+        (1, [1, 1, 2, 3, 4, 4, 4, 4, 4, 4]),
+        (5, [1, 1, 1, 1, 1, 1, 2, 3, 4, 4]),
+    ] {
         let profiles = Arc::new(FakeProfiles {
             seed: Some(seeded_anchor(1_024, true)),
             ..FakeProfiles::default()
@@ -1381,7 +1435,7 @@ fn a_short_window_does_not_double_the_item_cap() {
             token.finish(WindowOutcome::Responded { oom: None });
             grants.push(units);
         }
-        assert_eq!(grants[..expected.len()], *expected, "{grants:?}");
+        assert_eq!(grants, expected);
     }
 }
 
@@ -1468,10 +1522,9 @@ fn a_reload_books_the_start_up_its_first_batch_adds() {
 
     let (handle, admission) = cold_gpu_replica(&ledger, "g/restart", GPU, item_cost(8));
     let token = admission.request_grant(8, None, 1, 0).expect("granted");
-    assert_eq!(
-        row(&ledger, "g/restart").ram_booked_mb,
-        FIXED + STARTUP + 8 * RAM_PER_UNIT_MB
-    );
+    // Past the sizes measured: the two-unit batch's whole growth per unit.
+    let booked = 8 * (FIXED + 2 * RAM_PER_UNIT_MB) / 2;
+    assert_eq!(row(&ledger, "g/restart").ram_booked_mb, STARTUP + booked);
     // It keeps 80 MiB beyond the start-up: growth it may reuse, not load level.
     handle
         .lock()
@@ -1479,7 +1532,6 @@ fn a_reload_books_the_start_up_its_first_batch_adds() {
         .record_measurements(vec![ram_batch(8, level + 180, level + 80)]);
     token.finish(WindowOutcome::Responded { oom: None });
     let token = admission.request_grant(8, None, 1, 0).expect("granted");
-    let booked = FIXED + 8 * RAM_PER_UNIT_MB;
     assert_eq!(row(&ledger, "g/restart").ram_booked_mb, booked, "started");
     assert_eq!(cpu_row(&ledger).charges_mb, level + 80 + (booked - 80));
     drop(token);
@@ -1992,4 +2044,46 @@ fn an_out_of_memory_window_host_ram_sized_leaves_the_pool_margin() {
         });
         assert_eq!(margin_steps(&ledger, "g/a", GPU), raised);
     }
+}
+
+/// A first uncapped window priced from two- and three-page batches whose
+/// pages cost less (414 MiB a page) than the job's (457): it books what its
+/// pages need and leaves the host its RAM.
+#[test]
+fn a_first_large_window_priced_from_cheap_small_batches_covers_its_pages() {
+    const STARTUP: u64 = 700;
+    const OTHERS: u64 = 10_161;
+    let profiles = Arc::new(FakeProfiles {
+        seed: Some(seeded_anchor(1_024, true)),
+        ..FakeProfiles::default()
+    });
+    let ledger = host(&[GPU], Some(profiles));
+    let (handle, admission) = cold_gpu_replica(&ledger, "g/pages", GPU, item_cost(32));
+    let level = RSS_AT_LOAD_MB + STARTUP;
+    for (window, (pages, growth)) in [(1, 427), (2, 828), (2, 688), (3, 1_226)]
+        .into_iter()
+        .enumerate()
+    {
+        let before = if window == 0 { RSS_AT_LOAD_MB } else { level };
+        ledger.record_free_for_test(cpu::DEVICE_KEY, CPU_RAM_MB - OTHERS - before);
+        let token = admission.request_grant(pages, None, 1, 0).expect("granted");
+        assert!(token.grant().user_cap_items.is_some());
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![ram_batch(pages, level + growth, level)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+    }
+    ledger.record_free_for_test(cpu::DEVICE_KEY, CPU_RAM_MB - OTHERS - level);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let pages = token.grant().unit_budget;
+    assert_eq!(token.grant().user_cap_items, None);
+    let need = 457 * pages;
+    assert!(
+        row(&ledger, "g/pages").ram_booked_mb >= need,
+        "{pages} pages"
+    );
+    assert!(OTHERS + level + need <= CPU_RAM_MB, "{pages} pages");
 }

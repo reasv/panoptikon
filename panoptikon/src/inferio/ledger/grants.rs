@@ -174,8 +174,8 @@ impl VramLedger {
             // Host RAM caps a GPU replica's batch as the edge of a full card
             // would; the GPU side above is unchanged.
             let ram = self.ram_ceiling_locked(&state, entry);
-            let ram_bound = ram.is_some_and(|ram| ram.units < units);
-            if let Some(ram) = ram.filter(|_| ram_bound) {
+            let ram_bound = ram.as_ref().is_some_and(|ram| ram.units < units);
+            if let Some(ram) = ram.as_ref().filter(|_| ram_bound) {
                 units = ram.units;
                 if let Some(price) = price {
                     mb = price.cost_mb(units);
@@ -193,7 +193,7 @@ impl VramLedger {
                 }
             }
             let ram_cost = ram.and_then(|ram| ram.cost);
-            let ram_mb = ram_cost.map_or(0, |cost| cost.booking_mb(units));
+            let ram_mb = ram_cost.as_ref().map_or(0, |cost| cost.booking_mb(units));
             let ram_mb_per_unit = ram_cost.map(|cost| cost.mb_per_unit);
             (
                 units,

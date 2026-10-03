@@ -23,67 +23,83 @@ fn push_fit_sample(ring: &mut VecDeque<FitSample>, sample: FitSample) {
     }
 }
 
-/// The host RAM a GPU replica books, from its samples: the Theil–Sen fixed
-/// part (0 until two sizes ran), plus per unit an upper estimate, since the
-/// per-unit cost varies with the input and this is a safety ceiling: the
-/// largest cost above the fixed part among batches within
-/// [`RATCHET_FACTOR`] of the largest, or the slope if higher. `None` with no
-/// sample, or a per-unit cost of 0: unknown, not free.
+/// The host RAM a GPU replica books, from its samples. Every size is priced
+/// at an upper bound, since the per-unit cost varies with the input and this
+/// is a safety ceiling; no batch books less than the costliest one measured
+/// at a size no larger, or than the smallest one measured.
+///
+/// Up to the largest batch measured it books the Theil–Sen fit, once two
+/// sizes ran: its fixed part plus per unit the largest cost above it among
+/// batches within [`RATCHET_FACTOR`] of the largest, or the slope if higher.
+/// Past the largest, a fixed part read too high would leave part of the
+/// per-unit cost out, so each of those batches is extended from its own
+/// growth at its whole growth per unit, the highest of them, or the slope if
+/// higher. Past [`RamCost::fitted_reach`], where a few small batches price a
+/// far larger one, the rate is at least the one-size rate below.
 ///
 /// Samples are measured over a load level that includes what a replica's
 /// first batch (`first_units`) kept (`first_kept_mb`), which may be that
-/// batch's own memory rather than start-up. So batches no larger than it are
-/// left out, and with one size the per-unit cost is the lower of the kept
-/// memory priced as this batch's own and this batch's growth over the units
-/// beyond the first batch's. Both bound the cost only where it is the same
-/// for every input, so a one-size cost prices only item-capped windows. From
-/// two sizes the slope does not depend on what the first batch kept.
-///
-/// A fit from small batches can read part of the per-unit cost as fixed, so a
-/// batch past [`RamCost::fitted_reach`] books the whole growth per unit of
-/// the same batches instead.
+/// batch's own memory, reused by later ones. So batches no larger than the
+/// first are left out, and a batch's one-size rate
+/// is the lower of its growth plus the kept memory over its units and its
+/// growth over the units beyond the first batch's: either bounds the cost per
+/// unit, whichever the kept memory is, when every input costs the same. A
+/// one-size cost books its growth up to the size measured and is extended at
+/// that rate. `None` with no sample, or a per-unit cost of 0: unknown, not
+/// free.
 pub(super) fn ram_cost(
     samples: &[FitSample],
     first_units: u64,
     first_kept_mb: u64,
 ) -> Option<RamCost> {
-    let samples: Vec<FitSample> = samples
+    let mut samples: Vec<FitSample> = samples
         .iter()
         .copied()
         .filter(|sample| sample.units > first_units)
         .collect();
-    let largest = samples
-        .iter()
-        .map(|sample| sample.units)
-        .max()
-        .filter(|units| *units > 0)?;
+    samples.sort_by_key(|sample| sample.units);
+    let largest = samples.last()?.units;
     let fit = theil_sen(&samples);
     let fixed_mb = fit.map_or(0.0, |fit| fit.intercept_mb.max(0.0));
-    let near_largest = || {
-        samples
-            .iter()
-            .filter(|sample| sample.units.saturating_mul(RATCHET_FACTOR) >= largest)
-    };
-    let per_unit = near_largest()
-        .map(|sample| {
-            let over = sample.delta_mb as f64 - fixed_mb;
-            let per_unit = over / sample.units as f64;
-            if fit.is_some() {
-                per_unit
-            } else {
-                ((over + first_kept_mb as f64) / sample.units as f64)
-                    .min(over / (sample.units - first_units) as f64)
-            }
-        })
-        .fold(0.0, f64::max);
-    let mb_per_unit = per_unit.max(fit.map_or(0.0, |fit| fit.slope_mb_per_unit));
-    let whole_per_unit = near_largest()
-        .map(|sample| sample.delta_mb as f64 / sample.units as f64)
-        .fold(0.0, f64::max);
+    let slope = fit.map_or(0.0, |fit| fit.slope_mb_per_unit);
+    let mut mb_per_unit = slope;
+    let mut lines = Vec::new();
+    for sample in samples
+        .iter()
+        .filter(|sample| sample.units.saturating_mul(RATCHET_FACTOR) >= largest)
+    {
+        let (units, delta) = (sample.units as f64, sample.delta_mb as f64);
+        let whole = delta / units;
+        let one_size = ((delta + first_kept_mb as f64) / units)
+            .min(delta / (sample.units - first_units) as f64)
+            .max(whole);
+        let (fitted, near) = match fit {
+            Some(_) => ((delta - fixed_mb) / units, whole),
+            None => (one_size, one_size),
+        };
+        mb_per_unit = mb_per_unit.max(fitted);
+        lines.push(RamLine {
+            units: sample.units,
+            delta_mb: delta,
+            near_mb_per_unit: near.max(slope),
+            far_mb_per_unit: one_size.max(slope),
+        });
+    }
+    let mut floor: Vec<FitSample> = Vec::new();
+    for sample in samples {
+        if floor
+            .last()
+            .is_none_or(|top| sample.delta_mb > top.delta_mb)
+        {
+            floor.push(sample);
+        }
+    }
     Some(RamCost {
         fixed_mb,
         mb_per_unit,
-        whole_mb_per_unit: whole_per_unit.max(mb_per_unit),
+        lines,
+        floor,
+        startup_mb: 0.0,
         fitted: fit.is_some(),
         measured_units: largest,
     })

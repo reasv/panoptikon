@@ -179,7 +179,7 @@ impl VramLedger {
             return None;
         }
         let cal = cal_locked(state, entry);
-        let Some(mut cost) = cal.and_then(|cal| cal.ram_cost) else {
+        let Some(mut cost) = cal.and_then(|cal| cal.ram_cost.clone()) else {
             return Some(RamCeiling {
                 units: entry.seed_units.max(1),
                 cost: None,
@@ -187,7 +187,7 @@ impl VramLedger {
         };
         // Before its first batch a replica will add start-up memory as well.
         if !entry.ram_started {
-            cost.fixed_mb += cal.map_or(0, |cal| cal.ram_startup_mb) as f64;
+            cost.startup_mb = cal.map_or(0, |cal| cal.ram_startup_mb) as f64;
         }
         let margin = self.budgets.for_gpu(cpu::DEVICE_KEY).margin_in_force();
         let headroom = self.overdraft_with_margin_locked(state, cpu::DEVICE_KEY, margin);
@@ -213,7 +213,7 @@ impl VramLedger {
     pub(super) fn item_cap_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u32> {
         entry.item_cap.filter(|_| {
             cal_locked(state, entry)
-                .and_then(|cal| cal.ram_cost)
+                .and_then(|cal| cal.ram_cost.as_ref())
                 .is_none_or(|cost| !cost.fitted)
         })
     }

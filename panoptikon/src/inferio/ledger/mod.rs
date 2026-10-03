@@ -624,23 +624,27 @@ struct Share {
 }
 
 /// A GPU replica's host RAM ceiling ([`VramLedger::ram_ceiling_locked`]).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct RamCeiling {
     units: u64,
     /// `None` until measured: nothing is booked.
     cost: Option<RamCost>,
 }
 
-/// What a GPU replica's batch books in host RAM: `fixed_mb + units ×
-/// mb_per_unit` ([`measurements::ram_cost`]), up to
-/// [`Self::fitted_reach`]; a larger batch books `whole_mb_per_unit` per unit.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// What a GPU replica's batch books in host RAM ([`measurements::ram_cost`]):
+/// `startup_mb` plus the highest of the costliest growth measured at a size
+/// no larger (`floor`), the fit `fixed_mb + units × mb_per_unit` up to
+/// [`Self::fitted_reach`], and every line from a batch no larger. A one-size
+/// cost books the growth it measured up to that size.
+#[derive(Debug, Clone, PartialEq)]
 struct RamCost {
     fixed_mb: f64,
     mb_per_unit: f64,
-    /// The costliest measured growth per unit with no fixed part taken out;
-    /// never below `mb_per_unit`.
-    whole_mb_per_unit: f64,
+    lines: Vec<RamLine>,
+    /// Samples by units, each costlier than every smaller one.
+    floor: Vec<FitSample>,
+    /// Start-up memory a replica's first batch will add.
+    startup_mb: f64,
     /// From two sizes or more. From one size it prices item-capped windows,
     /// and after those at most [`Self::fitted_reach`].
     fitted: bool,
@@ -648,27 +652,66 @@ struct RamCost {
     measured_units: u64,
 }
 
+/// A batch near the largest measured, extended from its growth by a rate per
+/// further unit: `near_mb_per_unit` up to [`RamCost::fitted_reach`],
+/// `far_mb_per_unit` past it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RamLine {
+    units: u64,
+    delta_mb: f64,
+    near_mb_per_unit: f64,
+    far_mb_per_unit: f64,
+}
+
 impl RamCost {
-    /// The largest batch the fitted figures price: [`RATCHET_FACTOR`] × the
-    /// largest measured.
+    /// [`RATCHET_FACTOR`] × the largest batch measured.
     fn fitted_reach(&self) -> u64 {
         self.measured_units.saturating_mul(RATCHET_FACTOR)
     }
 
+    /// The costliest growth measured at `units` or fewer, and below the
+    /// smallest size measured, the growth there.
+    fn floor_mb(&self, units: u64) -> f64 {
+        let below = self.floor.iter().take_while(|sample| sample.units <= units);
+        below
+            .last()
+            .or(self.floor.first())
+            .map_or(0.0, |sample| sample.delta_mb as f64)
+    }
+
     fn booking_mb(&self, units: u64) -> u64 {
-        let per_unit = if units > self.fitted_reach() {
-            self.whole_mb_per_unit
+        let far = units > self.fitted_reach();
+        let mut mb = if self.fitted {
+            let fit = self.fixed_mb + units as f64 * self.mb_per_unit;
+            self.floor_mb(units).max(if far { 0.0 } else { fit })
         } else {
-            self.mb_per_unit
+            self.floor_mb(units.max(self.measured_units))
         };
-        (self.fixed_mb + units as f64 * per_unit).ceil() as u64
+        for line in self.lines.iter().filter(|line| line.units <= units) {
+            let rate = if far {
+                line.far_mb_per_unit
+            } else {
+                line.near_mb_per_unit
+            };
+            mb = mb.max(line.delta_mb + (units - line.units) as f64 * rate);
+        }
+        (self.startup_mb + mb).ceil() as u64
     }
 
     /// The largest batch whose booking fits `room_mb`, at least one unit.
+    /// The booking never falls as the batch grows.
     fn units_within(&self, room_mb: f64) -> u64 {
-        let over = room_mb - self.fixed_mb;
-        let fitted = ((over / self.mb_per_unit).floor().max(1.0) as u64).min(self.fitted_reach());
-        fitted.max((over / self.whole_mb_per_unit).floor().max(0.0) as u64)
+        let fits = |units: u64| self.booking_mb(units) as f64 <= room_mb;
+        let mut high = self.measured_units.max(1);
+        while fits(high) && high < u64::MAX / 2 {
+            high *= 2;
+        }
+        let mut low = 0;
+        while high - low > 1 {
+            let mid = low + (high - low) / 2;
+            if fits(mid) { low = mid } else { high = mid }
+        }
+        low.max(1)
     }
 }
 
