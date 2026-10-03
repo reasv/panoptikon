@@ -131,7 +131,8 @@ def meminfo_mb(roots: Roots, key: str) -> Optional[int]:
 
 def memory_mb(roots: Roots, gpu: Gpu) -> Optional[Tuple[int, int]]:
     """`(total_mb, free_mb)` as `rocm.rs::query_memory` computes it: on a
-    unified GPU, carve-out plus GTT, with free GTT clamped by `MemAvailable`."""
+    unified GPU, carve-out plus GTT, with free GTT clamped by the RAM the
+    kernel could deliver, `MemAvailable` less `SReclaimable`."""
     device = os.path.join(roots.pci_devices, gpu.bdf)
 
     def mb(name: str) -> Optional[int]:
@@ -147,6 +148,7 @@ def memory_mb(roots: Roots, gpu: Gpu) -> Optional[Tuple[int, int]]:
     available = meminfo_mb(roots, "MemAvailable")
     if gtt_total is None or gtt_used is None or available is None:
         return None
+    available = max(0, available - (meminfo_mb(roots, "SReclaimable") or 0))
     return (total + gtt_total,
             max(0, total - used) + min(max(0, gtt_total - gtt_used), available))
 

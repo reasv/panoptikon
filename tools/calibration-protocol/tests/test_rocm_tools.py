@@ -58,7 +58,8 @@ class Host:
         os.symlink(rocm_sysfs.INIT_PID_NS if host_pid_ns else "pid:[4026532999]",
                    root / "proc/self/ns/pid")
         (root / "proc/meminfo").write_text(
-            "MemTotal: 134217728 kB\nMemAvailable: 8388608 kB\n")
+            "MemTotal: 134217728 kB\nMemAvailable: 8388608 kB\n"
+            "SReclaimable: 1048576 kB\n")
         if kfd_proc:
             (root / "kfd/proc").mkdir()
 
@@ -134,15 +135,16 @@ def test_inventory_indexes_openable_nodes_and_keys_like_rocm_rs(tmp_path):
 
 
 def test_a_unified_gpu_totals_and_prices_its_gtt(tmp_path):
-    """Total = carve-out + GTT; free GTT clamped by MemAvailable (8 GiB);
-    per process, fdinfo VRAM + GTT even where KFD's counter is readable."""
+    """Total = carve-out + GTT; free GTT clamped by MemAvailable less
+    SReclaimable (8 - 1 GiB); per process, fdinfo VRAM + GTT even where KFD's
+    counter is readable."""
     host = Host(tmp_path).gpu(1, 0x0300, used=256 * MIB,
                               gtt=(64 * GIB, 4 * GIB))
     host.kfd(700, 1, 100 * MIB)
     host.fdinfo(700, 5, _fd(BDF_03, 1, 200 * 1024, gtt_kib=1024 * 1024))
     (gpu,) = rocm_sysfs.inventory(host.roots)
     assert gpu.unified
-    assert rocm_sysfs.memory_mb(host.roots, gpu) == (512 + 65536, 256 + 8192)
+    assert rocm_sysfs.memory_mb(host.roots, gpu) == (512 + 65536, 256 + 7168)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
         "fdinfo", {700: 1224}, [])
     assert legs.rocm_total_mb(0, host.roots) == 66048
