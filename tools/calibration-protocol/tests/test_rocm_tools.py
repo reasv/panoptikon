@@ -310,8 +310,9 @@ def test_used_that_moves_during_the_process_scan_is_flagged_and_not_judged(
     monkeypatch.setattr(vramrec.rocm_sysfs, "process_vram_mb", moving)
     assert sample() == [(6144, 5120), (512, 1536)]
 
-    # The allowance on this 24 GiB GPU is 1 GiB; the measured difference is
-    # 3800 MiB with `external_mb` 0, 1800 MiB with 2000 and 1200 with 5000.
+    # The allowance on this 24 GiB GPU is 1 GiB, on a 96 GiB one 1966 MiB; the
+    # measured difference is 3800 MiB with `external_mb` 0, 1800 MiB with 2000
+    # and 1200 with 5000.
     ctx = _amdgpu_ctx("amdgpu-kfd", [(900, 1200)])
     gpu = ctx.health_samples[0]["health"]["vram"][0]
     row = ctx.vram_samples[0]["gpus"][0]
@@ -321,6 +322,10 @@ def test_used_that_moves_during_the_process_scan_is_flagged_and_not_judged(
         result = analyze.check_oracle_agreement(ctx)
         assert result.verdict == verdict, (external, skew)
     assert result.numbers["skewed_samples"] == 1
+    gpu["total_mb"], gpu["external_mb"], row["skew_mb"] = 98304, 0, 1500
+    result = analyze.check_oracle_agreement(ctx)
+    assert result.verdict == "FAIL"
+    assert result.numbers["worst_sample"]["skew_mb"] == 1500
 
 
 def test_vramrec_selects_the_amdgpu_oracle_without_nvml(tmp_path, monkeypatch):

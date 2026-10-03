@@ -736,7 +736,7 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                 }
             if delta > allowance:
                 breaches += 1
-    skipped = (f"; {skewed} samples read while GPU used moved past the "
+    skipped = (f"; {skewed} GPU-samples read while GPU used moved past the "
                "allowance were skipped" if skewed else "")
     if joined == 0 and unpriced:
         return Verdict(

@@ -336,7 +336,8 @@ _MEMINFO_KEYS = {
     "Cached": "cached_mb",
     "SwapFree": "swap_free_mb",
     "SwapTotal": "swap_total_mb",
-    # The product's free host RAM is MemAvailable less SReclaimable.
+    # The product's free host RAM is MemAvailable less SReclaimable (before any
+    # cgroup limit).
     "SReclaimable": "s_reclaimable_mb",
     # Shared memory, which no single process's RSS accounts for.
     "Shmem": "shmem_mb",
