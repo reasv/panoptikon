@@ -1441,9 +1441,9 @@ residents"):
   nearly always and would tear down healthy pools every other window. Against
   slack the rule is also self-limiting — after a release there is no slack, so
   the next window cannot re-trigger. MPS has no split counter, so there a
-  release can return nothing and leave the slack where it was; after such a
-  release the rule does not count again until the slack grows past what it
-  left. A **memory-blind** window (`grant.mb` is
+  release can leave its slack in the pool; after a release that left at
+  least 256 MiB of its slack in the pool, the rule does not count again until
+  the slack grows 256 MiB past what it left. A **memory-blind** window (`grant.mb` is
   `0`: the GPU had nothing left to price it against) is the strongest squeeze
   there is and counts as one of the two, provided the slack is worth returning
   (256 MiB) — without that clause a pool that has itself consumed the card's

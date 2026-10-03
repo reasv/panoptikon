@@ -2267,8 +2267,9 @@ def test_a_clean_pool_of_the_same_size_is_still_released(fake_torch):
 def test_after_a_release_that_returned_nothing_the_slack_must_grow_first():
     """Metal keeps part of the pool through `empty_cache()` and publishes no
     counter for it, so slack can be claimed that a release does not return.
-    After such a release the rule waits for the slack to grow past what it
-    left, instead of releasing it again every other window."""
+    After a release that left at least 256 MiB of its slack in the pool, the
+    rule waits for the slack to grow 256 MiB past what it left, instead of
+    releasing it again every other window."""
 
     class FragmentedMps(FakeMpsAllocator):
         kept = 0
@@ -2278,16 +2279,26 @@ def test_after_a_release_that_returned_nothing_the_slack_must_grow_first():
             self.driver = min(self.driver, self.allocated + self.kept)
 
     mps = FragmentedMps()
+
+    def windows(count, grant_mb=100, grow_mb=0):
+        for _ in range(count):
+            mps.driver += grow_mb * MIB
+            packing.maybe_shrink(grant_mb)
+        return mps.empty_cache_calls
+
     with mps_host(available_mb=40 * 1024, mps=mps):
         mps.allocate(3000, driver_mb=5000)
-        mps.kept = 2000 * MIB
-        for _ in range(6):
-            packing.maybe_shrink(100)
-        assert mps.empty_cache_calls == 1, "the 2000 MiB slack never came back"
-        mps.driver += 500 * MIB
-        packing.maybe_shrink(100)
-        packing.maybe_shrink(100)
-        assert mps.empty_cache_calls == 2, "the slack grew"
+        mps.kept = 1999 * MIB
+        assert windows(6) == 1, "the release returned 1 MiB of 2000"
+        assert windows(6, grow_mb=1) == 1, "the slack grew 6 MiB"
+        mps.driver += 256 * MIB
+        assert windows(2) == 2, "the slack grew 256 MiB"
+        assert windows(4, grant_mb=0) == 2, "memory-blind windows wait as well"
+        packing.note_trimmed()
+        mps.kept = 0
+        assert windows(2) == 3, "a trim forgets what a release left"
+        mps.driver += 200 * MIB
+        assert windows(2) == 4, "a release that returned all its slack left none"
 
 
 def test_the_clamp_credits_a_split_pool_the_release_decision_refuses(fake_torch):
