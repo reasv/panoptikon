@@ -702,7 +702,7 @@ def test_batch_coverage_counts_every_batch_from_each_workers_seq_1():
     assert coverage((), (), check=analyze.CHECKS["batch_coverage"])[0] == "SKIP"
 
 
-def test_throughput_subtracts_the_clock_step_legs_measured(tmp_path):
+def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
     def leg(name, items, server_s, marks):
         """jobs.json holds the first job's LogRecord; a mark is (event, wall
         seconds[, t_mono])."""
@@ -722,8 +722,11 @@ def test_throughput_subtracts_the_clock_step_legs_measured(tmp_path):
     ours = leg("ours", 100, 8.2, [
         ("job_posted", 0.0, 1000.25), ("job_end", 8.45, 1010.5),
         ("job_posted", 9.0, 1011.0), ("job_end", 17.0, 1014.0)])
-    # An older recording: marks without t_mono, so the server span stands.
-    baseline = leg("c0", 100, 20.0, [("job_posted", 0.0), ("job_end", 24.0)])
+    # A baseline whose clock stepped back 5 s: both sides are corrected.
+    stepped = leg("stepped", 100, 20.0, [
+        ("job_posted", 0.0, 500.0), ("job_end", 20.0, 525.0)])
+    # An older baseline: marks without t_mono, so neither side is corrected.
+    old = leg("c0", 100, 20.0, [("job_posted", 0.0), ("job_end", 24.0)])
 
     def throughput(*argv):
         out = tmp_path / "verdicts.json"
@@ -732,10 +735,28 @@ def test_throughput_subtracts_the_clock_step_legs_measured(tmp_path):
         (verdict,) = json.loads(out.read_text())["verdicts"]
         return verdict["numbers"]
 
-    numbers = throughput("--baseline-jobs", str(baseline))
+    numbers = throughput("--baseline-jobs", str(stepped))
     assert numbers["items_per_s"] == pytest.approx(10.0)
+    assert numbers["baseline_items_per_s"] == pytest.approx(4.0)
+    assert numbers["baseline_clock_step_s"] == pytest.approx(-5.0)
+    numbers = throughput("--baseline-jobs", str(old))
+    assert numbers["items_per_s"] == pytest.approx(100 / 8.2)
     assert numbers["baseline_items_per_s"] == pytest.approx(5.0)
-    assert numbers["baseline_clock_step_s"] is None
+    assert (numbers["clock_step_s"], numbers["baseline_clock_step_s"]) == (
+        None, None)
     # An explicit --jobs may be another job's: no step is subtracted.
     assert throughput("--jobs", str(ours))["items_per_s"] == pytest.approx(
         100 / 8.2)
+
+    def record(start, end):
+        return {"total_segments": 100, "inference_time": 4.0,
+                "data_load_time": 0.5,
+                "start_time": f"2026-10-03 10:00:{start}",
+                "end_time": f"2026-10-03 10:00:{end}"}
+
+    # A backward step longer than the job: end before start, still the span.
+    assert analyze._items_per_s([record(10, "05")], -10.0) == pytest.approx(
+        20.0)
+    # A step larger than the span fell outside it: busy time, no step.
+    assert analyze._items_per_s([record(10, 20)], 30.0) == pytest.approx(
+        100 / 4.5)
