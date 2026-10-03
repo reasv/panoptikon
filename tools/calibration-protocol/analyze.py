@@ -2375,8 +2375,8 @@ def check_batch_coverage(ctx: Context) -> Verdict:
     return Verdict(
         "batch_coverage", "WARN" if lost else "PASS",
         f"{seen} of {seen + lost} batches appeared in a health sample"
-        + (f"; missed per model {missed}: record at a shorter "
-           "--health-interval" if lost else ""),
+        + (f"; missed per model {missed}: more batches between two samples, "
+           "or in one reply, than /health's 4-entry tail" if lost else ""),
         {"seen": seen, "missed": lost, "missed_per_model": missed})
 
 

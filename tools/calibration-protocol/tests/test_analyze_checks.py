@@ -674,9 +674,14 @@ def test_calibration_learned_cannot_judge_a_seed_no_window_reached():
 def test_batch_coverage_counts_every_batch_from_each_workers_seq_1():
     def coverage(*samples, check=analyze.check_batch_coverage):
         """Each sample is one replica's ring or a list of rings, one per
-        replica; an empty list is a sample without the model."""
+        replica; an empty list is a sample without the model, None a failed
+        /health read."""
         recording = []
         for rings in samples:
+            if rings is None:
+                recording.append({"kind": "sample", "t_wall": 100.0,
+                                  "health": {"ok": False}})
+                continue
             rings = rings if isinstance(rings, list) else [rings]
             models = [{"inference_id": MODEL, "generation": 1, "replicas": [
                 {"recent_batches": [{"seq": seq} for seq in ring]}
@@ -695,10 +700,13 @@ def test_batch_coverage_counts_every_batch_from_each_workers_seq_1():
     # A seq that goes back is a new worker, counted from its seq 1.
     assert coverage(range(1, 5), (2, 3)) == ("WARN", 6, 1, {MODEL: 1})
     # Each replica is its own series.
-    assert coverage([range(1, 5), (1, 3)]) == ("WARN", 6, 1, {MODEL: 1})
+    assert coverage([range(1, 5), range(5, 9)],
+                    [range(5, 9), range(9, 13)]) == ("WARN", 16, 4, {MODEL: 4})
     # A model missing from a sample was unloaded: the worker that loads it
     # again at the same key counts from its own seq 1.
     assert coverage(range(1, 4), [], range(4, 8)) == ("WARN", 7, 3, {MODEL: 3})
+    # A failed /health read ends no series.
+    assert coverage(range(1, 5), None, range(3, 7)) == ("PASS", 6, 0, {})
     assert coverage((), (), check=analyze.CHECKS["batch_coverage"])[0] == "SKIP"
 
 
