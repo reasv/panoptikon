@@ -804,6 +804,18 @@ explicit error instead of silently assuming the wrong schema. Freshly created
 DBs get the alembic head revision stamped into `alembic_version` so they
 remain manageable by the Python server during the transition.
 
+Before migrating, the server checks that it can write every database in
+`data_folder` (with its `-wal` and `-shm` files and its folder) and the folders
+it creates databases in; this runs the same way inside and outside Docker.
+After a run as another user (`sudo panoptikon`), what that user created belongs
+to it, and the next start stops with an error naming the file and its owner.
+Hand the data folder back with `sudo chown -R "$USER" data`; when the file sits
+behind a symlink, the error names the link's target instead, since `chown -R`
+does not follow links. To keep a database another user owns unchanged (an
+archive), move it out of `data_folder`, or set `readonly = true`, which serves
+every database read-only without the check or the migrations. A read-only
+filesystem does not stop the start; it is named only when a migration fails.
+
 ## Production UI
 
 With `[upstreams.ui] local = true` the gateway also runs the production
