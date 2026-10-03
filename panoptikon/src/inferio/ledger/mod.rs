@@ -729,6 +729,9 @@ struct WorkerEntry {
     /// When [`Self::reserved_mb`]'s sample was captured; the trim and
     /// per-batch paths skip samples no newer than it.
     reserved_seen_at: Option<Instant>,
+    /// That sample's pool exceeded the GPU's used memory: part of it is in
+    /// system RAM.
+    pool_off_device: bool,
     /// Outstanding grants: id → its charge.
     grants: HashMap<u64, GrantCharge>,
     /// Demand: requests in hand at the last grant request or settle.
@@ -1388,6 +1391,9 @@ struct GpuLedger {
     /// When `free` was credited for a departed resident. Forces a refresh;
     /// readings captured before it are refused.
     free_adjusted_at: Option<Instant>,
+    /// `external` at the last worker sample while no resident's pool was
+    /// partly in system RAM; held while one is.
+    unspilled_external_mb: Option<u64>,
 }
 
 #[derive(Default)]

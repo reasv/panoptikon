@@ -387,6 +387,33 @@ fn external_clamps_at_zero() {
     assert_eq!(gpu.headroom_mb, 1700, "9700 - 8000 footprint");
 }
 
+/// Our pool partly in system RAM is in our footprint but not in the GPU's
+/// used memory, so `external` would read 0. While a resident's last sample has
+/// its pool above the used memory, `external` keeps its value from before.
+#[test]
+fn a_pool_partly_in_system_ram_holds_external() {
+    let ledger = ledger(24_000, no_margin());
+    let handle = loaded(Some(1_000), Some(0));
+    let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
+    let external = |free_mb, pool_mb| {
+        push_memory_with_total(&handle, free_mb, pool_mb, Some(24_000), "nvml");
+        ledger.ingest_all_for_test();
+        ledger.health()[0].external_mb
+    };
+    assert_eq!(
+        external(18_000, 2_000),
+        3_000,
+        "24 000 - 18 000 - 3 000 ours"
+    );
+    // 30 000 of pool on a full card of 24 000: 6 000 of it are off the card.
+    assert_eq!(external(0, 30_000), 3_000, "held");
+    assert_eq!(
+        external(16_000, 2_000),
+        5_000,
+        "back on the card: read afresh"
+    );
+}
+
 /// A worker with no reported base (CTranslate2, a remote API) contributes
 /// only pool growth; its real VRAM lands in `external`.
 #[test]

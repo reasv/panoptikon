@@ -222,7 +222,26 @@ impl VramLedger {
     /// sampling skew from inventing headroom. `None` with no free reading.
     /// On a Metal allocator with a [`RamBasis`] the sum is taken in the RAM
     /// domain (`hw.memsize − available`) and not clipped to the device total.
+    /// While a resident's pool is partly in system RAM the footprints count
+    /// memory the device does not, so the last value from before is held.
     pub(super) fn external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
+        let held = state.gpus.get(gpu)?.unspilled_external_mb;
+        if let Some(held) = held.filter(|_| Self::pool_off_device_locked(state, gpu)) {
+            return Some(held);
+        }
+        Self::measured_external_locked(state, gpu)
+    }
+
+    /// Whether any resident's last sample put part of its pool off `gpu`.
+    pub(super) fn pool_off_device_locked(state: &LedgerState, gpu: &str) -> bool {
+        state
+            .workers
+            .values()
+            .any(|entry| entry.gpu == gpu && entry.pool_off_device)
+    }
+
+    /// [`Self::external_locked`] from the current reading alone.
+    pub(super) fn measured_external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let gpu_ledger = state.gpus.get(gpu)?;
         let sample = gpu_ledger.free.as_ref()?;
         // "Ours" includes the RAM-domain peer's residents: they are in this

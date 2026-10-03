@@ -1345,7 +1345,12 @@ impl's own kernels have said they cannot execute at this corpus's shapes.
   currency: the pool charged has to be the pool the worker holds now
   (`reserved_after_mb`, below). `external` is clamped at ≥ 0:
   `free` and the per-worker samples come from different moments, and
-  sampling skew must never manufacture phantom headroom. When a replica
+  sampling skew must never manufacture phantom headroom. Where a full GPU
+  spills to system RAM, the part of our pool off the card is in Σ footprint
+  but not in `total − free`, so `external` reads too low (0 once the spill
+  exceeds other processes' use). While a replica's last sample has its pool
+  above NVML's used memory (one sample), `external` is held at its value
+  from the last sample with no pool off the card. When a replica
   leaves the GPU its footprint is credited back to the freshest free
   reading as it drops out of the sum — nothing samples a GPU *because*
   a worker left, so without the credit the departed replica's whole

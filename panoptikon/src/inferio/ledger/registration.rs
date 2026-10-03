@@ -747,6 +747,7 @@ impl VramLedger {
                 allocated_at_load_mb: report.allocated_at_load_mb,
                 reserved_mb: pool_at_load,
                 reserved_seen_at: None,
+                pool_off_device: false,
                 grants: HashMap::new(),
                 pending_requests: 0,
                 oom_at_floor: floor_strikes,
