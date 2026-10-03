@@ -1022,9 +1022,9 @@ mod route_tests {
     }
 
     /// The refusal comes before any migration: the default database's folder
-    /// is a symlink to a folder another user owns. A migration of that
-    /// database that fails (here, after that folder appears) is explained by
-    /// it.
+    /// is a symlink to a folder another user owns, whose owner is the one to
+    /// change. A migration of that database that fails (here, after that
+    /// folder appears) is explained by it.
     #[cfg(unix)]
     #[tokio::test]
     async fn startup_refuses_or_explains_a_database_folder_another_user_owns() {
@@ -1037,7 +1037,7 @@ mod route_tests {
         let default = data.path().join("index/default");
         std::fs::create_dir_all(data.path().join("user_data")).unwrap();
         std::fs::create_dir(default.parent().unwrap()).unwrap();
-        let expected = owned_by_another_user(&default, owner, data.path());
+        let expected = owned_by_another_user(&default, owner, folder);
 
         let migrate = async {
             std::os::unix::fs::symlink(folder, &default)?;

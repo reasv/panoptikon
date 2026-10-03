@@ -165,13 +165,24 @@ mod unix {
                  (uid {uid}); run as uid {owner}, or change the owner of '{}' and \
                  everything in it to uid {uid}",
                 path.display(),
-                tree.display()
+                handed_over(tree, path).display()
             )),
             Access::ReadOnly if read_only_too => {
                 Some(format!("'{}' is on a read-only filesystem", path.display()))
             }
             _ => None,
         })
+    }
+
+    /// The folder whose owner, changed with everything in it, reaches `path`:
+    /// `tree`, or the target of the deepest symlink from `tree` down to
+    /// `path`, since a recursive change of owner follows no symlink.
+    fn handed_over(tree: &Path, path: &Path) -> PathBuf {
+        let mut ancestors = path.ancestors().take_while(|path| path.starts_with(tree));
+        match ancestors.find(|path| path.is_symlink()) {
+            Some(link) => std::fs::canonicalize(link).unwrap_or_else(|_| link.to_path_buf()),
+            None => tree.to_path_buf(),
+        }
     }
 
     pub(super) fn explain(
@@ -283,6 +294,16 @@ pub(crate) mod tests {
         unix::reason(data, &database_paths(data, "default"), false, 1000, access)
     }
 
+    /// How [`refusal`] names `path` and the folder to hand over.
+    fn owned_by_root(path: &Path, tree: &Path) -> String {
+        format!(
+            "'{}' is owned by uid 0 and is not writable by the current user (uid 1000); \
+             run as uid 0, or change the owner of '{}' and everything in it to uid 1000",
+            path.display(),
+            tree.display()
+        )
+    }
+
     #[test]
     fn the_list_is_the_databases_their_wal_files_and_their_folders() {
         let data = data_folder();
@@ -378,18 +399,35 @@ pub(crate) mod tests {
         assert!(refusal(data, &data.join("index")).is_some());
     }
 
+    /// A recursive change of owner of the data folder does not follow the
+    /// link, so the link's target is the folder to hand over.
     #[test]
-    fn a_symlinked_database_folder_is_listed() {
+    fn a_symlinked_database_folder_is_listed_and_its_target_handed_over() {
         let (data, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         std::fs::write(elsewhere.path().join("index.db"), b"").unwrap();
         let index = data.path().join("index");
         std::fs::create_dir(&index).unwrap();
+        std::fs::create_dir(data.path().join("user_data")).unwrap();
         std::os::unix::fs::symlink(elsewhere.path(), index.join("linked")).unwrap();
         let listed = database_paths(data.path(), "default");
         assert!(listed.contains(&index.join("linked")), "{listed:?}");
         assert!(
             listed.contains(&index.join("linked/index.db")),
             "{listed:?}"
+        );
+        let target = elsewhere.path().canonicalize().unwrap();
+        for owned in [index.join("linked"), index.join("linked/index.db-wal")] {
+            let refusal = refusal(data.path(), &owned).unwrap();
+            assert!(
+                refusal.starts_with(&owned_by_root(&owned, &target)),
+                "{refusal}"
+            );
+        }
+        let default = index.join("default");
+        let refusal = refusal(data.path(), &default).unwrap();
+        assert!(
+            refusal.starts_with(&owned_by_root(&default, data.path())),
+            "{refusal}"
         );
     }
 
@@ -466,7 +504,7 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink(folder, &link).unwrap();
         assert_eq!(
             database_problem(&link, "cache.db"),
-            Some(owned_by_another_user(&link, owner, &link))
+            Some(owned_by_another_user(&link, owner, folder))
         );
         assert_eq!(
             database_problem(&folder.join("no-such-folder"), "cache.db"),
@@ -522,7 +560,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(data.path().join("user_data")).unwrap();
         std::fs::create_dir(default.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(folder, &default).unwrap();
-        let expected = owned_by_another_user(&default, owner, data.path());
+        let expected = owned_by_another_user(&default, owner, folder);
         let refused = check_databases(data.path(), "default").unwrap_err();
         assert!(refused.to_string().starts_with(&expected), "{refused}");
         let failed = FailedDatabase(default.join("index.db"));
