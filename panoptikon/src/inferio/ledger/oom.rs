@@ -134,8 +134,7 @@ impl VramLedger {
                 gpu,
                 base_mb,
                 needs_mb: 0,
-                died: true,
-                lapse_secs: state.death_verdict_lapse.as_secs(),
+                death_lapse_secs: Some(state.death_verdict_lapse.as_secs()),
             });
         }
         // A lower bound: base plus more than the failed window's room, and
@@ -152,8 +151,7 @@ impl VramLedger {
             gpu,
             base_mb,
             needs_mb,
-            died: false,
-            lapse_secs: 0,
+            death_lapse_secs: None,
         })
     }
 
@@ -229,14 +227,13 @@ impl VramLedger {
     /// (`charge`).
     ///
     /// The (model, device) is capped at half that window's unit budget, at
-    /// least one item's units: for the life of this process, or while macOS
-    /// was paging through the [`PressureCap`], which lifts as a paging
-    /// out-of-memory window's does. Without the cap the next replica is
-    /// admitted for the batch that died, and dies again. A window the queue
-    /// sized sets no cap: its size says nothing about the batch the model can
-    /// run. An item-capped window does, since the cap sized it. On a GPU with
-    /// its own memory the kill was for host RAM: nothing else about the GPU
-    /// changes.
+    /// least one item's units: for the life of this process, or, while macOS
+    /// was paging, through the [`PressureCap`], which lifts as the batch grows
+    /// back at normal pressure. Without the cap the next replica is admitted
+    /// for the batch that died, and dies again. A window the queue sized sets
+    /// no cap: its size says nothing about the batch the model can run. An
+    /// item-capped window does, since the cap sized it. On a GPU with its own
+    /// memory the kill was for host RAM: nothing else about the GPU changes.
     ///
     /// On a unified-memory device the kill is also a negative: the replica
     /// is deflated and its (model, GPU) anchor halved, for this run only.
@@ -251,23 +248,52 @@ impl VramLedger {
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let unified_ram_mb = state.gpus.get(&key.1)?.unified_ram_mb;
         let sized_by_queue = charge.queue_bound && !charge.squeezed && charge.item_cap.is_none();
-        if !sized_by_queue {
-            let cap = (charge.unit_budget / 2).max(charge.item_units);
-            let paging = charge.pressure.paging();
-            let cap = if paging {
-                let halved = GrantCharge {
-                    unit_budget: cap,
-                    ..charge
-                };
-                state.calibration.entry(key.clone()).or_default();
-                Self::note_pressure_size_locked(state, worker, halved, false);
-                cap
+        let paging = charge.pressure.paging();
+        let mut cap = (!sized_by_queue).then(|| (charge.unit_budget / 2).max(charge.item_units));
+        if !paging && let Some(halved) = cap {
+            let cal = state.calibration.entry(key.clone()).or_default();
+            let held = cal.death_cap_units.map_or(halved, |held| held.min(halved));
+            cal.death_cap_units = Some(held);
+            cap = Some(held);
+        }
+        let mut negative = None;
+        if let Some(ram_mb) = unified_ram_mb {
+            let entry = state.workers.get(&worker)?;
+            let anchor_before = Self::anchor_locked(state, entry);
+            if let Some(entry) = state.workers.get_mut(&worker) {
+                entry.note_negative_sample(anchor_before);
+            }
+            // Floored at 1, since zero means "never measured" and turns the
+            // ratchet ceiling off; an anchor that was already zero stays zero.
+            let anchor_after = if anchor_before > 0 {
+                (anchor_before / 2).max(1)
             } else {
-                let cal = state.calibration.entry(key.clone()).or_default();
-                let cap = cal.death_cap_units.map_or(cap, |held| held.min(cap));
-                cal.death_cap_units = Some(cap);
-                cap
+                0
             };
+            if let Some(cal) = state.calibration.get_mut(&key) {
+                cal.max_units_measured = anchor_after;
+            }
+            negative = Some(DeathNegative {
+                inference_id: key.0.clone(),
+                gpu: key.1.clone(),
+                ram_mb,
+                anchor_before,
+                anchor_after,
+            });
+        }
+        // Set after the negative and the anchor halving, as on the paging
+        // out-of-memory path. The window was not sized by the queue, whatever
+        // `queue_bound` says.
+        if paging && let Some(units) = cap {
+            state.calibration.entry(key.clone()).or_default();
+            let halved = GrantCharge {
+                unit_budget: units,
+                queue_bound: false,
+                ..charge
+            };
+            Self::note_pressure_size_locked(state, worker, halved, false);
+        }
+        if let Some(cap) = cap {
             tracing::warn!(
                 model = %key.0,
                 gpu = %key.1,
@@ -280,29 +306,7 @@ impl VramLedger {
                  grow back at normal pressure"
             );
         }
-        let entry = state.workers.get(&worker)?;
-        let ram_mb = unified_ram_mb?;
-        let anchor_before = Self::anchor_locked(state, entry);
-        if let Some(entry) = state.workers.get_mut(&worker) {
-            entry.note_negative_sample(anchor_before);
-        }
-        // Floored at 1, since zero means "never measured" and turns the ratchet
-        // ceiling off; an anchor that was already zero stays zero.
-        let anchor_after = if anchor_before > 0 {
-            (anchor_before / 2).max(1)
-        } else {
-            0
-        };
-        if let Some(cal) = state.calibration.get_mut(&key) {
-            cal.max_units_measured = anchor_after;
-        }
-        Some(DeathNegative {
-            inference_id: key.0,
-            gpu: key.1,
-            ram_mb,
-            anchor_before,
-            anchor_after,
-        })
+        negative
     }
 }
 
@@ -321,20 +325,19 @@ pub struct UnrunnableReplica {
     /// The GPU's limit with the reserve deducted, which a window is priced
     /// against; the refusal room and `needs_mb` leave the reserve out.
     pub room_mb: u64,
-    /// The last strike was a memory kill, not an out-of-memory error:
-    /// `needs_mb` is 0 and the refusal lapses after `lapse_secs`.
-    pub died: bool,
-    pub lapse_secs: u64,
+    /// Set when the last strike was a memory kill, not an out-of-memory
+    /// error: the seconds after which the refusal lapses. `needs_mb` is 0.
+    pub death_lapse_secs: Option<u64>,
 }
 
 impl std::fmt::Display for UnrunnableReplica {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.died {
+        if let Some(lapse_secs) = self.death_lapse_secs {
             return write!(
                 f,
                 "the worker of model {} died {} times in a row running a \
                  single item on GPU {}; it is not loaded there again for {} s",
-                self.inference_id, OOM_WINDOWS_AT_FLOOR, self.gpu, self.lapse_secs
+                self.inference_id, OOM_WINDOWS_AT_FLOOR, self.gpu, lapse_secs
             );
         }
         write!(

@@ -532,20 +532,27 @@ const SIGKILL: i32 = 9;
 /// `STATUS_NO_MEMORY` and `STATUS_COMMITMENT_LIMIT`.
 const WINDOWS_OUT_OF_MEMORY_STATUSES: [u32; 2] = [0xC000_0017, 0xC000_012D];
 
-/// A memory kill when the process died of a SIGKILL or a Windows
-/// out-of-memory status that the gateway did not cause; otherwise a crash.
-fn death_kind(attribution: DeathAttribution, signal: Option<i32>, code: Option<i32>) -> DeathKind {
+/// `None` when the gateway killed the process; otherwise a memory kill for a
+/// SIGKILL or a Windows out-of-memory status, and a crash for anything else.
+fn death_kind(
+    attribution: DeathAttribution,
+    signal: Option<i32>,
+    code: Option<i32>,
+) -> Option<DeathKind> {
+    if attribution.killed_by_gateway() {
+        return None;
+    }
     let out_of_memory = signal == Some(SIGKILL)
         || code.is_some_and(|code| WINDOWS_OUT_OF_MEMORY_STATUSES.contains(&(code as u32)));
-    if out_of_memory && !attribution.killed_by_gateway() {
+    Some(if out_of_memory {
         DeathKind::MemoryKill
     } else {
         DeathKind::Crash
-    }
+    })
 }
 
 impl WorkerDeath {
-    pub fn kind(&self) -> DeathKind {
+    pub fn kind(&self) -> Option<DeathKind> {
         death_kind(
             self.attribution,
             self.signal,
@@ -1551,13 +1558,14 @@ impl Worker {
         self.death.as_ref()
     }
 
-    /// How this worker died with a request in flight (not a desync kill),
-    /// claimed at most once so one death settles at most one window.
+    /// How this worker died with a request in flight; `None` for a kill the
+    /// gateway made. Claimed at most once so one death settles at most one
+    /// window.
     pub(crate) fn take_death(&mut self) -> Option<DeathKind> {
         if !std::mem::take(&mut self.unreachable) {
             return None;
         }
-        self.death.as_ref().map(WorkerDeath::kind)
+        self.death.as_ref().and_then(WorkerDeath::kind)
     }
 
     fn stderr_tail_snapshot(&self) -> String {
@@ -2691,23 +2699,28 @@ mod tests {
         }
     }
 
-    /// A SIGKILL or a Windows out-of-memory status is a memory kill unless
-    /// the gateway caused it; any other exit is a crash.
+    /// A SIGKILL or a Windows out-of-memory status is a memory kill and any
+    /// other exit a crash, unless the gateway killed the process.
     #[test]
     fn the_exit_status_tells_a_memory_kill_from_a_crash() {
         use DeathAttribution::{Dying, ReapedBeforeSignal, StillRunning};
         use DeathKind::{Crash, MemoryKill};
         let windows = |status: u32| Some(status as i32);
         for (attribution, signal, code, kind) in [
-            (ReapedBeforeSignal, Some(9), None, MemoryKill),
-            (Dying, Some(9), None, MemoryKill),
-            (StillRunning, Some(9), None, Crash),
-            (ReapedBeforeSignal, Some(11), None, Crash),
-            (ReapedBeforeSignal, None, Some(3), Crash),
-            (ReapedBeforeSignal, None, windows(0xC000_0017), MemoryKill),
-            (Dying, None, windows(0xC000_012D), MemoryKill),
-            (ReapedBeforeSignal, None, windows(0xC000_0005), Crash),
-            (StillRunning, None, windows(0xC000_0017), Crash),
+            (ReapedBeforeSignal, Some(9), None, Some(MemoryKill)),
+            (Dying, Some(9), None, Some(MemoryKill)),
+            (StillRunning, Some(9), None, None),
+            (ReapedBeforeSignal, Some(11), None, Some(Crash)),
+            (ReapedBeforeSignal, None, Some(3), Some(Crash)),
+            (
+                ReapedBeforeSignal,
+                None,
+                windows(0xC000_0017),
+                Some(MemoryKill),
+            ),
+            (Dying, None, windows(0xC000_012D), Some(MemoryKill)),
+            (ReapedBeforeSignal, None, windows(0xC000_0005), Some(Crash)),
+            (StillRunning, None, windows(0xC000_0017), None),
         ] {
             assert_eq!(
                 death_kind(attribution, signal, code),

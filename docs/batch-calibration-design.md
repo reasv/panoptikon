@@ -192,9 +192,9 @@ the queue runs dry inside a trial (the run ended, or its caller fell behind):
   `W`, the up half is skipped and the replica keeps asking for `2 W`, which
   costs nothing; the first window granted a larger size starts a trial at
   once. A window that runs out of memory, collapses, or whose worker is
-  killed for memory ends the trial and the asking; one under memory pressure puts the trial
-  off for 12 windows. Either way `W` keeps what the trial had measured below
-  that window's size.
+  killed for memory ends the trial and the asking; one under memory pressure
+  puts the trial off for 12 windows. Either way `W` keeps what the trial had
+  measured below that window's size.
 - **The store holds every size a trial placed.** `knee_units` is written as
   soon as a trial moves `W`, up or down, during the climb as well, and when
   a trial leaves an opening size in place; the wait is stored beside it
@@ -775,47 +775,47 @@ therefore differs from a GPU in six ways.
   than a batch runs), the kernel kills the worker and not another program.
   The death settles as `WorkerDied` and the job re-queues the items.
 - **A memory kill caps the batch.** The exit status tells a memory kill from
-  a crash. A SIGKILL the gateway did not send (the kernel's or a cgroup's
-  OOM killer, macOS jetsam) is a memory kill, and so is a Windows exit
-  status `STATUS_NO_MEMORY` (0xC0000017) or `STATUS_COMMITMENT_LIMIT`
-  (0xC000012D). Any other exit (SIGSEGV, SIGABRT, an exit code) is a crash;
-  the gateway's own SIGKILL of a live worker settles as an abort. A crash
-  says nothing about memory and is accounted as an aborted window: no cap,
-  no anchor change, no failed trial. A memory kill with a granted window in
-  flight caps its (model, device) at half that window's unit budget, at
-  least one item's units. (A unified-memory device also halves the anchor,
-  but the next replica is admitted for twice the anchor, which is the batch
-  that died, and deflation is lost with the replica.) The cap holds for the
-  life of the server process, halves again at each further kill, and stops
-  the ramp like a shape ceiling; `/health` shows it as `death_cap_units`. It
-  applies on every device. On a GPU with its own memory the kill was for
-  host RAM, whether or not the window had any booked: the GPU's anchor,
-  margin and ramp are untouched. A window the gateway tore down itself (a
-  cancel) and the death of an idle replica cap nothing; the latter includes
-  a replica that had already exited when the next request reached it, which
-  the worker handle checks before it sends a frame. A window the queue sized
-  (fewer units in hand than the model is admitted for) caps nothing either:
-  one failed search query must not hold a model that ran 256 at one unit. An
-  item-capped cold-start window is sized by its cap and does count. A kill
-  while the Mac pages lowers the paging cap to half the batch that died
-  instead, and that cap lifts as the batch grows back at normal pressure,
-  as after a paging out-of-memory window. A model that cannot run one item
-  is still condemned as before, and a memory kill of a window of one item
-  (a budget under two items' units, whatever the cost unit) counts toward
-  that verdict whatever room the ledger saw: the batch cannot shrink
-  further. Three such kills in a row (a clean window clears the count, which
-  passes from a dead replica to the next; an abort, a crash or a window
-  while the Mac pages neither counts nor clears it) refuse the model's next
-  load and arm the load cooldown instead of reloading it for ever. A verdict
-  reached by kills names no memory figure: it and the load refusal say that
-  the worker died three times in a row running a single item. Such a
-  verdict lapses after `load_failure_cooldown_max_secs` (the load cooldown's
-  ceiling, which the manager arms on the same verdict) while the strike
-  count is kept: the model gets one load attempt per lapse, one more kill at
-  one item refuses it again at once, and a clean window clears everything. A
-  host another program squeezed for a while therefore gets its model back
-  without a restart. A verdict reached by out-of-memory errors keeps its
-  working set until a clean window, as before.
+  a crash. A SIGKILL the gateway did not send (the kernel's or a cgroup's OOM
+  killer, macOS jetsam) is a memory kill, and so is a Windows exit status
+  `STATUS_NO_MEMORY` (0xC0000017) or `STATUS_COMMITMENT_LIMIT` (0xC000012D).
+  Any other exit (SIGSEGV, SIGABRT, an exit code) is a crash; the gateway's
+  own SIGKILL of a live worker settles as an abort. A crash says nothing
+  about memory and is accounted as an aborted window: no cap, no anchor
+  change, no failed trial. A memory kill with a granted window in flight caps
+  its (model, device) at half that window's unit budget, at least one item's
+  units. (A unified-memory device also halves the anchor, but the next
+  replica is admitted for twice the anchor, which is the batch that died, and
+  deflation is lost with the replica.) The cap holds for the life of the
+  server process, halves again at each further kill, and stops the ramp like
+  a shape ceiling; `/health` shows it as `death_cap_units`. It applies on
+  every device. On a GPU with its own memory the kill was for host RAM,
+  whether or not the window had any booked: the GPU's anchor, margin and
+  deflation are untouched, and the gain rule sees a failed window (the trial
+  ends). A window the gateway tore down itself (a cancel) and the death of an
+  idle replica cap nothing; the latter includes a replica that had already
+  exited when the next request reached it, which the worker handle checks
+  before it sends a frame. A window the queue sized (fewer units in hand than
+  the model is admitted for) caps nothing either: one failed search query
+  must not hold a model that ran 256 at one unit. An item-capped cold-start
+  window is sized by its cap and does count. A kill while the Mac pages sets
+  the pressure cap at half the dying batch instead, and that cap lifts as the
+  batch grows back at normal pressure. A model that cannot run one item is
+  still condemned as before, and a memory kill of a window of one item (one
+  item in the window, or a budget under two of its smallest items, whatever
+  the cost unit) counts toward that verdict whatever room the ledger saw: the
+  batch cannot shrink further. Three such kills in a row (a clean window
+  clears the count, which passes from a dead replica to the next; an abort, a
+  crash or a window while the Mac pages neither counts nor clears it) refuse
+  the model's next load and arm the load cooldown instead of reloading it for
+  ever. A verdict reached by kills names no memory figure: it and the load
+  refusal say that the worker died three times in a row running a single
+  item. Such a verdict lapses after `load_failure_cooldown_max_secs` (the
+  load-failure cooldown's ceiling) while the strike count is kept: the model
+  gets one load attempt per lapse, one more kill at one item refuses it again
+  at once, and a clean window clears everything. A host another program
+  squeezed for a while therefore gets its model back without a restart. A
+  verdict reached by out-of-memory errors keeps its working set until a clean
+  window, as before.
 
 The reserve and the free reading apply to every replica whose host RAM is
 booked on the CPU device, GPU replicas included (next section), and to the
@@ -1132,8 +1132,8 @@ rather than losing another program, and the kill caps the model's batch
 A fatal failure settles as `WorkerDied`, with the kind of death its exit
 status names, only when the worker actually stopped answering; a torn-down
 stream the dispatcher itself caused by dropping a request future (the
-user-cancel path) settles as `Aborted`, which teaches the ledger nothing. The death is claimed rather than read, so one death settles
-at most one window.
+user-cancel path) settles as `Aborted`, which teaches the ledger nothing. The
+death is claimed rather than read, so one death settles at most one window.
 
 When a merged window fails with a per-request error the requests are retried
 individually inside the same reservation, but if the failure was an
@@ -2389,14 +2389,14 @@ grants of the replica that OOMed, and a window that ran out of memory *halves a
 seeded anchor*. Two triggers, both the same evidence: the window's own error
 frame, and a batch's out-of-memory report inside it. A memory kill on a card
 with its own memory was for host RAM and lowers nothing; on a unified-memory
-device the death path halves the anchor. A cancelled window lowers nothing;
-it reports no failure. An anchor a clean batch on this GPU has reached is a batch size it has actually run and no OOM
-unmeasures it, but a seeded one is a claim about another card and
-an OOM is the evidence against it. Both corrections are runtime-only; a seeded
-anchor never travels into the local store under our own generator stamp,
-exactly as a seeded working size and a seeded fit do not. The local store's
-other fields — the ring, `local_samples` — still confer nothing from a
-baseline: a file dropped into the *local* store is by definition this
+device the death path halves the anchor. A cancelled window lowers nothing; it
+reports no failure. An anchor a clean batch on this GPU has reached is a batch
+size it has actually run and no OOM unmeasures it, but a seeded one is a claim
+about another card and an OOM is the evidence against it. Both corrections are
+runtime-only; a seeded anchor never travels into the local store under our own
+generator stamp, exactly as a seeded working size and a seeded fit do not. The
+local store's other fields — the ring, `local_samples` — still confer nothing
+from a baseline: a file dropped into the *local* store is by definition this
 machine's own evidence, and copying into it asserts that. The SKU name stays in
 the file as `gpu`, a provenance field nothing matches on.
 

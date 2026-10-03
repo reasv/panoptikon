@@ -273,13 +273,13 @@ fn a_death_in_a_window_the_queue_sized_sets_no_cap() {
     }
 }
 
-/// A worker killed for memory at one unit cannot be given a smaller batch.
+/// A worker killed for memory at one item cannot be given a smaller batch.
 /// Three such kills in a row, each a fresh replica, condemn the model as
 /// three one-item out-of-memory windows do, whatever room the ledger saw and
 /// whether or not host RAM was booked; a clean window in between starts the
 /// count again. An abort or a crash neither counts nor clears.
 #[test]
-fn three_deaths_in_a_row_at_one_unit_condemn_the_model() {
+fn three_deaths_in_a_row_at_one_item_condemn_the_model() {
     let memory_kill = WindowOutcome::WorkerDied(DeathKind::MemoryKill);
     let clean = WindowOutcome::Responded { oom: None };
     for (ledger, gpu) in [
@@ -303,7 +303,7 @@ fn three_deaths_in_a_row_at_one_unit_condemn_the_model() {
             }
             (handle, admission)
         };
-        let one_unit_window = |outcome| {
+        let one_item_window = |outcome| {
             let (_handle, admission) = admitted();
             let token = admission
                 .request_grant(u64::MAX, None, 1, 0)
@@ -324,16 +324,16 @@ fn three_deaths_in_a_row_at_one_unit_condemn_the_model() {
                 assert!(token.finish(WindowOutcome::Responded { oom }).is_none());
             }
         }
-        assert!(one_unit_window(memory_kill).is_none());
-        assert!(one_unit_window(memory_kill).is_none());
-        assert!(one_unit_window(clean).is_none());
+        assert!(one_item_window(memory_kill).is_none());
+        assert!(one_item_window(memory_kill).is_none());
+        assert!(one_item_window(clean).is_none());
         assert!(!ledger.was_condemned("g/a", gpu));
         for _ in 1..OOM_WINDOWS_AT_FLOOR {
-            assert!(one_unit_window(memory_kill).is_none());
+            assert!(one_item_window(memory_kill).is_none());
         }
-        assert!(one_unit_window(WindowOutcome::Aborted).is_none());
-        assert!(one_unit_window(WindowOutcome::WorkerDied(DeathKind::Crash)).is_none());
-        let verdict = one_unit_window(memory_kill).expect("the third in a row");
+        assert!(one_item_window(WindowOutcome::Aborted).is_none());
+        assert!(one_item_window(WindowOutcome::WorkerDied(DeathKind::Crash)).is_none());
+        let verdict = one_item_window(memory_kill).expect("the third in a row");
         assert_eq!(
             (verdict.inference_id.as_str(), verdict.gpu.as_str()),
             ("g/a", gpu)
@@ -342,19 +342,52 @@ fn three_deaths_in_a_row_at_one_unit_condemn_the_model() {
     }
 }
 
-/// One item is the floor whatever the unit. For a model priced in pixels or
-/// tokens a window carrying one item counts toward [`OOM_WINDOWS_AT_FLOOR`]:
-/// a memory kill whatever the room, an out-of-memory error when the room was
-/// short of the item. A kill in a window memory cut below two items caps the
-/// batch at that one item, not at half the cut budget.
-#[test]
-fn a_one_item_window_is_the_floor_whatever_the_unit() {
-    let priced_in = |unit, seed| CostDimension {
+/// A model priced in `unit`, summed over its items.
+fn priced_in(unit: CostUnit, seed: u32) -> CostDimension {
+    CostDimension {
         unit,
         aggregation: Some(CostAggregation::Sum),
         seed_units: Some(seed),
         ..item_cost(4)
-    };
+    }
+}
+
+/// `cost` as `g/a`, fitted at `mb_per_unit`, alone on a 64 000 MiB GPU with
+/// `free_mb` free.
+fn fitted_alone(
+    cost: CostDimension,
+    mb_per_unit: f64,
+    free_mb: u64,
+) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
+    let ledger = ledger(64_000, no_margin());
+    let handle = loaded(Some(3000), Some(0));
+    let admission = ledger
+        .register_worker("g/a", cost, &handle, None)
+        .expect("registers");
+    ledger.install_fit_for_test(
+        "g/a",
+        GPU,
+        FitSnapshot {
+            slope_mb_per_unit: mb_per_unit,
+            intercept_mb: 0.0,
+            residual_mb: 0.0,
+            samples: 8,
+            version: 1,
+        },
+    );
+    ledger.record_free_for_test(GPU, free_mb);
+    (ledger, handle, admission)
+}
+
+/// One item is the floor whatever the unit. For a model priced in pixels or
+/// tokens a window whose batches held one item counts toward
+/// [`OOM_WINDOWS_AT_FLOOR`]: a memory kill whatever the room, an
+/// out-of-memory error when the room was short of the item. A kill in a
+/// window memory cut below two items caps the batch at that one item, not at
+/// half the cut budget. A budget that holds two of the window's smallest
+/// items is no floor, whatever its largest item.
+#[test]
+fn a_one_item_window_is_the_floor_whatever_the_unit() {
     // (cost, one item's units, MiB per unit: one item costs 20 000 MiB)
     for (cost, item, mb_per_unit) in [
         (priced_in(CostUnit::Pixel, 8_000_000), 2_000_000, 0.01),
@@ -368,7 +401,7 @@ fn a_one_item_window_is_the_floor_whatever_the_unit() {
                 .expect("admitted");
             push_memory_with_total(&handle, 40_000, 0, Some(CPU_RAM_MB), "ram");
             let token = admission
-                .request_grant_byte_bound(item, item, None, 1, 0, false)
+                .request_grant_byte_bound(item, item, 1, None, 1, 0, false)
                 .expect("granted");
             assert_eq!(token.grant().unit_budget, item);
             token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill))
@@ -376,30 +409,23 @@ fn a_one_item_window_is_the_floor_whatever_the_unit() {
         assert!(killed().is_none() && killed().is_none());
         assert!(killed().is_some(), "the third kill at one item");
 
-        let ledger = ledger(16_000, no_margin());
-        let handle = loaded(Some(3000), Some(0));
-        let admission = ledger
-            .register_worker("g/a", cost, &handle, None)
-            .expect("registers");
-        ledger.install_fit_for_test(
-            "g/a",
-            GPU,
-            FitSnapshot {
-                slope_mb_per_unit: mb_per_unit,
-                intercept_mb: 0.0,
-                residual_mb: 0.0,
-                samples: 8,
-                version: 1,
-            },
-        );
-        ledger.record_free_for_test(GPU, 12_000);
+        // Two items in a budget of one and three quarters.
+        let (ledger, _handle, admission) = fitted_alone(cost, mb_per_unit, 48_000);
+        let token = admission
+            .request_grant_byte_bound(2 * item, item, 2, None, 1, 0, false)
+            .expect("granted");
+        assert!((3 * item / 2..2 * item).contains(&token.grant().unit_budget));
+        token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
+        assert_eq!(floor_strikes(&ledger), 1);
+
+        let (ledger, _handle, admission) = fitted_alone(cost, mb_per_unit, 12_000);
         let oom = WindowOutcome::Responded {
             oom: Some(ErrorFrameOom::Prose),
         };
         let mut verdicts = Vec::new();
         for outcome in [WindowOutcome::WorkerDied(DeathKind::MemoryKill), oom, oom] {
             let token = admission
-                .request_grant_byte_bound(4 * item, item, None, 1, 0, false)
+                .request_grant_byte_bound(4 * item, item, 4, None, 1, 0, false)
                 .expect("granted");
             assert!((2..item).contains(&token.grant().unit_budget));
             verdicts.push(token.finish(outcome).is_some());
@@ -407,6 +433,24 @@ fn a_one_item_window_is_the_floor_whatever_the_unit() {
         }
         assert_eq!(verdicts, [false, false, true]);
     }
+
+    // Token items of 2000, 50, 50 and 50, in a budget that holds the three
+    // small ones.
+    let token_priced = priced_in(CostUnit::Token, 4096);
+    let (ledger, _handle, admission) = fitted_alone(token_priced, 40.0, 20_000);
+    let token = admission
+        .request_grant_byte_bound(2150, 50, 4, None, 1, 0, false)
+        .expect("granted");
+    let budget = token.grant().unit_budget;
+    assert!((150..2000).contains(&budget), "{budget}");
+    token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
+    assert_eq!(floor_strikes(&ledger), 0);
+    assert!(death_cap(&ledger).is_some_and(|cap| cap <= budget / 2));
+}
+
+/// The floor strikes `g/a` on [`GPU`] carries into its next replica.
+fn floor_strikes(ledger: &Arc<VramLedger>) -> u32 {
+    ledger.lock().calibration[&("g/a".to_owned(), GPU.to_owned())].floor_strikes
 }
 
 /// A fresh CPU replica of `g/a` with RAM to spare whose one window of
@@ -441,13 +485,14 @@ async fn a_verdict_reached_by_deaths_says_so_and_lapses() {
     let load = || ledger.reserve_load("g/a", item_cost(1), "CPU", None);
     assert!(died().is_none() && died().is_none());
     let verdict = died().expect("the third death in a row");
-    assert!(verdict.died);
     assert_eq!(verdict.needs_mb, 0);
 
     let refusal = load().await.err().expect("refused");
-    assert!(refusal.died);
     assert_eq!(refusal.needs_mb, 0);
-    assert_eq!((verdict.lapse_secs, refusal.lapse_secs), (60, 60));
+    assert_eq!(
+        (verdict.death_lapse_secs, refusal.death_lapse_secs),
+        (Some(60), Some(60))
+    );
     for text in [verdict.to_string(), refusal.to_string()] {
         assert!(
             text.contains("died 3 times in a row running a single item on GPU CPU"),
@@ -464,7 +509,7 @@ async fn a_verdict_reached_by_deaths_says_so_and_lapses() {
     assert!(!ledger.was_condemned("g/a", "CPU"));
 
     // Still at three strikes: one more death refuses it for another term.
-    assert!(died().is_some_and(|verdict| verdict.died));
+    assert!(died().is_some_and(|verdict| verdict.death_lapse_secs.is_some()));
     assert!(load().await.is_err());
 
     // A clean window clears the verdict and the count.
@@ -1102,6 +1147,7 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
         requests: 1,
         unit_budget: 8,
         item_units: 1,
+        items: 8,
         size_asked: 8,
         granted_at: Instant::now(),
         squeezed: false,
@@ -1197,6 +1243,7 @@ fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
         requests: 1,
         unit_budget: 512,
         item_units: 1,
+        items: 512,
         size_asked: 512,
         granted_at: Instant::now(),
         squeezed: false,
@@ -1643,9 +1690,9 @@ fn an_out_of_memory_window_at_the_rooms_limit_makes_later_grants_smaller() {
 }
 
 /// Only a window the room sized through the fitted price raises the pool
-/// margin. Not one the queue sized, a one-unit window (no price can make it
-/// smaller), a window whose worker died, or an aborted one. Two units is
-/// enough.
+/// margin. Not one the queue sized, a one-item window whatever its unit (no
+/// price can make it smaller), a window whose worker died, or an aborted one.
+/// Two items is enough.
 #[test]
 fn an_out_of_memory_window_the_room_did_not_size_leaves_the_pool_margin() {
     let (ledger, handle, admission) = at_the_rooms_limit();
@@ -1664,7 +1711,7 @@ fn an_out_of_memory_window_the_room_did_not_size_leaves_the_pool_margin() {
         room_window(&handle, &admission, OUT_OF_MEMORY),
         (1, 10, true)
     );
-    assert_eq!(steps(), 0, "one unit");
+    assert_eq!(steps(), 0, "one item");
 
     room(&ledger, &handle, 1_000);
     let died = room_window(
@@ -1700,6 +1747,16 @@ fn an_out_of_memory_window_the_room_did_not_size_leaves_the_pool_margin() {
         (2, 20, true)
     );
     assert_eq!(steps(), 1, "two units the room sized");
+
+    let item = 2_000_000;
+    let pixel_priced = priced_in(CostUnit::Pixel, 8_000_000);
+    let (ledger, _handle, admission) = fitted_alone(pixel_priced, 0.01, 12_000);
+    let token = admission
+        .request_grant_byte_bound(item, item, 1, None, 1, 0, false)
+        .expect("granted");
+    assert!(token.grant().squeezed && token.grant().unit_budget >= 2);
+    token.finish(OUT_OF_MEMORY);
+    assert_eq!(margin_steps(&ledger, "g/a", GPU), 0, "one item of pixels");
 }
 
 /// A spill or a throughput collapse in a window the room sized deflates, as

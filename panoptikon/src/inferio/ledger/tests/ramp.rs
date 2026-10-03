@@ -324,51 +324,59 @@ fn aborted_windows_do_not_move_the_batch_size() {
 /// A window whose worker absorbed an out-of-memory in its own halving loop
 /// still returns 200: `max_units_measured` takes the window's clean batch,
 /// `max_units_measured_here` (the only figure stored) does not, and the
-/// absorbed batch contributes to neither.
+/// absorbed batch contributes to neither. The same holds for clean batches
+/// of a window whose worker then crashed.
 #[test]
 fn an_absorbed_oom_splits_the_ratchet_anchor_from_the_persisted_one() {
-    let profiles = Arc::new(FakeProfiles::default());
-    let ledger = ledger_with(100_000, no_margin(), &profiles);
-    let handle = loaded(Some(1000), Some(0));
-    let admission = ledger
-        .register_worker("g/a", item_cost(8), &handle, None)
-        .unwrap();
-    push_memory(&handle, 90_000, 0);
-    // One clean window at the seed: both anchors reach 8, and 8 is stored.
-    assert_eq!(measured_window(&handle, &admission, 8), 8);
-    assert_eq!(anchors(&ledger, "g/a", GPU), (8, 8));
-    assert_eq!(stored_anchor(&profiles), 8);
+    let clean = measurement(16, 0, 10 * 16 + 100);
+    let absorbed = BatchMeasurement {
+        oom: true,
+        ..clean.clone()
+    };
+    for (batches, outcome) in [
+        (
+            vec![clean.clone(), absorbed],
+            WindowOutcome::Responded { oom: None },
+        ),
+        (
+            vec![clean.clone()],
+            WindowOutcome::WorkerDied(DeathKind::Crash),
+        ),
+    ] {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        // One clean window at the seed: both anchors reach 8, and 8 is stored.
+        assert_eq!(measured_window(&handle, &admission, 8), 8);
+        assert_eq!(anchors(&ledger, "g/a", GPU), (8, 8));
+        assert_eq!(stored_anchor(&profiles), 8);
 
-    // A window that ran a 16-unit batch clean and absorbed an OOM in a second
-    // batch. HTTP 200, `Responded { oom: None }`.
-    let token = admission
-        .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
-    let granted = token.grant().unit_budget;
-    assert_eq!(granted, 16, "the next size");
-    handle.lock().unwrap().record_measurements(vec![
-        measurement(16, 0, 10 * 16 + 100),
-        BatchMeasurement {
-            oom: true,
-            ..measurement(16, 0, 10 * 16 + 100)
-        },
-    ]);
-    token.finish(WindowOutcome::Responded { oom: None });
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().unit_budget, 16, "the next size");
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(outcome);
 
-    assert_eq!(
-        anchors(&ledger, "g/a", GPU),
-        (16, 8),
-        "the ratchet anchor took the window's clean batch; the \
-         persistable one did not, because `clean_window` is false"
-    );
-    assert_eq!(
-        stored_anchor(&profiles),
-        8,
-        "so the store row stays at the first clean window's size"
-    );
-    // The same window deflated the replica.
-    assert_eq!(ledger.health()[0].workers[0].deflation, 1);
-    assert!(ledger.health()[0].workers[0].unit_budget < 16);
+        assert_eq!(
+            anchors(&ledger, "g/a", GPU),
+            (16, 8),
+            "{outcome:?}: the ratchet anchor took the window's clean batch; \
+             the persistable one did not, because `clean_window` is false"
+        );
+        assert_eq!(
+            stored_anchor(&profiles),
+            8,
+            "{outcome:?}: so the store row stays at the first clean window's size"
+        );
+        // The absorbed OOM deflated the replica; the crash did not.
+        let deflated = matches!(outcome, WindowOutcome::Responded { .. });
+        assert_eq!(ledger.health()[0].workers[0].deflation, u32::from(deflated));
+    }
 }
 
 /// Every window with an absorbed OOM is negative, so a run made only of them
@@ -461,7 +469,7 @@ fn a_byte_closed_window_records_its_anchor_without_earning_a_step() {
         push_memory(&handle, 90_000, 0);
         for _ in 0..6 {
             let token = admission
-                .request_grant_byte_bound(4, 1, None, 1, 4, byte_bound)
+                .request_grant_byte_bound(4, 1, 4, None, 1, 4, byte_bound)
                 .expect("granted");
             assert_eq!(
                 token.grant().unit_budget,
@@ -1430,8 +1438,9 @@ fn queue_sized_windows_wait() {
 
 /// A trial ends at a window that runs out of memory or whose worker is
 /// killed for memory, and keeps what it measured below that size; an aborted
-/// window or a crash changes nothing. Deflation then halves the batch as after any failure, and
-/// deflated windows do not count towards the next trial.
+/// window or a crash changes nothing. Deflation then halves the batch as
+/// after any failure, and deflated windows do not count towards the next
+/// trial.
 #[test]
 fn a_trial_ends_at_a_window_that_fails() {
     let failures = [

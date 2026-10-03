@@ -1906,7 +1906,7 @@ fn registry_default_batch(registry: &Registry, full_inference_id: &str) -> Optio
 mod tests {
     use super::super::calibration::{ProfileQuery, ProfileSeed, ProfileUpdate};
     use super::super::cost::CostAggregation;
-    use super::super::ledger::{IDLE_POOL_RELEASE, WindowOutcome};
+    use super::super::ledger::{IDLE_POOL_RELEASE, OOM_WINDOWS_AT_FLOOR, WindowOutcome};
     use super::super::registry::RegistryConfig;
     use super::super::worker::WorkerDeadlines;
     use super::super::worker::testing::test_spawn_config;
@@ -2169,6 +2169,18 @@ metadata.cost.aggregation = "sum"
 metadata.cost.epoch = 4
 metadata.cost.seed_units = 1000000
 [group.dieledger.inference_ids.test]
+
+# Killed for memory on every input, priced; on a GPU inventory the load
+# reports GPU-0000.
+[group.killed]
+config.impl_class = "dying_test"
+config.signal = 9
+config.load_report = { gpu_uuid = "GPU-0000", base_mb = 512 }
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.epoch = 4
+metadata.cost.seed_units = 1000000
+[group.killed.inference_ids.test]
 "#;
 
     struct TestSetup {
@@ -3522,6 +3534,52 @@ metadata.cost.seed_units = 1000000
         manager.shutdown().await;
     }
 
+    /// A worker killed for memory on every input condemns its model on the
+    /// third single-item kill, each after a reload, on a GPU with nothing
+    /// booked and on the CPU device: the cooldown arms, and once it has run
+    /// out the ledger still refuses the load for `cooldown_max`.
+    #[tokio::test]
+    async fn a_model_killed_on_every_input_is_condemned_after_three_reloads() {
+        for (gpus, device) in [
+            (test_gpus(), "GPU-0000"),
+            (
+                GpuInventory::known_cpu(16 * 1024),
+                super::super::cpu::DEVICE_KEY,
+            ),
+        ] {
+            let setup = test_manager_with(ManagerOpts {
+                gpus,
+                loads: LoadPolicy {
+                    cooldown_base: Duration::from_millis(100),
+                    cooldown_max: Duration::from_secs(60),
+                    ..LoadPolicy::default()
+                },
+                ..Default::default()
+            });
+            let manager = setup.manager.clone();
+            for kill in 0..OOM_WINDOWS_AT_FLOOR {
+                assert!(!manager.ledger.was_condemned("killed/test", device));
+                predict_one(&manager, "killed/test", "k", -1, None, json!(kill))
+                    .await
+                    .expect_err("the worker is killed");
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while manager.loaded_generation("killed/test").is_some() {
+                    assert!(tokio::time::Instant::now() < deadline, "{device}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+            assert!(manager.ledger.was_condemned("killed/test", device));
+            assert_eq!(manager.health().load_cooldowns.len(), 1, "{device}");
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let err = predict_one(&manager, "killed/test", "k", -1, None, json!("ok"))
+                .await
+                .expect_err("refused");
+            assert!(format!("{err:#}").contains("again until 60 s"), "{err:#}");
+            manager.shutdown().await;
+        }
+    }
+
     /// The sentence belongs to the card that passed it. A condemnation
     /// recorded on some other GPU is not evidence about this death, so the
     /// death respawns on the next predict like every uncosted one.
@@ -3768,23 +3826,6 @@ metadata.cost.seed_units = 1000000
             .expect("load task")
             .expect("the slow load lands");
         manager.shutdown().await;
-    }
-
-    /// A death verdict refuses loads for as long as the load-failure
-    /// cooldown's ceiling, which this manager arms on the same verdict.
-    #[tokio::test]
-    async fn the_death_verdict_lapses_with_the_cooldown_ceiling() {
-        let setup = test_manager_with(ManagerOpts {
-            loads: LoadPolicy {
-                cooldown_max: Duration::from_secs(60),
-                ..LoadPolicy::default()
-            },
-            ..Default::default()
-        });
-        assert_eq!(
-            setup.manager.ledger.death_verdict_lapse_for_test(),
-            Duration::from_secs(60)
-        );
     }
 
     /// The gate is keyed by **GPU** and is `max_concurrent_loads` permits wide,

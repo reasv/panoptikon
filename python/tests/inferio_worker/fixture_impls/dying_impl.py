@@ -4,7 +4,8 @@ os._exit bypasses all Python cleanup, so the parent sees the process die
 with a pending request — the manager must treat it as a fatal worker death:
 fail the request, drop the model from every LRU/cache-key, and let the next
 predict auto-load a fresh worker. With a `signal` config the process sends
-itself that signal instead.
+itself that signal instead. A `load_report` config is merged into the load
+response, standing in for the device a real load reports.
 """
 
 import os
@@ -19,7 +20,15 @@ class DyingModel:
         return "dying_test"
 
     def load(self) -> None:
-        pass
+        report = self.config.get("load_report")
+        if report:
+            from inferio_worker import memory
+
+            finish_load = memory.finish_load
+            memory.finish_load = lambda before, instance: {
+                **finish_load(before, instance),
+                **report,
+            }
 
     def predict(self, inputs):
         if "signal" in self.config:

@@ -951,6 +951,7 @@ impl Admission {
         self.request_grant_byte_bound(
             window_units,
             1,
+            usize::try_from(window_units).unwrap_or(usize::MAX),
             user_cap_items,
             window_requests,
             queued_behind,
@@ -960,12 +961,15 @@ impl Admission {
 
     /// Reserve headroom for one window. Demand is `window_requests +
     /// queued_behind`; the window's own requests retire when it settles.
-    /// `item_units`: the units of one of the window's items, on average.
-    /// `byte_bound`: the byte limit, not the queue, closed the window.
+    /// `item_units`: the units of the window's smallest item; `window_items`:
+    /// its item count. `byte_bound`: the byte limit, not the queue, closed the
+    /// window.
+    #[allow(clippy::too_many_arguments)]
     pub fn request_grant_byte_bound(
         &self,
         window_units: u64,
         item_units: u64,
+        window_items: usize,
         user_cap_items: Option<u32>,
         window_requests: usize,
         queued_behind: usize,
@@ -975,6 +979,7 @@ impl Admission {
             self.worker,
             window_units,
             item_units,
+            window_items,
             user_cap_items,
             window_requests,
             queued_behind,

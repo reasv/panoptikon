@@ -579,8 +579,10 @@ struct GrantCharge {
     /// The admitted per-batch unit budget; the batch size may move before
     /// settle.
     unit_budget: u64,
-    /// The units of one of the window's items, on average; at least 1.
+    /// The units of the window's smallest item; at least 1.
     item_units: u64,
+    /// The window's item count.
+    items: usize,
     /// The batch size the gain rule asked for this window
     /// ([`VramLedger::size_locked`]), before anything cut it.
     size_asked: u64,
@@ -622,9 +624,10 @@ struct GrantCharge {
 }
 
 impl GrantCharge {
-    /// The window's batches held one item: its budget is under two items.
+    /// The window's batches held one item: the window held at most one, or
+    /// its budget is under two of its smallest items.
     fn one_item(&self) -> bool {
-        self.unit_budget < self.item_units.saturating_mul(2)
+        self.items <= 1 || self.unit_budget < self.item_units.saturating_mul(2)
     }
 }
 
@@ -1425,8 +1428,8 @@ struct LedgerState {
     /// refused for `death_verdict_lapse` from then, or until a clean window.
     /// The strike count outlives the refusal, so one more kill refuses again.
     death_verdicts: HashMap<(String, String), Instant>,
-    /// The load-failure cooldown's ceiling
-    /// ([`VramLedger::set_death_verdict_lapse`]).
+    /// A death verdict lapses after `load_failure_cooldown_max_secs` (the
+    /// load-failure cooldown's ceiling; [`VramLedger::set_death_verdict_lapse`]).
     death_verdict_lapse: Duration,
     /// Trims waiting for the manager to route to dispatchers.
     pending_trims: Vec<TrimRequest>,
@@ -1563,9 +1566,9 @@ impl VramLedger {
         }
     }
 
-    /// How long a verdict reached by memory kills refuses the model's loads:
-    /// the load-failure cooldown's ceiling, which the manager arms on the same
-    /// verdict.
+    /// A verdict reached by memory kills refuses the model's loads, and lapses
+    /// after `load_failure_cooldown_max_secs` (the load-failure cooldown's
+    /// ceiling).
     pub fn set_death_verdict_lapse(&self, lapse: Duration) {
         self.lock().death_verdict_lapse = lapse;
     }

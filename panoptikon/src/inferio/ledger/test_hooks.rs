@@ -179,6 +179,22 @@ impl VramLedger {
         self.lock().workers.get(&worker)?.last_trim_at
     }
 
+    /// `(smallest item's units, item count)` of each window `worker` holds a
+    /// grant for.
+    #[cfg(test)]
+    pub(in crate::inferio) fn open_grant_items_for_test(&self, worker: u64) -> Vec<(u64, usize)> {
+        let state = self.lock();
+        let grants = state
+            .workers
+            .get(&worker)
+            .map(|entry| entry.grants.values());
+        grants
+            .into_iter()
+            .flatten()
+            .map(|charge| (charge.item_units, charge.items))
+            .collect()
+    }
+
     /// The throughput ring as `(units, units/sec)`.
     #[cfg(test)]
     pub(super) fn throughput_for_test(&self, inference_id: &str, gpu: &str) -> Vec<(u64, f64)> {
@@ -285,12 +301,6 @@ impl VramLedger {
         for died_at in self.lock().death_verdicts.values_mut() {
             *died_at = died_at.checked_sub(by).expect("a clock that old");
         }
-    }
-
-    /// How long a death verdict refuses loads.
-    #[cfg(test)]
-    pub(crate) fn death_verdict_lapse_for_test(&self) -> Duration {
-        self.lock().death_verdict_lapse
     }
 
     /// Age this replica's deflation repayment clock by `by`.

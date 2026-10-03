@@ -581,12 +581,19 @@ pub(crate) async fn run_dispatcher(
                 last_shape = shape;
             }
             let byte_closed = closed_on_bytes(&shapes, take, window_bytes, bounds);
+            let smallest_item_units = window
+                .iter()
+                .map(|queued| queued.shape.units / queued.shape.items.max(1) as u64)
+                .min()
+                .unwrap_or(1)
+                .max(1);
             // Granted before hand-off, so no headroom is promised twice.
             let plan = match &replica.admission {
                 Some(admission) => {
                     let grant = admission.request_grant_byte_bound(
                         window_units,
-                        window_units / window_items.max(1) as u64,
+                        smallest_item_units,
+                        window_items,
                         cap,
                         window.len(),
                         queue.len(),
@@ -2235,6 +2242,50 @@ mod tests {
         uncapped.shutdown().await;
     }
 
+    /// A priced window's grant carries the units of its smallest item and its
+    /// item count: here requests of one 100-token input and two 25-token ones.
+    #[tokio::test]
+    async fn a_grant_carries_the_windows_smallest_item_and_item_count() {
+        let tokens = CostDimension {
+            unit: CostUnit::Token,
+            aggregation: Some(CostAggregation::Sum),
+            seed_units: Some(4096),
+            ..item_cost(1)
+        };
+        let harness = one_replica(32_768, "slow_test", tokens).await;
+        let text = |tokens: u64| json_input(json!("x".repeat((tokens * BYTES_PER_TOKEN) as usize)));
+        // Queued before the dispatcher task first runs.
+        let answers: Vec<_> = [vec![text(100)], vec![text(25), text(25)]]
+            .into_iter()
+            .map(|inputs| {
+                let (reply, answer) = oneshot::channel();
+                harness
+                    .tx
+                    .send(DispatchMsg::Predict(DispatchRequest {
+                        inputs,
+                        max_batch: None,
+                        reply,
+                    }))
+                    .expect("queued");
+                answer
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let grants = loop {
+            let grants = harness.ledger.open_grant_items_for_test(harness.worker_id);
+            if !grants.is_empty() {
+                break grants;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no window granted");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(grants, [(25, 3)]);
+        for answer in answers {
+            answer.await.expect("replied").expect("succeeded");
+        }
+        harness.shutdown().await;
+    }
+
     /// End to end: a replica that books host RAM runs its first window as one
     /// item in one batch, though three requests were queued. The fixture
     /// reports no host RAM, so the next window holds two items in one batch.
@@ -2569,16 +2620,13 @@ mod tests {
     /// The other half: a replica that dies with the window in flight really
     /// is a death, settles as one exactly once, and its exit status names the
     /// kind: a SIGKILL from outside (an out-of-memory killer, from this side
-    /// of the pipe) is a memory kill, an exit code or another signal a crash.
+    /// of the pipe) is a memory kill, an exit code a crash.
     #[tokio::test]
     async fn a_worker_that_stopped_answering_settles_as_a_death() {
         use super::super::ledger::DeathKind;
         let mut cases = vec![(json!({}), DeathKind::Crash)];
         #[cfg(unix)]
-        cases.extend([
-            (json!({"signal": libc::SIGKILL}), DeathKind::MemoryKill),
-            (json!({"signal": libc::SIGTERM}), DeathKind::Crash),
-        ]);
+        cases.push((json!({"signal": libc::SIGKILL}), DeathKind::MemoryKill));
         for (config, kind) in cases {
             let cfg = super::super::worker::testing::test_spawn_config();
             let mut spec = super::super::worker::testing::spec("dying_test");

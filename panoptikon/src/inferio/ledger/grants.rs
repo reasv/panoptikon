@@ -72,6 +72,7 @@ impl VramLedger {
         worker: WorkerId,
         window_units: u64,
         item_units: u64,
+        window_items: usize,
         user_cap_items: Option<u32>,
         window_requests: usize,
         queued_behind: usize,
@@ -251,6 +252,7 @@ impl VramLedger {
                     requests: window_requests,
                     unit_budget,
                     item_units: item_units.max(1),
+                    items: window_items,
                     size_asked,
                     granted_at: Instant::now(),
                     squeezed,
@@ -423,7 +425,7 @@ impl VramLedger {
                 gpu = %verdict.gpu,
                 base_mb = verdict.base_mb,
                 room_mb = verdict.room_mb,
-                died = verdict.died,
+                death_lapse_secs = verdict.death_lapse_secs,
                 windows = OOM_WINDOWS_AT_FLOOR,
                 "this model cannot run a single item on this GPU; failing it \
                  instead of dispatching to it again"
@@ -466,11 +468,12 @@ impl VramLedger {
         if !matches!(outcome, WindowOutcome::Responded { oom: None }) {
             entry.fit_version_sent = 0;
         }
-        // A failed window may not mark the anchor "measured here".
-        let window_failed = matches!(
-            outcome,
-            WindowOutcome::WorkerDied(_) | WindowOutcome::Responded { oom: Some(_) }
-        );
+        // A failed or crashed window may not mark the anchor "measured here".
+        let window_failed = crashed
+            || matches!(
+                outcome,
+                WindowOutcome::WorkerDied(_) | WindowOutcome::Responded { oom: Some(_) }
+            );
         let ingested = Self::ingest_locked(&mut state, worker, granted_units, window_failed);
         // Allocator retries: the card is full now, so ask neighbours now.
         if ingested.alloc_retries.is_some_and(|retries| retries > 0) {
