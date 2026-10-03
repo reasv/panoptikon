@@ -1698,8 +1698,12 @@ Worker, per batch within its window:
   (1.88×, 545 MiB at 16 units after 32 against 289 on the ramp).
   `accelerator_env.rs` pins `MALLOC_MMAP_THRESHOLD_` and
   `MALLOC_TRIM_THRESHOLD_` to 128 KiB in the CPU worker's environment,
-  which held the floor at 678 MiB and reproduced every size to ≤ 4 MiB;
-  off Linux/glibc, where those are ignored, the residue is an over-read
+  which held the floor at 678 MiB and reproduced every size to ≤ 4 MiB.
+  A value the operator set is kept. A larger one keeps freed blocks
+  resident: the ledger charges them to the replica as its footprint, and a
+  batch after a larger one reads back the larger footprint, so later
+  batches are booked above their need and other replicas get less room.
+  Off Linux/glibc, where those are ignored, the residue is an over-read
   the free intercept and `residual_mb` absorb (7 % on the slope at worst,
   measured un-mitigated).
   `max_memory_allocated` has no caching hysteresis, so **every** clean
