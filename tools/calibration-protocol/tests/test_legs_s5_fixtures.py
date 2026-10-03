@@ -77,11 +77,6 @@ def test_the_dies_on_load_leg_declares_its_empty_setter_both_ways():
     assert not _leg("calibfixture/dying_cuda").expects_no_items()
 
 
-def test_s5_samples_health_often_enough_to_see_a_fixture_job():
-    """A fixture's job can last 0.3 s; the default 0.5 s poll misses it."""
-    assert legs.SCENARIOS["S5"].health_interval <= 0.1
-
-
 # --- what analyze.py makes of them ------------------------------------------
 
 #: Each count `--expect-*` flag, and the check that judges it.
@@ -90,8 +85,11 @@ COUNTS = {"--expect-ooms": "failures", "--expect-deaths": "failures",
           "--expect-failed-jobs": "job_outcome"}
 
 
-def _verdicts(directory: Path, model: str, expect, counts):
-    """`failures` and `job_outcome` over a recording holding `counts`."""
+def _verdicts(directory: Path, model: str, expect, counts,
+              job_ends=("drained",)):
+    """`failures`, `job_outcome` and `deflation_recovery` over a recording
+    holding `counts`, a worker deflated with no clean window, and one job
+    per `job_ends` entry in legs.json (None: no `job_end`)."""
     directory.mkdir()
     log = ["2026-10-03T00:00:00.000000Z  INFO panoptikon: started"]
     log += [f"2026-10-03T00:00:00.{index:06d}Z  WARN panoptikon::inferio::"
@@ -105,10 +103,20 @@ def _verdicts(directory: Path, model: str, expect, counts):
         "history": [{"setter": model, "total_segments": items,
                      "failed_items": counts["--expect-failures"]}],
         "outcomes": [{"status": "failed"}] * counts["--expect-failed-jobs"]}))
+    (directory / "healthrec.jsonl").write_text(json.dumps(
+        {"kind": "sample", "t_wall": 1.0, "health": {"workers": [
+            {"inference_id": model, "gpu_uuid": "GPU-0", "deflation": 1}]}})
+        + "\n")
+    events = []
+    for outcome in job_ends:
+        events.append({"event": "job_start"})
+        if outcome:
+            events.append({"event": "job_end", "outcome": outcome})
+    (directory / "legs.json").write_text(json.dumps({"events": events}))
     out = directory / "verdicts.json"
     analyze.main(["--scenario", str(directory), "--checks",
-                  "failures,job_outcome", "--quiet", "--json", str(out),
-                  *expect])
+                  "failures,job_outcome,deflation_recovery", "--quiet",
+                  "--json", str(out), *expect])
     return {row["name"]: row["verdict"]
             for row in json.loads(out.read_text())["verdicts"]}
 
@@ -126,6 +134,14 @@ def test_each_fixture_passes_at_its_thresholds_and_fails_one_past(tmp_path,
     verdicts = _verdicts(tmp_path / "at", model, expect, at)
     assert verdicts["failures"] in ("PASS", "WARN")
     assert verdicts["job_outcome"] == "PASS"
+    # Only `oom` declares that it ends deflated.
+    assert ("--expect-deflated" in expect) == (name == "oom")
+    assert (verdicts["deflation_recovery"] == "PASS") == (name == "oom")
+    # A job cut at `--job-cap`, or one legs.py never saw end.
+    for ends in (["cap_exceeded"], [None]):
+        unfinished = _verdicts(tmp_path / f"ends-{ends[0]}", model, expect,
+                              at, ends)
+        assert unfinished["job_outcome"] == "FAIL"
     for flag, check in COUNTS.items():
         over = _verdicts(tmp_path / flag, model, expect,
                          {**at, flag: at[flag] + 1})

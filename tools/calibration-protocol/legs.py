@@ -225,7 +225,8 @@ SMOKE_IMAGES = sum(group.count for group in corpus_tiers.tier_groups("smoke")
 #: bigger corpus raises them by hand. One flat `--expect-ooms 1` for the whole
 #: table would FAIL every fixture but one for working as designed. A fixture
 #: that OOMs on every batch logs at most one OOM negative per item, and `oom`
-#: never runs a clean window, so its deflation never returns to 0.
+#: runs no clean window, so its deflation does not return to 0 within the
+#: leg's settle (time repayment returns it after cap x 30 s).
 S5_FIXTURES: Dict[str, Fixture] = {
     "oom_second_batch": Fixture(("--expect-ooms", "1")),
     "oom": Fixture(("--expect-ooms", str(SMOKE_IMAGES),
@@ -1788,7 +1789,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--stop-grace", type=float, default=60.0)
     parser.add_argument("--vram-interval", type=float, default=0.25)
     parser.add_argument("--health-interval", type=float, default=None,
-                        help="seconds; default: the scenario's (0.5, S5 0.1)")
+                        help="seconds; default: the scenario's")
     parser.add_argument("--health-full", action="store_true",
                         help="healthrec.py --full (keeps the raw payload; "
                              "~2x the file, needed for inference_clients and "
@@ -2084,8 +2085,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 3. the gateway's own view, then the gateway
         health_argv = [args.python, str(HERE / "healthrec.py"), "--base", base,
                        "--out", str(leg.path("healthrec.jsonl")), "--interval",
-                       str(args.health_interval
-                           or leg.scenario.health_interval), "--quiet"]
+                       str(leg.scenario.health_interval
+                           if args.health_interval is None
+                           else args.health_interval), "--quiet"]
         if args.health_full:
             health_argv.append("--full")
         leg.supervisor.start("healthrec", health_argv)
