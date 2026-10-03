@@ -106,12 +106,14 @@ class FakeOomRetryUtils:
         self.generation = 0
         self.slot = None
         self.total = 0
+        self.host_ram_total = 0
         self.index_limits = 0
 
-    def record(self, largest, halvings=0):
+    def record(self, largest, halvings=0, host_ram=False):
         self.generation += 1
         self.slot = (self.generation, largest, halvings)
         self.total += halvings
+        self.host_ram_total += halvings if host_ram else 0
 
     def last_oom_retry(self):
         return self.slot
@@ -120,6 +122,9 @@ class FakeOomRetryUtils:
         """The only reading that survives an impl calling the helper twice in
         one `predict`; the per-call record keeps the last call only."""
         return self.total
+
+    def total_host_ram_halvings(self):
+        return self.host_ram_total
 
     def note_index_limit(self):
         """A batch the impl could not execute at the size it was formed at for
@@ -1408,8 +1413,13 @@ def test_the_oom_classifier_covers_the_non_cuda_backends(fake_torch):
     for name, failure in failures.items():
         with pytest.raises(packing.WindowFailure) as caught:
             packing.run_window(Recorder(raises=failure), items(2), grant(unit_budget=2))
+        oom_class = caught.value.measurements[0]["oom_class"]
         assert caught.value.measurements[0]["oom"] is True, name
-        assert packing.OOM_WINDOW_PREFIX in str(caught.value), name
+        # The CPU allocator's failures are host RAM's, and say so.
+        host_ram = name != "mps"
+        assert oom_class["host_ram"] is host_ram, name
+        prefix = packing.OOM_HOST_RAM_PREFIX if host_ram else packing.OOM_WINDOW_PREFIX
+        assert str(caught.value).startswith(prefix), name
 
     with pytest.raises(packing.WindowFailure) as caught:
         packing.run_window(
@@ -1464,10 +1474,12 @@ def test_a_typed_allocator_exception_classifies_structurally(fake_torch_with_oom
     assert classified["exception"] == "torch.FakeTorchOom"
     assert classified["free_mb_at_failure"] == 137, "the live reading at failure"
     assert classified["device"] == "cuda"
+    assert classified["host_ram"] is False
 
     host = packing.classify_oom(MemoryError())
     assert host["source"] == packing.OOM_SOURCE_TYPED
     assert host["exception"] == "MemoryError"
+    assert host["host_ram"] is True
 
 
 def test_the_typed_tier_holds_on_a_hip_build(fake_rocm_torch):
@@ -1622,15 +1634,23 @@ def test_an_internally_absorbed_oom_carries_the_marker_class(
     fake_torch, fake_oom_retry
 ):
     class Halving:
+        host_ram = False
+
         def predict(self, inputs):
-            fake_oom_retry.record(largest=len(inputs), halvings=1)
+            fake_oom_retry.record(
+                largest=len(inputs), halvings=1, host_ram=self.host_ram
+            )
             return [None] * len(inputs)
 
-    payload = packing.run_window(Halving(), items(2), grant(unit_budget=2))
-    measurement = payload["measurements"][0]
-    assert measurement["oom"] is True
-    assert measurement["oom_class"]["source"] == packing.OOM_SOURCE_MARKER
-    assert measurement["oom_class"]["exception"] == packing.OOM_HALVING_WITNESS
+    impl = Halving()
+    for host_ram in (False, True):
+        impl.host_ram = host_ram
+        payload = packing.run_window(impl, items(2), grant(unit_budget=2))
+        measurement = payload["measurements"][0]
+        assert measurement["oom"] is True
+        assert measurement["oom_class"]["source"] == packing.OOM_SOURCE_MARKER
+        assert measurement["oom_class"]["exception"] == packing.OOM_HALVING_WITNESS
+        assert measurement["oom_class"]["host_ram"] is host_ram
 
 
 def test_the_classifier_never_raises(fake_torch):

@@ -1925,6 +1925,7 @@ fn a_single_item_window_out_of_memory_deflates() {
                 exception: "torch.OutOfMemoryError".to_owned(),
                 free_mb_at_failure: Some(0),
                 device: "cuda:0".to_owned(),
+                host_ram: false,
             }),
             ..ram_batch(1, RSS_AT_LOAD_MB + RAM_PER_UNIT_MB, RSS_AT_LOAD_MB)
         }]);

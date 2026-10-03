@@ -1126,6 +1126,8 @@ struct Ingested {
     /// The first trusted OOM classification, and how many measurements had one.
     oom_evidence: Option<OomEvidence>,
     oom_samples: usize,
+    /// A batch ran out of host RAM on a GPU with its own memory: no negative.
+    host_ram_oom: bool,
     /// Each clamped measurement's reason; `None` is the memory clamp.
     clamps: Vec<Option<String>>,
     /// This window moved the [`ShapeCeiling`].

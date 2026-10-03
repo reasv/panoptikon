@@ -24,6 +24,10 @@ logger = logging.getLogger("inferio_worker.packing")
 # Prefix on a whole-batch OOM the impl's own halving loop did not absorb.
 OOM_WINDOW_PREFIX = "INFERENCE_OOM_WINDOW:"
 
+# Prefix on an OOM of host RAM, from a whole batch or from
+# `inferio.impl.utils` at one item.
+OOM_HOST_RAM_PREFIX = "INFERENCE_OOM_HOST_RAM:"
+
 # The substring both of our own out-of-memory markers contain (case-sensitive).
 OOM_MARKER = "INFERENCE_OOM"
 
@@ -41,7 +45,6 @@ OOM_SOURCE_PATTERN = "message_pattern"
 # Lower-cased allocation-failure messages that do not say "out of memory".
 OOM_MESSAGE_PATTERNS = (
     "mps backend out of memory",
-    "enforce fail at alloc_cpu.cpp",
     "cublas_status_alloc_failed",
     "cudnn_status_alloc_failed",
     "cusolver_status_alloc_failed",
@@ -52,8 +55,10 @@ OOM_MESSAGE_PATTERNS = (
     "hiperrormemoryallocation",
 )
 
-# Two-part patterns: both fragments must appear in one message.
-OOM_MESSAGE_PAIRS = (("defaultcpuallocator", "allocate memory"),)
+# The CPU allocator's failures, which are host RAM's (two-part patterns: both
+# fragments must appear in one message).
+HOST_RAM_MESSAGE_PATTERNS = ("enforce fail at alloc_cpu.cpp",)
+HOST_RAM_MESSAGE_PAIRS = (("defaultcpuallocator", "allocate memory"),)
 
 # "out of memory" counts only beside a device-API token as a whole word; a
 # host allocator's bare "out of memory" is not a device OOM.
@@ -972,20 +977,35 @@ def _marker_oom(error: BaseException) -> str | None:
     return None
 
 
+def _host_ram_text(lowered: str) -> bool:
+    """Whether lower-cased text is the CPU allocator's failure."""
+    return any(pattern in lowered for pattern in HOST_RAM_MESSAGE_PATTERNS) or any(
+        first in lowered and second in lowered
+        for first, second in HOST_RAM_MESSAGE_PAIRS
+    )
+
+
 def _pattern_oom(error: BaseException) -> str | None:
-    """The exception's name when its text matches a device allocation failure.
-    A bare `out of memory` is not a match.
+    """The exception's name when its text matches an allocation failure. A
+    bare `out of memory` is not a match.
     """
     lowered = str(error).lower()
-    for pattern in OOM_MESSAGE_PATTERNS:
-        if pattern in lowered:
-            return _qualified_name(type(error))
-    for first, second in OOM_MESSAGE_PAIRS:
-        if first in lowered and second in lowered:
-            return _qualified_name(type(error))
+    if any(pattern in lowered for pattern in OOM_MESSAGE_PATTERNS) or _host_ram_text(
+        lowered
+    ):
+        return _qualified_name(type(error))
     if OOM_DEVICE_PHRASE in lowered and OOM_DEVICE_TOKENS.search(lowered):
         return _qualified_name(type(error))
     return None
+
+
+def _host_ram(error: BaseException) -> bool:
+    """Whether the failure that classified a batch was a host RAM
+    allocation's: `MemoryError`, our host RAM prefix or the CPU allocator."""
+    if isinstance(error, MemoryError):
+        return True
+    text = str(error)
+    return OOM_HOST_RAM_PREFIX in text or _host_ram_text(text.lower())
 
 
 def _chain(exc: BaseException | None) -> tuple[BaseException, ...]:
@@ -1007,18 +1027,19 @@ def _chain(exc: BaseException | None) -> tuple[BaseException, ...]:
 
 
 def classify_oom(
-    exc: BaseException | None, absorbed: int = 0
+    exc: BaseException | None, absorbed: int = 0, absorbed_host_ram: int = 0
 ) -> dict[str, Any] | None:
     """`oom_class` for a batch, or `None` when nothing says out of memory.
 
     Each tier (typed, marker, pattern) is tried over the whole chain before the
     next. `absorbed` classifies a batch whose OOMs the impl's halving loop
-    absorbed. Never raises. See docs/inferio-worker-protocol.md "Memory
-    sensing".
+    absorbed, host RAM's when all `absorbed_host_ram` were. `host_ram` says
+    the allocation that failed was host RAM's. Never raises. See
+    docs/inferio-worker-protocol.md "Memory sensing".
     """
     try:
         chain = _chain(exc)
-        found: tuple[str, str] | None = None
+        found: tuple[str, str, bool] | None = None
         for source, probe in (
             (OOM_SOURCE_TYPED, _typed_oom),
             (OOM_SOURCE_MARKER, _marker_oom),
@@ -1027,12 +1048,16 @@ def classify_oom(
             for error in chain:
                 name = probe(error)
                 if name is not None:
-                    found = (source, name)
+                    found = (source, name, _host_ram(error))
                     break
             if found is not None:
                 break
         if found is None and absorbed > 0:
-            found = (OOM_SOURCE_MARKER, OOM_HALVING_WITNESS)
+            found = (
+                OOM_SOURCE_MARKER,
+                OOM_HALVING_WITNESS,
+                absorbed_host_ram >= absorbed,
+            )
         if found is None:
             return None
         free_mb = memory.free_at_failure_mb()
@@ -1041,6 +1066,7 @@ def classify_oom(
             "exception": found[1],
             "free_mb_at_failure": free_mb,
             "device": memory.device_label(),
+            "host_ram": found[2],
         }
     except Exception as exc_inner:  # pragma: no cover - defensive
         logger.debug("out-of-memory classification failed: %s", exc_inner)
@@ -1324,6 +1350,7 @@ def run_window(
         try:
             retry_before = _oom_retry_record()
             halvings_before = _utils_total("total_oom_halvings")
+            host_ram_before = _utils_total("total_host_ram_halvings")
             index_limits_before = _utils_total("total_index_limit_events")
             started = time.perf_counter()
             try:
@@ -1333,7 +1360,11 @@ def run_window(
                 executed, absorbed = _batch_shape(
                     retry_before, len(batch), halvings_before
                 )
-                oom_class = classify_oom(exc, absorbed)
+                oom_class = classify_oom(
+                    exc,
+                    absorbed,
+                    _utils_total("total_host_ram_halvings") - host_ram_before,
+                )
                 oom = oom_class is not None
                 if not oom:
                     logger.debug(
@@ -1362,9 +1393,14 @@ def run_window(
                 message = str(exc)
                 if oom and len(batch) > 1 and OOM_WINDOW_PREFIX not in message:
                     # The whole-window OOM signal; batch-1 has its own prefix.
+                    prefix, what = (
+                        (OOM_HOST_RAM_PREFIX, "host RAM")
+                        if oom_class["host_ram"]
+                        else (OOM_WINDOW_PREFIX, "GPU memory")
+                    )
                     message = (
-                        f"{OOM_WINDOW_PREFIX} out of GPU memory on a packed batch "
-                        f"of {len(batch)} inputs ({priced} {unit} units): {exc}"
+                        f"{prefix} out of {what} on a packed batch of "
+                        f"{len(batch)} inputs ({priced} {unit} units): {exc}"
                     )
                 raise WindowFailure(message, measurements, exc) from exc
             elapsed = time.perf_counter() - started
@@ -1406,7 +1442,13 @@ def run_window(
                 items=len(batch),
                 units=priced if priceable else None,
                 oom=absorbed_ooms > 0,
-                oom_class=classify_oom(None, absorbed_ooms) if absorbed_ooms else None,
+                oom_class=classify_oom(
+                    None,
+                    absorbed_ooms,
+                    _utils_total("total_host_ram_halvings") - host_ram_before,
+                )
+                if absorbed_ooms
+                else None,
                 free_mb=live.free_mb,
                 free_source=live.free_source,
                 ram_mb=live.ram_mb,

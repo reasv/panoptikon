@@ -4,7 +4,7 @@
 use super::*;
 
 /// How the host read an out-of-memory condition from an error frame (which
-/// carries no `oom_class`). Both are trusted; the distinction is for the log.
+/// carries no `oom_class`). All are trusted; the distinction is for the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorFrameOom {
     /// The worker's own `INFERENCE_OOM_*` sentinel. Logged as `marker`.
@@ -12,6 +12,11 @@ pub enum ErrorFrameOom {
     /// The message matched [`message_oom_tier`]'s patterns. Logged as
     /// `error_frame`.
     Prose,
+    /// Host RAM ran out: the worker's `INFERENCE_OOM_HOST_RAM:` sentinel or
+    /// the CPU allocator's wording. The device's out-of-memory only where its
+    /// memory is host RAM ([`VramLedger::has_private_memory_locked`]). Logged
+    /// as `host_ram`.
+    HostRam,
 }
 
 impl ErrorFrameOom {
@@ -20,6 +25,7 @@ impl ErrorFrameOom {
         match self {
             Self::Marker => OOM_SOURCE_MARKER,
             Self::Prose => OOM_SOURCE_ERROR_FRAME,
+            Self::HostRam => "host_ram",
         }
     }
 }
@@ -63,6 +69,15 @@ pub(super) struct OomEvidence {
 }
 
 impl VramLedger {
+    /// Whether `gpu` has memory of its own, so that host RAM running out is
+    /// no out-of-memory of the device.
+    pub(super) fn has_private_memory_locked(state: &LedgerState, gpu: &str) -> bool {
+        state
+            .gpus
+            .get(gpu)
+            .is_some_and(|gpu| gpu.unified_ram_mb.is_none())
+    }
+
     /// Count consecutive out-of-memory windows that carried one item
     /// ([`GrantCharge::one_item`]) into less room than one item costs
     /// ([`Self::one_item_appetite_mb_locked`]); at
@@ -359,9 +374,8 @@ impl std::fmt::Display for UnrunnableReplica {
 
 /// Allocator and driver failures worded without "out of memory". Mirrors the
 /// worker's `packing.OOM_MESSAGE_PATTERNS`, lower-cased.
-const OOM_MESSAGE_PATTERNS: [&str; 10] = [
+const OOM_MESSAGE_PATTERNS: [&str; 9] = [
     "mps backend out of memory",
-    "enforce fail at alloc_cpu.cpp",
     "cublas_status_alloc_failed",
     "cudnn_status_alloc_failed",
     "cusolver_status_alloc_failed",
@@ -372,8 +386,11 @@ const OOM_MESSAGE_PATTERNS: [&str; 10] = [
     "hiperrormemoryallocation",
 ];
 
-/// Fragment pairs that must share a line (`packing.OOM_MESSAGE_PAIRS`).
-const OOM_MESSAGE_PAIRS: [(&str, &str); 1] = [("defaultcpuallocator", "allocate memory")];
+/// The CPU allocator's failures, which are host RAM's
+/// (`packing.HOST_RAM_MESSAGE_PATTERNS` and `HOST_RAM_MESSAGE_PAIRS`; a pair
+/// must share a line).
+const HOST_RAM_MESSAGE_PATTERNS: [&str; 1] = ["enforce fail at alloc_cpu.cpp"];
+const HOST_RAM_MESSAGE_PAIRS: [(&str, &str); 1] = [("defaultcpuallocator", "allocate memory")];
 
 /// The device-scoped form of "out of memory": the words **plus** a device-API
 /// token as a whole word in the same line (`packing.OOM_DEVICE_TOKENS`).
@@ -425,17 +442,21 @@ pub(super) enum OomVerdict {
     /// A `message_pattern` claim with at least the grant free at failure. Not
     /// a negative.
     Contradicted { free_mb: u64, grant_mb: u64 },
+    /// Host RAM ran out on a GPU with its own memory: no negative of the GPU.
+    HostRam,
 }
 
 /// Whether a measurement's `oom` flag is evidence to deflate on.
 /// `typed_exception` and `marker` are trusted outright; `message_pattern` is
 /// trusted unless `free_mb_at_failure` is at least the window's grant `mb` (a
 /// veto, not a requirement; `mb == 0` cannot veto). No class, or an unknown
-/// source, is trusted. See docs/batch-calibration-design.md, "What counts as
-/// an out-of-memory condition at all".
+/// source, is trusted. A host RAM class on a device with `private_memory` is
+/// [`OomVerdict::HostRam`]. See docs/batch-calibration-design.md, "What
+/// counts as an out-of-memory condition at all".
 pub(super) fn oom_verdict(
     measurement: &BatchMeasurement,
     window: Option<&GrantCharge>,
+    private_memory: bool,
 ) -> OomVerdict {
     if !measurement.oom {
         return OomVerdict::None;
@@ -444,6 +465,9 @@ pub(super) fn oom_verdict(
         // An older worker's bare `oom` flag.
         return OomVerdict::Trusted(OomTrust::Outright);
     };
+    if class.host_ram && private_memory {
+        return OomVerdict::HostRam;
+    }
     match class.source.as_str() {
         OOM_SOURCE_TYPED | OOM_SOURCE_MARKER => OomVerdict::Trusted(OomTrust::Outright),
         OOM_SOURCE_MESSAGE_PATTERN => {
@@ -570,31 +594,45 @@ fn contains_word(line: &str, token: &str) -> bool {
 }
 
 /// Whether a worker error message names an out-of-memory condition:
-/// [`ErrorFrameOom::Marker`] for an `INFERENCE_OOM_*` prefix,
-/// [`ErrorFrameOom::Prose`] for a recognised wording, `None` otherwise.
+/// [`ErrorFrameOom::HostRam`] for the host RAM prefix or the CPU allocator's
+/// wording, [`ErrorFrameOom::Marker`] for another `INFERENCE_OOM_*` prefix,
+/// [`ErrorFrameOom::Prose`] for a device's wording, `None` otherwise. A
+/// device's wording outranks the CPU allocator's.
 ///
 /// Must match the worker's `packing._pattern_oom` exactly. A bare "out of
 /// memory" only counts beside a device-API token, and every rule is tested
 /// per line, so a traceback's file path cannot supply the token.
 pub fn message_oom_tier(message: &str) -> Option<ErrorFrameOom> {
+    if message.contains("INFERENCE_OOM_HOST_RAM:") {
+        return Some(ErrorFrameOom::HostRam);
+    }
     if message.contains("INFERENCE_OOM_BATCH_SIZE_1:") || message.contains("INFERENCE_OOM_WINDOW:")
     {
         return Some(ErrorFrameOom::Marker);
     }
-    let prose = message.lines().any(|line| {
-        let lowered = line.to_ascii_lowercase();
+    let lines: Vec<String> = message.lines().map(str::to_ascii_lowercase).collect();
+    let device = lines.iter().any(|lowered| {
         OOM_MESSAGE_PATTERNS
             .iter()
             .any(|pattern| lowered.contains(pattern))
-            || OOM_MESSAGE_PAIRS
-                .iter()
-                .any(|(first, second)| lowered.contains(first) && lowered.contains(second))
             || (lowered.contains(OOM_DEVICE_PHRASE)
                 && OOM_DEVICE_TOKENS
                     .iter()
-                    .any(|token| contains_word(&lowered, token)))
+                    .any(|token| contains_word(lowered, token)))
     });
-    prose.then_some(ErrorFrameOom::Prose)
+    let host_ram = lines.iter().any(|lowered| {
+        HOST_RAM_MESSAGE_PATTERNS
+            .iter()
+            .any(|pattern| lowered.contains(pattern))
+            || HOST_RAM_MESSAGE_PAIRS
+                .iter()
+                .any(|(first, second)| lowered.contains(first) && lowered.contains(second))
+    });
+    if device {
+        Some(ErrorFrameOom::Prose)
+    } else {
+        host_ram.then_some(ErrorFrameOom::HostRam)
+    }
 }
 
 /// [`message_oom_tier`] as a predicate, for the parity tests.

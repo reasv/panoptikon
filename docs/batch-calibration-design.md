@@ -1964,12 +1964,18 @@ Worker, per batch within its window:
     standing, because a *missed* out-of-memory leaves the ledger
     over-admitting against a model that has just proved it cannot take the
     size.
+  - **Host RAM** (`MemoryError`, the CPU allocator, `oom_class.host_ram`) is
+    the device's memory on the CPU device, MPS and an APU, and counts there as
+    above. On a GPU with its own memory it is no negative of the GPU: no
+    deflation, anchor, pool-margin change or one-item strike, and the window is
+    neither clean nor a negative for the GPU (the gain rule sees it fail).
   - **Without one** (the error frame: a `predict` that failed with nothing
     measured), the host mirrors the worker's classifier exactly: the
     `INFERENCE_OOM_*` markers, the closed list of allocator and driver
     spellings that never say "out of memory", the `defaultcpuallocator` pair,
     and the words `out of memory` **plus a device-API token as a whole word**
-    (`cuda`, `hip`, `rocm`, `nvml`, `xpu`, `sycl`). The bare substring is
+    (`cuda`, `hip`, `rocm`, `nvml`, `xpu`, `sycl`). The host RAM marker and
+    the CPU allocator's wordings read as host RAM. The bare substring is
     gone; the scoped rule is what keeps `CUDA driver error: out of memory` and
     CTranslate2's `CUDA failed with error out of memory` from being lost to a
     closed list. Every rule is matched per **line** of the failure's own

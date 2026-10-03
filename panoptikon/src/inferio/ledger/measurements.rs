@@ -402,6 +402,8 @@ impl VramLedger {
         // Trusted OOMs, for the negative's log line: the first and the count.
         let mut trusted_oom: Option<OomEvidence> = None;
         let mut trusted_ooms = 0usize;
+        let private_memory = Self::has_private_memory_locked(state, &gpu);
+        let mut host_ram_oom = false;
         // Every clamp reason this window reported, for the settle line.
         let mut clamps: Vec<Option<String>> = Vec::new();
         // Shape-ceiling evidence: the smallest `index_limit` `to_units`, and
@@ -542,8 +544,12 @@ impl VramLedger {
                 measurement.throughput_collapse && !collapse_suppressed && !uncorroborated;
             // A message-only OOM the free reading contradicts is not a
             // negative ([`oom_verdict`]).
-            let oom = match oom_verdict(measurement, window.as_ref()) {
+            let oom = match oom_verdict(measurement, window.as_ref(), private_memory) {
                 OomVerdict::None => false,
+                OomVerdict::HostRam => {
+                    host_ram_oom = true;
+                    false
+                }
                 OomVerdict::Trusted(trust) => {
                     trusted_ooms += 1;
                     trusted_oom.get_or_insert_with(|| oom_evidence(measurement, trust));
@@ -901,6 +907,7 @@ impl VramLedger {
             spill: saw_spill,
             oom_evidence: trusted_oom,
             oom_samples: trusted_ooms,
+            host_ram_oom,
             clamps,
             shape_ceiling,
             alloc_retries,

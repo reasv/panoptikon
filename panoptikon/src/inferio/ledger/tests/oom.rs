@@ -1089,6 +1089,7 @@ fn a_typed_out_of_memory_class_deflates_without_corroboration() {
                 exception: "torch.OutOfMemoryError".to_owned(),
                 free_mb_at_failure: Some(granted_mb * 10),
                 device: "cuda:0".to_owned(),
+                host_ram: false,
             }),
             ..measurement(4, 0, 900)
         }]);
@@ -1120,6 +1121,7 @@ fn a_message_pattern_class_deflates_only_when_the_gpu_was_tight() {
                 exception: "RuntimeError".to_owned(),
                 free_mb_at_failure: Some(granted_mb.saturating_mul(20)),
                 device: "cuda:0".to_owned(),
+                host_ram: false,
             }),
             ..measurement(4, 0, 900)
         }]);
@@ -1145,6 +1147,7 @@ fn a_message_pattern_class_deflates_only_when_the_gpu_was_tight() {
                 exception: "RuntimeError".to_owned(),
                 free_mb_at_failure: Some(granted_mb / 2),
                 device: "cuda:0".to_owned(),
+                host_ram: false,
             }),
             ..measurement(4, 0, 900)
         }]);
@@ -1180,7 +1183,7 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
         item_cap: None,
     };
     assert_eq!(
-        oom_verdict(&honest, Some(&charge)),
+        oom_verdict(&honest, Some(&charge), true),
         OomVerdict::Trusted(OomTrust::Outright),
         "no class stated"
     );
@@ -1193,10 +1196,12 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
                         exception: "torch.OutOfMemoryError".to_owned(),
                         free_mb_at_failure: Some(90_000),
                         device: "cuda:0".to_owned(),
+                        host_ram: false,
                     }),
                     ..honest.clone()
                 },
-                Some(&charge)
+                Some(&charge),
+                true
             ),
             OomVerdict::Trusted(OomTrust::Outright),
             "{source} is structural; the free reading has no veto over it"
@@ -1210,10 +1215,12 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
                     exception: "X".to_owned(),
                     free_mb_at_failure: Some(90_000),
                     device: "cuda:0".to_owned(),
+                    host_ram: false,
                 }),
                 ..honest.clone()
             },
-            Some(&charge)
+            Some(&charge),
+            true
         ),
         OomVerdict::Trusted(OomTrust::Outright),
         "an unrecognised tier is believed, not second-guessed"
@@ -1224,17 +1231,18 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
             exception: "RuntimeError".to_owned(),
             free_mb_at_failure: None,
             device: "cuda:0".to_owned(),
+            host_ram: false,
         }),
         ..honest.clone()
     };
     assert_eq!(
-        oom_verdict(&pattern, Some(&charge)),
+        oom_verdict(&pattern, Some(&charge), true),
         OomVerdict::Trusted(OomTrust::Unopposed),
         "no reading to contradict it: a veto that cannot fire lets the \
          classification stand — and the log says it stood unopposed"
     );
     assert_eq!(
-        oom_verdict(&pattern, Some(&GrantCharge { mb: 0, ..charge })),
+        oom_verdict(&pattern, Some(&GrantCharge { mb: 0, ..charge }), true),
         OomVerdict::Trusted(OomTrust::Unopposed),
         "a memory-blind grant states no envelope either"
     );
@@ -1244,7 +1252,8 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
                 oom: false,
                 ..honest
             },
-            Some(&charge)
+            Some(&charge),
+            true
         ),
         OomVerdict::None
     );
@@ -1282,11 +1291,12 @@ fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
             exception: "RuntimeError".to_owned(),
             free_mb_at_failure: Some(free_mb_at_failure),
             device: "mps".to_owned(),
+            host_ram: false,
         }),
         ..BatchMeasurement::default()
     };
     assert_eq!(
-        oom_verdict(&refused(103_918), Some(&charge)),
+        oom_verdict(&refused(103_918), Some(&charge), false),
         OomVerdict::Contradicted {
             free_mb: 103_918,
             grant_mb: 14_430
@@ -1294,7 +1304,7 @@ fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
         "the RAM beside the allocator is not what refused the batch"
     );
     assert_eq!(
-        oom_verdict(&refused(594), Some(&charge)),
+        oom_verdict(&refused(594), Some(&charge), false),
         OomVerdict::Trusted(OomTrust::Corroborated),
         "what the allocator had left agrees the batch was too big"
     );
@@ -1322,6 +1332,7 @@ fn an_out_of_memory_negative_names_the_tier_that_classified_it() {
                 exception: "torch.OutOfMemoryError".to_owned(),
                 free_mb_at_failure: Some(512),
                 device: "cuda:0".to_owned(),
+                host_ram: false,
             }),
             ..measurement(4, 0, 900)
         }]);
@@ -1364,6 +1375,7 @@ fn a_message_pattern_negative_says_whether_the_gpu_corroborated_it() {
             exception: "RuntimeError".to_owned(),
             free_mb_at_failure,
             device: "cuda:0".to_owned(),
+            host_ram: false,
         }),
         ..measurement(4, 0, 900)
     };
@@ -1511,6 +1523,7 @@ fn a_tier_stated_as_an_empty_string_still_names_something() {
                 exception: String::new(),
                 free_mb_at_failure: None,
                 device: String::new(),
+                host_ram: false,
             }),
             ..measurement(4, 0, 900)
         }]);
@@ -1542,10 +1555,25 @@ fn oom_messages_are_classified() {
     assert!(message_reports_oom(
         "RuntimeError: MPS backend out of memory (MPS allocated: 96.00 GB)"
     ));
-    assert!(message_reports_oom(
-        "RuntimeError: [enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator: \
-         can't allocate memory: you tried to allocate 8589934592 bytes"
-    ));
+    // Host RAM's: our own sentinel and the CPU allocator, unless a device's
+    // wording is there too.
+    for (message, tier) in [
+        (
+            "RuntimeError: [enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator: \
+             can't allocate memory: you tried to allocate 8589934592 bytes",
+            ErrorFrameOom::HostRam,
+        ),
+        (
+            "INFERENCE_OOM_HOST_RAM: out of host RAM on a single input: ",
+            ErrorFrameOom::HostRam,
+        ),
+        (
+            "DefaultCPUAllocator: can't allocate memory\nCUDA out of memory",
+            ErrorFrameOom::Prose,
+        ),
+    ] {
+        assert_eq!(message_oom_tier(message), Some(tier), "{message}");
+    }
     assert!(!message_reports_oom("ValueError: bad input"));
     // Neither half of the CPU pair means anything on its own, and the pair
     // is per **line**, not per multi-line blob.
@@ -1804,6 +1832,74 @@ fn a_spill_or_collapse_at_the_rooms_limit_leaves_the_pool_margin() {
         let deflation = ledger.health()[0].workers[0].deflation;
         assert_eq!(deflation as usize, window + 1, "a negative");
         assert_eq!(margin_steps(&ledger, "g/a", GPU), 0);
+    }
+}
+
+/// Host RAM running out, read from the error frame or from a batch's class,
+/// is no out-of-memory of a GPU with its own memory: at the room's limit it
+/// deflates nothing and leaves the pool margin, and one-item windows condemn
+/// nothing. On the CPU device, whose memory is host RAM, it is a negative.
+#[test]
+fn host_ram_running_out_is_no_out_of_memory_of_a_gpu() {
+    let host_ram_batch = || BatchMeasurement {
+        oom: true,
+        oom_class: Some(OomClass {
+            source: OOM_SOURCE_TYPED.to_owned(),
+            exception: "MemoryError".to_owned(),
+            free_mb_at_failure: None,
+            device: "cuda:0".to_owned(),
+            host_ram: true,
+        }),
+        ..BatchMeasurement::default()
+    };
+    let host_ram_frame = WindowOutcome::Responded {
+        oom: Some(ErrorFrameOom::HostRam),
+    };
+    let fail = |handle: &TelemetryHandle, token: GrantToken, from_batch: bool| {
+        if from_batch {
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![host_ram_batch()]);
+            token.finish_for_test(CLEAN)
+        } else {
+            token.finish_for_test(host_ram_frame)
+        }
+    };
+
+    let (limit, handle, admission) = at_the_rooms_limit();
+    for from_batch in [false, true] {
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(token.grant().unit_budget, 100);
+        let window = fail(&handle, token, from_batch).window.expect("settled");
+        assert_eq!(
+            (window.outcome, window.negative_reason),
+            ("host_ram_oom", None)
+        );
+        assert_eq!(window.deflation, 0);
+        assert_eq!(margin_steps(&limit, "g/a", GPU), 0);
+    }
+
+    let card = ledger(10_000, no_margin());
+    let handle = loaded(Some(9_900), Some(0));
+    let admission = card
+        .register_worker("g/big", item_cost(4), &handle, None)
+        .expect("registers");
+    push_memory(&handle, 0, 0);
+    card.ingest_all_for_test();
+    for window in 0..2 * OOM_WINDOWS_AT_FLOOR {
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(token.grant().unit_budget, 1);
+        assert!(fail(&handle, token, window % 2 == 1).unrunnable.is_none());
+    }
+    assert!(!card.was_condemned("g/big", GPU));
+
+    let ledger = cpu_ledger(no_margin());
+    let (handle, admission) = cpu_replica(&ledger);
+    for from_batch in [false, true] {
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let window = fail(&handle, token, from_batch).window.expect("settled");
+        assert_eq!(window.negative_reason, Some("oom"));
     }
 }
 

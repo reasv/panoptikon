@@ -445,6 +445,21 @@ impl VramLedger {
         let mut state = self.lock();
         // Time repayment first, whatever the outcome.
         Self::repay_deflation_locked(&mut state, worker);
+        // Host RAM running out on a GPU with its own memory is no
+        // out-of-memory of the GPU.
+        let frame_host_ram = outcome
+            == (WindowOutcome::Responded {
+                oom: Some(ErrorFrameOom::HostRam),
+            })
+            && state
+                .workers
+                .get(&worker)
+                .is_some_and(|entry| Self::has_private_memory_locked(&state, &entry.gpu));
+        let outcome = if frame_host_ram {
+            WindowOutcome::Responded { oom: None }
+        } else {
+            outcome
+        };
         let Some(entry) = state.workers.get_mut(&worker) else {
             return Settled::default();
         };
@@ -474,6 +489,8 @@ impl VramLedger {
                 WindowOutcome::WorkerDied(_) | WindowOutcome::Responded { oom: Some(_) }
             );
         let ingested = Self::ingest_locked(&mut state, worker, granted_units, window_failed);
+        // Neither a negative nor a clean window of the GPU, but a failed one.
+        let host_ram = frame_host_ram || ingested.host_ram_oom;
         // Allocator retries: the card is full now, so ask neighbours now.
         if ingested.alloc_retries.is_some_and(|retries| retries > 0) {
             Self::flag_starved_neighbours_locked(&mut state, worker);
@@ -494,7 +511,7 @@ impl VramLedger {
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
                     entry.note_negative_sample(anchor);
-                } else {
+                } else if !host_ram {
                     entry.note_clean_window();
                 }
             }
@@ -508,7 +525,7 @@ impl VramLedger {
             .then(|| Self::note_death_locked(&mut state, worker, charge))
             .flatten();
         if !matches!(outcome, WindowOutcome::Aborted) {
-            let failed = responded_negative || died;
+            let failed = responded_negative || died || host_ram;
             self.note_gain_locked(&mut state, worker, charge, ingested.at_budget, failed);
         }
         // Any OOM lowers a seeded anchor, unless the unified-memory death path
@@ -531,7 +548,7 @@ impl VramLedger {
             charge,
             frame_oom.is_some() || ingested.oom || died,
             died,
-            matches!(outcome, WindowOutcome::Responded { .. }) && !responded_negative,
+            matches!(outcome, WindowOutcome::Responded { .. }) && !responded_negative && !host_ram,
         );
         Self::refit_locked(&mut state, worker);
         // No store, no write policy: it would move `cal.persisted` for nothing.
@@ -546,6 +563,7 @@ impl VramLedger {
             gpu: entry.gpu.clone(),
             outcome: match outcome {
                 WindowOutcome::Responded { .. } if responded_negative => "negative",
+                WindowOutcome::Responded { .. } if host_ram => "host_ram_oom",
                 WindowOutcome::Responded { .. } => "clean",
                 WindowOutcome::Aborted if crashed => "worker_crashed",
                 WindowOutcome::Aborted => "aborted",

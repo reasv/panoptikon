@@ -294,6 +294,9 @@ pub struct OomClass {
     /// Corroborates a message-pattern match.
     pub free_mb_at_failure: Option<u64>,
     pub device: String,
+    /// The allocation that failed was host RAM's (`MemoryError`, the CPU
+    /// allocator): the device's own memory only where that is host RAM.
+    pub host_ram: bool,
 }
 
 /// One GPU batch the worker ran, from a `predict` or `error` reply (protocol
@@ -1906,6 +1909,7 @@ impl OomClass {
             exception: field_string(map, "exception").unwrap_or_default(),
             free_mb_at_failure: field_u64(map, "free_mb_at_failure"),
             device: field_string(map, "device").unwrap_or_default(),
+            host_ram: field_bool(map, "host_ram"),
         })
     }
 }
