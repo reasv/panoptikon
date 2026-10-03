@@ -687,29 +687,39 @@ fn a_gpu_replica_that_dies_with_host_ram_booked_is_capped() {
 }
 
 /// An item-capped window is sized by the cap, not by the queue, even when the
-/// dispatcher hands it exactly that many items: its death still caps.
+/// dispatcher hands it exactly that many items: its death still caps. While
+/// macOS pages it caps through the pressure cap, also in a window of fewer
+/// items than the cap.
 #[test]
 fn a_death_in_a_booked_item_capped_window_caps() {
-    let ledger = host(&[GPU], None);
-    let (handle, admission) = cold_gpu_replica(&ledger, "g/capped", GPU, item_cost(64));
-    cpu_free_to_book(&ledger, 45_000);
-    single_item_window(&handle, &admission, 1, RAM_PER_UNIT_MB);
-    // Two items: the first size measured, so the next window is booked.
-    let token = admission.request_grant(2, None, 1, 0).expect("granted");
-    handle.lock().unwrap().record_measurements(vec![ram_batch(
-        2,
-        RSS_AT_LOAD_MB + 2 * RAM_PER_UNIT_MB,
-        RSS_AT_LOAD_MB,
-    )]);
-    token.finish(WindowOutcome::Responded { oom: None });
-    admission.earn_next_size();
+    // (paging, items in the window, death cap, pressure cap)
+    for (paging, items, caps) in [(false, 4, (Some(2), None)), (true, 3, (None, Some(1)))] {
+        let ledger = host(&[GPU], None);
+        let (handle, admission) = cold_gpu_replica(&ledger, "g/capped", GPU, item_cost(64));
+        cpu_free_to_book(&ledger, 45_000);
+        single_item_window(&handle, &admission, 1, RAM_PER_UNIT_MB);
+        // Two items: the first size measured, so the next window is booked.
+        let token = admission.request_grant(2, None, 1, 0).expect("granted");
+        handle.lock().unwrap().record_measurements(vec![ram_batch(
+            2,
+            RSS_AT_LOAD_MB + 2 * RAM_PER_UNIT_MB,
+            RSS_AT_LOAD_MB,
+        )]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        admission.earn_next_size();
 
-    assert_eq!(item_bound(&admission), 4);
-    let token = admission.request_grant(4, None, 1, 0).expect("granted");
-    assert_eq!(token.grant().user_cap_items, Some(4));
-    assert!(row(&ledger, "g/capped").ram_booked_mb > 0);
-    token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
-    assert_eq!(row(&ledger, "g/capped").death_cap_units, Some(2));
+        assert_eq!(item_bound(&admission), 4);
+        let token = admission.request_grant(items, None, 1, 0).expect("granted");
+        assert_eq!(token.grant().user_cap_items, Some(4));
+        assert!(row(&ledger, "g/capped").ram_booked_mb > 0);
+        if paging {
+            ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
+        }
+        token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
+        let cal = &ledger.lock().calibration[&("g/capped".to_owned(), GPU.to_owned())];
+        let held = (cal.death_cap_units, cal.pressure_cap.map(|cap| cap.units));
+        assert_eq!(held, caps);
+    }
 }
 
 /// A probe stub answering `free_mb` for the CPU device.
