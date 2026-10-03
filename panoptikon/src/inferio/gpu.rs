@@ -201,11 +201,10 @@ pub fn probe(accelerator: Accelerator) -> HostGpus {
             // nvidia-smi ignores CUDA_VISIBLE_DEVICES, so it is applied here.
             let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
             let mut host = build(query(accelerator).as_deref(), visible.as_deref());
-            let platform = DriverPlatform::current(Path::new(WSL_GPU_DEVICE));
-            let models = (platform == DriverPlatform::Windows)
-                .then(query_driver_models)
-                .flatten();
-            host.inventory.set_spilling(platform, models.as_deref());
+            host.inventory.set_spilling(
+                DriverPlatform::current(Path::new(WSL_GPU_DEVICE)),
+                query_driver_models,
+            );
             if !host.inventory.spilling_gpus().is_empty() {
                 tracing::warn!(
                     "with the NVIDIA driver's default \"CUDA - Sysmem Fallback Policy\", a GPU \
@@ -892,9 +891,14 @@ impl GpuInventory {
     }
 
     /// The NVIDIA GPUs, visible or adoptable, that move memory to system RAM
-    /// instead of failing a full allocation ([`spills`]).
-    fn set_spilling(&mut self, platform: DriverPlatform, driver_models: Option<&str>) {
-        let models = driver_models.map(parse_driver_models).unwrap_or_default();
+    /// instead of failing a full allocation ([`spills`]). `query` reads the
+    /// driver models, and runs only on native Windows.
+    fn set_spilling(&mut self, platform: DriverPlatform, query: impl FnOnce() -> Option<String>) {
+        let driver_models = (platform == DriverPlatform::Windows).then(query).flatten();
+        let models = driver_models
+            .as_deref()
+            .map(parse_driver_models)
+            .unwrap_or_default();
         let gpus = self.gpus().unwrap_or(&[]).iter().chain(self.adoptable());
         let verdicts: Arc<[String]> = gpus
             .filter(|gpu| spills(platform, models.get(gpu.uuid.as_str()).copied()))
@@ -1469,7 +1473,6 @@ mod tests {
         for (platform, model, spilled) in [
             (Other, None, false),
             (Wsl, None, true),
-            (Wsl, Some("TCC"), true),
             (Windows, Some("WDDM"), true),
             (Windows, Some("tcc"), false),
             (Windows, Some("MCDM"), false),
@@ -1491,19 +1494,21 @@ mod tests {
         let models = "GPU-1111, WDDM\nGPU-2222, TCC\nunparseable\n";
         for visible in [None, Some("1")] {
             let mut inventory = build(Some(rows), visible).inventory;
-            inventory.set_spilling(Windows, Some(models));
+            inventory.set_spilling(Windows, || Some(models.to_owned()));
             assert_eq!(inventory.spilling_gpus(), ["GPU-1111"], "{visible:?}");
             assert_eq!(inventory.spill_verdict(Some("GPU-1111")), Some(true));
             assert_eq!(inventory.spill_verdict(Some("GPU-2222")), Some(false));
             assert_eq!(inventory.spill_verdict(None), None, "an unknown device");
-            inventory.set_spilling(Windows, None);
+            inventory.set_spilling(Windows, || None);
             assert_eq!(inventory.spilling_gpus().len(), 2, "no models read: WDDM");
-            inventory.set_spilling(Other, Some(models));
+            inventory.set_spilling(Other, || panic!("queried off native Windows"));
             assert!(inventory.spilling_gpus().is_empty());
+            inventory.set_spilling(Wsl, || panic!("queried off native Windows"));
+            assert_eq!(inventory.spilling_gpus().len(), 2, "WSL: every GPU");
         }
         // Each replica's spawn config carries its own GPU's verdict.
         let mut inventory = build(Some(rows), None).inventory;
-        inventory.set_spilling(Windows, Some(models));
+        inventory.set_spilling(Windows, || Some(models.to_owned()));
         let spawn = super::super::worker::testing::test_spawn_config();
         let told = |key| {
             let config = inventory.spawn_config(&spawn, Some(key));
