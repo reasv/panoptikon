@@ -74,9 +74,9 @@ impl VramLedger {
     /// A worker that `died` running one unit counts whatever room the ledger
     /// saw, where a death may be a host RAM kill ([`death_may_be_ram`]): the
     /// batch cannot shrink further. The count passes to the next replica.
-    /// A one-unit window whose one-item batch `spilled` to system RAM counts
-    /// whatever the room: a one-item batch's pool is never released, so its
-    /// spill is live memory that does not fit.
+    /// A one-unit window whose one-item batch `spilled` to system RAM right
+    /// after a pool release counts whatever the room: that spill is live
+    /// memory that does not fit.
     ///
     /// Condemning remembers the model's working set on this GPU: the next load
     /// is refused while the refusal room ([`Self::refusal_room_locked`],
@@ -338,8 +338,8 @@ impl std::fmt::Display for UnrunnableReplica {
         }
         write!(
             f,
-            "model {} ran out of memory on GPU {} at a one-item batch {} \
-             windows running: its base is {} MiB of the {} MiB this GPU lends \
+            "model {} did not fit in memory (out of memory, or spilled to \
+             system RAM) on GPU {} at a one-item batch {} windows running: its base is {} MiB of the {} MiB this GPU lends \
              a window after its reserve, and one item on top of it did not \
              fit; the next load of it here is refused unless the card has {} \
              MiB free before the reserve",

@@ -2566,6 +2566,7 @@ def nvml_card(cuda, monkeypatch, total_mb=8192, others_mb=1000):
         return (total_mb - others_mb - ours, total_mb)
 
     monkeypatch.setattr(memory, "_nvml_memory", reading)
+    monkeypatch.setitem(memory._release_state, "armed", False)
     monkeypatch.setitem(memory._release_state, "largest_units", None)
     monkeypatch.setitem(memory._release_state, "largest_input", None)
 
@@ -2658,33 +2659,45 @@ def test_the_backstop_needs_nvml(fake_torch, monkeypatch):
 
 
 def test_a_grantless_window_releases_the_pool_before_a_larger_input_only(
-    spill_host,
+    spill_host, caplog
 ):
     """The grantless path runs a window in one call: the pool is released
-    before a window whose largest input is larger than any since the last
-    release."""
-    impl = caching_impl(spill_host, [100])
-    payloads = [
-        packing.run_grantless_window(
-            impl, [PredictionInput(data=0, file=png_bytes(w, h)) for w, h in window]
-        )
-        for window in ([(40, 30)], [(40, 30), (30, 40)], [(100, 100)], [(40, 30)])
-    ]
+    before a window whose largest input has more pixels than any since the
+    last release. The third window's largest input comes second and has less
+    width than the first; the two-item pool is 256 MiB above what the card
+    holds, within the tolerance."""
+    assert len(png_bytes(30, 45)) == len(png_bytes(40, 30)), "same PNG bytes"
+    impl = caching_impl(spill_host, [4224])
+    with caplog.at_level(logging.DEBUG, logger="inferio_worker.packing"):
+        payloads = [
+            packing.run_grantless_window(
+                impl, [PredictionInput(data=0, file=png_bytes(w, h)) for w, h in window]
+            )
+            for window in ([(40, 30)], [(30, 40)], [(40, 30), (30, 45)], [(40, 30)])
+        ]
     assert spill_host.empty_cache_calls == 1
     assert [p["measurements"][0].get("regrow_after") for p in payloads] == [
         None, None, memory.GROWTH_RELEASE, None
     ]
+    assert not any(p["measurements"][0].get("spilled") for p in payloads)
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
-def test_a_grantless_window_that_spills_is_flagged_and_warned_of_once(
+def test_a_grantless_window_that_spills_is_flagged_and_releases_the_pool(
     spill_host, caplog
 ):
-    impl = caching_impl(spill_host, [8192 + 1000])
+    mb_per_item = [8192 + 1000]
+    impl = caching_impl(spill_host, mb_per_item)
     with caplog.at_level(logging.DEBUG, logger="inferio_worker.packing"):
-        payloads = [packing.run_grantless_window(impl, items(1)) for _ in range(2)]
-    assert [p["measurements"][0].get("spilled") for p in payloads] == [True, True]
+        spilled = packing.run_grantless_window(impl, items(1))
+        mb_per_item[0] = 100
+        after = packing.run_grantless_window(impl, items(1))
+    assert spilled["measurements"][0]["spilled"] is True
+    assert spill_host.empty_cache_calls == 1
+    assert after["measurements"][0].get("spilled") is None
+    assert after["measurements"][0]["regrow_after"] == memory.SPILL_RELEASE
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1, "a spill no release could clear: warned of once"
+    assert len(warnings) == 1
 
 
 def test_any_release_restarts_the_largest_batch_record(spill_host):
@@ -2778,8 +2791,8 @@ def test_a_model_that_cannot_fit_warns_once_and_stops_halving_at_one_item(
     spill_host, caplog
 ):
     """Live memory past the card: releasing gives nothing back, so after the
-    halving reaches one item every batch is flagged but none is released, and
-    the warning is given once."""
+    halving reaches one item every batch is still flagged and released, the
+    next one re-growing from it, and the warning is given once."""
 
     def predict(inputs):
         spill_host.reserved = spill_host.allocated = (8192 + 1000) * MIB
@@ -2793,6 +2806,9 @@ def test_a_model_that_cannot_fit_warns_once_and_stops_halving_at_one_item(
     measurements = first["measurements"] + second["measurements"]
     assert [m["items"] for m in measurements] == [4, 2, 1, 1, 1]
     assert all(m["spilled"] for m in measurements)
-    assert spill_host.empty_cache_calls == 2, "the 4 and the 2 only"
+    assert spill_host.empty_cache_calls == 5
+    assert [m.get("regrow_after") for m in measurements] == [None] + [
+        memory.SPILL_RELEASE
+    ] * 4
     spills = [r for r in caplog.records if "system memory" in r.getMessage()]
     assert [r.levelno for r in spills] == [logging.WARNING] + [logging.DEBUG] * 4

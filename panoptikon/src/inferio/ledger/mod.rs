@@ -146,8 +146,8 @@ pub const EXTERNAL_SAMPLE_MAX_AGE: Duration = Duration::from_secs(10);
 pub const CLEAN_WINDOWS_TO_RESTORE: u32 = 3;
 
 /// Consecutive one-item out-of-memory windows, with less room than one item,
-/// or one-item windows that spilled to system RAM, after which a replica is
-/// declared unable to run on this GPU.
+/// or one-item windows that spilled to system RAM right after a pool release,
+/// after which a replica is declared unable to run on this GPU.
 pub const OOM_WINDOWS_AT_FLOOR: u32 = CLEAN_WINDOWS_TO_RESTORE;
 
 /// How long a verdict reached by worker deaths refuses the model's loads; the
@@ -1105,7 +1105,7 @@ struct Ingested {
     oom: bool,
     throughput_collapse: bool,
     spill: bool,
-    /// A batch of one item spilled.
+    /// A batch of one item spilled right after a pool release.
     one_item_spill: bool,
     /// The first trusted OOM classification, and how many measurements had one.
     oom_evidence: Option<OomEvidence>,

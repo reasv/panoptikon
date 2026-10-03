@@ -137,8 +137,8 @@ SHRINK_WINDOWS = 2
 # a squeeze. Mirrors the host's `TRIM_SLACK_MB`.
 SHRINK_BLIND_SLACK_MB = 256
 
-# Set once a spill outlived its release, or had no release (a one-item batch):
-# the live memory itself does not fit, so later spills are logged at debug.
+# Set once a spill outlived its release, or had no release: the live memory
+# itself does not fit, so later spills are logged at debug.
 _spill_persists = False
 
 # Consecutive granted windows below `SHRINK_RATIO` × the releasable slack.
@@ -939,7 +939,7 @@ def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]
     Where a full GPU spills to system RAM, the pool is released before a
     window whose largest input is larger than any since the last release (as
     `run_window` does before a growing batch), and a window whose pool ends
-    above NVML's used memory is flagged `spilled`.
+    above NVML's used memory is flagged `spilled` and the pool released.
     """
     spill_host = memory.spill_capable()
     largest = max(map(_input_size, inputs), default=0) if spill_host else 0
@@ -957,7 +957,11 @@ def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]
         if off_device_mb is not None and off_device_mb > SPILL_TOLERANCE_MB:
             payload["measurements"][0]["spilled"] = True
             reserved_mb = payload["memory"]["reserved_mb"]
-            _log_spill(reserved_mb, off_device_mb, False, off_device_mb)
+            released = memory.empty_cache(memory.SPILL_RELEASE)
+            if released:
+                payload["memory"] = memory.device_memory_sample() or payload["memory"]
+            after_mb = pool_off_device_mb(payload["memory"])
+            _log_spill(reserved_mb, off_device_mb, released, after_mb)
     return payload
 
 
@@ -1075,8 +1079,8 @@ def classify_oom(
 
 
 def batching_disabled(instance: Any) -> bool:
-    """Whether the impl sets `enable_batching`/`enable_batch` falsy: it batches
-    internally, so it takes the grantless path.
+    """Whether the impl sets `enable_batching`/`enable_batch` falsy: it runs
+    one input at a time inside `predict`, so it takes the grantless path.
     """
     for attribute in ("enable_batching", "enable_batch"):
         if not hasattr(instance, attribute):
@@ -1236,9 +1240,7 @@ def _log_spill(
         "the GPU, so part of it is in system memory; %s",
         reserved_mb,
         off_device_mb,
-        "released it and halved the batch size for the rest of this window"
-        if released
-        else "left the pool and the batch size as they are",
+        "released the pool" if released else "left the pool as it is",
     )
 
 
@@ -1471,9 +1473,10 @@ def run_window(
         # last). A fresh reading, so free and pool describe the same instant.
         if measurement.get("spilled"):
             reserved_mb = sample["reserved_mb"]
-            released = len(batch) > 1 and memory.empty_cache(memory.SPILL_RELEASE)
+            released = memory.empty_cache(memory.SPILL_RELEASE)
             if released:
-                budget = max(1, min(budget, priced // 2))
+                if len(batch) > 1:
+                    budget = max(1, min(budget, priced // 2))
                 sample = memory.device_memory_sample()
             _log_spill(reserved_mb, off_device_mb, released, pool_off_device_mb(sample))
         if emit_memory is not None and pending:

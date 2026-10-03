@@ -310,7 +310,7 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
             if not isinstance(grant, dict):
                 grant = None
             if grant is not None:
-                # An impl that batches internally takes the grantless path.
+                # An impl with batching off takes the grantless path.
                 if packing.batching_disabled(instance):
                     if not batching_off_logged:
                         batching_off_logged = True

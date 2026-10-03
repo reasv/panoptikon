@@ -563,7 +563,10 @@ impl VramLedger {
                 saw_oom |= oom;
                 saw_collapse |= collapse;
                 saw_spill |= measurement.spilled;
-                saw_one_item_spill |= measurement.spilled && measurement.items == Some(1);
+                // Started from a released pool: the spill is live memory.
+                saw_one_item_spill |= measurement.spilled
+                    && measurement.items == Some(1)
+                    && measurement.regrow_after.is_some();
                 continue;
             }
             if collapse_suppressed || uncorroborated {
