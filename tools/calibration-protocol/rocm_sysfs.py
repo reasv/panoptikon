@@ -221,17 +221,24 @@ def _pasid(text: str) -> Optional[int]:
     return None
 
 
-def _fdinfo_bytes(texts: List[str], gpu: Gpu) -> int:
-    """Bytes on `gpu` over one PID's DRM clients, each client counted once."""
+def _fdinfo_held_mb(texts: Dict[int, Optional[List[str]]], gpu: Gpu
+                    ) -> Dict[int, int]:
+    """MiB on `gpu` per PID over its DRM clients. Each client counts once: a
+    descriptor inherited across fork names the same client in both PIDs and
+    is credited to the lower PID."""
     regions = ("vram", "gtt") if gpu.unified else ("vram",)
-    seen, total = set(), 0
-    for text in texts:
-        record = parse_fdinfo(text, regions)
-        if record is None or record[0] != gpu.bdf or record[1] in seen:
-            continue
-        seen.add(record[1])
-        total += record[2]
-    return total
+    seen, held = set(), {}
+    for pid in sorted(texts):
+        total = 0
+        for text in texts[pid] or []:
+            record = parse_fdinfo(text, regions)
+            if record is None or record[0] != gpu.bdf or record[1] in seen:
+                continue
+            seen.add(record[1])
+            total += record[2]
+        if total:
+            held[pid] = total // MIB
+    return held
 
 
 def _in_initial_pid_ns(roots: Roots) -> bool:
@@ -255,7 +262,8 @@ def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = N
     initial PID namespace, else by the `pasid:` of the PID's DRM fdinfo, which
     KFD sets to its own PASID for that process. A GPU where a PID holding
     memory has no KFD entry is read from fdinfo, as is a unified GPU (KFD
-    counts VRAM only, not GTT).
+    counts VRAM only, not GTT) and every GPU when two PIDs reach one KFD
+    entry (a descriptor inherited across fork carries the parent's PASID).
     """
     kfd_root = os.path.join(roots.kfd, "proc")
     kfd_present = os.path.isdir(kfd_root)
@@ -280,12 +288,12 @@ def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = N
                           if pasid and pasid in by_pasid), None)
             if match:
                 entries[pid] = match
+    shared = len(set(entries.values())) < len(entries)
     unreadable = sorted(pid for pid, pid_texts in texts.items() if pid_texts is None)
     out: Dict[str, Reading] = {}
     for gpu in gpus:
-        fdinfo = {pid: value // MIB for pid, pid_texts in texts.items()
-                  if pid_texts and (value := _fdinfo_bytes(pid_texts, gpu))}
-        if (gpu.unified or gpu.gpu_id is None or not kfd_present
+        fdinfo = _fdinfo_held_mb(texts, gpu)
+        if (gpu.unified or gpu.gpu_id is None or not kfd_present or shared
                 or not (by_pid or (entries and set(fdinfo) <= set(entries)))):
             out[gpu.key] = Reading("fdinfo", fdinfo, unreadable)
             continue

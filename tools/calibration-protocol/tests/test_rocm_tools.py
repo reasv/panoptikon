@@ -194,6 +194,18 @@ def test_in_a_container_kfd_is_found_by_the_fdinfo_pasid(tmp_path):
         "fdinfo", {700: 150, 701: 64}, [])
 
 
+def test_a_descriptor_inherited_across_fork_counts_once(tmp_path):
+    """Parent and child both name the parent's PASID: KFD's figure would be
+    credited to each, so the GPU is read from fdinfo, the client once."""
+    host = Host(tmp_path, host_pid_ns=False).gpu(1, 0x0300)
+    host.kfd(4242, 1, 300 * MIB, pasid=32770)
+    for pid in (700, 701):
+        host.fdinfo(pid, 3, _fd(BDF_03, 11, 150 * 1024, pasid=32770))
+    (gpu,) = rocm_sysfs.inventory(host.roots)
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
+        "fdinfo", {700: 150}, [])
+
+
 def test_a_pasid_reused_after_the_kfd_list_is_read_is_left_out(tmp_path,
                                                                monkeypatch):
     host = Host(tmp_path, host_pid_ns=False).gpu(1, 0x0300)
