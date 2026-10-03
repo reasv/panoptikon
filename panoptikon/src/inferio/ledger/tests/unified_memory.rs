@@ -1599,7 +1599,11 @@ fn the_pool_is_in_the_room_and_in_the_charge_so_only_free_ram_is_admitted() {
         .finish(WindowOutcome::Responded { oom: None });
     let gpu = &ledger.health()[0];
     assert_eq!(gpu.external_mb, EXTERNAL);
-    assert_eq!(gpu.reserve_mb, cpu::ram_reserve_mb(MAC_RAM_MB), "the RAM floor");
+    assert_eq!(
+        gpu.reserve_mb,
+        cpu::ram_reserve_mb(MAC_RAM_MB),
+        "the RAM floor"
+    );
     assert_eq!(
         gpu.limit_mb,
         available + OURS - gpu.reserve_mb,
@@ -1666,7 +1670,13 @@ fn paging_windows(
     windows: usize,
 ) {
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
-    push_ram(handle, MAC_TOTAL_MB, cpu::ram_reserve_mb(MAC_RAM_MB), 180, 0);
+    push_ram(
+        handle,
+        MAC_TOTAL_MB,
+        cpu::ram_reserve_mb(MAC_RAM_MB),
+        180,
+        0,
+    );
     for window in 0..windows {
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
@@ -1700,7 +1710,13 @@ fn an_out_of_memory_window_while_the_mac_pages_leaves_the_pool_margin() {
     ] {
         let (ledger, handle, admission) = ramped_mac_replica();
         ledger.set_memory_pressure_for_test(pressure);
-        push_ram(&handle, MAC_TOTAL_MB, cpu::ram_reserve_mb(MAC_RAM_MB), 180, 0);
+        push_ram(
+            &handle,
+            MAC_TOTAL_MB,
+            cpu::ram_reserve_mb(MAC_RAM_MB),
+            180,
+            0,
+        );
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
@@ -1890,7 +1906,13 @@ fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
         "5 units of work, room for more"
     );
 
-    push_ram(&handle, MAC_TOTAL_MB, cpu::ram_reserve_mb(MAC_RAM_MB), 180, 0);
+    push_ram(
+        &handle,
+        MAC_TOTAL_MB,
+        cpu::ram_reserve_mb(MAC_RAM_MB),
+        180,
+        0,
+    );
     let granted = queued_window_at_the_rate(&handle, &admission, 20, |_| 100.0);
     assert_eq!(granted, 8, "20 units of work, memory for 8");
     assert_eq!(pressure_cap(&ledger).map(|cap| cap.units), Some(8));
@@ -1929,7 +1951,13 @@ fn at_warning_without_paging_the_batch_size_is_held() {
     );
 
     // Memory for 8 units for one window, then room again.
-    push_ram(&handle, MAC_TOTAL_MB, cpu::ram_reserve_mb(MAC_RAM_MB), 180, 0);
+    push_ram(
+        &handle,
+        MAC_TOTAL_MB,
+        cpu::ram_reserve_mb(MAC_RAM_MB),
+        180,
+        0,
+    );
     assert_eq!(ramp_window(&handle, &admission, &MINILM_M3_MAX), 8);
     assert_eq!(
         pressure_cap(&ledger),

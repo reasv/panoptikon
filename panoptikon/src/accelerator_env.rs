@@ -72,7 +72,11 @@ pub fn cpu_device_env() -> Vec<(String, String)> {
 /// operator set.
 fn cpu_device_env_over(operator_set: impl Fn(&str) -> bool) -> Vec<(String, String)> {
     std::iter::once((DEVICE_ENV_VAR, "cpu"))
-        .chain(GLIBC_MALLOC_ENV.into_iter().filter(|(key, _)| !operator_set(key)))
+        .chain(
+            GLIBC_MALLOC_ENV
+                .into_iter()
+                .filter(|(key, _)| !operator_set(key)),
+        )
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect()
 }
