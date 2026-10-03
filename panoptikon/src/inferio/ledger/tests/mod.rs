@@ -473,7 +473,7 @@ fn push_ram(
 const CPU_RAM_MB: u64 = 64 * 1024 - 700;
 
 /// The ledger a CPU-only host gets, built through `VramLedger::new` over a
-/// real CPU inventory, which derives the cap default and the adoption scope.
+/// real CPU inventory, which derives the adoption scope.
 fn cpu_ledger(budgets: impl Into<VramBudgets>) -> Arc<VramLedger> {
     VramLedger::new(
         &crate::inferio::gpu::GpuInventory::known_cpu(CPU_RAM_MB),
