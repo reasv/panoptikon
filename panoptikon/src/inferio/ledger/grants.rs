@@ -87,6 +87,9 @@ impl VramLedger {
         let mut state = self.lock();
         Self::repay_deflation_locked(&mut state, worker);
         let gpu = state.workers.get(&worker)?.gpu.clone();
+        if pressure.paging() {
+            Self::nothing_available_locked(&mut state, &gpu);
+        }
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.pending_requests = window_requests.saturating_add(queued_behind);
         }

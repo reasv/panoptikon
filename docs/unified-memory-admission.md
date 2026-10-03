@@ -275,14 +275,19 @@ Single synthetic device:
   reading asks a second question, **is the kernel paging**: the `swapouts`
   counter of the same `vm_statistics64` rose since the previous reading or
   within the 10 s before this one (`PAGING_WINDOW` / `MAC_PAGING_SECONDS`,
-  one remembered counter per process). A first reading cannot tell, and
-  neither can one whose predecessor is more than 60 s old (`PAGING_STALE` /
-  `MAC_PAGING_STALE_SECONDS`): an idle worker's first batch of a new job must
-  not read "paging" from swap-outs that happened while it sat idle. The bound
-  is longer than the window because a large batch takes longer than 10 s (a
-  63-item ViT-H batch takes about 10 s on an M3 Max), and consecutive batches
-  must still see the counter rise. `MemoryPressure` is the two facts
-  together: `Normal`, `Warning`, `Paging` (warning while paging), `Critical`.
+  one remembered counter per process). The gateway and every worker also
+  read the counter on a background thread every 2 s (`SWAPOUT_TICK` /
+  `MAC_SWAPOUT_TICK_SECONDS`), so a rise is dated within one tick however far
+  apart the readings memory is priced from are: a batch longer than the
+  window still sees paging that began during it, and an idle worker's first
+  batch of a new job does not read "paging" from swap-outs that happened
+  while it sat idle. A first reading cannot tell, and neither can one whose
+  predecessor is more than 5 s old (`PAGING_STALE` /
+  `MAC_PAGING_STALE_SECONDS`; the process had just started or was
+  suspended). While the gateway reads paging, a grant takes the device's
+  free reading as 0 whatever the worker last reported, since that report
+  may predate the paging. `MemoryPressure` is the two facts together:
+  `Normal`, `Warning`, `Paging` (warning while paging), `Critical`.
   - **Paging or critical: `ram_available` is 0.** macOS keeps file-backed
     pages while it swaps — about 9 GiB on the M3 Max while it swapped
     20–38 GiB — so the formula still offered 8–10 GiB that did not exist.

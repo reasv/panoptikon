@@ -1652,8 +1652,9 @@ fn pressure_cap(ledger: &Arc<VramLedger>) -> Option<PressureCap> {
     ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].pressure_cap
 }
 
-/// `windows` windows while macOS pages: the worker reads nothing available
-/// and holds 180 MiB of pool, which is 8 units.
+/// `windows` windows while macOS pages: the worker holds 180 MiB of pool,
+/// which is 8 units, and its last reading, from before the paging, still
+/// shows 90 000 MiB available. The ledger's own reading says nothing is.
 fn paging_windows(
     ledger: &Arc<VramLedger>,
     handle: &TelemetryHandle,
@@ -1661,7 +1662,7 @@ fn paging_windows(
     windows: usize,
 ) {
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
-    push_ram(handle, MAC_TOTAL_MB, 0, 180, 0);
+    push_ram(handle, MAC_TOTAL_MB, 90_000, 180, 0);
     for window in 0..windows {
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
@@ -1878,14 +1879,10 @@ fn a_reloaded_replica_inherits_the_size_paging_left() {
 fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
     let (ledger, handle, admission) = ramped_mac_replica();
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
-    queued_window_at_the_rate(&handle, &admission, 5, |_| 100.0);
-    assert_eq!(
-        pressure_cap(&ledger),
-        None,
-        "5 units of work, room for more"
-    );
-
     push_ram(&handle, MAC_TOTAL_MB, 0, 180, 0);
+    queued_window_at_the_rate(&handle, &admission, 5, |_| 100.0);
+    assert_eq!(pressure_cap(&ledger), None, "5 units of work, a pool for 8");
+
     let granted = queued_window_at_the_rate(&handle, &admission, 20, |_| 100.0);
     assert_eq!(granted, 8, "20 units of work, memory for 8");
     assert_eq!(pressure_cap(&ledger).map(|cap| cap.units), Some(8));

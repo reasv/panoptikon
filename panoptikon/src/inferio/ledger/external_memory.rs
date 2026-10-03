@@ -112,6 +112,18 @@ impl VramLedger {
         }
     }
 
+    /// Take `gpu`'s free reading as 0 while macOS pages: nothing is available
+    /// then, and a worker's reading may predate the paging.
+    pub(super) fn nothing_available_locked(state: &mut LedgerState, gpu: &str) {
+        let Some(sample) = state.gpus.get_mut(gpu).and_then(|gpu| gpu.free.as_mut()) else {
+            return;
+        };
+        sample.free_mb = 0;
+        if let Some(ram) = sample.ram.as_mut() {
+            ram.available_mb = 0;
+        }
+    }
+
     /// Carry `device`'s free reading forward to `at` across a change in our
     /// own memory made after it was taken (`before_mb` → `after_mb`), so
     /// `external` stays put until a later reading arrives; older readings are
