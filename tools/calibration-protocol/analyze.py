@@ -2290,6 +2290,47 @@ def check_alloc_retries(ctx: Context) -> Verdict:
     )
 
 
+def check_batch_coverage(ctx: Context) -> Verdict:
+    """Every measured batch must appear in some health sample.
+
+    A replica's `recent_batches` is the tail of a ring numbered 1, 2, ... per
+    worker, so a `seq` no sample showed is a batch the recording lost. A
+    replica first seen with batches, or whose `seq` went back without an idle
+    sample (a new worker), sets a baseline: nothing before it is counted.
+    """
+    if not ctx.health_samples:
+        return Verdict("batch_coverage", "SKIP", "no healthrec.jsonl")
+    last: Dict[Tuple[Any, ...], int] = {}
+    seen = 0
+    missed: Dict[str, int] = {}
+    for sample in ctx.health_samples:
+        for model in (sample.get("health") or {}).get("models") or []:
+            for index, replica in enumerate(model.get("replicas") or []):
+                seqs = {batch.get("seq") for batch
+                        in replica.get("recent_batches") or []
+                        if isinstance(batch.get("seq"), int)}
+                top = max(seqs, default=0)
+                key = (model.get("inference_id"), model.get("generation"), index)
+                prior = last.get(key)
+                base = prior if prior is not None and top >= prior else None
+                new = sum(1 for seq in seqs if base is None or seq > base)
+                seen += new
+                if base is not None and top - base > new:
+                    name = str(model.get("inference_id"))
+                    missed[name] = missed.get(name, 0) + top - base - new
+                last[key] = top
+    if not seen:
+        return Verdict("batch_coverage", "SKIP",
+                       "no health sample showed a measured batch")
+    lost = sum(missed.values())
+    return Verdict(
+        "batch_coverage", "WARN" if lost else "PASS",
+        f"{seen} of {seen + lost} batches appeared in a health sample"
+        + (f"; missed per model {missed}: record at a shorter "
+           "--health-interval" if lost else ""),
+        {"seen": seen, "missed": lost, "missed_per_model": missed})
+
+
 CHECKS: Dict[str, Callable[[Context], Verdict]] = {
     "oracle_agreement": check_oracle_agreement,
     "base_accuracy": check_base_accuracy,
@@ -2309,6 +2350,7 @@ CHECKS: Dict[str, Callable[[Context], Verdict]] = {
     "ramp_progress": check_ramp_progress,
     "calibration_learned": check_calibration_learned,
     "alloc_retries": check_alloc_retries,
+    "batch_coverage": check_batch_coverage,
 }
 
 

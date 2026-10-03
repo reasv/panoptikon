@@ -666,3 +666,20 @@ def test_calibration_learned_cannot_judge_a_seed_no_window_reached():
     for stuck in (_learning_context(64, 64), _learning_context(120000, None),
                   _learning_context(120000, 6293, queue_bound=6)):
         assert analyze.check_calibration_learned(stuck).verdict == "FAIL"
+
+
+def test_batch_coverage_counts_the_batches_no_health_sample_showed():
+    def sample(*seqs):
+        replica = {"recent_batches": [{"seq": seq} for seq in seqs]}
+        return {"kind": "sample", "t_wall": 100.0, "health": {"models": [
+            {"inference_id": MODEL, "generation": 1, "replicas": [replica]}]}}
+
+    # Idle, then 1-4, 7-10: 5 and 6 were evicted between two samples. A seq
+    # that goes back is a new worker and only sets a baseline.
+    recording = [sample(), sample(1, 2, 3, 4), sample(7, 8, 9, 10), sample(2, 3)]
+    verdict = analyze.check_batch_coverage(_context(healthrec=recording))
+    assert (verdict.verdict, verdict.numbers["seen"],
+            verdict.numbers["missed"]) == ("WARN", 10, 2)
+    recording[2] = sample(3, 4, 5, 6)
+    verdict = analyze.check_batch_coverage(_context(healthrec=recording))
+    assert (verdict.verdict, verdict.numbers["missed"]) == ("PASS", 0)

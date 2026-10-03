@@ -798,6 +798,7 @@ that move them are in `analyze.py --help`.
 | `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form |
 | `ramp_progress` | `unit_budget` / `fit_samples` / the working size over time | — | INFO |
 | `calibration_learned` | the same three numbers, as a verdict | see below | FAIL only under `--learning` |
+| `batch_coverage` | the `seq` of each replica's `recent_batches` across health samples: a number no sample showed is a lost batch | none lost | PASS/WARN |
 
 `ledger_invariant` has two forms and reports both. The strict form — Σ charges
 + load reservations ≤ `limit_mb` — cannot hold on a nearly-full GPU: `limit =
