@@ -97,6 +97,19 @@ pub(crate) fn absent_path(name: &str) -> String {
     format!("{}{}{name}", absent_root(), std::path::MAIN_SEPARATOR)
 }
 
+/// A port nothing in this process can be listening on. Binding and dropping
+/// an *ephemeral* port is not sound: it goes straight back to the pool this
+/// binary's other tests bind from, so the "closed" port is occasionally a
+/// neighbour's stub. Port 1 is below `ip_local_port_range`.
+pub(crate) async fn closed_port() -> std::net::SocketAddr {
+    let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_err(),
+        "premise: {addr} refuses connections; something here is listening"
+    );
+    addr
+}
+
 /// Writes a per-database `config.toml` carrying only `detect_outros`, at the
 /// path `SystemConfigStore::from_env()` resolves for `index_db`.
 ///

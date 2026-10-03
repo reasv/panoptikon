@@ -1415,10 +1415,7 @@ mod tests {
         // A server that is not listening at all (the "inference server is
         // down" deployment) behaves the same way: silent for an empty set,
         // an error once there is something to validate.
-        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_addr = dead.local_addr().unwrap();
-        drop(dead);
-        let dead_url = format!("http://{dead_addr}");
+        let dead_url = format!("http://{}", crate::test_utils::closed_port().await);
         let unreachable =
             crate::inferio_client::InferenceApiClient::new_with_metadata_cache(&dead_url, false)
                 .unwrap();

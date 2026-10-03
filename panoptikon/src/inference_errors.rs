@@ -188,9 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_closed_port_is_unreachable_with_the_os_reason() {
-        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", dead.local_addr().unwrap());
-        drop(dead);
+        let url = format!("http://{}", crate::test_utils::closed_port().await);
         let err = client(&url).get_metadata().await.unwrap_err();
         let Some(UpstreamFailure::Unreachable { reason, timed_out }) =
             UpstreamFailure::classify(&err)

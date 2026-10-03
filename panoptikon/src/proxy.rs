@@ -1497,11 +1497,10 @@ allow = "*"
     #[tokio::test]
     async fn the_proxy_client_dials_an_https_upstream() {
         let state = test_proxy_state();
-        // Port 1 is below `ip_local_port_range`: nothing answers, so the only
-        // question this asks is which side refused, the connector or the peer.
+        let url = format!("https://{}/", crate::test_utils::closed_port().await);
         let err = state
             .client
-            .get("https://127.0.0.1:1/".parse().unwrap())
+            .get(url.parse().unwrap())
             .await
             .expect_err("nothing is listening on port 1");
         let chain = format!("{:#}", anyhow::Error::new(err));

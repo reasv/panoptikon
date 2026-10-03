@@ -3055,20 +3055,6 @@ pub(crate) mod tests {
         addr
     }
 
-    /// A port nothing in this process can be listening on. Binding and
-    /// dropping an *ephemeral* port is not sound: it goes straight back to
-    /// the pool this binary's other tests bind from, so the "closed" port is
-    /// occasionally a neighbour's stub. Port 1 is below `ip_local_port_range`
-    /// and cannot be bound without privileges.
-    async fn closed_port() -> SocketAddr {
-        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        assert!(
-            tokio::net::TcpStream::connect(addr).await.is_err(),
-            "premise: {addr} refuses connections; something here is listening"
-        );
-        addr
-    }
-
     /// A proxy's 502, 503 and 504 are misses; any other status, and a check
     /// that cannot be made, are not.
     #[tokio::test]
@@ -3083,7 +3069,7 @@ pub(crate) mod tests {
             let missed = client.health_check().await.is_err();
             assert_eq!(missed, (502..=504).contains(&status), "{status}");
         }
-        let url = format!("http://{}", closed_port().await);
+        let url = format!("http://{}", crate::test_utils::closed_port().await);
         let client = InferenceApiClient::new_with_metadata_cache(url, false).unwrap();
         assert_eq!(client.health_check().await, Ok(()), "refused");
     }
@@ -3733,7 +3719,7 @@ pub(crate) mod tests {
     /// peer, which `reqwest` reports as it reports an h2-preface refusal.
     #[tokio::test]
     async fn an_unreachable_endpoint_is_not_remembered_as_http11() {
-        let closed = closed_port().await;
+        let closed = crate::test_utils::closed_port().await;
         let dropping = spawn_raw_peer(RawPeer::Drop).await;
         for (addr, label) in [(closed, "a closed port"), (dropping, "a peer that drops")] {
             let client =
@@ -3761,7 +3747,7 @@ pub(crate) mod tests {
     /// classification *is* a reading of `reqwest`'s error.
     #[tokio::test]
     async fn each_phase_of_a_transport_failure_is_classified_by_where_it_stopped() {
-        let closed = closed_port().await;
+        let closed = crate::test_utils::closed_port().await;
         for (addr, timeout, phase, class, label) in [
             (
                 closed,
@@ -3811,7 +3797,7 @@ pub(crate) mod tests {
     /// retry budget, without disturbing the transport memo.
     #[tokio::test]
     async fn a_predict_that_never_reaches_its_peer_is_typed_and_requeueable() {
-        let closed = closed_port().await;
+        let closed = crate::test_utils::closed_port().await;
         let client =
             InferenceApiClient::new_with_metadata_cache(format!("http://{closed}"), false).unwrap();
 
