@@ -103,10 +103,11 @@ def _verdicts(directory: Path, model: str, expect, counts,
         "history": [{"setter": model, "total_segments": items,
                      "failed_items": counts["--expect-failures"]}],
         "outcomes": [{"status": "failed"}] * counts["--expect-failed-jobs"]}))
-    (directory / "healthrec.jsonl").write_text(json.dumps(
-        {"kind": "sample", "t_wall": 1.0, "health": {"workers": [
-            {"inference_id": model, "gpu_uuid": "GPU-0", "deflation": 1}]}})
-        + "\n")
+    # The model is unloaded once its job ends.
+    (directory / "healthrec.jsonl").write_text("".join(json.dumps(
+        {"kind": "sample", "t_wall": t, "health": {"workers": workers}}) + "\n"
+        for t, workers in ((1.0, [{"inference_id": model, "gpu_uuid": "GPU-0",
+                                   "deflation": 1}]), (2.0, []))))
     events = []
     for outcome in job_ends:
         events.append({"event": "job_start"})
@@ -136,7 +137,8 @@ def test_each_fixture_passes_at_its_thresholds_and_fails_one_past(tmp_path,
     assert verdicts["job_outcome"] == "PASS"
     # Only `oom` declares that it ends deflated.
     assert ("--expect-deflated" in expect) == (name == "oom")
-    assert (verdicts["deflation_recovery"] == "PASS") == (name == "oom")
+    assert verdicts["deflation_recovery"] == ("PASS" if name == "oom"
+                                              else "WARN")
     # A job cut at `--job-cap`, or one legs.py never saw end.
     for ends in (["cap_exceeded"], [None]):
         unfinished = _verdicts(tmp_path / f"ends-{ends[0]}", model, expect,

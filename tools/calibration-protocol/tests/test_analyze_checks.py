@@ -809,7 +809,7 @@ def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
 # --- deflation_recovery ------------------------------------------------------
 
 
-def _deflation(deflation, outcome="clean", gpu=GPU):
+def _deflation(deflation, outcome="clean", gpu=GPU, clean_windows=0):
     """A settle line, or with `outcome=None` the time-repay line."""
     return {"ts": "2026-10-03T00:00:00.000000Z", "t_wall": 100.0,
             "level": "WARN" if outcome == "negative" else "DEBUG",
@@ -817,7 +817,8 @@ def _deflation(deflation, outcome="clean", gpu=GPU):
             "message": ("settled a granted window" if outcome else
                         analyze.DEFLATION_REPAID_LINE),
             "fields": {"model": MODEL, "gpu": gpu, "outcome": outcome,
-                       "deflation": deflation}, "line": ""}
+                       "deflation": deflation,
+                       "clean_windows": clean_windows}, "line": ""}
 
 
 def _deflated_health(deflation):
@@ -827,35 +828,45 @@ def _deflated_health(deflation):
 
 
 def _deflation_recovery(log, healthrec=(), declared=False):
-    ctx = _utilization_context(healthrec, log=log)
+    """A leg's health samples end with the model unloaded."""
+    unloaded = {**_worker_health(0), "health": {"ok": True, "workers": []}}
+    ctx = _utilization_context([*healthrec, unloaded], log=log)
     ctx.args.expect_deflated = declared
     return analyze.check_deflation_recovery(ctx)
 
 
 def test_deflation_recovery_reads_the_settle_lines_before_health():
-    """A level is repaid on its third clean window, or by elapsed time. A
-    0.3 s job no health sample saw gets a verdict, a lone deflated sample is
-    not the end, a worker that died restarts at 0, and one the last health
-    sample no longer lists is not judged."""
-    recovered = [_deflation(1, "negative"), _deflation(1), _deflation(1),
-                 _deflation(0)]
-    replaced = [_deflation(0), _deflation(1, "worker_died"),
-                _deflation(1, "negative", gpu="GPU-1111")]
+    """A level is repaid on its third clean window, or by elapsed time; the
+    window that repays a level does not count toward the next. A 0.3 s job
+    no health sample saw gets a verdict, a lone deflated sample is not the
+    end, a worker that died restarts at 0, and one that left keeps its last
+    value."""
+    recovered = [_deflation(1, "negative"), _deflation(1, clean_windows=1),
+                 _deflation(1, clean_windows=2), _deflation(0)]
+    replaced = [_deflation(0), _deflation(1, "worker_died")]
+    two_levels = [_deflation(1, "negative"), _deflation(2, "negative")] + [
+        _deflation(level, clean_windows=windows)
+        for level, windows in ((2, 1), (2, 2), (1, 0), (1, 1), (1, 2), (0, 0))]
     for log, healthrec in ((recovered, []), (recovered, [_deflated_health(1)]),
                            ([_deflation(1, "negative"), _deflation(0, None)],
                             []),
-                           (replaced, [_deflated_health(0)])):
+                           (replaced, [_deflated_health(0)]),
+                           (two_levels, [])):
         verdict = _deflation_recovery(log, healthrec)
         assert (verdict.verdict, verdict.numbers["source"]) == ("PASS", "log")
-    stuck = _deflation_recovery([_deflation(0), _deflation(1, "negative")]
-                                + [_deflation(1)] * 3)
-    assert stuck.verdict == "FAIL"
-    assert stuck.numbers["clean_windows_at_level"] == {f"{MODEL}@{GPU}": 3}
-    # The third clean window repays a level the clock already lowered.
-    ended = _deflation_recovery([_deflation(3, "negative"), _deflation(3),
-                                 _deflation(3), _deflation(2, None),
-                                 _deflation(1)])
-    assert ended.verdict == "WARN"
+    for log in ([_deflation(0), _deflation(1, "negative")] + [_deflation(1)] * 3,
+                [_deflation(1, "negative"), _deflation(1), _deflation(1),
+                 _deflation(1, "aborted"), _deflation(1)]):
+        stuck = _deflation_recovery(log)
+        assert stuck.verdict == "FAIL"
+        assert stuck.numbers["clean_windows_at_level"] == {f"{MODEL}@{GPU}": 3}
+    # Short of three clean windows at the end: the third window repays a level
+    # the clock already lowered; one window short; a worker that left at 1.
+    for log in ([_deflation(3, "negative"), _deflation(3), _deflation(3),
+                 _deflation(2, None), _deflation(1)],
+                two_levels[:-1],
+                replaced + [_deflation(1, "negative", gpu="GPU-1111")]):
+        assert _deflation_recovery(log, [_deflated_health(0)]).verdict == "WARN"
     # Another target at DEBUG, the ledger's at INFO: only negatives logged.
     other = {**_deflation(0), "target": "panoptikon::db", "message": "chose"}
     verdict = _deflation_recovery([other, _deflation(1, "negative")],
@@ -865,15 +876,15 @@ def test_deflation_recovery_reads_the_settle_lines_before_health():
 
 
 def test_deflation_that_never_recovers_passes_only_when_declared():
-    """The `/health` fallback, for a log with no DEBUG settle or repay line
-    (a real leg logs DEBUG, so its log is read): still deflated at the end
-    FAILs unless declared."""
-    ctx = _utilization_context([_deflated_health(0), _deflated_health(3)],
-                               log=[_deflation(3, "negative")])
-    verdict = analyze.check_deflation_recovery(ctx)
-    assert (verdict.verdict, verdict.numbers["source"]) == ("FAIL", "healthrec")
-    ctx.args.expect_deflated = True
-    assert analyze.check_deflation_recovery(ctx).verdict == "PASS"
+    """Ending deflated WARNs from either source unless declared: the log
+    when it holds a DEBUG ledger line such as a grant, `/health` when only
+    the WARN negatives were logged."""
+    for log, source in (([_budget_grant(1), _deflation(3, "negative")], "log"),
+                        ([_deflation(3, "negative")], "healthrec")):
+        healthrec = [_deflated_health(0), _deflated_health(3)]
+        verdict = _deflation_recovery(log, healthrec)
+        assert (verdict.verdict, verdict.numbers["source"]) == ("WARN", source)
+        assert _deflation_recovery(log, healthrec, True).verdict == "PASS"
 
 
 # --- job_outcome and legs.json -------------------------------------------------

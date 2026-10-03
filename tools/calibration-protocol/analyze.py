@@ -1447,23 +1447,24 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
     """Deflation must be repaid: one level per `CLEAN_WINDOWS_TO_RESTORE`
     consecutive clean windows, or one by elapsed time on a `/health` read.
 
-    Read from the log when it holds a DEBUG clean settle or the time-repay
-    line: both carry the worker's `deflation`. Otherwise `/health` samples
-    stand in, and only the end state is judged. A worker that died restarts
-    at 0, as its replacement registers undeflated without a line, and a
-    worker missing from the last health sample is not judged.
+    Read from the log when it holds any DEBUG ledger line: the settle and
+    time-repay lines carry the worker's `deflation`. Otherwise `/health`
+    samples stand in, and only the end state is judged. A worker that died
+    restarts at 0, as its replacement registers undeflated without a line.
+    A worker that left keeps its last value.
 
-    FAIL: a level outlasted `CLEAN_WINDOWS_TO_RESTORE` clean windows, or,
-    from `/health`, a worker is still deflated at the end. WARN: still
-    deflated when the recording ended. `--expect-deflated` declares a model
-    that OOMs on every batch: ending deflated is then its result, and never
-    deflating FAILs."""
+    FAIL: a level outlasted `CLEAN_WINDOWS_TO_RESTORE` clean windows. WARN:
+    still deflated when the recording ended. `--expect-deflated` declares a
+    model that OOMs on every batch: ending deflated is then its result, and
+    never deflating FAILs."""
     settle = "settled a granted window"
-    from_log = any((event["level"] == "DEBUG" and event["message"] == settle)
-                   or event["message"].startswith(DEFLATION_REPAID_LINE)
+    from_log = any(event["level"] == "DEBUG"
+                   and event["target"].startswith("panoptikon::inferio::ledger")
                    for event in ctx.log)
     # Per worker: peak and final deflation, consecutive clean windows at the
-    # final level, and the last level that outlasted CLEAN_WINDOWS_TO_RESTORE.
+    # final level, and the highest level that outlasted
+    # CLEAN_WINDOWS_TO_RESTORE. The window that repays a level is logged at
+    # the new level and does not count toward it.
     rows: Dict[str, Dict[str, int]] = {}
     for event in ctx.log if from_log else []:
         fields = event["fields"]
@@ -1479,13 +1480,13 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
             continue  # it leaves the clean count as it was
         if outcome == "worker_died":
             value = 0
-        if outcome != "clean" or value != row["final"]:
-            row["clean"] = 0
         if outcome == "clean":
-            row["clean"] += 1
+            row["clean"] = 0 if value < row["final"] else row["clean"] + 1
+        else:
+            row["clean"] = 0
         row["final"] = value
         if value and row["clean"] >= CLEAN_WINDOWS_TO_RESTORE:
-            row["held"] = value
+            row["held"] = max(row["held"], value)
     source = "log" if rows else "healthrec"
     for sample in ctx.health_samples if not rows else []:
         for worker in (sample.get("health") or {}).get("workers") or []:
@@ -1494,24 +1495,15 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
                 {"peak": 0, "final": 0, "clean": 0, "held": 0})
             row["final"] = int(worker.get("deflation") or 0)
             row["peak"] = max(row["peak"], row["final"])
-    last = next((sample["health"]["workers"]
-                 for sample in reversed(ctx.health_samples)
-                 if isinstance((sample.get("health") or {}).get("workers"),
-                               list)), None)
-    if last is not None:
-        alive = {f"{worker['inference_id']}@{worker.get('gpu_uuid')}"
-                 for worker in last}
-        rows = {key: row for key, row in rows.items() if key in alive}
     if not rows:
         return Verdict("deflation_recovery", "SKIP",
-                       "no DEBUG settle or repay line, and no worker in the "
-                       "last health sample")
+                       "no ledger DEBUG line and no worker in any health "
+                       "sample")
     declared = bool(getattr(ctx.args, "expect_deflated", False))
     peak = max(row["peak"] for row in rows.values())
     held = {key: row["held"] for key, row in rows.items() if row["held"]}
     stuck = {key: row for key, row in rows.items() if row["final"] > 0}
-    if held or (declared and not peak) or (
-            stuck and source == "healthrec" and not declared):
+    if held or (declared and not peak):
         verdict = "FAIL"
     else:
         verdict = "WARN" if stuck and not declared else "PASS"
