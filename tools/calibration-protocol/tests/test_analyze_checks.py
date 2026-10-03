@@ -668,18 +668,21 @@ def test_calibration_learned_cannot_judge_a_seed_no_window_reached():
         assert analyze.check_calibration_learned(stuck).verdict == "FAIL"
 
 
-def test_batch_coverage_counts_the_batches_no_health_sample_showed():
-    def sample(*seqs):
-        replica = {"recent_batches": [{"seq": seq} for seq in seqs]}
-        return {"kind": "sample", "t_wall": 100.0, "health": {"models": [
-            {"inference_id": MODEL, "generation": 1, "replicas": [replica]}]}}
+def test_batch_coverage_counts_every_batch_from_each_workers_seq_1():
+    def coverage(*rings, check=analyze.check_batch_coverage):
+        recording = [{"kind": "sample", "t_wall": 100.0, "health": {"models": [
+            {"inference_id": MODEL, "generation": 1, "replicas": [
+                {"recent_batches": [{"seq": seq} for seq in ring]}]}]}}
+            for ring in rings]
+        verdict = check(_context(healthrec=recording))
+        return (verdict.verdict, verdict.numbers.get("seen"),
+                verdict.numbers.get("missed"))
 
-    # Idle, then 1-4, 7-10: 5 and 6 were evicted between two samples. A seq
-    # that goes back is a new worker and only sets a baseline.
-    recording = [sample(), sample(1, 2, 3, 4), sample(7, 8, 9, 10), sample(2, 3)]
-    verdict = analyze.check_batch_coverage(_context(healthrec=recording))
-    assert (verdict.verdict, verdict.numbers["seen"],
-            verdict.numbers["missed"]) == ("WARN", 10, 2)
-    recording[2] = sample(3, 4, 5, 6)
-    verdict = analyze.check_batch_coverage(_context(healthrec=recording))
-    assert (verdict.verdict, verdict.numbers["missed"]) == ("PASS", 0)
+    # First seen busy at 7-10: 1-6 were never shown.
+    assert coverage(range(7, 11)) == ("WARN", 4, 6)
+    # A repeated and an overlapping ring count each batch once.
+    assert coverage(range(1, 5), range(1, 5)) == ("PASS", 4, 0)
+    assert coverage(range(1, 5), range(3, 7)) == ("PASS", 6, 0)
+    # A seq that goes back is a new worker, counted from its seq 1.
+    assert coverage(range(1, 5), (2, 3)) == ("WARN", 6, 1)
+    assert coverage((), (), check=analyze.CHECKS["batch_coverage"])[0] == "SKIP"

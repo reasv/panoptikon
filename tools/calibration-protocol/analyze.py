@@ -2314,18 +2314,23 @@ def check_alloc_retries(ctx: Context) -> Verdict:
 
 
 def check_batch_coverage(ctx: Context) -> Verdict:
-    """Every measured batch must appear in some health sample.
-
-    A replica's `recent_batches` is the tail of a ring numbered 1, 2, ... per
-    worker, so a `seq` no sample showed is a batch the recording lost. A
-    replica first seen with batches, or whose `seq` went back without an idle
-    sample (a new worker), sets a baseline: nothing before it is counted.
-    """
+    """`seq` numbers each worker's batches from 1, so a number no health sample
+    showed is a lost batch, and a seq that goes back starts a new worker."""
     if not ctx.health_samples:
         return Verdict("batch_coverage", "SKIP", "no healthrec.jsonl")
-    last: Dict[Tuple[Any, ...], int] = {}
+    held: Dict[Tuple[Any, ...], Set[int]] = {}
+    highest: Dict[Tuple[Any, ...], int] = {}
     seen = 0
     missed: Dict[str, int] = {}
+
+    def close(key: Tuple[Any, ...]) -> None:
+        nonlocal seen
+        count = len(held.pop(key, ()))
+        seen += count
+        lost = highest.pop(key, 0) - count
+        if lost:
+            missed[str(key[0])] = missed.get(str(key[0]), 0) + lost
+
     for sample in ctx.health_samples:
         for model in (sample.get("health") or {}).get("models") or []:
             for index, replica in enumerate(model.get("replicas") or []):
@@ -2334,14 +2339,12 @@ def check_batch_coverage(ctx: Context) -> Verdict:
                         if isinstance(batch.get("seq"), int)}
                 top = max(seqs, default=0)
                 key = (model.get("inference_id"), model.get("generation"), index)
-                prior = last.get(key)
-                base = prior if prior is not None and top >= prior else None
-                new = sum(1 for seq in seqs if base is None or seq > base)
-                seen += new
-                if base is not None and top - base > new:
-                    name = str(model.get("inference_id"))
-                    missed[name] = missed.get(name, 0) + top - base - new
-                last[key] = top
+                if top < highest.get(key, 0):
+                    close(key)
+                held.setdefault(key, set()).update(seqs)
+                highest[key] = max(highest.get(key, 0), top)
+    for key in list(held):
+        close(key)
     if not seen:
         return Verdict("batch_coverage", "SKIP",
                        "no health sample showed a measured batch")
