@@ -540,10 +540,10 @@ mod tests {
         let marker = (DEVICE_ENV_VAR.to_owned(), "cpu".to_owned());
         assert_eq!(cpu_device_env_over(|_| true), std::slice::from_ref(&marker));
         assert_eq!(
-            cpu_device_env_over(|key| key == "MALLOC_TRIM_THRESHOLD_"),
+            cpu_device_env_over(|key| key == "MALLOC_MMAP_THRESHOLD_"),
             [
                 marker,
-                ("MALLOC_MMAP_THRESHOLD_".to_owned(), "131072".to_owned())
+                ("MALLOC_TRIM_THRESHOLD_".to_owned(), "131072".to_owned())
             ]
         );
     }
