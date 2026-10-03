@@ -1,4 +1,4 @@
-# Windows and macOS check: builds the server for the two shipped non-Linux
+# Windows and macOS check: builds the workspace for the two shipped non-Linux
 # targets with warnings as errors, runs the platform-specific Rust tests and
 # the inference worker's tests natively. Manual dispatch only, like nix.yml;
 # run it before tagging, since release.yml is the only other place these
@@ -15,11 +15,17 @@ concurrency:
   group: platforms-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   check:
     name: Check (${{ matrix.triple }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      RUSTFLAGS: -D warnings
     strategy:
       fail-fast: false
       matrix:
@@ -37,19 +43,20 @@ jobs:
         with:
           components: clippy
 
-      # Reported, not a gate: new stable clippy releases add lints that
-      # fire on every platform alike.
-      - name: Clippy
-        run: cargo clippy --all-targets -p panoptikon
+      # tauri-build requires the sidecar and, on macOS, the framework dylib
+      # to exist; release.yml stages the real ones.
+      - name: Stage placeholder Desktop resources
+        run: |
+          set -euo pipefail
+          ext=""; if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          mkdir -p panoptikon-desktop/src-tauri/binaries panoptikon-desktop/src-tauri/resources/pdfium
+          touch "panoptikon-desktop/src-tauri/binaries/panoptikon-${{ matrix.triple }}${ext}"
+          touch panoptikon-desktop/src-tauri/resources/pdfium/libpdfium.dylib
 
       - name: Check
-        env:
-          RUSTFLAGS: -D warnings
-        run: cargo check --all-targets -p panoptikon
+        run: cargo check --workspace --all-targets --features panoptikon/bundled
 
       - name: Platform tests
-        env:
-          RUSTFLAGS: -D warnings
         run: cargo test -p panoptikon --bin panoptikon -- ownership inferio::mps inferio::cpu
 
       # The uv release `panoptikon setup` pins (setup.rs UV_VERSION).
@@ -62,3 +69,8 @@ jobs:
         run: |
           uv sync --locked --group test --extra cpu
           uv run --no-sync python -m pytest tests/inferio_worker
+
+      # Reports and does not gate.
+      - name: Clippy
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --features panoptikon/bundled
