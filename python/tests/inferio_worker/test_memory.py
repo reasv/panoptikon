@@ -2172,6 +2172,9 @@ def test_background_readings_date_a_rise_within_one_tick() -> None:
     first batch. Without the background readings none of these is judged."""
     clock = [0.0]
 
+    def now() -> float:
+        return 1000.0 + clock[0]
+
     def judged(count, seconds: int, background: bool) -> bool:
         def counters():
             return (0, 0, 0, 0, 1, count(clock[0]))
@@ -2182,9 +2185,11 @@ def test_background_readings_date_a_rise_within_one_tick() -> None:
 
         clock[0] = 0.0
         with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
-            with mock.patch("time.monotonic", side_effect=lambda: 1000.0 + clock[0]):
+            with mock.patch("time.monotonic", side_effect=now):
                 memory._mac_paging(count(0))
-                with mock.patch.object(memory, "_mac_memory_counters", counters):
+                with mock.patch.object(
+                    memory, "_mac_memory_counters", counters
+                ):
                     memory._follow_swapouts(wait)
                 clock[0] = seconds
                 return memory._mac_paging(count(seconds))

@@ -1141,8 +1141,8 @@ def _index_limit(exc: BaseException) -> bool:
     """`inferio.impl.utils.looks_like_index_limit(exc)` via `sys.modules`;
     False when unavailable."""
     utils = sys.modules.get("inferio.impl.utils")
-    probe = getattr(utils, "looks_like_index_limit", None) if utils is not None else None
-    if probe is None:
+    probe = getattr(utils, "looks_like_index_limit", None)
+    if utils is None or probe is None:
         return False
     try:
         return bool(probe(exc))
@@ -1402,10 +1402,16 @@ def run_window(
                 )
                 oom_class = classify_oom(exc, absorbed)
                 oom = oom_class is not None
-                impl_cut = _utils_total("total_index_limit_events") > index_limits_before
+                impl_cut = (
+                    _utils_total("total_index_limit_events") > index_limits_before
+                )
                 # A shape ceiling the impl did not cut itself: the rest of the
                 # window runs at half this batch's items.
-                split = not (oom or impl_cut) and len(batch) > 1 and _index_limit(exc)
+                split = (
+                    not (oom or impl_cut)
+                    and len(batch) > 1
+                    and _index_limit(exc)
+                )
                 if split:
                     executed = len(batch) // 2
                 elif not oom:

@@ -2438,8 +2438,8 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
             self.batches.append(len(inputs))
             if len(inputs) > self.limit:
                 raise RuntimeError(
-                    "[MPSNDArray initWithDevice:descriptor:] Error: total bytes "
-                    "of NDArray > 2**32"
+                    "[MPSNDArray initWithDevice:descriptor:] Error: total "
+                    "bytes of NDArray > 2**32"
                 )
             return [item.data for item in inputs]
 

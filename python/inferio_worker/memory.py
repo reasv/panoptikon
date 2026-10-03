@@ -1001,7 +1001,9 @@ def _mac_paging(swapouts: int) -> bool:
     return rose_at is not None and now - rose_at <= MAC_PAGING_SECONDS
 
 
-def _follow_swapouts(wait: Callable[[float], bool] = threading.Event().wait) -> None:
+def _follow_swapouts(
+    wait: Callable[[float], bool] = threading.Event().wait,
+) -> None:
     """Feed `_mac_paging` a reading every `MAC_SWAPOUT_TICK_SECONDS` until
     `wait` returns True (the default waits on an event nobody sets)."""
     while not wait(MAC_SWAPOUT_TICK_SECONDS):
