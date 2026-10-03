@@ -511,16 +511,17 @@ impl VramLedger {
         }
     }
 
-    /// What one unit of this model costs: its fitted price, or pre-fit a
+    /// What one item of `item_units` costs: its fitted price, or pre-fit a
     /// lower bound ([`PRE_FIT_ONE_UNIT_BASE_DIVISOR`]). A window with less
     /// room than this cannot run at all.
-    pub(super) fn one_unit_appetite_mb_locked(
+    pub(super) fn one_item_appetite_mb_locked(
         &self,
         state: &LedgerState,
         entry: &WorkerEntry,
+        item_units: u64,
     ) -> f64 {
         match Self::grant_price_locked(state, entry) {
-            Some(price) => price.cost(1).max(1.0),
+            Some(price) => price.cost(item_units).max(1.0),
             None => (entry.base_mb.unwrap_or(0) / PRE_FIT_ONE_UNIT_BASE_DIVISOR)
                 .max(SEED_BATCH_FLOOR_MB) as f64,
         }

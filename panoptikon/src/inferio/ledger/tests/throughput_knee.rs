@@ -355,6 +355,7 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         room: 512,
         requests: 1,
         unit_budget: 64,
+        item_units: 1,
         size_asked: 64,
         granted_at: Instant::now(),
         squeezed: false,

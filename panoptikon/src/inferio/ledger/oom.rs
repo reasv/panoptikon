@@ -63,14 +63,15 @@ pub(super) struct OomEvidence {
 }
 
 impl VramLedger {
-    /// Count consecutive out-of-memory windows that carried one item into less
-    /// room than one item costs ([`Self::one_unit_appetite_mb_locked`]); at
+    /// Count consecutive out-of-memory windows that carried one item
+    /// ([`GrantCharge::one_item`]) into less room than one item costs
+    /// ([`Self::one_item_appetite_mb_locked`]); at
     /// [`OOM_WINDOWS_AT_FLOOR`] the replica is unrunnable. A clean window
     /// clears the count; an aborted one neither counts nor clears, nor does
     /// one that failed while macOS was paging, which leaves every window that
     /// little room.
     ///
-    /// A worker killed for memory (`died`) running one unit counts whatever
+    /// A worker killed for memory (`died`) running one item counts whatever
     /// room the ledger saw: the batch cannot shrink further. The count passes
     /// to the next replica.
     ///
@@ -87,13 +88,13 @@ impl VramLedger {
         clean: bool,
     ) -> Option<UnrunnableReplica> {
         let entry = state.workers.get(&worker)?;
-        let one_unit = self.one_unit_appetite_mb_locked(state, entry);
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let at_floor = failed
             && charge
-                .filter(|charge| !charge.pressure.paging())
+                .filter(|charge| !charge.pressure.paging() && charge.one_item())
                 .is_some_and(|charge| {
-                    charge.unit_budget <= 1 && (died || (charge.room as f64) < one_unit)
+                    died || (charge.room as f64)
+                        < self.one_item_appetite_mb_locked(state, entry, charge.item_units)
                 });
         let entry = state.workers.get_mut(&worker)?;
         if clean {
@@ -181,7 +182,7 @@ impl VramLedger {
         );
     }
 
-    /// A window of more than one unit that the device's room sized
+    /// A window of more than one item that the device's room sized
     /// ([`GrantCharge::room_bound`]) ran out of memory: its batch needed more
     /// than its price. The (model, device)'s pool margin is raised by
     /// [`OOM_MARGIN_STEP`], at most [`OOM_MARGIN_MAX_STEPS`] times, so the
@@ -193,7 +194,7 @@ impl VramLedger {
         worker: WorkerId,
         charge: GrantCharge,
     ) {
-        if !charge.room_bound || charge.unit_budget <= 1 || charge.pressure.paging() {
+        if !charge.room_bound || charge.one_item() || charge.pressure.paging() {
             return;
         }
         let Some(entry) = state.workers.get(&worker) else {
@@ -226,7 +227,7 @@ impl VramLedger {
     /// (`charge`).
     ///
     /// The (model, device) is capped at half that window's unit budget for
-    /// the life of this process, at least one unit. Without the cap the next
+    /// the life of this process, at least one item's units. Without the cap the next
     /// replica is admitted for the batch that died, and dies again. A window
     /// the queue sized sets no cap: its size says nothing about the batch
     /// the model can run. An item-capped window does, since the cap sized it.
@@ -247,7 +248,7 @@ impl VramLedger {
         let unified_ram_mb = state.gpus.get(&key.1)?.unified_ram_mb;
         let sized_by_queue = charge.queue_bound && !charge.squeezed && charge.item_cap.is_none();
         if !sized_by_queue {
-            let cap = (charge.unit_budget / 2).max(1);
+            let cap = (charge.unit_budget / 2).max(charge.item_units);
             let cal = state.calibration.entry(key.clone()).or_default();
             let cap = cal.death_cap_units.map_or(cap, |held| held.min(cap));
             cal.death_cap_units = Some(cap);

@@ -938,7 +938,8 @@ impl Admission {
         cal.trial = None;
     }
 
-    /// [`Self::request_grant_byte_bound`] with `byte_bound = false`.
+    /// [`Self::request_grant_byte_bound`] for items of one unit each, with
+    /// `byte_bound = false`.
     #[cfg(test)]
     pub fn request_grant(
         &self,
@@ -949,6 +950,7 @@ impl Admission {
     ) -> Option<GrantToken> {
         self.request_grant_byte_bound(
             window_units,
+            1,
             user_cap_items,
             window_requests,
             queued_behind,
@@ -958,10 +960,12 @@ impl Admission {
 
     /// Reserve headroom for one window. Demand is `window_requests +
     /// queued_behind`; the window's own requests retire when it settles.
+    /// `item_units`: the units of one of the window's items, on average.
     /// `byte_bound`: the byte limit, not the queue, closed the window.
     pub fn request_grant_byte_bound(
         &self,
         window_units: u64,
+        item_units: u64,
         user_cap_items: Option<u32>,
         window_requests: usize,
         queued_behind: usize,
@@ -970,6 +974,7 @@ impl Admission {
         self.ledger.request_grant(
             self.worker,
             window_units,
+            item_units,
             user_cap_items,
             window_requests,
             queued_behind,

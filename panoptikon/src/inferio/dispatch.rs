@@ -586,6 +586,7 @@ pub(crate) async fn run_dispatcher(
                 Some(admission) => {
                     let grant = admission.request_grant_byte_bound(
                         window_units,
+                        window_units / window_items.max(1) as u64,
                         cap,
                         window.len(),
                         queue.len(),

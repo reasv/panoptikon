@@ -584,6 +584,8 @@ struct GrantCharge {
     /// The admitted per-batch unit budget; the batch size may move before
     /// settle.
     unit_budget: u64,
+    /// The units of one of the window's items, on average; at least 1.
+    item_units: u64,
     /// The batch size the gain rule asked for this window
     /// ([`VramLedger::size_locked`]), before anything cut it.
     size_asked: u64,
@@ -622,6 +624,13 @@ struct GrantCharge {
     /// two sizes ([`VramLedger::item_cap_locked`]). It only limits the
     /// batch: to the GPU side the window is a window of that size.
     item_cap: Option<u32>,
+}
+
+impl GrantCharge {
+    /// The window's batches held one item: its budget is under two items.
+    fn one_item(&self) -> bool {
+        self.unit_budget < self.item_units.saturating_mul(2)
+    }
 }
 
 /// One requester's slice of a GPU's headroom, and the contention floor it was
