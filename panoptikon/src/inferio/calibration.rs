@@ -534,7 +534,7 @@ impl CalibrationStore {
                         error = %err,
                         path = %file.display(),
                         "failed to read a calibration file; it contributes \
-                         nothing until it changes"
+                         nothing until it is edited or the server restarts"
                     );
                     Vec::new()
                 });
@@ -2398,6 +2398,7 @@ sample_delta_mb = [80, 160]
         // reachable without a test-only hook.
         fs::create_dir_all(&path).unwrap();
         let store = store(root.path());
+        let (_guard, reasons) = crate::test_utils::warned_reasons();
         assert!(store.local_entries().is_empty());
         assert!(
             !store.local_is_loaded(),
@@ -2412,6 +2413,7 @@ sample_delta_mb = [80, 160]
             "nothing was written over the unread store"
         );
         assert!(!store.local_is_loaded(), "and the failure was not cached");
+        assert_eq!(reasons.lock().unwrap().len(), 1, "one cause, one WARN");
 
         // The file becomes readable again, carrying another model this
         // process never saw. The retry merges rather than truncating.
@@ -2432,6 +2434,15 @@ sample_delta_mb = [80, 160]
         let stored = |id: &str| by_key[&(id.into(), ARCH.into(), "fp16".into())].slope_mb_per_unit;
         approx(stored("clip/vit"), 0.79); // the pending update was never dropped
         approx(stored("clip/other"), 0.5); // and the unseen entry was not truncated
+
+        // A successful read re-arms the WARN. The directory's mtime is stamped
+        // past the write's, which can share its timestamp tick.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let later = SystemTime::now() + Duration::from_secs(5);
+        fs::File::open(&path).unwrap().set_modified(later).unwrap();
+        let _ = lookup(&store, "clip/vit");
+        assert_eq!(reasons.lock().unwrap().len(), 2);
     }
 
     /// A store folder another user owns is warned about once, naming it and
