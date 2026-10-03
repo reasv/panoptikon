@@ -94,6 +94,8 @@ struct Queued {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct WindowItem {
     pub units: u64,
+    /// Units of the request's smallest input ([`smallest_input_units`]).
+    pub min_input_units: u64,
     pub bytes: usize,
     pub items: usize,
     /// Normalised by [`effective_cap`].
@@ -228,6 +230,19 @@ fn request_units(inputs: &[WorkerInput], cost: &CostDimension) -> u64 {
         Some(CostAggregation::Sum) | Some(CostAggregation::MaxTimesCount) => {
             per_item.fold(0u64, u64::saturating_add)
         }
+    }
+}
+
+/// The request's smallest input in [`request_units`]' terms: 1 when units
+/// count inputs.
+fn smallest_input_units(inputs: &[WorkerInput], cost: &CostDimension) -> u64 {
+    match cost.aggregation {
+        Some(CostAggregation::Count) | None => 1,
+        Some(CostAggregation::Sum) | Some(CostAggregation::MaxTimesCount) => inputs
+            .iter()
+            .map(|input| estimate_input_units(input, cost))
+            .min()
+            .unwrap_or(1),
     }
 }
 
@@ -583,7 +598,7 @@ pub(crate) async fn run_dispatcher(
             let byte_closed = closed_on_bytes(&shapes, take, window_bytes, bounds);
             let smallest_item_units = window
                 .iter()
-                .map(|queued| queued.shape.units / queued.shape.items.max(1) as u64)
+                .map(|queued| queued.shape.min_input_units)
                 .min()
                 .unwrap_or(1)
                 .max(1);
@@ -902,6 +917,7 @@ async fn run_trim(
 fn enqueue(request: DispatchRequest, cost: &CostDimension) -> Queued {
     let shape = WindowItem {
         units: request_units(&request.inputs, cost),
+        min_input_units: smallest_input_units(&request.inputs, cost),
         bytes: request_bytes(&request.inputs),
         items: request.inputs.len(),
         cap: effective_cap(request.max_batch),
@@ -1192,6 +1208,7 @@ mod tests {
     fn shape(units: u64, items: usize, cap: Option<u32>) -> WindowItem {
         WindowItem {
             units,
+            min_input_units: 1,
             bytes: 0,
             items,
             cap,
@@ -1355,6 +1372,7 @@ mod tests {
         let exact = [plain(2), plain(3), plain(3)];
         let fat = |bytes| WindowItem {
             units: 1,
+            min_input_units: 1,
             bytes,
             items: 1,
             cap: None,
@@ -2242,10 +2260,10 @@ mod tests {
         uncapped.shutdown().await;
     }
 
-    /// A priced window's grant carries the units of its smallest item and its
-    /// item count: here requests of one 100-token input and two 25-token ones.
+    /// A priced window's grant carries the units of its smallest item: here
+    /// a request of 100, 25 and 25 tokens and one of 50.
     #[tokio::test]
-    async fn a_grant_carries_the_windows_smallest_item_and_item_count() {
+    async fn a_grant_carries_the_windows_smallest_item() {
         let tokens = CostDimension {
             unit: CostUnit::Token,
             aggregation: Some(CostAggregation::Sum),
@@ -2255,7 +2273,7 @@ mod tests {
         let harness = one_replica(32_768, "slow_test", tokens).await;
         let text = |tokens: u64| json_input(json!("x".repeat((tokens * BYTES_PER_TOKEN) as usize)));
         // Queued before the dispatcher task first runs.
-        let answers: Vec<_> = [vec![text(100)], vec![text(25), text(25)]]
+        let answers: Vec<_> = [vec![text(100), text(25), text(25)], vec![text(50)]]
             .into_iter()
             .map(|inputs| {
                 let (reply, answer) = oneshot::channel();
@@ -2279,7 +2297,7 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "no window granted");
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        assert_eq!(grants, [(25, 3)]);
+        assert_eq!(grants, [(25, 4)]);
         for answer in answers {
             answer.await.expect("replied").expect("succeeded");
         }
