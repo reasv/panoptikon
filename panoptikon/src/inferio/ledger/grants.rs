@@ -430,6 +430,13 @@ impl VramLedger {
     }
 
     fn settle_locked(&self, worker: WorkerId, grant_id: u64, outcome: WindowOutcome) -> Settled {
+        // A crash says nothing about memory: it is accounted as an abort.
+        let crashed = outcome == WindowOutcome::WorkerDied(DeathKind::Crash);
+        let outcome = if crashed {
+            WindowOutcome::Aborted
+        } else {
+            outcome
+        };
         let pressure = self.memory_pressure();
         let mut state = self.lock();
         // Time repayment first, whatever the outcome.
@@ -459,7 +466,7 @@ impl VramLedger {
         // A failed window may not mark the anchor "measured here".
         let window_failed = matches!(
             outcome,
-            WindowOutcome::WorkerDied | WindowOutcome::Responded { oom: Some(_) }
+            WindowOutcome::WorkerDied(_) | WindowOutcome::Responded { oom: Some(_) }
         );
         let ingested = Self::ingest_locked(&mut state, worker, granted_units, window_failed);
         // Allocator retries: the card is full now, so ask neighbours now.
@@ -491,7 +498,7 @@ impl VramLedger {
                 Self::note_pressure_size_locked(&mut state, worker, charge, filled);
             }
         }
-        let died = matches!(outcome, WindowOutcome::WorkerDied);
+        let died = matches!(outcome, WindowOutcome::WorkerDied(_));
         let death = died
             .then(|| Self::note_death_locked(&mut state, worker, charge))
             .flatten();
@@ -499,9 +506,10 @@ impl VramLedger {
             let failed = responded_negative || died;
             self.note_gain_locked(&mut state, worker, charge, ingested.at_budget, failed);
         }
-        // Any OOM or death lowers a seeded anchor, unless the unified-memory
-        // death path already halved it.
-        if death.is_none() && (frame_oom.is_some() || ingested.oom || died) {
+        // Any OOM lowers a seeded anchor, unless the unified-memory death path
+        // already halved it. A memory kill on a GPU with its own memory was
+        // for host RAM and leaves it.
+        if death.is_none() && (frame_oom.is_some() || ingested.oom) {
             Self::lower_seeded_anchor_locked(&mut state, worker);
         }
         // An out-of-memory window the room sized was priced too low.
@@ -534,8 +542,9 @@ impl VramLedger {
             outcome: match outcome {
                 WindowOutcome::Responded { .. } if responded_negative => "negative",
                 WindowOutcome::Responded { .. } => "clean",
+                WindowOutcome::Aborted if crashed => "worker_crashed",
                 WindowOutcome::Aborted => "aborted",
-                WindowOutcome::WorkerDied => "worker_died",
+                WindowOutcome::WorkerDied(_) => "worker_died",
             },
             negative_reason: if responded_negative {
                 if frame_oom.is_some() || ingested.oom {

@@ -690,7 +690,7 @@ fn a_deaths_halved_anchor_never_reaches_the_store() {
     admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted")
-        .finish(WindowOutcome::WorkerDied);
+        .finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
     assert_eq!(
         ledger.health()[0].workers[0].max_units_measured,
         8,
@@ -740,7 +740,7 @@ fn repeated_deaths_never_take_the_anchor_below_one() {
         admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted")
-            .finish(WindowOutcome::WorkerDied);
+            .finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
         assert_eq!(
             ledger.health()[0].workers[0].max_units_measured,
             1,
@@ -757,7 +757,7 @@ fn repeated_deaths_never_take_the_anchor_below_one() {
     admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted")
-        .finish(WindowOutcome::WorkerDied);
+        .finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
     assert_eq!(
         fresh.health()[0].workers[0].max_units_measured,
         0,
@@ -1045,11 +1045,11 @@ fn a_cpu_devices_total_is_never_adopted_from_a_worker() {
     );
 }
 
-/// A replica that dies with a granted window in flight is a memory negative
-/// on every **unified-memory** device, where an out-of-memory kill is an
-/// uncatchable SIGKILL: it deflates the replica and halves the anchor, and
-/// never reaches the fit. On private VRAM a death has too many other causes,
-/// and an abort is not a death anywhere.
+/// A replica killed for memory with a granted window in flight is a memory
+/// negative on every **unified-memory** device: it deflates the replica and
+/// halves the anchor, and never reaches the fit. On private VRAM the kill was
+/// for host RAM; a crash or an abort is no negative anywhere. Every memory
+/// kill caps the batch.
 #[test]
 fn a_death_mid_window_deflates_only_a_unified_device() {
     /// `(label, ledger, handle, gpu key, free sample, outcome, deflation, anchor)`.
@@ -1070,7 +1070,7 @@ fn a_death_mid_window_deflates_only_a_unified_device() {
             loaded_mps(Some(MAC_RAM_MB / 4 * 3)),
             MPS_GPU,
             (60_000, None, "nvml"),
-            WindowOutcome::WorkerDied,
+            WindowOutcome::WorkerDied(DeathKind::MemoryKill),
             1,
             8,
         ),
@@ -1081,7 +1081,7 @@ fn a_death_mid_window_deflates_only_a_unified_device() {
             loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB)),
             AMD_A,
             (60_000, None, "nvml"),
-            WindowOutcome::WorkerDied,
+            WindowOutcome::WorkerDied(DeathKind::MemoryKill),
             1,
             8,
         ),
@@ -1091,17 +1091,27 @@ fn a_death_mid_window_deflates_only_a_unified_device() {
             loaded_cpu(Some(CPU_RAM_MB)),
             "CPU",
             (40_000, Some(CPU_RAM_MB), "ram"),
-            WindowOutcome::WorkerDied,
+            WindowOutcome::WorkerDied(DeathKind::MemoryKill),
             1,
             8,
         ),
         (
-            "a GPU with private VRAM: too many non-memory causes",
+            "a crash on a unified device: not a memory kill",
+            mps_ledger(),
+            loaded_mps(Some(MAC_RAM_MB / 4 * 3)),
+            MPS_GPU,
+            (60_000, None, "nvml"),
+            WindowOutcome::WorkerDied(DeathKind::Crash),
+            0,
+            16,
+        ),
+        (
+            "a GPU with private VRAM: a kill for host RAM",
             ledger(100_000, no_margin()),
             loaded(Some(1000), Some(0)),
             GPU,
             (60_000, None, "nvml"),
-            WindowOutcome::WorkerDied,
+            WindowOutcome::WorkerDied(DeathKind::MemoryKill),
             0,
             16,
         ),
@@ -1140,8 +1150,8 @@ fn a_death_mid_window_deflates_only_a_unified_device() {
         assert_eq!(worker.max_units_measured, anchor, "{label}");
         assert_eq!(
             worker.death_cap_units.is_some(),
-            deflation == 1,
-            "{label}: capped exactly where the death is a negative"
+            outcome == WindowOutcome::WorkerDied(DeathKind::MemoryKill),
+            "{label}"
         );
         assert_eq!(
             ledger
@@ -1985,7 +1995,7 @@ fn a_death_cap_and_a_paging_cap_hold_the_smaller_batch() {
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
     assert_eq!(token.grant().unit_budget, 8);
-    token.finish(WindowOutcome::WorkerDied);
+    token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
     assert_eq!(
         pressure_cap(&ledger),
         Some(paged),

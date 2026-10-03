@@ -23,8 +23,8 @@
 //! On the CPU device `reserved` is the live resident set and no growth is
 //! reusable: `charge(w) = footprint(w) + Σ grants(w)` and `room(w) = headroom`.
 //! Its reserve is never below [`cpu::ram_reserve_mb`]. A replica whose process
-//! dies mid-window there, or with host RAM booked, caps later batches of its
-//! (model, device) at half that batch ([`VramLedger::note_death_locked`]).
+//! is killed for memory mid-window caps later batches of its (model, device)
+//! at half that batch ([`VramLedger::note_death_locked`]).
 //!
 //! A worker with no reported base contributes only growth; the rest of its
 //! memory reads as `external`. The batch size moves only on measured rates
@@ -553,12 +553,21 @@ pub enum WindowOutcome {
     Responded { oom: Option<ErrorFrameOom> },
     /// Aborted before a response: nothing is learned.
     Aborted,
-    /// The worker process stopped answering with the window in flight: killed
-    /// (by the kernel or anyone but the gateway) or crashed. Accounted as
-    /// aborted, except that on a unified-memory device it is also a negative
-    /// sample (an OOM kill is a SIGKILL), and there or with host RAM booked
-    /// it caps later batches ([`VramLedger::note_death_locked`]).
-    WorkerDied,
+    /// The worker process stopped answering with the window in flight. A
+    /// memory kill caps later batches and is a failed window; on a
+    /// unified-memory device it is also a negative sample
+    /// ([`VramLedger::note_death_locked`]). A crash is accounted as aborted.
+    WorkerDied(DeathKind),
+}
+
+/// How a worker died, read from its exit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeathKind {
+    /// A SIGKILL the gateway did not send (the kernel's or a cgroup's OOM
+    /// killer, macOS jetsam), or a Windows out-of-memory exit status.
+    MemoryKill,
+    /// Any other exit: a signal such as SIGSEGV or SIGABRT, or an exit code.
+    Crash,
 }
 
 /// Opaque worker identity inside the ledger.
@@ -726,8 +735,8 @@ struct WorkerEntry {
     grants: HashMap<u64, GrantCharge>,
     /// Demand: requests in hand at the last grant request or settle.
     pending_requests: usize,
-    /// Consecutive one-item windows that ran out of memory or died; see
-    /// [`OOM_WINDOWS_AT_FLOOR`].
+    /// Consecutive one-item windows that ran out of memory or were killed
+    /// for memory; see [`OOM_WINDOWS_AT_FLOOR`].
     oom_at_floor: u32,
     /// Halvings applied by deflation. Runtime-only, reset on respawn.
     deflation: u32,
@@ -1200,11 +1209,11 @@ struct ModelCalibration {
     persisted: Option<Persisted>,
     /// See [`ShapeCeiling`]. Runtime-only.
     shape_ceiling: Option<ShapeCeiling>,
-    /// Half the batch a replica was running when its process died
-    /// mid-window; no later batch of this (model, device) is larger. Kept
-    /// for the life of this process ([`VramLedger::note_death_locked`]).
+    /// Half the batch a replica was running when its process was killed for
+    /// memory mid-window; no later batch of this (model, device) is larger.
+    /// Kept for the life of this process ([`VramLedger::note_death_locked`]).
     death_cap_units: Option<u64>,
-    /// [`WorkerEntry::oom_at_floor`] of a replica that died at one unit; the
+    /// [`WorkerEntry::oom_at_floor`] of a replica killed at one item; the
     /// next replica starts from it, a clean window clears it.
     floor_strikes: u32,
     /// See [`PressureCap`]. Runtime-only; a reloaded replica inherits it.

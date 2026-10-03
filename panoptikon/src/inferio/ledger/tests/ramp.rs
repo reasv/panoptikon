@@ -1428,9 +1428,9 @@ fn queue_sized_windows_wait() {
     assert_eq!(ledger.trial_for_test("g/a", GPU), (None, RETEST_WINDOWS, 1));
 }
 
-/// A trial ends at a window that runs out of memory or whose worker dies,
-/// and keeps what it measured below that size; an aborted window changes
-/// nothing. Deflation then halves the batch as after any failure, and
+/// A trial ends at a window that runs out of memory or whose worker is
+/// killed for memory, and keeps what it measured below that size; an aborted
+/// window or a crash changes nothing. Deflation then halves the batch as after any failure, and
 /// deflated windows do not count towards the next trial.
 #[test]
 fn a_trial_ends_at_a_window_that_fails() {
@@ -1438,7 +1438,7 @@ fn a_trial_ends_at_a_window_that_fails() {
         WindowOutcome::Responded {
             oom: Some(ErrorFrameOom::Marker),
         },
-        WindowOutcome::WorkerDied,
+        WindowOutcome::WorkerDied(DeathKind::MemoryKill),
     ];
     for failure in failures {
         let (ledger, handle, admission) = ramping_from_seed(64);
@@ -1446,19 +1446,24 @@ fn a_trial_ends_at_a_window_that_fails() {
         for _ in 0..3 {
             window_leaving_warm(&handle, &admission, |_| 2, rising);
         }
-        let aborted = admission
-            .request_grant(u64::MAX, None, 1, 0)
-            .expect("granted");
-        assert_eq!(aborted.grant().unit_budget, 256);
-        handle.lock().unwrap().record_measurements(vec![
-            BatchMeasurement {
-                duration_ms: Some(256.0 * 1000.0 / 16.0),
-                ..measurement(256, 2660, 2660)
-            };
-            2
-        ]);
-        aborted.finish(WindowOutcome::Aborted);
-        assert_eq!(ledger.trial_for_test("g/a", GPU), (Some(256), 0, 0));
+        for nothing in [
+            WindowOutcome::Aborted,
+            WindowOutcome::WorkerDied(DeathKind::Crash),
+        ] {
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            assert_eq!(token.grant().unit_budget, 256);
+            handle.lock().unwrap().record_measurements(vec![
+                BatchMeasurement {
+                    duration_ms: Some(256.0 * 1000.0 / 16.0),
+                    ..measurement(256, 2660, 2660)
+                };
+                2
+            ]);
+            token.finish(nothing);
+            assert_eq!(ledger.trial_for_test("g/a", GPU), (Some(256), 0, 0));
+        }
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");

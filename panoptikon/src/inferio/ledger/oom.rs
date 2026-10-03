@@ -24,8 +24,8 @@ impl ErrorFrameOom {
     }
 }
 
-/// A replica died mid-window on a unified-memory device and its anchor was
-/// halved. Logged after the lock drops.
+/// A replica was killed for memory mid-window on a unified-memory device and
+/// its anchor was halved. Logged after the lock drops.
 pub(super) struct DeathNegative {
     inference_id: String,
     gpu: String,
@@ -43,11 +43,10 @@ impl DeathNegative {
             anchor_units_before = self.anchor_before,
             anchor_units_after = self.anchor_after,
             negative_sample = "unified-memory-device worker death",
-            "this replica died while running a granted window on a GPU whose \
-             memory is the machine's own; recording it as a memory negative \
-             (an out-of-memory kill there is a signal from the OS, which no \
-             in-process handler can catch) and halving the batch size the next \
-             replica of this model is admitted for"
+            "this replica was killed for memory while running a granted window \
+             on a GPU whose memory is the machine's own; recording it as a \
+             memory negative and halving the batch size the next replica of \
+             this model is admitted for"
         );
     }
 }
@@ -71,9 +70,9 @@ impl VramLedger {
     /// one that failed while macOS was paging, which leaves every window that
     /// little room.
     ///
-    /// A worker that `died` running one unit counts whatever room the ledger
-    /// saw, where a death may be a host RAM kill ([`death_may_be_ram`]): the
-    /// batch cannot shrink further. The count passes to the next replica.
+    /// A worker killed for memory (`died`) running one unit counts whatever
+    /// room the ledger saw: the batch cannot shrink further. The count passes
+    /// to the next replica.
     ///
     /// Condemning remembers the model's working set on this GPU: the next load
     /// is refused while the refusal room ([`Self::refusal_room_locked`],
@@ -94,9 +93,7 @@ impl VramLedger {
             && charge
                 .filter(|charge| !charge.pressure.paging())
                 .is_some_and(|charge| {
-                    charge.unit_budget <= 1
-                        && ((charge.room as f64) < one_unit
-                            || (died && death_may_be_ram(state, &key.1, &charge)))
+                    charge.unit_budget <= 1 && (died || (charge.room as f64) < one_unit)
                 });
         let entry = state.workers.get_mut(&worker)?;
         if clean {
@@ -225,16 +222,18 @@ impl VramLedger {
         );
     }
 
-    /// A replica whose process died holding a granted window (`charge`).
+    /// A replica whose process was killed for memory holding a granted window
+    /// (`charge`).
     ///
-    /// Where the death may be a host RAM kill ([`death_may_be_ram`]), the
-    /// (model, device) is capped at half that window's unit budget for the
-    /// life of this process, at least one unit. Without the cap the next
+    /// The (model, device) is capped at half that window's unit budget for
+    /// the life of this process, at least one unit. Without the cap the next
     /// replica is admitted for the batch that died, and dies again. A window
     /// the queue sized sets no cap: its size says nothing about the batch
     /// the model can run. An item-capped window does, since the cap sized it.
+    /// On a GPU with its own memory the kill was for host RAM: nothing else
+    /// about the GPU changes.
     ///
-    /// On a unified-memory device the death is also a negative: the replica
+    /// On a unified-memory device the kill is also a negative: the replica
     /// is deflated and its (model, GPU) anchor halved, for this run only.
     /// `None` on a discrete GPU, without a grant, or for a forgotten replica.
     pub(super) fn note_death_locked(
@@ -247,7 +246,7 @@ impl VramLedger {
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let unified_ram_mb = state.gpus.get(&key.1)?.unified_ram_mb;
         let sized_by_queue = charge.queue_bound && !charge.squeezed && charge.item_cap.is_none();
-        if death_may_be_ram(state, &key.1, &charge) && !sized_by_queue {
+        if !sized_by_queue {
             let cap = (charge.unit_budget / 2).max(1);
             let cal = state.calibration.entry(key.clone()).or_default();
             let cap = cal.death_cap_units.map_or(cap, |held| held.min(cap));
@@ -257,9 +256,9 @@ impl VramLedger {
                 gpu = %key.1,
                 died_at_units = charge.unit_budget,
                 batch_cap_units = cap,
-                "a worker died while running a granted window; this model's \
-                 batches on this device are capped at half that batch until \
-                 the server restarts"
+                "a worker was killed for memory while running a granted window; \
+                 this model's batches on this device are capped at half that \
+                 batch until the server restarts"
             );
         }
         let ram_mb = unified_ram_mb?;
@@ -287,19 +286,9 @@ impl VramLedger {
     }
 }
 
-/// Whether a death holding `charge` on `gpu` may be the kernel killing the
-/// worker for host RAM: on a unified-memory device, or with host RAM booked.
-fn death_may_be_ram(state: &LedgerState, gpu: &str, charge: &GrantCharge) -> bool {
-    charge.ram_mb > 0
-        || state
-            .gpus
-            .get(gpu)
-            .is_some_and(|gpu| gpu.unified_ram_mb.is_some())
-}
-
-/// A replica that ran out of memory, or died, [`OOM_WINDOWS_AT_FLOOR`] windows
-/// running at one item. [`GrantToken::finish`] hands it to the dispatcher, which fails
-/// the model.
+/// A replica that ran out of memory, or was killed for it,
+/// [`OOM_WINDOWS_AT_FLOOR`] windows running at one item. [`GrantToken::finish`]
+/// hands it to the dispatcher, which fails the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnrunnableReplica {
     pub inference_id: String,
@@ -312,7 +301,7 @@ pub struct UnrunnableReplica {
     /// The GPU's limit with the reserve deducted, which a window is priced
     /// against; the refusal room and `needs_mb` leave the reserve out.
     pub room_mb: u64,
-    /// The last strike was a worker death, not an out-of-memory error:
+    /// The last strike was a memory kill, not an out-of-memory error:
     /// `needs_mb` is 0 and the refusal lapses ([`DEATH_VERDICT_LAPSE`]).
     pub died: bool,
 }

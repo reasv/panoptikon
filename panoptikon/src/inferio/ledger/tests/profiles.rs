@@ -298,12 +298,14 @@ fn a_clean_batch_in_a_failed_window_never_confirms_the_anchor() {
     );
 }
 
-/// The backstop's three triggers, and the cancelled window, which reports no
-/// failure at all.
+/// The backstop's triggers, and what leaves the anchor: a cancelled window,
+/// and on a GPU with its own memory any worker death (a memory kill there
+/// is for host RAM).
 #[test]
 fn every_out_of_memory_lowers_a_seeded_anchor_and_a_cancelled_window_does_not() {
     for (outcome, expected) in [
-        (WindowOutcome::WorkerDied, 256),
+        (WindowOutcome::WorkerDied(DeathKind::MemoryKill), 512),
+        (WindowOutcome::WorkerDied(DeathKind::Crash), 512),
         (WindowOutcome::Aborted, 512),
         (
             WindowOutcome::Responded {

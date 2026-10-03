@@ -656,9 +656,9 @@ fn two_replicas_book_no_more_than_is_truly_free() {
     assert_eq!(a_grant.grant().unit_budget, 512);
 }
 
-/// A GPU replica that dies while its window holds a host RAM booking is
-/// capped at half that batch, since host RAM may be what killed it. Its
-/// anchor and ramp are left alone: on private memory a death is no negative.
+/// A GPU replica killed for memory while its window holds a host RAM booking
+/// is capped at half that batch. Its anchor and ramp are left alone: on
+/// private memory the kill was for host RAM, no GPU negative.
 #[test]
 fn a_gpu_replica_that_dies_with_host_ram_booked_is_capped() {
     let ledger = host(&[GPU], None);
@@ -674,7 +674,7 @@ fn a_gpu_replica_that_dies_with_host_ram_booked_is_capped() {
     assert_eq!(token.grant().unit_budget, 256);
     assert_eq!(before.ram_booked_mb, 0);
     assert_eq!(row(&ledger, "g/died").ram_booked_mb, 2_560);
-    token.finish(WindowOutcome::WorkerDied);
+    token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
 
     let after = row(&ledger, "g/died");
     assert_eq!(after.death_cap_units, Some(128));
@@ -708,7 +708,7 @@ fn a_death_in_a_booked_item_capped_window_caps() {
     let token = admission.request_grant(4, None, 1, 0).expect("granted");
     assert_eq!(token.grant().user_cap_items, Some(4));
     assert!(row(&ledger, "g/capped").ram_booked_mb > 0);
-    token.finish(WindowOutcome::WorkerDied);
+    token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
     assert_eq!(row(&ledger, "g/capped").death_cap_units, Some(2));
 }
 

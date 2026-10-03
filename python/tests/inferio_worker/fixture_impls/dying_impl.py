@@ -3,7 +3,8 @@
 os._exit bypasses all Python cleanup, so the parent sees the process die
 with a pending request — the manager must treat it as a fatal worker death:
 fail the request, drop the model from every LRU/cache-key, and let the next
-predict auto-load a fresh worker.
+predict auto-load a fresh worker. With a `signal` config the process sends
+itself that signal instead.
 """
 
 import os
@@ -21,6 +22,8 @@ class DyingModel:
         pass
 
     def predict(self, inputs):
+        if "signal" in self.config:
+            os.kill(os.getpid(), self.config["signal"])
         os._exit(3)
 
     def unload(self) -> None:

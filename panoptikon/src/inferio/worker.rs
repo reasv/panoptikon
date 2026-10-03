@@ -48,7 +48,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
-use super::ledger::{FitSnapshot, Grant};
+use super::ledger::{DeathKind, FitSnapshot, Grant};
 use super::registry::SpawnSpec;
 use super::slot_error::{ERROR_SLOT_KEY, SlotError, Unattempted, slot_error_from_parts};
 use crate::process_tree::{
@@ -525,7 +525,34 @@ impl fmt::Display for DeathAttribution {
     }
 }
 
+/// SIGKILL on Linux and macOS: what an out-of-memory killer sends.
+const SIGKILL: i32 = 9;
+
+/// Windows exit statuses of a process that ran out of memory:
+/// `STATUS_NO_MEMORY` and `STATUS_COMMITMENT_LIMIT`.
+const WINDOWS_OUT_OF_MEMORY_STATUSES: [u32; 2] = [0xC000_0017, 0xC000_012D];
+
+/// A memory kill when the process died of a SIGKILL or a Windows
+/// out-of-memory status that the gateway did not cause; otherwise a crash.
+fn death_kind(attribution: DeathAttribution, signal: Option<i32>, code: Option<i32>) -> DeathKind {
+    let out_of_memory = signal == Some(SIGKILL)
+        || code.is_some_and(|code| WINDOWS_OUT_OF_MEMORY_STATUSES.contains(&(code as u32)));
+    if out_of_memory && !attribution.killed_by_gateway() {
+        DeathKind::MemoryKill
+    } else {
+        DeathKind::Crash
+    }
+}
+
 impl WorkerDeath {
+    pub fn kind(&self) -> DeathKind {
+        death_kind(
+            self.attribution,
+            self.signal,
+            self.status.and_then(|status| status.code()),
+        )
+    }
+
     fn status_text(&self) -> String {
         match self.status {
             Some(status) => status.to_string(),
@@ -1483,6 +1510,7 @@ impl Worker {
             core_dumped = death.core_dumped,
             attribution = death.attribution.as_str(),
             killed_by_gateway = death.attribution.killed_by_gateway(),
+            kind = ?death.kind(),
             "an inferio worker process is gone. Cause: {}. stderr tail:\n{}",
             death.why,
             death.stderr_tail,
@@ -1523,10 +1551,13 @@ impl Worker {
         self.death.as_ref()
     }
 
-    /// Whether this worker died (not a desync kill), claimed at most once so
-    /// one death gives the ledger at most one negative sample.
-    pub(crate) fn take_death(&mut self) -> bool {
-        std::mem::take(&mut self.unreachable)
+    /// How this worker died with a request in flight (not a desync kill),
+    /// claimed at most once so one death settles at most one window.
+    pub(crate) fn take_death(&mut self) -> Option<DeathKind> {
+        if !std::mem::take(&mut self.unreachable) {
+            return None;
+        }
+        self.death.as_ref().map(WorkerDeath::kind)
     }
 
     fn stderr_tail_snapshot(&self) -> String {
@@ -2576,7 +2607,10 @@ mod tests {
         // Poisoned: further requests fail fast rather than hanging.
         let err = worker.ping().await.expect_err("dead worker stays dead");
         assert!(format!("{err:#}").contains("dead"));
-        assert!(!worker.take_death(), "it did not die running the request");
+        assert!(
+            worker.take_death().is_none(),
+            "it did not die running the request"
+        );
 
         let death = worker
             .last_death()
@@ -2653,7 +2687,33 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             assert!(death.why.contains("had exited before"), "{}", death.why);
-            assert!(!worker.take_death());
+            assert!(worker.take_death().is_none());
+        }
+    }
+
+    /// A SIGKILL or a Windows out-of-memory status is a memory kill unless
+    /// the gateway caused it; any other exit is a crash.
+    #[test]
+    fn the_exit_status_tells_a_memory_kill_from_a_crash() {
+        use DeathAttribution::{Dying, ReapedBeforeSignal, StillRunning};
+        use DeathKind::{Crash, MemoryKill};
+        let windows = |status: u32| Some(status as i32);
+        for (attribution, signal, code, kind) in [
+            (ReapedBeforeSignal, Some(9), None, MemoryKill),
+            (Dying, Some(9), None, MemoryKill),
+            (StillRunning, Some(9), None, Crash),
+            (ReapedBeforeSignal, Some(11), None, Crash),
+            (ReapedBeforeSignal, None, Some(3), Crash),
+            (ReapedBeforeSignal, None, windows(0xC000_0017), MemoryKill),
+            (Dying, None, windows(0xC000_012D), MemoryKill),
+            (ReapedBeforeSignal, None, windows(0xC000_0005), Crash),
+            (StillRunning, None, windows(0xC000_0017), Crash),
+        ] {
+            assert_eq!(
+                death_kind(attribution, signal, code),
+                kind,
+                "{attribution} {signal:?} {code:?}"
+            );
         }
     }
 
