@@ -2435,18 +2435,22 @@ sample_delta_mb = [80, 160]
         approx(stored("clip/vit"), 0.79); // the pending update was never dropped
         approx(stored("clip/other"), 0.5); // and the unseen entry was not truncated
 
-        // A successful read re-arms the WARN. The directory's mtime is stamped
-        // past the write's, which can share its timestamp tick.
-        fs::remove_file(&path).unwrap();
-        fs::create_dir(&path).unwrap();
-        let later = SystemTime::now() + Duration::from_secs(5);
-        fs::File::open(&path).unwrap().set_modified(later).unwrap();
-        let _ = lookup(&store, "clip/vit");
-        assert_eq!(reasons.lock().unwrap().len(), 2);
+        // After the flush, a new failure is warned about again. The directory's
+        // mtime is stamped past the write's, which can share its timestamp tick.
+        #[cfg(unix)]
+        {
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            let later = SystemTime::now() + Duration::from_secs(5);
+            fs::File::open(&path).unwrap().set_modified(later).unwrap();
+            let _ = lookup(&store, "clip/vit");
+            assert_eq!(reasons.lock().unwrap().len(), 2);
+        }
     }
 
     /// A store folder another user owns is warned about once, naming it and
-    /// its owner, however many writes fail; the update stays in memory.
+    /// its owner, however many writes fail, and again after a write succeeds;
+    /// the update stays in memory.
     #[cfg(unix)]
     #[test]
     fn a_store_folder_another_user_owns_is_warned_about_once() {
@@ -2462,9 +2466,16 @@ sample_delta_mb = [80, 160]
         for slope in [0.5, 0.6, 0.7] {
             store.record(update("clip/vit", "fp16", slope));
         }
-        let expected = owned_by_another_user(&data, owner, folder);
-        assert_eq!(*reasons.lock().unwrap(), [Some(expected)]);
         approx(lookup(&store, "clip/vit").unwrap().slope_mb_per_unit, 0.7);
+        let writable = tempfile::tempdir().unwrap();
+        fs::remove_file(&data).unwrap();
+        std::os::unix::fs::symlink(writable.path(), &data).unwrap();
+        store.record(update("clip/vit", "fp16", 0.8));
+        fs::remove_file(&data).unwrap();
+        std::os::unix::fs::symlink(folder, &data).unwrap();
+        store.record(update("clip/vit", "fp16", 0.9));
+        let expected = Some(owned_by_another_user(&data, owner, folder));
+        assert_eq!(*reasons.lock().unwrap(), [expected.clone(), expected]);
     }
 
     /// A local entry with no fit of its own — what the ledger writes while it
