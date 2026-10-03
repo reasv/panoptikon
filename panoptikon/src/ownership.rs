@@ -88,7 +88,8 @@ fn database_paths(data_folder: &Path, index_db: &str) -> Vec<PathBuf> {
     paths.push(user_data.clone());
     for file in entries(&user_data) {
         let extension = file.extension().and_then(|extension| extension.to_str());
-        if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("db")) {
+        if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("db")) && file.is_file()
+        {
             push_database(&mut paths, file);
         }
     }
@@ -251,6 +252,7 @@ pub(crate) mod tests {
             "user_data/default.db",
             "user_data/other.DB",
             "user_data/notes.txt",
+            "user_data/archive.db/notes.txt",
         ] {
             let file = data.path().join(file);
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -306,8 +308,9 @@ pub(crate) mod tests {
         assert_eq!(listed, expected.map(PathBuf::from));
     }
 
-    /// Root's `config.toml` (replaced by rename), a backup copy, `lost+found`
-    /// and `index/` itself do not stop a server that can write its databases.
+    /// Root's `config.toml` (replaced by rename), a backup copy, `lost+found`,
+    /// a folder named like a database and `index/` itself do not stop a
+    /// server that can write its databases.
     #[test]
     fn what_the_server_never_writes_in_place_does_not_refuse() {
         let data = data_folder();
@@ -317,6 +320,7 @@ pub(crate) mod tests {
             "index/default/index.db.bak",
             "index/lost+found",
             "index",
+            "user_data/archive.db",
         ] {
             let owned = data.path().join(owned);
             assert_eq!(refusal(data.path(), &owned), None, "{}", owned.display());
