@@ -20,8 +20,7 @@ pub(crate) fn check_databases(data_folder: &Path, index_db: &str) -> anyhow::Res
 }
 
 /// The first of `paths` with a `problem`, as a message. A database, or its
-/// folder, can instead be left as it is: moved out of the data folder, or
-/// served read-only.
+/// folder, can instead be left as it is: moved out of the data folder.
 fn refusal(
     data_folder: &Path,
     paths: &[PathBuf],
@@ -35,8 +34,7 @@ fn refusal(
         return Some(reason);
     }
     Some(format!(
-        "{reason}; to keep that database as it is, move it out of '{}' or set readonly = true in \
-         the server config",
+        "{reason}; to keep that database as it is, move it out of '{}'",
         data_folder.display()
     ))
 }
@@ -61,7 +59,8 @@ fn migration_paths(err: &anyhow::Error) -> Vec<PathBuf> {
 
 /// Adds to `err` the first of `paths` the current user cannot write because
 /// another user owns it or because its filesystem is read-only; `err`
-/// unchanged without one. `tree` is the folder to hand over in the first case.
+/// unchanged without one. `tree` is the folder whose owner to change in the
+/// first case.
 pub(crate) fn explain(err: anyhow::Error, tree: &Path, paths: &[PathBuf]) -> anyhow::Error {
     #[cfg(unix)]
     {
@@ -190,7 +189,7 @@ mod unix {
                  (uid {uid}); run as uid {owner}, or change the owner of '{}' and \
                  everything in it to uid {uid}",
                 path.display(),
-                handed_over(tree, path).display()
+                chown_target(tree, path).display()
             )),
             Access::ReadOnly if read_only_too => {
                 Some(format!("'{}' is on a read-only filesystem", path.display()))
@@ -202,7 +201,7 @@ mod unix {
     /// The folder whose owner, changed with everything in it, reaches `path`:
     /// `tree`, or the target of the deepest symlink from `tree` down to
     /// `path`, since a recursive change of owner follows no symlink.
-    fn handed_over(tree: &Path, path: &Path) -> PathBuf {
+    fn chown_target(tree: &Path, path: &Path) -> PathBuf {
         let mut ancestors = path.ancestors().take_while(|path| path.starts_with(tree));
         match ancestors.find(|path| path.is_symlink()) {
             Some(link) => std::fs::canonicalize(link).unwrap_or_else(|_| link.to_path_buf()),
@@ -271,7 +270,12 @@ pub(crate) mod tests {
 
     pub(crate) fn owned_by_another_user(path: &Path, owner: u32, tree: &Path) -> String {
         // SAFETY: geteuid has no preconditions and cannot fail.
-        let uid = unsafe { libc::geteuid() };
+        owned_by(path, owner, unsafe { libc::geteuid() }, tree)
+    }
+
+    /// The message for `path`, owned by `owner` and not writable by `uid`,
+    /// with `tree` as the folder whose owner to change.
+    fn owned_by(path: &Path, owner: u32, uid: u32, tree: &Path) -> String {
         format!(
             "'{}' is owned by uid {owner} and is not writable by the current user (uid {uid}); \
              run as uid {owner}, or change the owner of '{}' and everything in it to uid {uid}",
@@ -308,7 +312,7 @@ pub(crate) mod tests {
 
     /// The startup check's message for uid 1000 when exactly `owned` belongs
     /// to root and is not writable.
-    fn refusal(data: &Path, owned: &Path) -> Option<String> {
+    fn refusal_for(data: &Path, owned: &Path) -> Option<String> {
         let access = |path: &Path| {
             if path == owned {
                 Access::Denied { owner: 0 }
@@ -317,19 +321,9 @@ pub(crate) mod tests {
             }
         };
         let paths = database_paths(data, "default");
-        super::refusal(data, &paths, |path| {
+        refusal(data, &paths, |path| {
             unix::reason(data, std::slice::from_ref(path), false, 1000, access)
         })
-    }
-
-    /// How [`refusal`] names `path` and the folder to hand over.
-    fn owned_by_root(path: &Path, tree: &Path) -> String {
-        format!(
-            "'{}' is owned by uid 0 and is not writable by the current user (uid 1000); \
-             run as uid 0, or change the owner of '{}' and everything in it to uid 1000",
-            path.display(),
-            tree.display()
-        )
     }
 
     #[test]
@@ -381,13 +375,22 @@ pub(crate) mod tests {
             "user_data/archive.db",
         ] {
             let owned = data.path().join(owned);
-            assert_eq!(refusal(data.path(), &owned), None, "{}", owned.display());
+            assert_eq!(
+                refusal_for(data.path(), &owned),
+                None,
+                "{}",
+                owned.display()
+            );
         }
-        assert_eq!(refusal(data.path(), data.path()), None, "the data folder");
+        assert_eq!(
+            refusal_for(data.path(), data.path()),
+            None,
+            "the data folder"
+        );
     }
 
-    /// A database can instead be moved out or served read-only; a folder the
-    /// server creates databases in cannot.
+    /// A database can instead be moved out; a folder the server creates
+    /// databases in cannot.
     #[test]
     fn a_database_its_wal_files_or_its_folder_owned_by_root_refuses() {
         let data = data_folder();
@@ -402,12 +405,10 @@ pub(crate) mod tests {
             ("user_data/other.DB-wal", true),
         ] {
             let owned = data.path().join(owned);
-            let refusal = refusal(data.path(), &owned).unwrap();
-            assert!(
-                refusal.starts_with(&owned_by_root(&owned, data.path())),
-                "{refusal}"
-            );
-            assert_eq!(refusal.contains("readonly = true"), database, "{refusal}");
+            let plain = owned_by(&owned, 0, 1000, data.path());
+            let refusal = refusal_for(data.path(), &owned).unwrap();
+            assert!(refusal.starts_with(&plain), "{refusal}");
+            assert_eq!(refusal != plain, database, "{refusal}");
         }
     }
 
@@ -416,22 +417,26 @@ pub(crate) mod tests {
     #[test]
     fn a_folder_the_server_must_create_in_refuses() {
         let data = tempfile::tempdir().unwrap();
-        let data = data.path();
-        assert!(refusal(data, data).is_some());
-        std::fs::create_dir(data.join("index")).unwrap();
-        assert!(
-            refusal(data, data).is_some(),
+        let (data, index) = (data.path(), data.path().join("index"));
+        let plain = owned_by(data, 0, 1000, data);
+        assert_eq!(refusal_for(data, data), Some(plain.clone()));
+        std::fs::create_dir(&index).unwrap();
+        assert_eq!(
+            refusal_for(data, data),
+            Some(plain),
             "user_data is still to create"
         );
         std::fs::create_dir(data.join("user_data")).unwrap();
-        assert_eq!(refusal(data, data), None);
-        assert!(refusal(data, &data.join("index")).is_some());
+        assert_eq!(refusal_for(data, data), None);
+        let plain = owned_by(&index, 0, 1000, data);
+        assert_eq!(refusal_for(data, &index), Some(plain));
     }
 
     /// A recursive change of owner of the data folder does not follow the
-    /// link, so the link's target is the folder to hand over.
+    /// link, so the deepest link's target is the folder whose owner to
+    /// change; a link above the data folder is ignored.
     #[test]
-    fn a_symlinked_database_folder_is_listed_and_its_target_handed_over() {
+    fn a_symlinked_database_folder_is_listed_and_its_target_named() {
         let (data, elsewhere) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         std::fs::write(elsewhere.path().join("index.db"), b"").unwrap();
         let index = data.path().join("index");
@@ -446,18 +451,44 @@ pub(crate) mod tests {
         );
         let target = elsewhere.path().canonicalize().unwrap();
         for owned in [index.join("linked"), index.join("linked/index.db-wal")] {
-            let refusal = refusal(data.path(), &owned).unwrap();
+            let refusal = refusal_for(data.path(), &owned).unwrap();
             assert!(
-                refusal.starts_with(&owned_by_root(&owned, &target)),
+                refusal.starts_with(&owned_by(&owned, 0, 1000, &target)),
                 "{refusal}"
             );
         }
         let default = index.join("default");
-        let refusal = refusal(data.path(), &default).unwrap();
+        let refusal = refusal_for(data.path(), &default).unwrap();
         assert!(
-            refusal.starts_with(&owned_by_root(&default, data.path())),
+            refusal.starts_with(&owned_by(&default, 0, 1000, data.path())),
             "{refusal}"
         );
+
+        // <root>/alias -> real; data/index -> x; x/linked -> y.
+        let root = tempfile::tempdir().unwrap();
+        let [real, x, y] = ["real", "x", "y"].map(|name| root.path().join(name));
+        std::fs::create_dir_all(real.join("data/user_data")).unwrap();
+        std::fs::create_dir(&x).unwrap();
+        std::fs::create_dir(&y).unwrap();
+        std::fs::write(y.join("index.db"), b"").unwrap();
+        std::os::unix::fs::symlink(&real, root.path().join("alias")).unwrap();
+        let data = root.path().join("alias/data");
+        std::os::unix::fs::symlink(&x, data.join("index")).unwrap();
+        std::os::unix::fs::symlink(&y, x.join("linked")).unwrap();
+        let (x, y) = (x.canonicalize().unwrap(), y.canonicalize().unwrap());
+        for (owned, target) in [
+            ("index/linked", &y),
+            ("index/linked/index.db-wal", &y),
+            ("index/default", &x),
+            ("user_data", &data),
+        ] {
+            let owned = data.join(owned);
+            let refusal = refusal_for(&data, &owned).unwrap();
+            assert!(
+                refusal.starts_with(&owned_by(&owned, 0, 1000, target)),
+                "{refusal}"
+            );
+        }
     }
 
     /// The startup check lets a read-only filesystem through (a database on
@@ -592,6 +623,7 @@ pub(crate) mod tests {
         let expected = owned_by_another_user(&default, owner, folder);
         let refused = check_databases(data.path(), "default").unwrap_err();
         assert!(refused.to_string().starts_with(&expected), "{refused}");
+        assert_ne!(refused.to_string(), expected);
         let failed = FailedDatabase(default.join("index.db"));
         let err = anyhow::anyhow!("open failed").context(failed);
         let explained = format!("{:#}", explain_migration(err, data.path()));

@@ -1023,8 +1023,8 @@ mod route_tests {
 
     /// The refusal comes before any migration: the default database's folder
     /// is a symlink to a folder another user owns, whose owner is the one to
-    /// change. A migration of that database that fails (here, after that
-    /// folder appears) is explained by it.
+    /// change. A failed migration (here, after that folder appears) is
+    /// explained by it only when it failed on the default database.
     #[cfg(unix)]
     #[tokio::test]
     async fn startup_refuses_or_explains_a_database_folder_another_user_owns() {
@@ -1039,17 +1039,23 @@ mod route_tests {
         std::fs::create_dir(default.parent().unwrap()).unwrap();
         let expected = owned_by_another_user(&default, owner, folder);
 
-        let migrate = async {
-            std::os::unix::fs::symlink(folder, &default)?;
-            let failed = FailedDatabase(default.join("index.db"));
-            Err::<(), anyhow::Error>(anyhow::anyhow!("migration failed").context(failed))
-        };
-        let error = migrate_at_startup(data.path(), "default", migrate)
-            .await
-            .unwrap_err();
-        let error = format!("{error:#}");
-        assert!(error.starts_with(&format!("{expected}: ")), "{error}");
-        assert!(error.ends_with(": migration failed"), "{error}");
+        for (db, explained) in [
+            ("index/second/index.db", false),
+            ("index/default/index.db", true),
+        ] {
+            let _ = std::fs::remove_file(&default);
+            let migrate = async {
+                std::os::unix::fs::symlink(folder, &default)?;
+                let failed = FailedDatabase(data.path().join(db));
+                Err::<(), anyhow::Error>(anyhow::anyhow!("migration failed").context(failed))
+            };
+            let error = migrate_at_startup(data.path(), "default", migrate)
+                .await
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert_eq!(error.starts_with(&expected), explained, "{error}");
+            assert!(error.ends_with(": migration failed"), "{error}");
+        }
 
         let migrate = async { Err(anyhow::anyhow!("migrated")) };
         let error = migrate_at_startup(data.path(), "default", migrate)

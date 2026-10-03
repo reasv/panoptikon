@@ -812,9 +812,8 @@ to it, and the next start stops with an error naming the file and its owner.
 Hand the data folder back with `sudo chown -R "$USER" data`; when the file sits
 behind a symlink, the error names the link's target instead, since `chown -R`
 does not follow links. To keep a database another user owns unchanged (an
-archive), move it out of `data_folder`, or set `readonly = true`, which serves
-every database read-only without the check or the migrations. A read-only
-filesystem does not stop the start; it is named only when a migration fails.
+archive), move it out of `data_folder`. A read-only filesystem does not stop
+the start; it is named only when a migration fails.
 
 ## Production UI
 
