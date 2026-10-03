@@ -11,8 +11,9 @@
 //! unparseable identity makes the whole result unknown, and unknown leaves
 //! pins untouched.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,6 +24,7 @@ use super::capability::{HostComputeCaps, find_nvidia_smi, output_with_timeout, p
 use super::cpu;
 use super::mps;
 use super::rocm;
+use super::worker::WorkerSpawnConfig;
 use crate::config::Accelerator;
 
 /// CUDA's device filter (and HIP's alias for its own). Takes a `GPU-…` UUID.
@@ -39,7 +41,7 @@ pub const HIP_PIN_ENV_VAR: &str = "HIP_VISIBLE_DEVICES";
 pub const UNIFIED_GPU_ENV_VAR: &str = "PANOPTIKON_UNIFIED_GPU";
 
 /// Set on a worker on an NVIDIA GPU: `1` when a full allocation there spills
-/// to system RAM ([`GpuInventory::spills_to_ram`]), `0` when it fails.
+/// to system RAM ([`GpuInventory::spill_verdict`]), `0` when it fails.
 pub const SPILLS_TO_RAM_ENV_VAR: &str = "PANOPTIKON_SPILLS_TO_RAM";
 
 /// Written next to the visibility variable with the same pin, so the worker
@@ -199,7 +201,7 @@ pub fn probe(accelerator: Accelerator) -> HostGpus {
             // nvidia-smi ignores CUDA_VISIBLE_DEVICES, so it is applied here.
             let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
             let mut host = build(query(accelerator).as_deref(), visible.as_deref());
-            let platform = DriverPlatform::current();
+            let platform = DriverPlatform::current(Path::new(WSL_GPU_DEVICE));
             let models = (platform == DriverPlatform::Windows)
                 .then(query_driver_models)
                 .flatten();
@@ -235,10 +237,11 @@ enum DriverPlatform {
 }
 
 impl DriverPlatform {
-    fn current() -> Self {
+    /// This host's platform; on Linux `dxg` is the WSL GPU device to look for.
+    fn current(dxg: &Path) -> Self {
         if cfg!(windows) {
             Self::Windows
-        } else if cfg!(target_os = "linux") && std::path::Path::new(WSL_GPU_DEVICE).exists() {
+        } else if cfg!(target_os = "linux") && dxg.exists() {
             Self::Wsl
         } else {
             Self::Other
@@ -317,15 +320,6 @@ fn with_cpu_device(mut host: HostGpus) -> HostGpus {
 /// KFD topology + amdgpu sysfs (`rocm.rs`). Capabilities are always unknown;
 /// off Linux there are no GPUs. The backend is `RocmSysfs` on every path.
 fn probe_rocm() -> HostGpus {
-    if DriverPlatform::current() == DriverPlatform::Wsl {
-        tracing::warn!(
-            "ROCm under WSL2 runs through the Windows display driver, which \
-             exposes none of the amdgpu memory counters this host reads: models \
-             on the GPU run without a memory ledger or batch-size calibration, \
-             and a GPU that runs out of memory may move it to system RAM and \
-             slow down instead of failing"
-        );
-    }
     let roots = rocm::SysfsRoots::default();
     let blank = if cfg!(target_os = "linux") {
         let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
@@ -386,7 +380,17 @@ fn probe_rocm() -> HostGpus {
     let gpus = match inventory {
         Some(Ok(gpus)) => gpus,
         Some(Err(failure)) => {
-            failure.log();
+            if DriverPlatform::current(Path::new(WSL_GPU_DEVICE)) == DriverPlatform::Wsl {
+                tracing::warn!(
+                    "ROCm under WSL2 runs through the Windows display driver, which \
+                     exposes none of the amdgpu memory counters this host reads: models \
+                     on the GPU run without a memory ledger or batch-size calibration, \
+                     and a GPU that runs out of memory may move it to system RAM and \
+                     slow down instead of failing"
+                );
+            } else {
+                failure.log();
+            }
             return host(None);
         }
         None => return host(None),
@@ -909,16 +913,25 @@ impl GpuInventory {
         }
     }
 
-    /// Whether a full allocation on this device spills to system RAM.
-    pub(super) fn spills_to_ram(&self, key: &str) -> bool {
-        self.spilling_gpus().iter().any(|uuid| uuid == key)
-    }
-
     /// What a worker on this device is told about spilling
     /// ([`SPILLS_TO_RAM_ENV_VAR`]): `None` off NVIDIA or for an unknown device.
     pub(super) fn spill_verdict(&self, key: Option<&str>) -> Option<bool> {
         let key = key.filter(|_| matches!(self.backend, MemoryBackend::NvidiaSmi { .. }))?;
-        Some(self.spills_to_ram(key))
+        Some(self.spilling_gpus().iter().any(|uuid| uuid == key))
+    }
+
+    /// The spawn config of a replica on device `key`: the CPU device's, or
+    /// `spawn` with a unified GPU's address and an NVIDIA GPU's spill verdict.
+    pub(super) fn spawn_config<'a>(
+        &self,
+        spawn: &'a WorkerSpawnConfig,
+        key: Option<&str>,
+    ) -> Cow<'a, WorkerSpawnConfig> {
+        if key == Some(cpu::DEVICE_KEY) {
+            return Cow::Owned(spawn.for_cpu_device());
+        }
+        let bdf = key.and_then(|key| self.unified_pin_bdf(Some(key)));
+        spawn.for_gpu(bdf.as_deref(), self.spill_verdict(key))
     }
 
     /// The GPUs an unmappable ambient mask hid, candidates for adoption.
@@ -1465,6 +1478,14 @@ mod tests {
         ] {
             assert_eq!(spills(platform, model), spilled, "{platform:?} {model:?}");
         }
+        #[cfg(target_os = "linux")]
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let dxg = dir.path().join("dxg");
+            assert_eq!(DriverPlatform::current(&dxg), Other);
+            std::fs::write(&dxg, "").expect("writes");
+            assert_eq!(DriverPlatform::current(&dxg), Wsl);
+        }
         // The verdict is per GPU, adoptable rows included, joined by UUID.
         let rows = "0, GPU-1111, A, 24576, 8.9\n1, GPU-2222, B, 97887, 12.0\n";
         let models = "GPU-1111, WDDM\nGPU-2222, TCC\nunparseable\n";
@@ -1472,7 +1493,7 @@ mod tests {
             let mut inventory = build(Some(rows), visible).inventory;
             inventory.set_spilling(Windows, Some(models));
             assert_eq!(inventory.spilling_gpus(), ["GPU-1111"], "{visible:?}");
-            assert!(inventory.spills_to_ram("GPU-1111") && !inventory.spills_to_ram("GPU-2222"));
+            assert_eq!(inventory.spill_verdict(Some("GPU-1111")), Some(true));
             assert_eq!(inventory.spill_verdict(Some("GPU-2222")), Some(false));
             assert_eq!(inventory.spill_verdict(None), None, "an unknown device");
             inventory.set_spilling(Windows, None);
@@ -1480,6 +1501,20 @@ mod tests {
             inventory.set_spilling(Other, Some(models));
             assert!(inventory.spilling_gpus().is_empty());
         }
+        // Each replica's spawn config carries its own GPU's verdict.
+        let mut inventory = build(Some(rows), None).inventory;
+        inventory.set_spilling(Windows, Some(models));
+        let spawn = super::super::worker::testing::test_spawn_config();
+        let told = |key| {
+            let config = inventory.spawn_config(&spawn, Some(key));
+            config
+                .env
+                .iter()
+                .find(|(name, _)| name == SPILLS_TO_RAM_ENV_VAR)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(told("GPU-1111").as_deref(), Some("1"));
+        assert_eq!(told("GPU-2222").as_deref(), Some("0"));
         let rocm = GpuInventory::known_rocm(vec![gpu(0, "GPU-1111", "")]);
         assert_eq!(
             rocm.spill_verdict(Some("GPU-1111")),

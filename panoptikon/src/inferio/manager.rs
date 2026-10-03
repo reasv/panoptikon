@@ -1636,12 +1636,6 @@ impl ModelManager {
         let _admission = self
             .acquire_load_admission(inference_id, &device_keys)
             .await;
-        // The address of a unified GPU whose worker counts GTT as its own.
-        let unified_devices: Vec<Option<String>> = spec
-            .device_pins
-            .iter()
-            .map(|pin| self.cfg.gpus.unified_pin_bdf(pin.as_deref()))
-            .collect();
         // A pooled worker needs the same pin and the same CPU placement.
         let pool_pin = self.cfg.gpus.default_pin();
         let pool_on_cpu =
@@ -1694,15 +1688,9 @@ impl ModelManager {
                 };
                 let spec = &spec;
                 let device = device.clone();
-                let unified = unified_devices[replica].clone();
-                let on_cpu = device_keys[replica].as_deref() == Some(super::cpu::DEVICE_KEY);
-                let spills = self.cfg.gpus.spill_verdict(device_keys[replica].as_deref());
+                let spawn =
+                    (self.cfg.gpus).spawn_config(&self.cfg.spawn, device_keys[replica].as_deref());
                 async move {
-                    let spawn = if on_cpu {
-                        std::borrow::Cow::Owned(self.cfg.spawn.for_cpu_device())
-                    } else {
-                        self.cfg.spawn.for_gpu(unified.as_deref(), spills)
-                    };
                     let mut worker = match claimed {
                         Some(worker) => {
                             match self

@@ -161,17 +161,10 @@ impl PrewarmPool {
         state.slots.insert(impl_class.to_owned(), Slot::Spawning);
         let weak = self.weak.get().cloned().expect("weak self is set in new()");
         let on_cpu = self.default_placement_is_cpu();
-        let spawn = if on_cpu {
-            self.spawn.for_cpu_device()
-        } else {
-            let key = self.gpus.resolve_device_key(None);
-            self.spawn
-                .for_gpu(
-                    self.gpus.unified_pin_bdf(None).as_deref(),
-                    self.gpus.spill_verdict(key.as_deref()),
-                )
-                .into_owned()
-        };
+        let spawn = self
+            .gpus
+            .spawn_config(&self.spawn, self.gpus.resolve_device_key(None).as_deref())
+            .into_owned();
         let task = tokio::spawn(warm_worker_task(
             weak,
             spawn,
