@@ -303,6 +303,7 @@ impl VramLedger {
                 external_mb,
                 reserve_mb,
                 reserve_rule,
+                ram_reserve_mb,
                 pre_fit,
                 working_units,
                 deflation,
