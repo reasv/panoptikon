@@ -250,6 +250,13 @@ class Context:
         self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
         self._pid_first_seen: Optional[Dict[int, float]] = None
         self._release_windows: Dict[str, List[Tuple[float, float, int, int]]] = {}
+        # Each worker PID whose death the log names, to the time of that line.
+        self.death_t: Dict[int, float] = {}
+        for event in self.log_matching("worker died fatally"):
+            spawn = event["t_wall"] is not None and self.replica_spawn(
+                str(event["fields"].get("model")), event["t_wall"])
+            if spawn:
+                self.death_t[spawn["pid"]] = event["t_wall"]
         self.vram_tolerance = self._join_tolerance(self._vram_times, self.vramrec)
         self.hog_tolerance = self._join_tolerance(self._hog_times, self.hog)
 
@@ -305,12 +312,15 @@ class Context:
                 now = {proc["pid"]: proc.get("used_mb")
                        for proc in shown.get("procs") or []}
                 ours = others = 0
+                opened = t_before
                 for proc in before.get("procs") or []:
                     held, later = proc.get("used_mb"), now.get(proc["pid"], 0)
                     if held is None or later is None or later >= held:
                         continue
                     if self.is_ours(proc):
                         ours += int(held) - int(later)
+                        if proc["pid"] not in now:
+                            opened = min(opened, self.death_t.get(proc["pid"], opened))
                     else:
                         others += int(held) - int(later)
                 if ours + others <= 0:
@@ -319,7 +329,9 @@ class Context:
                 level = unattributed[index - 1] + allowance_mb(shown.get("total_mb"))
                 drained = next((rows[later][0] for later in range(index, len(rows))
                                 if unattributed[later] <= level), None)
-                windows.append((t_before, max(end_t, drained or 0.0), ours, others))
+                closed = end_t if drained is None else max(
+                    end_t, min(drained, end_t + RELEASE_DRAIN_MAX_S))
+                windows.append((opened, closed, ours, others))
             self._release_windows[uuid] = windows
         return sum(others for opened, closed, _, others in windows
                    if opened < end and closed >= start) + sum(
@@ -624,6 +636,10 @@ def allowance_mb(total_mb: Any) -> float:
 #: gfx1030 and 40 ms on an MI100. The per-process figure falls at once, so in
 #: between `used` less our workers counts freed memory as another process's.
 RELEASE_LAG_S_PER_GIB = 0.040
+#: How long past that bound `used` may still be draining.
+RELEASE_DRAIN_MAX_S = 2.0
+#: The ledger refreshes a free reading older than this at its next batch or load.
+LEDGER_READ_MAX_AGE_S = 10.0
 
 # How long a hog must hold, and how much, before `external_mb` not moving at
 # all is a fault rather than staleness. See the README's "Checks, one by one".
@@ -835,7 +851,7 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             raw = abs(int(gpu.get("external_mb") or 0) - oracle_external)
             # From the ledger's free reading, or the earlier sample, to the later one.
             age = gpu.get("external_sample_age_ms")
-            read_t = sample["t_wall"] - (age or 0) / 1000.0
+            read_t = sample["t_wall"] - min((age or 0) / 1000.0, LEDGER_READ_MAX_AGE_S)
             first = min(sample["t_wall"], vram["t_wall"])
             last = max(sample["t_wall"], vram["t_wall"])
             released = ctx.released_mb(uuid, min(read_t, first), last,
@@ -891,8 +907,10 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
              "oracle_sources": unpriced_sources, **excluded})
     if joined == 0:
         return Verdict("oracle_agreement", "SKIP",
-                       "no health sample could be joined to a vramrec sample "
-                       f"within {ctx.vram_tolerance:.2f}s" + skipped,
+                       ("every joined GPU-sample was skipped"
+                        if idle + skewed + releasing + hog_moving else
+                        "no health sample could be joined to a vramrec sample "
+                        f"within {ctx.vram_tolerance:.2f}s") + skipped,
                        {"joined": 0, **excluded})
     verdict = "PASS" if breaches == 0 else "FAIL"
     return Verdict(
