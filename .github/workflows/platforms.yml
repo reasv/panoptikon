@@ -1,0 +1,64 @@
+# Windows and macOS check: builds the server for the two shipped non-Linux
+# targets with warnings as errors, runs the platform-specific Rust tests and
+# the inference worker's tests natively. Manual dispatch only, like nix.yml;
+# run it before tagging, since release.yml is the only other place these
+# targets are built.
+name: platforms
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platforms-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check (${{ matrix.triple }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Reported, not a gate: new stable clippy releases add lints that
+      # fire on every platform alike.
+      - name: Clippy
+        run: cargo clippy --all-targets -p panoptikon
+
+      - name: Check
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --all-targets -p panoptikon
+
+      - name: Platform tests
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test -p panoptikon --bin panoptikon -- ownership inferio::mps inferio::cpu
+
+      # The uv release `panoptikon setup` pins (setup.rs UV_VERSION).
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.28"
+
+      - name: Worker tests
+        working-directory: python
+        run: |
+          uv sync --locked --group test --extra cpu
+          uv run --no-sync python -m pytest tests/inferio_worker
