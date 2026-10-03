@@ -302,8 +302,8 @@ SCENARIOS: Dict[str, Scenario] = {
         checks="all",
         preconditions=(
             "the GPU is idle apart from the hog",
-            "judge `utilization` against the probe's boundary AT THE HOG'S "
-            "FREE LEVEL, never the full-GPU boundary",
+            "judge `utilization` against the idle-GPU probe: the check "
+            "subtracts what the hog held",
         ),
     ),
     "S4b": Scenario(

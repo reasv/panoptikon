@@ -405,14 +405,17 @@ def test_the_denominator_is_bounded_by_the_room_a_hog_leaves():
     model ran the hog held at least 3800 MiB, plus a 200 MiB context: room
     512 - 4000 / 20 = 312, so a 100-unit grant is 0.32, not 0.20. Its fill
     before the first grant and release after the last do not count. No room
-    bound for grants on two GPUs, or for a RAM hog unless the GPU is unified
-    (no context then); under one unit of room the row is not decidable."""
+    bound for grants on two GPUs, a GPU hog on another GPU, or a RAM hog
+    unless the GPU is unified (no context then). A headline fit prices the
+    hog unless its basis is allocated memory; under one unit of room, or with
+    no slope to price the hog, the row is not decidable."""
     probe = {**_bisect_probe(512),
              "fit": {"basis": "peak_allocated_mb", "slope_mb_per_unit": 10.0},
              "fit_reserved": {"basis": "delta_mb", "slope_mb_per_unit": 20.0}}
 
-    def utilization(target="gpu", held=3800, gpus=(GPU, GPU), unified=False):
-        hog = [{"kind": "header", "target": target, "gpu_uuid": GPU,
+    def utilization(target="gpu", held=3800, gpus=(GPU, GPU), unified=False,
+                    hog_gpu=GPU, fit=None):
+        hog = [{"kind": "header", "target": target, "gpu_uuid": hog_gpu,
                 "context_mb": 200},
                {"kind": "state", "t_wall": 10.0, "held_mb": 0},
                {"kind": "state", "t_wall": 50.0, "held_mb": held + 400},
@@ -424,15 +427,21 @@ def test_the_denominator_is_bounded_by_the_room_a_hog_leaves():
         vramrec = [{"kind": "header", "gpus": [{"uuid": GPU,
                                                 "unified": unified}]}]
         verdict = analyze.check_utilization(_utilization_context(
-            [_worker_health(100)], log=log, probes=[probe], hog=hog,
-            vramrec=vramrec))
+            [_worker_health(100)], log=log, vramrec=vramrec, hog=hog,
+            probes=[{**_bisect_probe(512), "fit": fit} if fit else probe]))
         return (verdict.verdict,
                 verdict.numbers["models"][0]["denominator_units"])
 
+    mps = analyze.MPS_DEVICE_KEY
     assert utilization() == ("PASS", 312)
     assert utilization(gpus=(GPU, "GPU-1111")) == ("FAIL", 512)
+    assert utilization(hog_gpu="GPU-1111") == ("FAIL", 512)
     assert utilization(target="ram") == ("FAIL", 512)
     assert utilization(target="ram", unified=True) == ("PASS", 322)
+    assert utilization(target="ram", gpus=(mps, mps)) == ("PASS", 322)
+    assert utilization(fit={"slope_mb_per_unit": 20.0}) == ("PASS", 312)
+    assert utilization(fit={"basis": "peak_allocated_mb",
+                            "slope_mb_per_unit": 10.0}) == ("INFO", None)
     assert utilization(held=20000) == ("INFO", None)
 
 

@@ -1680,7 +1680,8 @@ def check_utilization(ctx: Context) -> Verdict:
     measured on a GPU with nothing else on it; the denominator is never above
     that boundary less the least the hog held while the model ran, divided by
     the probe's reserved slope (both are physical memory). A room under one
-    unit is not decidable, and the row says so.
+    unit, or a hog with no reserved slope to price it, is not decidable, and
+    the row says so.
 
     Same split as `slope_accuracy`: "no worker was ever admitted" is a result,
     "no probe boundary was passed" a harness omission."""
@@ -1757,7 +1758,7 @@ def check_utilization(ctx: Context) -> Verdict:
             ctx, issued_at.get(model) or published_at.get(model, []))
         room = (int(boundary - held / slopes[model])
                 if held and model in slopes else None)
-        if room is not None and room < 1:
+        if held and (room is None or room < 1):
             rows.append({**row, "boundary_units": boundary,
                          "room_units": room, "denominator_units": None})
             continue
@@ -1776,8 +1777,11 @@ def check_utilization(ctx: Context) -> Verdict:
         if not row.get("boundary_units"):
             return " (no probe boundary)"
         if row["denominator_units"] is None:
-            return (f" / the hog left no room for one unit (probe boundary "
-                    f"{row['boundary_units']}): not decidable")
+            return ((" / the probe has no reserved slope to price the hog's "
+                     "memory" if row["room_units"] is None else
+                     " / the hog left no room for one unit")
+                    + f" (probe boundary {row['boundary_units']}): not "
+                    f"decidable")
         if row["room_units"] == row["denominator_units"]:
             return (f" / room under the hog {row['room_units']} (probe "
                     f"boundary {row['boundary_units']}) = {row['ratio']:.2f}")
