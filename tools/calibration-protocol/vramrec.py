@@ -27,6 +27,7 @@ Line 1 is a `"kind": "header"` object: argv, interval, host, an `"nvml"` block
      "iso", "sample_ms",
      "gpus":  [{"index", "uuid", "name", "total_mb", "used_mb", "free_mb",
                 "error", "oracle_source", "oracle_age_ms",
+                "skew_mb" (ROCm only),
                 "procs": [{"pid", "used_mb", "cmdline", "comm",
                 "type": "compute"|"graphics", "gone", "rss_mb", "vmhwm_mb",
                 "env": {"CUDA_VISIBLE_DEVICES": str, ...}}]}],
@@ -979,8 +980,6 @@ class AmdgpuOracle:
     def sample(self) -> List[Dict[str, Any]]:
         if time.monotonic() >= self._next_health:
             self._adopt_health()
-        # The device counters are read on both sides of the per-process scan;
-        # `skew_mb` is how far `used` moved while the processes were read.
         before = [rocm_sysfs.memory_mb(self.roots, gpu) for gpu in self.gpus]
         procs = rocm_sysfs.process_vram_mb(self.roots, self.gpus)
         rows = []
