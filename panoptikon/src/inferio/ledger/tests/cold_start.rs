@@ -96,7 +96,8 @@ impl Cold {
         self.batches += 1;
         // A full queue's window is several batches deep: the first may grow
         // the pool, the rest find it as that one left it. Those are untimed,
-        // so the knee ring stays out of these tables.
+        // so the throughput ring stays out of these tables: every size
+        // earns the next, as with a rate that rises.
         let batch = |before: u64| BatchMeasurement {
             reserved_before_mb: Some(before),
             reserved_after_mb: Some(self.pool_mb),
@@ -116,6 +117,7 @@ impl Cold {
         }));
         self.handle.lock().unwrap().record_measurements(batches);
         token.finish(WindowOutcome::Responded { oom: None });
+        self.admission.earn_next_size();
     }
 
     /// Its cost is fitted with a slope a grant can be priced with.
@@ -416,12 +418,12 @@ fn a_cold_mps_and_cpu_replica_on_a_16_gb_mac_are_priced_at_the_measured_pool() {
         ),
         (
             2.3,
-            [[8, 8], [7, 6], [8, 5], [8, 6]],
+            [[8, 8], [7, 6], [6, 5], [8, 6]],
             [-17, -17, -657, -657],
         ),
         (
             2.9,
-            [[8, 8], [7, 2], [8, 3], [8, 3]],
+            [[8, 8], [7, 2], [6, 3], [8, 3]],
             [1212, 1212, -388, -388],
         ),
     ];

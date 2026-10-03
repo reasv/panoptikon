@@ -17,8 +17,7 @@
 //! headroom     = limit − Σ charge(w) − Σ load_reservations  # may go negative
 //! room(w)      = headroom + max(0, growth(w) − Σ grants(w))
 //! price(u)     = pool margin × (max(0, intercept) + slope × u)
-//! grant        = min(room(w) share, ramp step, price(knee_units),
-//!                    priced window content)
+//! grant        = min(room(w) share, batch size, priced window content)
 //! ```
 //!
 //! On the CPU device `reserved` is the live resident set and no growth is
@@ -28,11 +27,13 @@
 //! (model, device) at half that batch ([`VramLedger::note_death_locked`]).
 //!
 //! A worker with no reported base contributes only growth; the rest of its
-//! memory reads as `external`. A unit budget never exceeds the ramp or
+//! memory reads as `external`. The batch size moves only on measured rates
+//! ([`VramLedger::note_gain_locked`]), and a unit budget never exceeds
 //! [`RATCHET_FACTOR`] × the anchor (the largest clean batch run here, or
-//! claimed by a profile). A matched profile seeds the fit, base and knee and,
-//! if it carries a fit, the anchor as a seeded claim; only a local one seeds
-//! the sample ring. Deflation, ramp position and grants are never persisted.
+//! claimed by a profile). A matched profile seeds the fit, base and working
+//! size and, if it carries a fit, the anchor as a seeded claim; only a local
+//! one seeds the sample ring and the wait for the next trial. Deflation, a
+//! trial in progress and grants are never persisted.
 //! A replica on a GPU with its own memory also books its host RAM on the CPU
 //! device, which caps its grant ([`VramLedger::ram_ceiling_locked`]).
 //!
@@ -43,8 +44,8 @@
 //!
 //! Submodules: `registration` (placing workers), `grants` (issue and settle),
 //! `headroom` (budget arithmetic), `external_memory` (free readings),
-//! `load_reservations`, `measurements` (ingest), `ramp`, `throughput_knee`,
-//! `oom`, `trims`, `calibration_store`, `health`.
+//! `load_reservations`, `measurements` (ingest), `ramp` (batch size), `oom`,
+//! `trims`, `calibration_store`, `health`.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, Weak};
@@ -52,7 +53,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
+use super::calibration::{
+    CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate, TrialCadence,
+};
 use super::cost::{CostAggregation, CostDimension, CostUnit, SEED_BUDGET_MB};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
 use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle, TrimReply};
@@ -70,7 +73,6 @@ mod ramp;
 mod registration;
 #[cfg(test)]
 mod test_hooks;
-mod throughput_knee;
 mod trims;
 
 #[cfg(test)]
@@ -87,12 +89,9 @@ use oom::{
     pool_grew_past_free,
 };
 pub use oom::{ErrorFrameOom, UnrunnableReplica, message_oom_tier};
-use ramp::{deflation_cap, ramp_floor_step, uncapped_units};
+use ramp::{deflation_cap, median};
 pub use registration::Admission;
 use registration::GpuLog;
-use throughput_knee::{
-    KneeExpired, bucket_rates, median, plateau_above, quiet_medians, size_bucket,
-};
 pub use trims::TrimRequest;
 
 /// Default margin over other processes' usage (the desktop lever):
@@ -166,40 +165,25 @@ pub const RATCHET_FACTOR: u64 = 2;
 /// Minimum fit samples before a fit is attempted at all.
 pub const MIN_FIT_SAMPLES: usize = 3;
 
-/// Fraction of the best observed throughput that counts as on the plateau;
-/// the knee is the smallest batch size that reaches it.
-pub const KNEE_RATIO: f64 = 0.9;
+/// The plateau band: a batch size whose rate is at least this fraction of the
+/// best rate measured is as good as the best, and the working size is the
+/// smallest such size.
+pub const KNEE_RATIO: f64 = 0.95;
 
-/// Observations, and distinct log2 buckets among them, a knee fit needs.
-pub const MIN_KNEE_SAMPLES: usize = 12;
-pub const MIN_KNEE_BUCKETS: usize = 3;
+/// A batch counts as one of a batch size when that size is at least this
+/// fraction of it: up to 1.11x larger is the same size.
+pub const SAME_SIZE_RATIO: f64 = 0.9;
 
-/// Quiet buckets required strictly above a candidate knee. See
-/// docs/batch-calibration-design.md, "Throughput knee: the fit itself", rule 3.
-pub const KNEE_PLATEAU_BUCKETS: usize = 2;
-
-/// Clean windows before a seeded (not locally fitted) knee's expiry widens it;
-/// a local knee takes [`KNEE_EXPIRY_CLEAN_WINDOWS`].
-pub const KNEE_SEED_REVALIDATION_WINDOWS: u32 = 2 * MIN_KNEE_BUCKET_SAMPLES as u32;
-
-/// Clean windows at its rung, with room for twice it, before a hold below the
-/// conferred anchor doubles its rung ([`VramLedger::reprobe_hold_locked`]).
-const HOLD_REPROBE_WINDOWS: u32 = KNEE_SEED_REVALIDATION_WINDOWS;
-
-/// Consecutive queue-sized clean windows after which a hold is no longer
-/// reported: the replica is waiting for work. Admission is unaffected.
-const QUEUE_BOUND_HOLD_WINDOWS: u32 = 2;
-
-/// Observations a log2 bucket needs to join a knee fit: the fewest a
-/// dispersion can be computed from.
+/// Observations of one batch size the gain rule needs to read its rate: the
+/// fewest a dispersion can be computed from.
 pub const MIN_KNEE_BUCKET_SAMPLES: usize = 2;
 
-/// Largest relative MAD (`MAD / median` of units/sec) a bucket may have for
-/// its median to decide a knee; one noisy bucket refuses the fit. The
+/// Largest relative MAD (`MAD / median` of units/sec) the observations of
+/// one batch size may have for their median to decide anything. The
 /// accelerator default and floor; the CPU device ships
 /// [`super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION`]. See
-/// docs/batch-calibration-design.md, "Throughput knee: narrowing the
-/// evidence", (c).
+/// docs/batch-calibration-design.md, "Batch size: what counts as a
+/// measurement".
 pub const KNEE_MAX_BUCKET_DISPERSION: f64 = 0.20;
 
 /// Batches a replica must have run before its throughput stops counting as
@@ -207,13 +191,45 @@ pub const KNEE_MAX_BUCKET_DISPERSION: f64 = 0.20;
 /// small batch (ONNX Runtime on the CPU device warms up over several).
 pub const KNEE_WARMUP_BATCHES: u64 = WINDOW_DEPTH_MULTIPLIER;
 
-/// Clean windows run at the knee with ample headroom after which it widens by
-/// one log2 bucket. See docs/batch-calibration-design.md, "Throughput knee:
-/// narrowing the evidence", (d).
-pub const KNEE_EXPIRY_CLEAN_WINDOWS: u32 = MIN_KNEE_SAMPLES as u32;
+/// Observations of each of two batch sizes with which their median rates
+/// are compared as they stand. With fewer, only a difference of more than
+/// [`CLEAR_ERRORS`] standard errors decides. Also the observations a side
+/// with which a working size a trial here placed is left for a larger one.
+pub const CONFIRM_SAMPLES: usize = 12;
+
+/// Standard errors of the difference between two sizes' rates that decide a
+/// comparison on fewer than [`CONFIRM_SAMPLES`] observations a side.
+pub const CLEAR_ERRORS: f64 = 4.0;
+
+/// Standard errors by which a smaller size must be inside the band, on
+/// [`CONFIRM_SAMPLES`] observations a side, for the working size to move
+/// down to it. A move up takes [`CLEAR_ERRORS`], so a size at the band's
+/// edge is not left and returned to as the observations scatter. Also the
+/// gain that carries a trial on past a doubling without one.
+pub const HOLD_ERRORS: f64 = 1.0;
+
+/// The gain of one doubling for which a trial goes on to the next: below
+/// it the rate has stopped rising.
+pub const TRIAL_STEP: f64 = 1.015;
+
+/// Observations of each of two batch sizes with which a comparison that is
+/// still undecided counts as not shown. They may come from more than one
+/// run: a run that ends inside a trial stores them.
+pub const TRIAL_SAMPLES: usize = 4 * CONFIRM_SAMPLES;
+
+/// Windows a trial may run without a verdict before the comparison counts as
+/// not shown: one observation a window on each side reaches
+/// [`CONFIRM_SAMPLES`].
+pub const TRIAL_WINDOWS: u32 = 2 * CONFIRM_SAMPLES as u32;
+
+/// Windows at the working size after a trial that left it in place before
+/// the next one, doubled by each further such trial [`RETEST_MAX_DOUBLINGS`]
+/// times at most: 12, 24, … 384.
+pub const RETEST_WINDOWS: u32 = 12;
+pub const RETEST_MAX_DOUBLINGS: u32 = 5;
 
 /// Fraction of its window's granted unit budget a batch must carry to count
-/// for the knee and the ramp; below 1.0 because batches pack whole items. A
+/// as an observation of that size; below 1.0 because batches pack whole items. A
 /// batch the next item would have pushed past the budget counts as well.
 pub const FULL_BATCH_RATIO: f64 = 0.8;
 
@@ -271,6 +287,7 @@ const TRIM_TRIGGER_SQUEEZED: &str = "squeezed";
 const TRIM_TRIGGER_IDLE: &str = "idle";
 const TRIM_TRIGGER_ALLOC_RETRIES: &str = "alloc_retries";
 const TRIM_TRIGGER_PRESSURE: &str = "memory_pressure";
+pub(in crate::inferio) const TRIM_TRIGGER_TRIAL: &str = "trial_over";
 
 /// A measurement's `regrow_after` for a release the host asked for (the
 /// worker's own is `shrink`); only these reach `/health`.
@@ -306,9 +323,6 @@ pub const OOM_MARGIN_MAX_STEPS: u32 = 3;
 /// Allocated delta below which a batch's pool ratio is allocator granularity,
 /// not a margin.
 pub const POOL_MARGIN_MIN_DELTA_MB: u64 = 64;
-
-/// Upper bound on the ramp exponent, so `seed << k` cannot overflow.
-const MAX_RAMP_STEP: u32 = 32;
 
 /// The admission limits for one GPU, from `[inference_local.vram]`. Any value
 /// must behave sensibly, not just the defaults.
@@ -440,24 +454,80 @@ pub struct FitSample {
     pub delta_mb: u64,
 }
 
-/// One throughput observation, in units/sec (not items/sec). Runtime-only.
+/// One throughput observation: a batch's units per second of its window's
+/// time from grant to settle, the time outside the batches shared out by
+/// batch time (units, not items). Runtime-only.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ThroughputSample {
     units: u64,
     units_per_sec: f64,
-    /// Other replicas with an overlapping window; only 0 may fit a knee.
+    /// Other replicas with an overlapping window.
     occupants: u32,
-    /// Position in this (model, GPU)'s observation stream; monotonic, never
-    /// reused.
-    seq: u64,
-    /// The anchor when this was taken; a sample below the current anchor dates
-    /// from the ramp's climb.
-    anchor: u64,
-    /// Taken in the replica's first settled window; the knee fit drops these.
+    /// The batch grew the allocator pool; `None` without pool figures.
+    grew_pool: Option<bool>,
+    /// Taken in the replica's first settled window, or within the first
+    /// [`KNEE_WARMUP_BATCHES`] it ran.
     warmup: bool,
-    /// Taken within the first [`KNEE_WARMUP_BATCHES`] after that window. Only
-    /// the knee fit drops these; the ramp still reads them.
-    warmup_tail: bool,
+}
+
+impl ThroughputSample {
+    /// Whether this observation may decide a batch size.
+    fn decides(&self) -> bool {
+        !self.warmup && self.units_per_sec.is_finite() && self.units_per_sec > 0.0
+    }
+
+    /// What its rate depends on besides the batch size: whether another
+    /// replica ran beside it, and whether the batch grew the pool. Only
+    /// observations with the same conditions are compared.
+    fn conditions(&self) -> (bool, bool) {
+        (self.occupants > 0, self.grew_pool == Some(true))
+    }
+}
+
+/// A trial of the batch sizes next to the working size
+/// ([`VramLedger::note_gain_locked`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Trial {
+    /// The larger size being measured, or `None` once the trial has turned
+    /// to the smaller one.
+    up: Option<u64>,
+    /// The size the next window is asked to run.
+    run: u64,
+    /// What the last window that asked for `up` was granted; until one has,
+    /// the size counts as granted in full.
+    granted: u64,
+    /// Windows since the last verdict.
+    windows: u32,
+    /// The trial moved the working size.
+    moved: bool,
+    /// The largest size it was granted, for the trim that follows.
+    largest: u64,
+    /// The doubling below `up` showed no gain: `up` has to gain on the size
+    /// two doublings below it, or the climb is over.
+    looks_ahead: bool,
+    /// The fastest size measured and the size below it, once the trial has
+    /// turned to the smaller size.
+    best: (u64, u64),
+    /// It started from a size no trial here had placed, or one memory had
+    /// held the replica at: a clear difference moves it, on any count.
+    opening: bool,
+}
+
+impl Trial {
+    /// A trial of twice `working`.
+    fn start(working: u64, opening: bool) -> Self {
+        Self {
+            up: Some(working.saturating_mul(2)),
+            run: working.saturating_mul(2),
+            granted: u64::MAX,
+            windows: 0,
+            moved: false,
+            largest: working,
+            looks_ahead: false,
+            best: (working, working / 2),
+            opening,
+        }
+    }
 }
 
 /// The fitted cost model for one (model, GPU) pair.
@@ -502,8 +572,15 @@ struct GrantCharge {
     room: u64,
     /// Requests in this window, retired from `pending_requests` at settle.
     requests: usize,
-    /// The admitted per-batch unit budget; the ramp may move before settle.
+    /// The admitted per-batch unit budget; the batch size may move before
+    /// settle.
     unit_budget: u64,
+    /// The batch size the gain rule asked for this window
+    /// ([`VramLedger::size_locked`]), before anything cut it.
+    size_asked: u64,
+    /// When the grant was issued: a throughput sample is charged its share
+    /// of the time from here to the settle.
+    granted_at: Instant,
     /// Memory held this window back ([`Grant::squeezed`]).
     squeezed: bool,
     /// The fitted price cut this window's batch to the device's room: not
@@ -512,26 +589,23 @@ struct GrantCharge {
     room_bound: bool,
     /// The contention tag: the most other replicas holding a window on this GPU
     /// at once while this one was out; 0 is sole occupancy. See
-    /// docs/batch-calibration-design.md, "Throughput knee: narrowing the
-    /// evidence", (b).
+    /// docs/batch-calibration-design.md, "Batch size: what counts as a
+    /// measurement".
     peak_occupants: u32,
-    /// The knee limited this window's batch size.
-    knee_bound: bool,
-    /// Room for a batch [`RATCHET_FACTOR`] × the appetite's, and not squeezed.
-    ample_headroom: bool,
-    /// Less work in hand than the budget admitted; earns no doubling.
+    /// Less work in hand than the budget admitted.
     queue_bound: bool,
     /// `dispatch::MAX_WINDOW_BYTES` closed this window: its batches count, but
-    /// it earns no ramp step.
+    /// it did not run at its budget.
     byte_bound: bool,
     /// Host RAM booked on the CPU device for this window (a GPU replica).
     ram_mb: u64,
-    /// Host RAM, not the GPU, set this window's unit budget: it earns no ramp
-    /// step and feeds no knee.
+    /// Host RAM, not the GPU, set this window's unit budget: it did not run
+    /// at its budget and feeds no throughput sample.
     ram_bound: bool,
     /// macOS's memory pressure while this window was out, the higher of its
-    /// grant and its settle. Above normal the window earns no ramp step,
-    /// feeds no knee, and its throughput-collapse flags are ignored. While
+    /// grant and its settle. Above normal the window did not run at its
+    /// budget, feeds no throughput sample, and its throughput-collapse flags
+    /// are ignored. While
     /// paging it also sets the [`PressureCap`] and its out-of-memory failures
     /// do not count toward [`OOM_WINDOWS_AT_FLOOR`].
     pressure: mps::MemoryPressure,
@@ -652,24 +726,9 @@ struct WorkerEntry {
     grants: HashMap<u64, GrantCharge>,
     /// Demand: requests in hand at the last grant request or settle.
     pending_requests: usize,
-    /// Ramp exponent: doublings earned by clean windows.
-    ramp_step: u32,
-    /// The last clean window refused a doubling. Also caps the budget floor and
-    /// the ratchet ceiling ([`uncapped_units`]).
-    ramp_held: bool,
-    /// The unit budget the hold was declared at; `None` unless held.
-    held_units: Option<u64>,
-    /// The ring certified the held rung (a knee or a measured plateau).
-    held_certified: bool,
     /// Consecutive one-item windows that ran out of memory or died; see
     /// [`OOM_WINDOWS_AT_FLOOR`].
     oom_at_floor: u32,
-    /// Consecutive queue-sized clean windows ([`Self::hold_reported`]).
-    windows_queue_bound: u32,
-    /// This hold was logged at INFO.
-    hold_announced: bool,
-    /// Clean windows towards widening the hold ([`HOLD_REPROBE_WINDOWS`]).
-    hold_reprobe_windows: u32,
     /// Halvings applied by deflation. Runtime-only, reset on respawn.
     deflation: u32,
     /// When deflation was last applied or repaid by time; `None` at 0.
@@ -696,6 +755,10 @@ struct WorkerEntry {
     /// The last release freed nothing: idle trims are off until another window
     /// settles.
     idle_release_gave_nothing: bool,
+    /// A batch size trial left the pool larger than the working size needs:
+    /// the dispatcher releases it when this replica's window returns
+    /// ([`Admission::take_trial_trim`]).
+    trial_trim_due: bool,
     /// Trim replies that freed memory (`released_mb > 0`); `None` until a reply
     /// carried the figure.
     pool_releases: Option<u64>,
@@ -717,9 +780,6 @@ struct WorkerEntry {
     ram_mb: Option<u64>,
     /// Host RAM capped its last grant ([`GrantCharge::ram_bound`]).
     ram_bound: bool,
-    /// The log2 size the ramp last ran a second window at for want of a knee
-    /// sample ([`VramLedger::awaits_knee_sample_locked`]).
-    awaited_sample_bucket: Option<u32>,
     /// Its first batch ran; what that batch kept is in its load level.
     ram_started: bool,
     /// Items per batch until its host RAM cost is measured at two sizes
@@ -850,61 +910,14 @@ impl WorkerEntry {
         self.reusable_pool_mb().saturating_sub(self.grants_mb())
     }
 
-    /// Account a clean window. First records the hold when `may_grow` (the
-    /// throughput brake) is false, at `hold_rung` if given or the current
-    /// rung. Then, while deflated, it repays deflation; otherwise it earns a
-    /// doubling only if `measured` (it added fit samples), `at_budget`
-    /// ([`Ingested::at_budget`]), below the shape `ceiling`, and `may_grow`.
-    fn note_clean_window(
-        &mut self,
-        measured: bool,
-        at_budget: bool,
-        anchor: u64,
-        ceiling: Option<u64>,
-        may_grow: bool,
-        hold_rung: Option<u64>,
-    ) {
-        // The rung this window ran on; a standing hold keeps its own.
-        let rung = uncapped_units(self, anchor);
-        let rung = match hold_rung {
-            Some(reached) => rung.min(reached),
-            None => rung,
-        };
-        self.ramp_held = !may_grow;
-        self.held_units = (!may_grow).then(|| self.held_units.unwrap_or(rung));
-        if self.deflation > 0 {
-            self.clean_windows += 1;
-            if self.clean_windows >= CLEAN_WINDOWS_TO_RESTORE {
-                self.deflation -= 1;
-                self.clean_windows = 0;
-            }
-        } else {
-            self.clean_windows = self.clean_windows.saturating_add(1);
-            if measured && at_budget {
-                // Grow from the effective exponent, not a lagging `ramp_step`.
-                let step = self.effective_ramp_step(anchor);
-                let at_ceiling =
-                    ceiling.is_some_and(|ceiling| uncapped_units(self, anchor) >= ceiling);
-                if step < MAX_RAMP_STEP && !at_ceiling && may_grow {
-                    self.ramp_step = step + 1;
-                }
-            }
+    /// Account a clean window: [`CLEAN_WINDOWS_TO_RESTORE`] of them repay one
+    /// level of deflation.
+    fn note_clean_window(&mut self) {
+        self.clean_windows = self.clean_windows.saturating_add(1);
+        if self.deflation > 0 && self.clean_windows >= CLEAN_WINDOWS_TO_RESTORE {
+            self.deflation -= 1;
+            self.clean_windows = 0;
         }
-    }
-
-    /// The ramp exponent in force: never below what the anchor implies
-    /// ([`ramp_floor_step`]).
-    fn effective_ramp_step(&self, anchor: u64) -> u32 {
-        self.ramp_step
-            .max(ramp_floor_step(self.seed_units, anchor))
-            .min(MAX_RAMP_STEP)
-    }
-
-    /// Whether the hold is reported (`/health`, log): not once the last
-    /// [`QUEUE_BOUND_HOLD_WINDOWS`] windows were queue-sized. Admission is
-    /// unaffected.
-    fn hold_reported(&self) -> bool {
-        self.ramp_held && self.windows_queue_bound < QUEUE_BOUND_HOLD_WINDOWS
     }
 
     /// An OOM or throughput collapse: one more halving, capped at
@@ -953,8 +966,6 @@ impl WorkerEntry {
 struct Settled {
     update: Option<ProfileUpdate>,
     death: Option<DeathNegative>,
-    /// The knee expired and was widened or withdrawn.
-    knee_expiry: Option<KneeExpired>,
     /// The window's log line.
     window: Option<WindowSettled>,
     /// The tier that classified this window's out-of-memory, if it was one.
@@ -1014,12 +1025,14 @@ struct WindowSettled {
     negative_reason: Option<&'static str>,
     fit_samples: usize,
     throughput_samples: usize,
-    ramp_step: u32,
+    /// The working batch size; 0 until one is set.
+    working_units: u64,
     deflation: u32,
     clean_windows: u32,
     max_units_measured: u64,
     /// Measurements that ran under their granted budget, and why
-    /// ([`grants::clamp_log_field`]); these are excluded from the knee ring.
+    /// ([`grants::clamp_log_field`]); these are excluded from the throughput
+    /// ring.
     clamped_samples: usize,
     clamped_reason: String,
     /// Allocator retries in this window; `None` off CUDA.
@@ -1038,7 +1051,7 @@ impl WindowSettled {
                 throughput_samples = self.throughput_samples,
                 clamped_samples = self.clamped_samples,
                 clamped = %self.clamped_reason,
-                ramp_step = self.ramp_step,
+                working_units = self.working_units,
                 deflation = self.deflation,
                 clean_windows = self.clean_windows,
                 max_units_measured = self.max_units_measured,
@@ -1053,7 +1066,7 @@ impl WindowSettled {
                 throughput_samples = self.throughput_samples,
                 clamped_samples = self.clamped_samples,
                 clamped = %self.clamped_reason,
-                ramp_step = self.ramp_step,
+                working_units = self.working_units,
                 deflation = self.deflation,
                 clean_windows = self.clean_windows,
                 max_units_measured = self.max_units_measured,
@@ -1070,21 +1083,17 @@ struct Ingested {
     /// At least one measurement reported an OOM, a throughput collapse or a
     /// spill.
     negative: bool,
-    /// Samples that entered the cost fit; growth is earned only on these.
+    /// Samples that entered the cost fit.
     fit_samples: usize,
-    /// The window ran at the ramp's budget: enough work in hand, and a batch
-    /// reached [`FULL_BATCH_RATIO`] of it or had no room for the next item.
-    /// Only such a window earns a doubling.
+    /// The window ran at its budget: enough work in hand, no memory
+    /// pressure, and a batch reached [`FULL_BATCH_RATIO`] of it or had no
+    /// room for the next item. Only such a window counts for the gain rule.
     at_budget: bool,
-    /// The same, whatever the memory pressure: the [`PressureCap`] grows on
-    /// these.
+    /// The same whatever the memory pressure, unless host RAM set the
+    /// budget: the [`PressureCap`] grows on these.
     filled: bool,
-    /// Samples that entered the knee ring.
+    /// Samples that entered the throughput ring.
     throughput_samples: usize,
-    /// The window's last batch at its budget grew the pool, and the worker
-    /// reported it still held after: no batch of that size has run warm yet,
-    /// and the next one would.
-    left_pool_grown: bool,
     /// Which kind of negative, for the log; all fold into `negative`.
     oom: bool,
     throughput_collapse: bool,
@@ -1117,8 +1126,20 @@ struct PressureCap {
     paging: bool,
 }
 
+/// What the local store holds of a (model, GPU), as far as the write policy
+/// compares it ([`VramLedger::pending_update_locked`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Persisted {
+    anchor: u64,
+    fit_version: u64,
+    /// The working size last written or read, if any.
+    knee: Option<u64>,
+    /// `(failed_trials, retest_after)` as [`calibration_store`] rounds them.
+    cadence: (u32, u32),
+}
+
 /// Per-(model, GPU) calibration state: the fit, its samples, the anchor and
-/// the knee.
+/// the working batch size.
 #[derive(Default)]
 struct ModelCalibration {
     /// At most one sample per distinct `units`; see [`FIT_RING`].
@@ -1148,29 +1169,35 @@ struct ModelCalibration {
     seeded: bool,
     /// Local clean fit samples: the confirmation gate. Persisted.
     local_samples: u32,
-    /// The knee fit's observations; [`KNEE_RING`]-bounded, runtime-only.
+    /// Throughput observations; [`KNEE_RING`]-bounded, runtime-only.
     throughput: VecDeque<ThroughputSample>,
-    /// The best bucket median ever seen here, `(bucket, units/sec)`: the
-    /// [`KNEE_RATIO`] reference, so an aged ring cannot walk the knee down.
-    /// Runtime-only.
-    knee_best: Option<(u32, f64)>,
-    /// The knee in force, fitted here or seeded from any profile (a knee can
-    /// only shrink a grant).
+    /// The working batch size: the smallest whose rate is within
+    /// [`KNEE_RATIO`] of the best measured ([`VramLedger::note_gain_locked`]),
+    /// or one a profile seeded (a working size can only shrink a grant).
+    /// `None` until a window ran at its budget.
     knee_units: Option<u64>,
-    /// The knee as fitted or seeded, before expiry widenings; persisted.
-    knee_fitted_units: Option<u64>,
-    /// Fitted here, so it may be persisted.
+    /// A trial on this machine moved to it or left it in place; only then
+    /// is it persisted.
     knee_is_local: bool,
-    /// Expiry counter ([`KNEE_EXPIRY_CLEAN_WINDOWS`]). Persisted.
-    knee_clean_windows: u32,
-    /// Set by an expiry widening. Runtime-only.
-    knee_widened: Option<KneeWidening>,
-    /// A knee was withdrawn and the store not yet told (the store reads an
-    /// absent knee as "none fitted").
-    knee_withdrawn: bool,
-    /// `(anchor, fit version, local knee)` as last written; a change triggers a
-    /// write.
-    persisted: Option<(u64, u64, Option<u64>)>,
+    /// The trial in progress. Runtime-only.
+    trial: Option<Trial>,
+    /// Windows at the working size still to run before the next trial.
+    /// Persisted with `failed_trials`, so a restart continues the wait.
+    retest_after: u32,
+    /// Trials in a row that left the working size in place.
+    failed_trials: u32,
+    /// What a trial the queue ran dry in had measured, as `(units,
+    /// units/sec)`: what the store holds for a restart to go on with.
+    unfinished: Vec<(u64, f64)>,
+    /// `unfinished` changed since the store was last told.
+    store_due: bool,
+    /// Memory granted the last trial nothing above the working size: the
+    /// replica keeps asking for twice that size, and the first window
+    /// granted a larger one starts a trial. Seeded for a stored working
+    /// size that is the largest size this machine has measured.
+    room_cut: bool,
+    /// What the store was last told; a change triggers a write.
+    persisted: Option<Persisted>,
     /// See [`ShapeCeiling`]. Runtime-only.
     shape_ceiling: Option<ShapeCeiling>,
     /// Half the batch a replica was running when its process died
@@ -1182,8 +1209,6 @@ struct ModelCalibration {
     floor_strikes: u32,
     /// See [`PressureCap`]. Runtime-only; a reloaded replica inherits it.
     pressure_cap: Option<PressureCap>,
-    /// Next [`ThroughputSample::seq`]; never rewinds.
-    throughput_seq: u64,
     /// A GPU replica's host RAM samples: batch units against the resident
     /// peak above `ram_at_load`. Runtime-only, like its cost below.
     ram_samples: VecDeque<FitSample>,
@@ -1197,18 +1222,8 @@ struct ModelCalibration {
     ram_first_units: u64,
 }
 
-/// Where a knee expiry left the model: a refit may put the knee back at or
-/// below `bucket` only on observations from `from_seq` on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct KneeWidening {
-    /// The log2 bucket the expired knee sat in.
-    bucket: u32,
-    /// The `seq` of the first observation after the widening.
-    from_seq: u64,
-}
-
 /// A batch size the impl itself reported it cannot run at this corpus's
-/// shapes (an `index_limit` clamp): the third brake beside the knee and the
+/// shapes (an `index_limit` clamp): a brake beside the gain rule and the
 /// ratchet. Runtime-only. See docs/batch-calibration-design.md, "Shape
 /// ceiling: the third brake".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1531,37 +1546,6 @@ impl VramLedger {
     /// One GPU's architecture, once known.
     pub fn gpu_arch(&self, gpu: &str) -> Option<String> {
         self.lock().gpus.get(gpu).and_then(|gpu| gpu.arch.clone())
-    }
-}
-
-/// What one knee fit read off the observation ring.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct KneeFit {
-    /// The knee, at the top of its bucket; `None` when none may be fitted.
-    knee_units: Option<u64>,
-    /// The ring's best bucket median, a candidate for
-    /// [`ModelCalibration::knee_best`].
-    best: (u32, f64),
-}
-
-/// The ring's verdict on the ramp's current size. Failing to certify a rung
-/// is a different claim from measuring a plateau there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RampGate {
-    /// The last doublings still bought throughput ([`ramp::ramp_still_gains`]).
-    gains: bool,
-    /// The rung has the observations to be judged
-    /// ([`ramp::ring_certifies_reached`]).
-    certified: bool,
-}
-
-impl RampGate {
-    /// No state to judge by: stops nothing.
-    fn open() -> Self {
-        Self {
-            gains: true,
-            certified: true,
-        }
     }
 }
 

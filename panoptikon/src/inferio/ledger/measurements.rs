@@ -1,17 +1,18 @@
-//! Ingesting batch telemetry: the cost fit, the knee ring, the shape ceiling.
+//! Ingesting batch telemetry: the cost fit, the throughput ring, the shape
+//! ceiling.
 
 use super::*;
 
-/// Whether a window's batches may feed the knee ring: not when it ran
-/// unpriced (`mb == 0`), host RAM set its budget, or it ran under memory
-/// pressure. A squeezed window is admitted; its budget is what the card ran.
-/// Excluded windows still feed the cost fit.
-pub(super) fn knee_admits_window(charge: &GrantCharge) -> bool {
-    charge.mb > 0 && !charge.ram_bound && charge.pressure == mps::MemoryPressure::Normal
+/// Whether a window's batches may feed the throughput ring: not when it ran
+/// unpriced (`mb == 0`) or under memory pressure. A window the room or host
+/// RAM cut is admitted; its budget is what the device ran. Excluded windows
+/// still feed the cost fit.
+pub(super) fn ring_admits_window(charge: &GrantCharge) -> bool {
+    charge.mb > 0 && charge.pressure == mps::MemoryPressure::Normal
 }
 
 /// Add a fit sample to a ring holding at most one per distinct `units`, so a
-/// steady state at one size cannot evict the ramp's other points.
+/// steady state at one size cannot evict the other sizes' points.
 fn push_fit_sample(ring: &mut VecDeque<FitSample>, sample: FitSample) {
     if let Some(pos) = ring.iter().position(|held| held.units == sample.units) {
         ring.remove(pos);
@@ -148,7 +149,7 @@ impl ShapeCeilingEvent {
             previous_age_secs = self.previous_age_secs.map_or(-1i64, |secs| secs as i64),
             "this model's own kernels named a batch size they cannot execute \
              at this corpus's shapes; the unit budget will not widen past it \
-             and the ramp takes no step beyond it. A shape ceiling is not a \
+             and no larger size is tried beyond it. A shape ceiling is not a \
              memory condition and never deflates anything — it is runtime-only \
              state, re-learned after a restart and dropped the moment the \
              canvas, the cost epoch or the corpus moves"
@@ -245,7 +246,7 @@ pub(super) fn update_shape_ceiling(
 
 impl VramLedger {
     /// Drain this worker's new telemetry into the ledger by watermark.
-    /// `window` is the settling window's grant; it gates the knee ring,
+    /// `window` is the settling window's grant; it gates the throughput ring,
     /// `max_units_measured_here` and the contention tag (no window counts as
     /// busy). The cost fit and the anchor take every clean priced batch.
     pub(super) fn ingest_locked(
@@ -354,24 +355,23 @@ impl VramLedger {
         let mut margin_samples: Vec<(u64, f64)> = Vec::new();
         let mut throughput: Vec<ThroughputSample> = Vec::new();
         let mut anchor = 0u64;
-        // "Ran at its budget", for both the ramp and the knee:
+        // "Ran at its budget", for the gain rule and the throughput ring:
         // [`FULL_BATCH_RATIO`] of the admitted (post-squeeze) unit budget, or
         // a batch the next item would have pushed past it.
         let budget_floor = window
             .map(|charge| ((charge.unit_budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1));
         let full_batch =
-            budget_floor.filter(|_| window.is_some_and(|charge| knee_admits_window(&charge)));
+            budget_floor.filter(|_| window.is_some_and(|charge| ring_admits_window(&charge)));
         // A clean priced batch of this window ran at its budget.
         let mut ran_full = false;
-        let mut left_pool_grown = false;
-        // A window the queue sized is no evidence for the ramp's next step;
-        // its batches still feed the knee ring.
+        // A window the queue sized did not run at its budget; its batches
+        // still feed the throughput ring.
         let queue_bound = window.is_none_or(|charge| charge.queue_bound);
         // A window the byte wall closed still counts toward
-        // `max_units_measured_here`, but earns the ramp no step.
+        // `max_units_measured_here`, but is no window at its budget.
         let byte_bound = window.is_some_and(|charge| charge.byte_bound);
-        // A window host RAM sized counts toward neither, and feeds no knee;
-        // nor does one run under memory pressure.
+        // A window host RAM sized counts toward neither; nor does one run
+        // under memory pressure, which also feeds no throughput sample.
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
         let pressure = window.is_some_and(|charge| charge.pressure != mps::MemoryPressure::Normal);
         let item_capped = window.is_some_and(|charge| charge.item_cap.is_some());
@@ -379,13 +379,13 @@ impl VramLedger {
         // and whether a batch filled the cap.
         let mut item_units: Option<u64> = None;
         let mut filled_cap = false;
-        // Contention tag for the knee samples and the collapse verdict. No
+        // Contention tag for the throughput samples and the collapse verdict. No
         // window counts as contended.
         let occupants = window
             .map(|charge| charge.peak_occupants)
             .unwrap_or(u32::MAX);
         let sole_occupancy = occupants == 0;
-        // The replica's first settled window is warm-up for the knee fit.
+        // The replica's first settled window is warm-up.
         let warmup_window = state
             .workers
             .get(&worker)
@@ -417,6 +417,16 @@ impl VramLedger {
         // corroborated by its memory figures.
         let mut clipped_collapses = 0usize;
         let mut uncorroborated_collapses = 0usize;
+        // The window's time from grant to settle over the time its batches
+        // ran, at least 1: each batch is charged its share of the rest.
+        let batch_ms: f64 = samples
+            .iter()
+            .filter_map(|sample| sample.measurement.duration_ms)
+            .sum();
+        let wall_ratio = window
+            .map(|charge| charge.granted_at.elapsed().as_secs_f64() * 1000.0 / batch_ms)
+            .filter(|ratio| ratio.is_finite())
+            .map_or(1.0, |ratio| ratio.max(1.0));
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
@@ -589,8 +599,8 @@ impl VramLedger {
             // which is not "warm". On every platform, CUDA included: a mid-batch
             // peak would mark every MPS batch, and every CUDA batch that
             // retried an allocation, as pool-growing. See
-            // docs/batch-calibration-design.md, "Throughput knee: what was
-            // decided at implementation".
+            // docs/batch-calibration-design.md, "Batch size: what counts as
+            // a measurement".
             let pool_after = measurement
                 .reserved_after_mb
                 .or(measurement.peak_reserved_mb);
@@ -599,18 +609,16 @@ impl VramLedger {
                 _ => None,
             };
             let high_water = grew_pool == Some(true);
-            let warm = grew_pool == Some(false);
             // Every batch that ran counts toward the warm-up, except negatives
             // and dropped collapses (skipped above).
             ran_batches = ran_batches.saturating_add(1);
-            // Knee samples (units/sec) exclude negatives, unpriced batches,
-            // batches with no allocator reading or a growing pool, batches below
-            // the full-batch floor, and clamped batches. All still feed the fit.
+            // Throughput samples (units/sec) exclude negatives, unpriced
+            // batches, batches below the full-batch floor, and clamped
+            // batches. All still feed the fit.
             if let Some(clamp) = &measurement.clamped {
                 clamps.push(clamp.reason.clone());
             }
-            if warm
-                && measurement.clamped.is_none()
+            if measurement.clamped.is_none()
                 && let (Some(units), Some(duration_ms), Some(full_batch)) =
                     (units, measurement.duration_ms, full_batch)
                 && duration_ms > 0.0
@@ -618,13 +626,10 @@ impl VramLedger {
             {
                 throughput.push(ThroughputSample {
                     units,
-                    units_per_sec: units as f64 * 1000.0 / duration_ms,
+                    units_per_sec: units as f64 * 1000.0 / (duration_ms * wall_ratio),
                     occupants,
-                    // Both stamped below from the calibration.
-                    seq: 0,
-                    anchor: 0,
-                    warmup: warmup_window,
-                    warmup_tail: !warmup_window && ran_batches <= KNEE_WARMUP_BATCHES,
+                    grew_pool,
+                    warmup: warmup_window || ran_batches <= KNEE_WARMUP_BATCHES,
                 });
             }
             // Every clean priced batch is a fit sample of the envelope
@@ -640,9 +645,6 @@ impl VramLedger {
                 let full = budget_floor
                     .is_some_and(|floor| units >= floor || measurement.next_over_budget);
                 ran_full |= full;
-                if full {
-                    left_pool_grown = high_water && measurement.reserved_after_mb.is_some();
-                }
             }
             // Pool-over-allocated ratio, only where the pool grew and the delta
             // reaches [`POOL_MARGIN_MIN_DELTA_MB`].
@@ -797,7 +799,7 @@ impl VramLedger {
         let throughput_samples = throughput.len();
         let ceiling_identity = key.clone();
         let cal = state.calibration.entry(key).or_default();
-        // The shape ceiling first: the ramp accounting below reads it.
+        // The shape ceiling first.
         let shape_ceiling = profile.and_then(|(canvas_pixels, max_tokens, epoch)| {
             update_shape_ceiling(
                 cal,
@@ -856,8 +858,7 @@ impl VramLedger {
                 cal.margin_ring.pop_front();
             }
         }
-        // The ratchet counts local clean priced batches. Updated before the
-        // knee ring, so this window's samples carry the anchor it reached.
+        // The ratchet counts local clean priced batches.
         let clean_window = !window_failed && !saw_oom;
         let reached_anchor = anchor > 0 && anchor >= cal.max_units_measured;
         if reached_anchor {
@@ -879,12 +880,7 @@ impl VramLedger {
         {
             cal.max_units_measured_here = anchor;
         }
-        // Stamp each sample with its sequence and the anchor in force, for
-        // [`fit_knee`]'s post-widening guard.
-        for mut sample in throughput {
-            sample.seq = cal.throughput_seq;
-            sample.anchor = cal.max_units_measured;
-            cal.throughput_seq = cal.throughput_seq.saturating_add(1);
+        for sample in throughput {
             cal.throughput.push_back(sample);
             while cal.throughput.len() > KNEE_RING {
                 cal.throughput.pop_front();
@@ -897,10 +893,9 @@ impl VramLedger {
         Ingested {
             negative,
             fit_samples: fit_sample_count,
-            at_budget: !queue_bound && !ram_bound && !pressure && ran_full,
+            at_budget: !queue_bound && !pressure && ran_full,
             filled: !queue_bound && !ram_bound && ran_full,
             throughput_samples,
-            left_pool_grown,
             oom: saw_oom,
             throughput_collapse: saw_collapse,
             spill: saw_spill,

@@ -155,6 +155,16 @@ impl VramLedger {
         );
     }
 
+    /// A trial left `worker`'s pool larger than its working size needs: mark
+    /// it for release at its next window boundary, unless the pool is under
+    /// [`TRIM_SLACK_MB`]. Not queued like the other triggers: those go to
+    /// idle replicas, and this one is busy.
+    pub(super) fn flag_trial_trim_locked(state: &mut LedgerState, worker: WorkerId) {
+        if let Some(entry) = state.workers.get_mut(&worker) {
+            entry.trial_trim_due = entry.pool_growth_mb() >= TRIM_SLACK_MB;
+        }
+    }
+
     /// Queue one trim per candidate up to [`MAX_PENDING_TRIMS`], skipping any
     /// already queued. The only place a [`TrimRequest`] is created. The
     /// debounce starts when the replica answers, not here.

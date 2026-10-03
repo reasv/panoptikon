@@ -1192,7 +1192,7 @@ fn an_aborted_windows_telemetry_is_not_charged_to_the_next_one() {
     token.finish(WindowOutcome::Aborted);
     let worker = &ledger.health()[0].workers[0];
     assert_eq!(worker.deflation, 0, "an aborted window does not deflate");
-    assert_eq!(worker.ramp_step, 0, "and earns no growth");
+    assert_eq!(worker.knee_units, None, "and sets no working size");
 
     // The next window is clean and measured.
     assert_eq!(measured_window(&handle, &admission, 4), 4);
@@ -1202,8 +1202,9 @@ fn an_aborted_windows_telemetry_is_not_charged_to_the_next_one() {
         "the aborted window's OOM was watermarked away, not inherited"
     );
     assert_eq!(
-        worker.ramp_step, 1,
-        "the clean measured window earned a step"
+        worker.knee_units,
+        Some(8),
+        "the clean measured window earned the next size"
     );
 }
 
@@ -1335,15 +1336,19 @@ fn a_frame_without_a_post_batch_pool_falls_back_to_the_peak() {
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
     let units = token.grant().unit_budget;
-    // peak above `before`: pool-growing, so not warm, so no ring sample.
+    // peak above `before`: pool-growing.
     handle
         .lock()
         .unwrap()
         .record_measurements(vec![measurement(units, 0, 10 * units + 100)]);
     token.finish(WindowOutcome::Responded { oom: None });
+    let sample = ledger.lock().calibration[&("g/a".to_owned(), GPU.to_owned())]
+        .throughput
+        .back()
+        .copied();
     assert_eq!(
-        ledger.health()[0].workers[0].throughput_samples,
-        0,
+        sample.and_then(|sample| sample.grew_pool),
+        Some(true),
         "a peak above the pre-batch pool is still `grew_pool = true`"
     );
 }

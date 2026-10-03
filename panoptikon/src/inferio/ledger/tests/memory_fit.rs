@@ -337,15 +337,15 @@ fn post_fit_units_derive_from_mb_via_the_slope() {
         .collect();
     handle.lock().unwrap().record_measurements(series);
     clean_window(&admission);
+    ledger.set_knee_for_test("g/a", GPU, 64);
     let fit = ledger.health()[0].workers[0]
         .fit
         .as_ref()
         .map(|fit| fit.slope_mb_per_unit)
         .expect("fitted");
     assert!((fit - 10.0).abs() < 1e-6, "slope {fit}");
-    // The anchor is 48 units, so the ramp's exponent is at 4 (32 <= 48) and
-    // its next step is 64 — under the ratchet ceiling of 96, and reserved at
-    // 64 * 10 = 640, not the whole share.
+    // The anchor is 48 units and the working size 64, under the ratchet
+    // ceiling of 96: reserved at 64 * 10 = 640, not the whole share.
     let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
     assert_eq!(token.grant().unit_budget, 64);
     assert_eq!(token.grant().mb, 640);
@@ -416,6 +416,7 @@ fn fitted_with_a_fixed_part(
         let batch = measurement(units, 0, fixed_mb + per_unit_mb * units);
         handle.lock().unwrap().record_measurements(vec![batch]);
         token.finish(WindowOutcome::Responded { oom: None });
+        admission.earn_next_size();
     }
     (handle, admission)
 }
@@ -531,6 +532,7 @@ fn the_cpu_device_charges_the_fixed_part_only_when_it_is_not_resident() {
             };
             handle.lock().unwrap().record_measurements(vec![batch]);
             token.finish(WindowOutcome::Responded { oom: None });
+            admission.earn_next_size();
         }
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         let grant = *token.grant();
@@ -538,59 +540,6 @@ fn the_cpu_device_charges_the_fixed_part_only_when_it_is_not_resident() {
             (grant.unit_budget, grant.mb, grant.fixed_mb),
             (64, fixed_mb + 64 * 82 * 5 / 4, fixed_mb),
             "{kept_mb} MiB kept"
-        );
-    }
-}
-
-/// Ample headroom is room for one batch twice the appetite's size: the fixed
-/// part counts once. With an anchor of 32 that is 800 + 64 × 10 MiB, not
-/// twice the 1120 MiB of 32 units. Pre-fit it is twice the base.
-#[test]
-fn ample_headroom_is_the_price_of_the_doubled_batch() {
-    let ample = |ledger: &Arc<VramLedger>, admission: &Admission| {
-        let token = admission.request_grant(32, None, 1, 0).unwrap();
-        assert!(!token.grant().squeezed);
-        let state = ledger.lock();
-        let grants = state
-            .workers
-            .values()
-            .flat_map(|entry| entry.grants.values());
-        grants
-            .map(|charge| charge.ample_headroom)
-            .collect::<Vec<_>>()
-    };
-    let fitted = ledger(100_000, no_margin());
-    let (handle, admission) = fitted_with_a_fixed_part(&fitted, "g/a", 800, 10);
-    for (room_mb, expected) in [(1440, true), (1439, false)] {
-        push_memory(&handle, room_mb, 0);
-        fitted.ingest_all_for_test();
-        assert_eq!(ample(&fitted, &admission), [expected], "{room_mb} MiB");
-    }
-    // A card that affords the 32 units but not 64 has no room for 64: the
-    // doubled batch is not cut to what the card affords. With no base of
-    // its own, the replica's room is the card's whole limit.
-    let small = ledger(100_000, no_margin());
-    let (handle, admission) = fitted_with_a_fixed_part(&small, "g/a", 800, 10);
-    small.lock().workers.values_mut().for_each(|entry| {
-        entry.base_mb = None;
-    });
-    push_memory(&handle, 1300, 0);
-    small.ingest_all_for_test();
-    let limit = small.health()[0].limit_mb;
-    assert_eq!((limit, small.headroom_mb(GPU)), (1300, 1300));
-    assert_eq!(ample(&small, &admission), [false], "1300 MiB card");
-    for (room_mb, expected) in [(2000, true), (1999, false)] {
-        let cold = ledger(1000 + room_mb, no_margin());
-        let handle = loaded(Some(1000), Some(0));
-        let admission = cold
-            .register_worker("g/a", item_cost(32), &handle, None)
-            .unwrap();
-        push_memory(&handle, room_mb, 0);
-        cold.ingest_all_for_test();
-        assert_eq!(
-            ample(&cold, &admission),
-            [expected],
-            "pre-fit, {room_mb} MiB"
         );
     }
 }

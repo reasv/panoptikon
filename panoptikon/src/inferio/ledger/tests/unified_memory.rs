@@ -1008,7 +1008,11 @@ fn a_cpu_replica_is_priced_beside_the_gpus_of_a_cuda_host() {
     }
     let health = ledger.health();
     for key in ["CPU", "GPU-3c4d"] {
-        assert!(device_of(&health, key).workers[0].ramp_step > 0, "{key}");
+        assert_eq!(
+            device_of(&health, key).workers[0].knee_units,
+            Some(16),
+            "{key}"
+        );
     }
 }
 
@@ -1434,12 +1438,12 @@ async fn a_load_on_the_cpu_device_of_a_mac_counts_on_the_mps_device() {
     assert_eq!(held.grant().mb, headroom / 2);
 }
 
-/// With MPS sampled peaks, no batch reads warm off `peak_reserved`, and an
-/// empty ring would let the ramp double to the memory ceiling. Read off the
-/// **post-batch** pool, the ring fills and the ramp holds at a rung it
-/// measured.
+/// With MPS sampled peaks, no batch reads warm off `peak_reserved`. Read off
+/// the **post-batch** pool, the ring's warm batches are told from the ones
+/// that grew it: wd-vit's rate is no better at 128 units than at 64, nor at
+/// 256, and within 5 % of its best down to 4 units, where the job ends.
 #[test]
-fn a_long_job_of_sampled_mps_windows_holds_at_a_rung_it_measured() {
+fn a_long_job_of_sampled_mps_windows_ends_at_the_smallest_size_near_its_best_rate() {
     let (ledger, handle, admission) = ramping_from_seed(64);
     let mut budgets = Vec::new();
     for _ in 0..1_200 {
@@ -1448,31 +1452,19 @@ fn a_long_job_of_sampled_mps_windows_holds_at_a_rung_it_measured() {
     let worker = &ledger.health()[0].workers[0];
     assert!(
         worker.throughput_samples > 0,
-        "the sampler's peak no longer disqualifies every batch"
+        "the sampler's peak does not disqualify every batch"
     );
+    assert_eq!(worker.knee_units, Some(4));
     assert_eq!(
-        worker.knee_units,
-        Some(511),
-        "the ring certifies a knee off wd-vit's decline past 256"
-    );
-    assert_eq!(
-        (budgets[0], budgets[3], budgets.iter().copied().max()),
-        (64, 512, Some(512)),
-        "the ramp walked four rungs and the curve stopped it, against the \
-         nine doublings to 19 100 an empty ring never brakes: {:?}",
+        (budgets[0], budgets[2], budgets.iter().copied().max()),
+        (64, 128, Some(256)),
+        "one size above was tried, one doubling past it, and no more: {:?}",
         &budgets[..12]
     );
-    let held = *budgets.last().expect("windows");
-    assert_eq!(held, 255, "and settled below the top rung it measured");
-    assert!(
-        held <= worker.max_units_measured,
-        "{held} is a rung that ran (measured up to {})",
-        worker.max_units_measured
-    );
+    assert_eq!(*budgets.last().expect("windows"), 4);
 }
 
-/// Three warm windows ahead of the same job change nothing once the ring
-/// fills; with it empty they would pin the budget at an unmeasured 512.
+/// Three warm windows ahead of the same job change nothing.
 #[test]
 fn three_warm_windows_do_not_decide_the_budget_for_the_whole_job() {
     let (ledger, handle, admission) = ramping_from_seed(64);
@@ -1484,14 +1476,9 @@ fn three_warm_windows_do_not_decide_the_budget_for_the_whole_job() {
         budgets.push(mps_sampled_window(&handle, &admission, &WDVIT_M3_MAX));
     }
     let worker = &ledger.health()[0].workers[0];
-    let held = *budgets.last().expect("windows");
-    assert_eq!(worker.knee_units, Some(255), "a knee either way");
-    assert_eq!(
-        held, 255,
-        "the same rung the job reaches without them, against the 512 \
-         `held_units` pinned when nothing behind them measured anything"
-    );
-    assert!(held <= worker.max_units_measured);
+    assert_eq!(worker.knee_units, Some(4));
+    assert_eq!(*budgets.last().expect("windows"), 4);
+    assert!(budgets.iter().all(|units| *units <= 256));
 }
 /// The **ceiling** half of `limit = min(recommended_max, memsize - external -
 /// reserve)`, swept: wherever more RAM is free than Metal will hand out, the
@@ -1638,22 +1625,22 @@ fn ramped_mac_replica() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("registers");
     push_ram(&handle, MAC_TOTAL_MB, 90_000, 0, 0);
-    let ramped: Vec<u64> = (0..5)
+    let ramped: Vec<u64> = (0..6)
         .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
         .collect();
-    assert_eq!(ramped, [4, 8, 16, 32, 64]);
+    assert_eq!(ramped, [4, 4, 8, 16, 32, 64]);
     (ledger, handle, admission)
 }
 
 /// `recommended_max_memory()` of the Mac in [`ramped_mac_replica`].
 const MAC_TOTAL_MB: u64 = 110_100;
 
-/// `(ramp_step, deflation, throughput_samples, unit_budget)` of the replica.
-fn ramp_figures(ledger: &Arc<VramLedger>) -> (u32, u32, usize, u64) {
+/// `(working size, deflation, throughput_samples, unit_budget)` of the replica.
+fn ramp_figures(ledger: &Arc<VramLedger>) -> (Option<u64>, u32, usize, u64) {
     let health = ledger.health();
     let worker = &health[0].workers[0];
     (
-        worker.ramp_step,
+        worker.knee_units,
         worker.deflation,
         worker.throughput_samples,
         worker.unit_budget,
@@ -1741,13 +1728,20 @@ fn ramp_windows(handle: &TelemetryHandle, admission: &Admission, windows: usize)
 #[test]
 fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
     let (ledger, handle, admission) = ramped_mac_replica();
-    let (step, _, samples, budget) = ramp_figures(&ledger);
-    assert_eq!(budget, 128, "the ramp's next size");
+    let (_, _, samples, budget) = ramp_figures(&ledger);
+    assert_eq!(budget, 128, "the trial's next size");
     paging_windows(&ledger, &handle, &admission, 3);
-    let (step_during, deflation, samples_during, _) = ramp_figures(&ledger);
-    assert_eq!(step_during, step, "no window earned a step");
+    let (size_during, deflation, samples_during, _) = ramp_figures(&ledger);
+    assert_eq!(
+        size_during,
+        Some(64),
+        "the trial is put off at the size it had measured; no paging window earned one"
+    );
     assert_eq!(deflation, 0, "no collapse was counted");
-    assert_eq!(samples_during, samples, "no rate reached the knee ring");
+    assert!(
+        samples_during <= samples,
+        "no rate reached the throughput ring"
+    );
 
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
     push_ram(&handle, MAC_TOTAL_MB, 90_000, 180, 0);
@@ -1755,8 +1749,12 @@ fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
     queued_window_at_the_rate(&handle, &admission, 3, |_| 100.0);
     assert_eq!(ramp_figures(&ledger).3, 8);
     assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 64]);
-    assert_eq!(pressure_cap(&ledger), None, "back at what the ramp admits");
-    assert_eq!(ramp_windows(&handle, &admission, 2), [128, 256]);
+    assert_eq!(pressure_cap(&ledger), None, "back at the working size");
+    assert_eq!(
+        ramp_windows(&handle, &admission, 2),
+        [64, 64],
+        "the trial that was put off waits its twelve windows"
+    );
 }
 
 /// At warning, once the paging has stopped, the batch grows back by doubling
@@ -1766,7 +1764,6 @@ fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
 fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() {
     use mps::MemoryPressure::{Normal, Warning};
     let (ledger, handle, admission) = ramped_mac_replica();
-    let step = ramp_figures(&ledger).0;
     paging_windows(&ledger, &handle, &admission, 2);
     ledger.set_memory_pressure_for_test(Warning);
     assert_eq!(
@@ -1779,12 +1776,12 @@ fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() 
     assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 32]);
     assert_eq!(
         ramp_figures(&ledger).0,
-        step,
-        "no pressure window earned a step"
+        Some(64),
+        "no pressure window earned a size"
     );
 
     ledger.set_memory_pressure_for_test(Normal);
-    assert_eq!(ramp_windows(&handle, &admission, 4), [32, 64, 128, 256]);
+    assert_eq!(ramp_windows(&handle, &admission, 4), [32, 64, 64, 64]);
     assert_eq!(pressure_cap(&ledger), None);
 }
 
@@ -1813,7 +1810,11 @@ fn a_warning_or_an_episode_before_the_batch_is_back_keeps_the_bound() {
     assert_eq!(ramp_windows(&handle, &admission, 1), [8]);
     paging_windows(&ledger, &handle, &admission, 1);
     ledger.set_memory_pressure_for_test(Warning);
-    assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 32]);
+    assert_eq!(
+        ramp_windows(&handle, &admission, 4),
+        [8, 16, 16, 16],
+        "half of the 64 in force when this paging began, halved again"
+    );
 }
 
 /// The bound is at least one unit, or a batch already at one unit would be
@@ -1893,21 +1894,28 @@ fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
     assert_eq!(ramp_figures(&ledger).3, 3);
 }
 
-/// At warning with nothing being paged out the replica keeps the size it
-/// had: no growth, no ramp step, no knee sample. A squeeze there is not
-/// kept once its cause is gone. Growth resumes when the pressure ends.
+/// At warning with nothing being paged out the replica keeps its working
+/// size: the trial of the next one is put off, and there is no growth and
+/// no throughput sample. A squeeze there is not kept once its cause is
+/// gone. The trial is taken up again after the pressure ends, within two
+/// doublings of the working size.
 #[test]
 fn at_warning_without_paging_the_batch_size_is_held() {
     let (ledger, handle, admission) = ramped_mac_replica();
-    let (step, _, samples, _) = ramp_figures(&ledger);
+    let samples = ramp_figures(&ledger).2;
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
     let held: Vec<u64> = (0..3)
         .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
         .collect();
-    assert_eq!(held, [128, 128, 128], "the budget in force, and no more");
-    let (step_during, _, samples_during, _) = ramp_figures(&ledger);
-    assert_eq!(step_during, step);
-    assert_eq!(samples_during, samples);
+    assert_eq!(held, [128, 64, 64], "the trial under way is put off");
+    let (size_during, _, samples_during, _) = ramp_figures(&ledger);
+    assert_eq!(size_during, Some(64), "what the trial had measured");
+    assert!(samples_during <= samples);
+    assert_eq!(
+        ledger.trial_for_test("g/a", MPS_GPU),
+        (None, RETEST_WINDOWS, 0),
+        "put off, not counted as a trial that left the size in place"
+    );
     let reached =
         ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].max_units_measured_here;
     assert_eq!(
@@ -1923,10 +1931,15 @@ fn at_warning_without_paging_the_batch_size_is_held() {
         None,
         "a squeeze, not a paging episode"
     );
-    assert_eq!(ramp_windows(&handle, &admission, 1), [128]);
+    assert_eq!(ramp_windows(&handle, &admission, 1), [64]);
 
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
-    assert_eq!(ramp_windows(&handle, &admission, 2), [128, 256]);
+    let after = ramp_windows(&handle, &admission, RETEST_WINDOWS as usize + 3);
+    assert_eq!(
+        after[..RETEST_WINDOWS as usize],
+        [64; RETEST_WINDOWS as usize]
+    );
+    assert_eq!(after[RETEST_WINDOWS as usize..], [128, 256, 256]);
 }
 
 /// Pressure at either end of a window marks it: at the grant only, or at the
@@ -1936,7 +1949,6 @@ fn a_window_under_pressure_at_either_end_earns_no_step() {
     use mps::MemoryPressure::{Critical, Normal, Warning};
     for (at_grant, at_settle) in [(Warning, Normal), (Normal, Critical)] {
         let (ledger, handle, admission) = ramped_mac_replica();
-        let step = ramp_figures(&ledger).0;
         ledger.set_memory_pressure_for_test(at_grant);
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
@@ -1952,8 +1964,8 @@ fn a_window_under_pressure_at_either_end_earns_no_step() {
         token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ramp_figures(&ledger).0,
-            step,
-            "{at_grant:?} at the grant, {at_settle:?} at the settle"
+            Some(64),
+            "128 units earned nothing: {at_grant:?} at the grant, {at_settle:?} at the settle"
         );
     }
 }

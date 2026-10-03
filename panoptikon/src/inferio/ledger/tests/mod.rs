@@ -10,16 +10,15 @@ use super::grants::{canvas_log_field, clamp_log_field};
 use super::load_reservations::OversizedLoad;
 use super::measurements::{
     CEILING_CAUSE_PROFILE, CEILING_CAUSE_RAN_WIDER, CEILING_CAUSE_REPORTED,
-    CLAMP_REASON_INDEX_LIMIT, knee_admits_window, ram_cost, robust_fit, update_shape_ceiling,
+    CLAMP_REASON_INDEX_LIMIT, ram_cost, ring_admits_window, robust_fit, update_shape_ceiling,
     watermark_gap,
 };
 use super::oom::{
     OOM_SOURCE_ERROR_FRAME, OOM_SOURCE_MARKER, OOM_SOURCE_MESSAGE_PATTERN, OOM_SOURCE_TYPED,
     OOM_SOURCE_UNCLASSIFIED, OomTrust,
 };
-use super::ramp::{ramp_still_gains, ring_certifies_reached};
+use super::ramp::{faster, placed, quiet_rate, relative_mad};
 use super::test_hooks::CalibrationState;
-use super::throughput_knee::{fit_knee, flat_above, relative_mad};
 
 const GPU: &str = "GPU-aaaa";
 /// The profile keyspace every test replica reports: one architecture, so
@@ -235,19 +234,21 @@ fn seeded_anchor(anchor: u64, local: bool) -> ProfileSeed {
         slope_mb_per_unit: 10.0,
         residual_mb: 0.0,
         samples: 20,
-        knee_units: None,
+        knee_units: Some(anchor),
+        knee_trials: Default::default(),
+        knee_rates: Vec::new(),
         local,
         fit_is_local: local,
         exact_torch: true,
         max_units_measured: anchor,
         local_samples: if local { 20 } else { 0 },
-        knee_clean_windows: 0,
         ring: Vec::new(),
     }
 }
 
-/// A clean window that reports one pool-growing batch of `units`, and the unit
-/// budget it was granted.
+/// A clean window that reports one pool-growing batch of `units`, of a model
+/// whose rate rises with every doubling ([`Admission::earn_next_size`]).
+/// Returns the unit budget it was granted.
 fn measured_window(handle: &TelemetryHandle, admission: &Admission, units: u64) -> u64 {
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
@@ -258,6 +259,7 @@ fn measured_window(handle: &TelemetryHandle, admission: &Admission, units: u64) 
         .unwrap()
         .record_measurements(vec![measurement(units, 0, 10 * units + 100)]);
     token.finish(WindowOutcome::Responded { oom: None });
+    admission.earn_next_size();
     granted
 }
 
@@ -523,13 +525,20 @@ fn rate(units: u64, units_per_sec: f64, count: usize) -> Vec<ThroughputSample> {
             units,
             units_per_sec,
             occupants: 0,
-            seq: 0,
-            anchor: 0,
+            grew_pool: Some(false),
             warmup: false,
-            warmup_tail: false,
         };
         count
     ]
+}
+
+/// The rate the ring holds for batch size `size`, from the observations
+/// comparable with its newest one.
+fn ring_rate(ring: &VecDeque<ThroughputSample>, size: u64, band: f64) -> Option<f64> {
+    quiet_rate(
+        &super::ramp::rates_at(&super::ramp::comparable(ring), size, size / 2),
+        band,
+    )
 }
 
 /// A **warm-pool** batch carrying no allocator reading: it reaches the
@@ -546,23 +555,20 @@ fn warm_batch(units: u64, units_per_sec: f64) -> BatchMeasurement {
 }
 
 /// One observation as the ledger recorded it: `(units, units/sec, the
-/// ratchet anchor at the time, the replica's window index)`.
-type Recorded = (u64, f64, u64, u64);
+/// replica's window index)`.
+type Recorded = (u64, f64, u64);
 
-/// A recorded series as [`fit_knee`] receives it — numbered in order, and
-/// with the replica's first window marked warm-up.
-fn recorded(series: &[Recorded]) -> Vec<ThroughputSample> {
+/// A recorded series as the ring holds it, with the replica's first window
+/// marked warm-up.
+fn recorded(series: &[Recorded]) -> VecDeque<ThroughputSample> {
     series
         .iter()
-        .enumerate()
-        .map(|(index, (units, rate_, anchor, window))| ThroughputSample {
+        .map(|(units, rate_, window)| ThroughputSample {
             units: *units,
             units_per_sec: *rate_,
             occupants: 0,
-            seq: index as u64,
-            anchor: *anchor,
+            grew_pool: Some(false),
             warmup: *window == 0,
-            warmup_tail: false,
         })
         .collect()
 }
@@ -578,12 +584,13 @@ fn priced_ledger(total_mb: u64) -> Arc<VramLedger> {
             residual_mb: 0.0,
             samples: 20,
             knee_units: None,
+            knee_trials: Default::default(),
+            knee_rates: Vec::new(),
             local: false,
             fit_is_local: false,
             exact_torch: true,
             max_units_measured: 0,
             local_samples: 0,
-            knee_clean_windows: 0,
             ring: Vec::new(),
         }),
         ..FakeProfiles::default()

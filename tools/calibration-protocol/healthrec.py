@@ -108,13 +108,12 @@ GPU_KEYS = (
 WORKER_KEYS = (
     "inference_id", "footprint_mb", "charge_mb", "base_mb",
     "reserved_at_load_mb", "reserved_mb", "grants_outstanding", "grants_mb",
-    "pending_requests", "seed_units", "ramp_step", "deflation",
+    "pending_requests", "seed_units", "deflation",
     "clean_windows", "unit_budget", "max_units_measured", "knee_units",
     "knee_is_local", "throughput_samples", "local_samples", "effective_margin",
-    # The throughput brake: whether the last clean window refused this replica
-    # its next doubling, the rung the hold was declared on, and whether the ring
-    # certified that rung -- an uncertified hold measured nothing.
-    "ramp_held", "held_units", "held_certified",
+    # The batch size trial: the size it runs next while one is on, and the
+    # full windows left before the next one.
+    "trial_units", "retest_after_windows",
     # The impl-stated batch ceiling (easyOCR's int32 index limit).
     "shape_ceiling_units",
     # Allocator retries: the last settled window's, and this replica's total.

@@ -32,11 +32,10 @@ Step 5 (the taxonomy table's impl-time verifications) is done — see the
 table's status column and the registry's `metadata.cost` comments, both of
 which now cite the code. Step 3 (auto everywhere with the number as a cap,
 plus the stamped one-time config migration) is implemented. Step 4's
-throughput-knee half is implemented: the knee is fitted orchestrator-side in
-units/sec from warm-pool batches, gated on a minimum sample count across a
-minimum number of geometric size buckets, enforced as a unit-side cap on
-every grant, and persisted through the existing store write path — see
-"Throughput knee: what was decided at implementation" below. The
+throughput half is implemented: the batch size moves only on rates measured
+orchestrator-side in units/sec, and each size a trial placed is
+persisted through the existing store write path — see "Batch size: growing
+only on a measured gain" below. The
 shipped-baseline *directory* has been wired since 1c but no actual baselines
 exist yet, which is the remainder of step 4. The easyOCR acceptance test of
 step 1 is still outstanding (see "Remaining for the easyOCR acceptance test"
@@ -49,548 +48,234 @@ wherever the thing really is a discrete card, and "device" only where the CPU
 and unified-memory pools are covered too — the admission key (`device_key`,
 `inferio/gpu.rs::resolve_device_key`) is the clearest example.
 
-### Throughput knee: what was decided at implementation
+### Batch size: growing only on a measured gain
 
-The design says "records units/sec per tried size and caps at the throughput
-knee". Everything below is the concrete reading of that, settled while
-implementing step 4 and recorded here because several parts are load-bearing
-in ways the one-line statement is not:
+The rule (2026-10-02): do not waste memory, but use as much of the hardware
+as makes a batch faster. **The working batch size is the smallest size whose
+rate is within 5 % of the best rate measured**, and it moves only on
+measurements: never because a larger size was merely no slower, and never
+because a timer ran out. The earlier machinery (a ramp that doubled until a
+gate stopped it, a hold, a knee fitted over the whole curve, and a knee that
+expired, widened and was withdrawn) grew by default whenever evidence was
+missing: a model running 6.5 items/s at every batch size was held at 7 units
+for eleven minutes and then walked to 400, 90 GiB of pool for nothing.
 
-- **Fitted in units/sec over log2 size buckets, one median per bucket.**
-  Buckets because the ramp itself is geometric (a linear binning would leave
-  every bucket but one empty) and because `sum`-dimension models never repeat
-  an exact unit count; a median per bucket because one batch that raced a
-  compositor redraw is a factor-of-two outlier and must not move a cap that
-  is permanent in practice.
-- **`KNEE_RATIO = 0.9`** makes "stopped improving" concrete: the knee is the
-  smallest bucket already within 90% of the best rate.
-- **Quantized to the top of its bucket.** Every size in a bucket is equally
-  supported by the one median that summarizes it, so the cap does not creep
-  downward as the ring ages, and "the knee changed materially" is decidable
-  by equality for the store's write policy.
-- **Fed by warm, full-budget batches only.** Pool-growing (high-water)
-  batches are excluded — they pay `cudaMalloc` for the size they are
-  *reaching*, and since every ramp step is high-water, including them would
-  bend the curve downward with size and manufacture a knee out of allocator
-  behaviour. **The reading that decides it is the pool after the batch**
-  (`reserved_after_mb`) against the pool before it, never a peak: MPS has no
-  peak counter, so `peak_reserved_mb` there is a 20 ms sampler's in-batch
-  maximum and exceeds the post-batch pool by construction. Compared against
-  it, no MPS batch is ever warm — measured, 0 throughput samples in 166 of 170
-  windows against the control's 914 in 366, and an empty ring is
-  the one case the ramp's throughput brake answers "carry on" to, so the
-  ratchet doubled the budget to the memory ceiling.
-  **The rule is universal, and it moves CUDA too.** `max_memory_reserved()`
-  exceeds the post-batch pool whenever the allocator released cached blocks
-  mid-batch to retry an allocation, so those batches — previously read as
-  pool-growing and kept out of the ring — now ring as warm at the rate the
-  retry stalled. Measured on an idle 5090: a wd-vit cold ramp's largest
-  granted budget fell **718 → 48** and its published one
-  **1 024 → 64**, at **1.119×** the items/s, with 0 squeezed windows on either
-  binary; GPU-bound MiniLM held 128 ring samples throughout and moved
-  **1.011×**, certifying a knee its full ring already justified. Braking where
-  more batch pays nothing is the ruled behaviour on every platform. Batches that did not spend
-  their window's granted unit budget (below 80% of it) are excluded too: window
-  tails and user-capped batches ran small because there was nothing bigger to
-  run, which is not evidence about the size. A batch the next item would have
-  pushed past the budget, carrying at least half of it (the worker's
-  `next_over_budget`), is not excluded: with items over half the budget and
-  under 80% of it, no batch ever reaches 80%, and the ramp would never step. A batch that filled a *deflated*
-  grant is admitted at its small size — that is honest data about running at
-  that size. Measurements carrying no allocator reading at all are excluded
-  rather than assumed warm. The cost is a rate, not a bias: a
-  variable-shape model whose every window is a fresh high-water mark fills
-  the knee ring slowly, and its curve is described by the sizes it repeats.
-- **Frontier guard on the knee bucket** (the design phrases it on the best
-  bucket): never cap at a size nothing was measured past. On real hardware
-  the largest bucket is a hair above its predecessor essentially always, so
-  requiring the *best* bucket to be interior would mean no knee is ever
-  fitted; where the curve is genuinely still climbing, the knee bucket is the
-  frontier too and the guard declines anyway.
-- **Sticky, with a historical anchor.** A knee is replaced, never withdrawn:
-  once it caps the budget, the sizes past it stop being run, so the ring can
-  no longer answer and that silence must not be read as "no knee". The same
-  effect applies to the *reference rate* — the peak that defined the knee
-  ages out of the ring — so the threshold is taken against the best bucket
-  median this model has ever shown here (a runtime-only high-water mark),
-  never against the surviving ring's alone. Without both this and the
-  full-budget rule, each refit lands lower than the last and the cap walks
-  itself down to a single unit, absorbingly.
-- **Enforced on the unit side.** The price of `knee_units` and a `min` on
-  admitted units are the same constraint post-fit and the unit-side one also
-  binds pre-fit; the same equivalence gives the contention appetite as the
-  price of `min(anchor, knee)` units.
-- **A profile's knee may be seeded from a shipped baseline** (unlike the
-  ratchet anchor): it can only ever make a grant smaller. It is never written
-  back out under our own generator stamp, and never overwrites a knee this
-  machine fitted.
+Per (model, device) the ledger keeps a **working size** `W`, stored and
+published as `knee_units`, and at times a **trial** of the sizes next to it.
+The unit budget is `W`, or the size the trial runs next; the memory rules
+then cut it as before (room, reserve, pre-fit cut, host-RAM ceiling and item
+cap, the ratchet at `RATCHET_FACTOR ×` the anchor, shape ceiling, death and
+pressure caps, deflation).
 
-### Throughput knee: narrowing the evidence
+```text
+rate(s)   = median of the comparable observations of size s, each a batch's
+            units per second of its window, from grant to settle
+            (unknown with fewer than 2, or a relative MAD over the device's band)
+d(a, b)   = the doublings between two sizes, 1 at most
 
-The knee estimator was measured firing on the wrong evidence and then
-outliving it: `knee_units` 1 and 63 under two hog schedules, 7 under the
-loadgen, 31 for
-MobileCLIP against an optimum of 128, and — the half that made the rest
-permanent — a soak whose knee was fitted **once**, four minutes in, and never
-refitted for 7 h 55 m across 13 job passes and 56 worker spawns, because it
-is persisted and every new replica is reseeded from it. Four changes, and they
-are deliberately layered: three
-of them narrow what may *become* evidence, and the fourth bounds the damage
-of a cap fitted from evidence that was wrong anyway.
+faster(lo, hi, f): is rate(hi) > f × rate(lo)?
+    CONFIRM_SAMPLES (12) observations on both sides  -> the medians decide
+    fewer                                            -> only a difference of more than
+                                                        CLEAR_ERRORS (4) standard errors
+    undecided -> the next window runs the side with fewer observations;
+                 at TRIAL_SAMPLES (48) a side, or after TRIAL_WINDOWS (24)
+                 windows, it counts as not shown
+clear(lo, hi, f, n): the same question, decided only by a difference of more
+    than n standard errors, whatever the count
 
-**(a) A window that was not free to choose its size describes no curve.**
-Two exclusions on top of the full-budget rule above, both of which the
-ledger already knows without asking anyone:
+opening:  W = the stored knee_units (a row with a fit), with the wait stored
+          beside it; otherwise the first window that ran at its budget with
+          memory to spare, and a trial at once. With a host-RAM side that is
+          the first window that ran the size asked (the seed): the windows
+          under the item cap and the ratchet before it open nothing.
+          A stored W that is the largest size this machine has measured is
+          asked past (2W) once W has run, as while memory grants nothing above
 
-- a **memory-blind** window (the grant's `mb` is 0: a pre-fit grant on a full
-  GPU, priced against nothing);
-- a batch the **worker's defensive clamp** shrank (the measurement carries a
-  `clamped` map). This one is per batch rather than per window, because the
-  clamp fires per batch.
+after `wait` full windows at W, a trial:
+  up:    G = W, the last size that gained; T = 2G, never above 4W
+         faster(G, T, TRIAL_STEP per doubling) and memory granted T in full
+                -> G = T, T = 2T
+         shown not faster, for the first time since a gain, T granted in full
+                -> T = 2T: one doubling of look-ahead. It goes on only if
+                   clear(G, T, TRIAL_STEP per doubling, HOLD_ERRORS) at twelve
+                   observations a side. A look-ahead memory cannot grant in
+                   full is not run
+         otherwise the climb is over; a size memory cut is the size it granted
+         after each gain and at the end, W is placed:
+           best = the fastest size from W to T
+           W stays unless clear(W, best, (1 / KNEE_RATIO) ^ d, CLEAR_ERRORS)
+                on twelve observations a side; on any count in the first
+                trial from a size no trial here placed, and in one that starts
+                because memory grants more than it had
+           else W = the smallest size above it that is not clearly slower
+                than the band: not clear(s, best, (1 / KNEE_RATIO) ^ d, CLEAR_ERRORS)
+  down:  (when the up half moved nothing)  D = W / 2
+         D is clearly inside the band of best [clear(D, best, (1 / KNEE_RATIO) ^ d,
+         HOLD_ERRORS (1) at twelve a side, CLEAR_ERRORS under) is false]
+                -> W = D, again
+  over:  W moved  -> wait = RETEST_WINDOWS (12), failed = 0
+         W stayed -> wait = 12 << failed (384 at most); failed += 1
+         the observations of the other sizes are dropped, and a pool larger
+         than W needs is released when the replica's window returns
 
-A **squeezed** window (`Grant.squeezed`: its share afforded fewer units than
-the window wanted; pre-fit, see "When a grant counts as squeezed") is *not*
-excluded, and that is the one at-budget rule
-: the granted `unit_budget` is already cut to the squeeze, so
-`FULL_BATCH_RATIO` is taken over the size that actually ran. The ramp earns its
-step off such a window for exactly that reason, and the ring may not refuse the
-same evidence the ramp accepted — otherwise the ring can certify a knee from
-windows the ramp was refused, and did.
+the queue runs dry inside a trial (the run ended, or its caller fell behind):
+         the pool the trial grew is released, what it measured is stored, and
+         the trial goes on when work returns, in this run or the next
+```
 
-Both exclusions still feed the **cost fit** and the ratchet: a clean high-water
-batch's allocator envelope is an honest point on the memory curve whatever
-decided its size. Only the throughput ring is protected.
+- **The rate is end to end.** A batch's observation is its units over its
+  share of the window's time, from the ledger issuing the grant to settling
+  it: `units × 1000 / (duration_ms × wall_ms / Σ duration_ms)`. The time
+  outside the batches (pricing, the round trip, the clamp, the frames
+  between batches) is paid per window and per batch, so it weighs most on
+  small batches. A model whose batches are no faster at any size therefore
+  stops stepping down where that time is inside the band: at 6.5 ms a window
+  and 1 ms a batch, 2 units at 22 items/s, 8 at 100, 16 at 300, and 1 unit
+  only for a model as slow as 6.5 items/s.
+- **The band is `KNEE_RATIO`.** Rates within 5 % of the best are a plateau,
+  and `W` is its smallest size. A trial doubles on while the last doubling
+  gained `TRIAL_STEP` (1.5 %), so a curve with a soft bend is followed to
+  where it flattens before `W` is placed. A step memory cuts short is held
+  to its share of both thresholds: 128 → 191 units is 0.58 of a doubling and
+  must be 1.03× faster to be kept. A size less than 1.11× the one below it
+  is the same size (`SAME_SIZE_RATIO`), and a step the ratchet, not memory,
+  trimmed to a full batch of the size asked ran that size.
+- **One doubling of look-ahead.** Some curves dip or stay flat for one
+  doubling and rise beyond it. A doubling shown to gain nothing is passed
+  once; the size beyond it has to be clearly faster than the last size that
+  gained, by the step for both doublings. Two in a row end the climb, and so
+  does a doubling that could not be measured in its windows.
+- **Down as well as up.** A model that opens larger than it needs (a full
+  queue at the seed, a stored size, a shipped one) steps down while half the
+  size is within the band of the fastest size the trial measured; that size
+  is kept through the steps, so the size cannot walk down pair by pair.
+- **A verdict needs evidence that survives noise.** Two sizes are compared on
+  twelve observations each, or on fewer when their difference is more than
+  four standard errors of both sides' scatter, so a model 1.44× faster per
+  doubling still takes one window per doubling and a noisy flat one waits.
+- **`W` is left only on a clear difference.** Up, the best size must be
+  faster than the band by four standard errors, and a size is passed over on
+  the way only when it is that much slower than the best; down, at twelve a
+  side, half the size must be inside the band by one. A size at the band's
+  edge is therefore not left and returned to as the observations scatter.
+  Moving up is the harder of the two because a move up that noise made costs
+  memory until a later trial undoes it.
+- **A size a trial placed is left on twelve observations a side.** On a
+  shared host the rate sits on one level for a stretch and then on another,
+  at every size, so a few batches of a larger size can read clearly faster
+  than the working size without being so. The size a replica opens at is a
+  guess (the seed, a shipped profile's size), and so is one memory had held
+  it at: the trial that starts from it moves on any clear difference, which
+  is what takes a model 1.44× faster per doubling up in a window per
+  doubling.
+- **A trial stays within two doublings of `W`.** The climb goes further only
+  once `W` has moved. A doubling passes the 1.5 % step by chance often
+  enough that a climb which the working size did not follow reached the room
+  on a model no faster there. The cost: a rate that gains less than the band
+  over two doublings (under 2.6 % a doubling) is not followed.
+- **No evidence is not a move.** A comparison that is still undecided with
+  `TRIAL_SAMPLES` observations a side, or after `TRIAL_WINDOWS` windows,
+  counts as not shown, and `W` stays.
+- **Nothing is permanent.** A trial that left `W` in place is repeated after
+  12, 24, 48 … 384 full windows at `W`; one that moved it after 12. The wait
+  is never longer than `W` has already been left in place, plus twelve. A
+  change of `W`'s own rate starts no trial: it says nothing about the sizes
+  next to `W`, and on a shared host it happens every few windows.
+- **The pool follows the size.** A trial that ran a larger size than the one
+  it leaves marks the replica, and the dispatcher sends it a `trim`
+  (`trial_over`) when its window returns, before the next one, with work
+  queued or not. So does a queue that runs dry inside a trial, `TRIM_DEBOUNCE`
+  apart at most: a run that ends there does not keep the trial's pool. The
+  other trims go to idle replicas and are declined by a busy one. A pool
+  under `TRIM_SLACK_MB` is left.
+- **Memory decides what a trial may run.** When memory grants nothing above
+  `W`, the up half is skipped and the replica keeps asking for `2 W`, which
+  costs nothing; the first window granted a larger size starts a trial at
+  once. A window that runs out of memory, collapses, or whose worker dies
+  ends the trial and the asking; one under memory pressure puts the trial
+  off for 12 windows. Either way `W` keeps what the trial had measured below
+  that window's size.
+- **The store holds every size a trial placed.** `knee_units` is written as
+  soon as a trial moves `W`, up or down, during the climb as well, and when
+  a trial leaves an opening size in place; the wait is stored beside it
+  (`knee_trials_failed`, `knee_retest_after` in whole twelves, rounded
+  down). A restart carries the wait on. A run that ended inside a trial
+  left no wait and what the trial had measured (`knee_rate_units`,
+  `knee_rates`, the ring's comparable observations, 128 at most), so the
+  next goes on with the trial instead of measuring its sizes again. It does
+  so once `W` has a rate in the new run and that rate has not clearly moved;
+  otherwise the stored observations are dropped. They are removed when the
+  trial ends.
+  `max_units_measured` is still the ratchet's anchor (the largest clean
+  batch run). When it is no larger than the stored `W`, nothing above `W`
+  was measured here: memory, or the end of the run, cut the climb, and the
+  room may differ now. The replica then runs `W` once and asks for `2 W`,
+  as it does within a process, so a larger room is found in its second
+  window. A row with an anchor and no `knee_units` opens at the seed.
+- **Rising rates.** One window more than before at the opening size (it must
+  be measured before the next can be compared with it), then one window per
+  doubling, and one window at half the size twelve windows later. A caller
+  that keeps a batch and a half in flight takes three per size. From a size
+  a trial had placed, a rate that starts to rise is followed two doublings
+  at a time, each on twelve observations of the larger size.
+- `/health`: `knee_units` is `W`; `knee_is_local` says a trial on this machine
+  moved to it or left it in place (in this run or the one that stored it);
+  `trial_units` is the size a trial runs next; `retest_after_windows` the
+  wait.
 
-**(b) The contention tag: only a sole occupant may describe a curve.** Every
-throughput sample carries the largest number of *other* replicas on the same
-GPU that held an outstanding window overlapping it, and the knee is fitted
-from the zero-tagged ones alone. A rate measured while a neighbour was
-running is a rate for that GPU state, not for that batch size; the estimator
-fitted `knee_units = 7` under the loadgen and produced three throughput-collapse
-negatives on MiniLM purely from sharing a GPU.
+What the rule cannot see: the dispatcher's time between a settle and the
+next grant is not in the rate; a rate that is flat for two doublings or more
+and rises beyond them is not followed, nor one that gains less than the band
+over two doublings; a rate scattered past the device's band has no value,
+and the size stays where it is. What it costs under heavy noise: a gain of
+5 to 15 % a doubling cannot be told from scatter of 15–20 % on the
+observations of one trial, so `W` stays and only the trial windows run the
+faster size.
 
-The tag is maintained by the grant path, which is the only moment occupancy
-can rise, and it is a **high-water mark over the window's life**: a window
-that starts alone and is joined half way through is tagged as contended.
-Granularity is per window rather than per sample, because a measurement
-carries a duration and no start instant — the approximation is one-sided, so
-it costs honest samples (a knee found late) and never admits contended ones
-(a wrong knee, which is the one that is permanent).
+### Batch size: what counts as a measurement
 
-The same tag decides the **throughput-collapse verdict**. The worker's
-collapse flag is a comparison between two consecutive batches, and a
-comparison is only meaningful inside one occupancy regime, so the host trusts
-it only from a window that had the GPU to itself throughout. A suppressed
-collapse is discarded whole rather than counted as a clean batch: "we cannot
-tell whether this was a spill" is not the finding "this was not a spill".
-What is suppressed is the *verdict*, never the measurement: one batch can
-carry `oom` and `throughput_collapse` together — an impl whose own halving
-loop absorbed an out-of-memory runs its retries inside the same wall clock,
-so its rate collapses for the most structural reason there is — and the OOM
-is a statement about that batch which no neighbour explains.
-Samples are **tagged and kept**, not dropped at ingest, so `/health`'s
-`throughput_samples` still reports everything the replica produced.
+The ring holds the last `KNEE_RING` (128) throughput observations per (model,
+device), in units per second of the window. What may enter it, and what is
+compared with what:
 
-**(c) The bucket-variance filter: no knee out of noisy evidence.** A
-desktop's own VRAM and GPU churn moves throughput without moving anything
-the ledger can observe — the contention tag sees our neighbours and nothing
-else. The remaining defence is to notice that the observations disagree with
-each other. So: a log2 bucket takes part in a fit only when it holds at least
-**2 observations** (a singleton's dispersion is zero by construction, which
-would wave through exactly the evidence being tested for), and if any
-participating bucket's **relative median absolute deviation** — `MAD /
-median` of its units/sec — exceeds **0.20**, no knee is fitted, none is
-persisted, and the historical peak is not updated either.
-
-Relative MAD rather than a coefficient of variation because the knee's own
-per-bucket summary is a median: the same robustness that stops one
-compositor-redraw outlier moving a permanent cap must stop it *blocking*
-one. A quiet wd-vit series is the case in point — relative MAD 0.003
-against a CV of 0.252.
-
-0.20 comes from measured series and from the knee's own arithmetic, and the
-two agree. Measured (request-level items/s per fixed-size batch, which
-over-states the noise of the batch-level series the ring holds): quiet GPUs
-0.003 (wd-vit under the loadgen) and 0.052 (MiniLM); three models contending
-for one GPU 0.034 for wd-vit and MobileCLIP and **0.899** for MiniLM, which is
-the series the three spurious collapse negatives above came out of. The
-geometric mean of 0.052
-and 0.899 is 0.216. Independently, `KNEE_RATIO = 0.9` makes the knee a
-decision about a 10% gap between bucket medians, and twice that gap is the
-loosest per-sample scatter under which those medians still mean anything.
-
-The cost is one-sided on purpose. A false negative is a knee found late:
-bounded, self-correcting, paid in throughput on a model whose curve has
-genuinely flattened. A false positive is the soak above — `knee_units = 1`
-fitted four minutes in, persisted, reseeded into 56 replicas, 4 281 of 4 285
-grants at one item for 7 h 55 m.
-
-**The CPU device ships a wider band, 0.35.** A quiet CPU host running wd-vit
-measures 0.13–0.20 in the buckets the ramp lives in (highest quiet bucket
-0.196, over three identical 2 000-item runs), so at 0.20 one honest bucket
-refuses every fit for the job. 0.35 is about 1.8× that quiet ceiling. The
-headroom admits some real noise: a 6 GB allocate/touch/free every 5 s beside
-the worker drove one bucket to 0.2227, which 0.20 would have refused, yet the
-knee fitted under it (15 units) matched the quiet runs. Both defaults are
-overridden by `knee_max_bucket_dispersion` in `[inference_local.vram]` or in
-one device's override table (`[inference_local.vram.gpu."CPU"]` for the CPU).
-
-**(d) The knee is a brake with an expiry, not a ceiling.** The three rules
-above narrow what may become evidence; this one bounds the damage of a cap
-fitted from evidence that was wrong anyway — which no filter can rule out,
-and which, measured, nothing ever revisits.
-
-After **12 clean windows** run *at* the knee, on a GPU that had room for
-`RATCHET_FACTOR × appetite` while they ran, the cap **widens by one log2
-bucket** (`knee_units` is the top of its bucket, so `2k + 1` is the top of the
-next) and the counter resets. Once a widening reaches the extrapolation
-ratchet's own ceiling — `RATCHET_FACTOR × anchor`, past which it could not cap
-anything — the knee is withdrawn outright.
-
-- *12*, because [`MIN_KNEE_SAMPLES`] is 12: twelve honest observations is what
-  the estimator demands before it may cap anything, so twelve clean windows at
-  that cap is the symmetric price of re-testing it.
-- *At the knee* means the knee was the binding constraint **and** the window
-  carried enough work to reach it. A window short of work, or held down by the
-  ramp or the ratchet, says nothing about the cap.
-- *With room to spare* means `headroom ≥ price(RATCHET_FACTOR × min(anchor,
-  knee))` and the window was not squeezed — exactly what the widened budget
-  would cost. Re-widening into a full GPU would be a squeeze, not a probe.
-- A **negative** window resets the counter. A model that just ran out of
-  memory is not a model asking to be let out.
-
-**One step, not a clearing.** Re-widening by a bucket rather than removing the
-cap is the whole difference between a brake and no brake: if the knee was
-right, the excursion costs one bucket's worth of throughput for one window and
-the next refit puts it back; if it was wrong, the model climbs out of it one
-step per twelve windows instead of never. The counter lives per (model,
-GPU), not per replica — the soak's damage was done *across* 56 worker spawns, so
-a counter that died with the replica would never have reached its threshold —
-and it is **persisted** alongside `knee_units` as a local-only store field, so
-a restart does not hand a stored knee a fresh twelve windows to be right in.
-What is persisted as `knee_units` is the knee as **fitted**, never the size a
-widening is currently probing with: the probe is this process's re-test of the
-cap, and storing it would start the next process at twice the cap this one
-learned (measured on MPS: 63 and 15 written against fits of 31 and 3). A knee that
-expires all the way to withdrawal is erased from the store by an explicit
-signal, because the merge rule otherwise reads an absent knee as "nothing
-fitted this run".
-
-**The oscillation guard.** Immediately after a widening the sample ring is
-exactly what it was when the knee expired, so a refit would hand the same
-number straight back before the model ever ran at the wider size. A widened
-knee therefore records the old cap's bucket as a frontier, and no refit may
-install a knee at or below it until the model has actually been observed
-running above it. Once it has, the refit runs normally — and on a genuinely
-flat curve it re-establishes the same knee, which is the expiry working, not
-failing: the steady-state cost is one probing window in thirteen, at twice the
-capped size, in exchange for a cap that can never again outlive its evidence.
-(The fit rules below replace the "one warm batch above" test with a
-per-sample sequence mark, which is what makes "after the widening" mean what
-it says.)
-
-### Throughput knee: the fit itself
-
-The rules above were measured working on hardware — the expiry fired ten
-times, every one at exactly twelve clean windows and one bucket; the variance
-filter fired 59 times on MiniLM; `knee_clean_windows` survived a restart —
-and the same measurement showed the estimator itself producing a knee that no
-filter could have caught, because the evidence behind it was quiet, sole
-occupancy, warm-pool and full-budget throughout:
-
-- **wd-vit**, whose measured curve is flat (35.9 items/s at batch 1, 36.1 at
-  2 048, and no knee at all before these rules) fitted `knee_units = 3` at 14
-  observations, oscillated 3 ↔ 7 for the rest of the job as the expiry widened
-  and the next refit put it straight back, and persisted 7. `utilization`
-  0.11 against 0.40 before.
-- **A second job**, seeded with that store, then held a *fresh* 2 000-item job
-  between 7 and 31 units for its entire length — 75 windows, `utilization`
-  0.01 against 0.80 before. The soak's failure, across a restart.
-
-Rebuilding the ring from that job's `panoptikon.log` reproduces all five of
-its fits exactly, and the first one shows the mechanism:
-
-| bucket | units | n | median units/s | in the fit? |
-|---|---|---|---|---|
-| 1 | 2 | 2 | **40.77** | yes — and the ring's *best* |
-| 2 | 4 | 2 | 34.96 | yes |
-| 3 | 8 | 2 | 40.31 | yes |
-| 4 | 16 | 1 | — | dropped: a singleton cannot be certified quiet |
-| 6 | 64 | 6 | 39.79 | yes |
-| 7 | 136 | 1 | — | dropped, **and it was the frontier** |
-
-The threshold is `KNEE_RATIO ×` the best bucket median = 36.69, and the
-estimator returns the smallest bucket that clears it. The smallest bucket
-*was* the best bucket, so it cleared its own threshold at the first
-comparison, and the frontier guard passed only because the real frontier
-(136 units, one sample) had been dropped and bucket 6 stood in for it.
-
-The flaw is that the plateau test was **self-referential and one-sided**: it
-compared the candidate to the ring's own maximum and never looked above the
-candidate at all. On a ramp the ring is dense at the bottom — a window at a
-small budget runs many warm batches — and sparse at the top, where a window
-runs one; so the bottom bucket wins on both count and stability for any model
-whose curve is flat, which is exactly the model that has nothing to gain from
-being capped.
-
-Five rules replace the single frontier guard. All five say the same thing: *a
-knee is a claim about the curve above it, and may only be made from honest,
-quiet samples taken in the regime the model is actually in.*
-
-1. **The frontier must be quiet.** The largest bucket the ring *observed* —
-   before the two-sample retain, not merely the largest that survived it —
-   must itself pass the retain and the variance filter, and the knee may not
-   be it. An unknown top end may be climbing. This is the rule that refuses
-   wd-vit's first fit.
-2. **The floor must be interior too.** The knee may not be the *smallest*
-   bucket the ring observed. A plateau that starts at the first size ever
-   measured is not a bend; it is the observation that nothing in the measured
-   range gained anything, which is a statement about the range and not about a
-   size — *unless* the `KNEE_PLATEAU_BUCKETS` doublings **immediately** above
-   the candidate were all measured and none beats its rate by `KNEE_RATIO`,
-   in which case the range does describe a size and growing past it
-   spends memory for no throughput (measured on wd-vit: flat across a ring
-   whose frontier reached 136 units, granted a peak `unit_budget` of 768 and a
-   40 574 MiB peak footprint for it). The exception is stated about the
-   candidate rather than about the floor, because a plateau starting anywhere
-   is the same claim: CLIP on MPS reaches 90.4 % of its own peak at 8 units
-   and stays within 6 % of it to 512, three buckets above the ring's floor.
-   Adjacency is what a gap cannot give: an unmeasured doubling inside the claim
-   is a size the plateau does not cover. Documented, not tuned: a curve gaining
-   ≤ 1.15× per doubling read through ±10 % noise — dispersion
-   `KNEE_MAX_BUCKET_DISPERSION` admits — stops early in 8 runs of 60, and the
-   expiry ladder recovers it at a transient cost of ≤ 1.75× over four
-   doublings.
-3. **The plateau must be established above the knee** —
-   `KNEE_PLATEAU_BUCKETS = 2` quiet buckets strictly above the candidate, none
-   of them faster than it by `KNEE_RATIO`. One bucket above is a single
-   comparison between two medians: the same "two points are not a curve"
-   objection that `MIN_KNEE_BUCKETS` answers for the fit and
-   `MIN_KNEE_BUCKET_SAMPLES` answers inside a bucket. Two means the flat
-   stretch spans a factor of four in batch size and, with rule 1, that it
-   reaches the largest size the model has been let out to try. Not three,
-   because each bucket is another doubling the ramp has to reach one window at
-   a time before any knee may be fitted.
-4. **No ramp-era knee below the anchor.** If the candidate is below the bucket
-   of the largest batch the model has been *seen* to run cleanly at full
-   budget — `max_units_measured` or the largest anchor the ring's own
-   observations were taken under, whichever is greater, since DP-2's halving
-   of the former unmeasures none of them — its own bucket must hold two
-   observations taken
-   once the ramp had already reached a *larger* bucket. A rate measured at 2
-   units while the ramp was on its way past 2 units is not evidence that the
-   model stops gaining at 2 — the ramp's next step is the standing evidence
-   against it, and it is about to be taken. A rate measured at 2 units after
-   the model has run 136 is a different thing: a steady-state window that
-   happened to be small, and it counts. A candidate that earned rule 2's
-   exception is exempt wherever it sits, because those next steps are exactly
-   the flat buckets that earned it.
-5. **After a widening, the evidence must be newer than the widening.** Every
-   observation carries a sequence number, and a widening records the mark it
-   happened at. A knee at or below the widened-from bucket may only be
-   installed once the smallest quiet bucket *above* that one carries
-   `MIN_KNEE_BUCKET_SAMPLES` observations from after the mark. The earlier
-   version cleared on "the ring now contains something bigger", which the ring
-   already
-   did — it still held the pre-knee ramp — so the widening survived about a
-   second, five times over.
-
-Three more changes carry the same principle outside `fit_knee`:
-
-**The ramp stops where the curve does.** The knee's rules cannot be reached at
-all while the ramp doubles every window: each bucket then holds one
-observation, and one observation cannot be certified quiet
-(`MIN_KNEE_BUCKET_SAMPLES`). So the ramp reads the same ring the fit does. It
-waits a window at a size the ring has seen once — which is how each bucket
-reaches two — and it stops doubling once the size it has reached **set no new
-best** *and* is the top of a plateau, the second judged by rule 2's own
-arithmetic on the same medians. Both clauses, because either alone stops a
-model too early: a doubling that gains 1 % still gains, and a lone dip at the
-frontier is noise. wd-vit is why the first is not optional — 26.7 / 27.8 / 28.8
-units·s⁻¹ at 1 / 2 / 4 units is inside `KNEE_RATIO` end to end while still
-climbing to the 29.9 it reaches at 8, so a stop judged on flatness alone would
-hold at 4, hide that peak from the fit and reproduce the soak's
-`knee_units = 1`. The stop lands two buckets above the knee it enables, so the
-expiry's
-first two widenings are exercisable without the ramp moving; a ring too noisy
-to summarize stops nothing.
-
-**And the stop is durable.** A knee caps every grant below the size the ramp
-reached, so within about 50 windows the ring holds no sample there at all — and
-reading that silence as "still gaining" let the exponent creep a step a window
-until it reached `MAX_RAMP_STEP` and, the moment the knee was withdrawn, spent
-the lot: 240 units where 3 paid. A ring with nothing at the frontier therefore
-holds unless it is empty altogether (a restart, where the restored anchor and
-knee govern), no exponent is earned while a knee is in force, and a held
-replica's budget stays on the rung the hold was declared on: the anchor sets the
-exponent floor, rounded down to the ladder, never the budget itself.
-
-Holding the exponent is not by itself enough. A model whose shipped
-`seed_units` is wide against what the card runs — wd-vit ships 64 — earns its
-first doublings on windows the *queue*, not memory, kept small, and leaves
-`seed << ramp_step` above every rung the ratchet will allow. From there
-`RATCHET_FACTOR × anchor` is the whole budget, and since a clean window
-advances the anchor to the size it ran, it doubles once a window with the
-exponent pinned: 8 units to 1 024 in seven held windows on the M3 Max (a
-wd-vit cold ramp granted 64 → 512 and published 1 024; under a hog, 108 586
-MiB and one allocator out-of-memory). So the hold also remembers the budget it
-was declared on and caps the ramp's term at it; the ratchet ceiling is applied
-after that cap and is untouched, which is what leaves a widened knee room to
-probe above the size it caps. And with no knee in force that budget is the
-rung itself and not `RATCHET_FACTOR ×` it, whenever the ring cannot yet certify
-the size the ramp reached — a rung with fewer than `MIN_KNEE_BUCKET_SAMPLES`
-observations has measured no gain, and the hold may not be paid for with the
-doubling it refused. One rung falls short on allocator behaviour alone: a batch
-rings as warm only once the pool has grown to the size it runs at, and a
-CLIP job's 64-unit rung grew it twice (1 190 → 2 254 → 3 278 MiB) in one run
-of five, leaving one warm batch of three where the other four left two — 11
-quiet observations against `MIN_KNEE_SAMPLES`' 12, no knee, and a ramp that ran
-to 1 024 units and 65 893 MiB at 0.92× the items/s of the runs that knee at 31.
-That rung is what **this replica ran** (`max_units_measured_here`), never the
-conferred anchor: a profile hands over `max_units_measured` whatever this card's
-headroom allows, and a replica squeezed to 70 units under a seeded 512 would
-otherwise bank the difference and spend it in one step the moment memory frees.
-And "ran" means *at its budget*, the same rule the exponent is earned under: a
-job's first window holds one item while the scanner fills, and reading that one
-unit as the size this replica ran declared the hold there — one queue-sized
-window pinning a seeded 512's job at a single unit for its whole life. Until
-some window has run at its budget the rung is the **seed**, the ramp's start and
-the contention floor. For the same reason the gate reads the rung this replica
-is *on* rather than a conferred anchor it has never reached: a ring that can
-never hold that size refuses for ever, and a hold that can never lift is not a
-brake but a cap.
-
-**So a rung the ramp never chose is re-tested.** A hold below *both* the
-conferred anchor and the ramp's own term is one memory or the seed imposed, and
-the sizes that would lift it are the ones it forbids: wd-vit was measured held
-at its 64-unit seed under a shipped 205 for three minutes of an idle card. It gets
-the way back up a knee has, on the same evidence — after
-`HOLD_REPROBE_WINDOWS = 4` clean windows that ran *at* the rung rather than at
-the queue's size, with room for `RATCHET_FACTOR ×` the model's appetite, the
-rung doubles, up to the anchor and never past it. The rung must also be one the
-ring measured, or a drought's return would buy the size above it, and a hold the
-ramp reached on its own sits *at* the anchor and never probes — which is every
-replica running without a conferred profile.
-
-And a bucket the ring never measured is **unknown**, never "not flat". A hole
-inside the plateau under test — a rung whose pool grew twice, one observation
-short — used to read as "the plateau cannot be claimed", which the ramp took for
-a gain and paid a doubling for; so did a restart, whose ring comes back empty
-and whose first window is warm-up, leaving nothing measured below the rung the
-anchor floors the exponent at. Both now hold: no evidence of gain is no growth.
-The one unmeasured doubling that still excuses a rung is the warm-up rung's own,
-at the bucket the ramp *starts* from — and only there, or the two fall-throughs
-compose: a seeded anchor of 32 on a curve flat past 16 took the empty-below
-escape at 32 and the hole that left at `start` at 64, reaching 4x the anchor
-with nothing measured below the rung it started from.
-A hold says so once, at INFO, with the rung and the reason, and `/health`
-publishes `ramp_held`, `held_units` and `held_certified` — without them a held
-replica is indistinguishable from an idle one, and without the last a hold on a
-measured plateau is indistinguishable from one on a rung the ring cannot
-certify, which is the difference between a calibration that learned where this
-replica stands and one that measured nothing (`analyze.py` reads it there). Both
-wait on a window that ran *at* its budget: a replica the queue is pacing is
-waiting for work rather than for the brake, so its hold caps admission as ever
-but is not reported — a textembed job published `ramp_held` with
-`held_certified = false` for 421 of 427 samples of a job whose every window was
-granted `RATCHET_FACTOR ×` the anchor.
-
-A window can also run at its budget and leave the ring empty: its one full
-batch grew the pool (so it is no warm batch) and the rest of the window was
-too short to count, which is what a caller that keeps a batch and a half in
-flight produces at every doubling. The gate would read that as a restart and
-step. So after such a window, if the worker reports the pool still held, the
-same size runs once more: that batch is warm, the ring gets its sample and
-the gate has something to compare. Once per log2 size; a second window that
-still gives nothing steps as before, so nothing holds on this alone.
-
-**And a doubling is earned only by a window that ran at its budget.** The
-exponent is a claim about the *next* rung, so the window paying for it has to
-have tested the one it was on: a window the queue sized — 1 unit offered
-against wd-vit's 64-unit rung while the scanner is still filling — is no
-evidence for 128, and a window whose batches ran a fraction of what they were
-granted is none either. Both are refused, over the same `FULL_BATCH_RATIO` the
-knee's throughput samples require — one rule, one floor, read by both. A window
-the *GPU* squeezed still earns its step: the squeeze is the budget that card
-ran, and it feeds the ring for the same reason. A **queue**-sized window is the
-one place the two part company: it earns no step, because it tested no rung,
-while its batches remain honest samples of the size they ran at, which is all
-the ring buckets by.
-
-The way back up is the knee's own expiry: a widening probe that measures a real
-gain, which withdraws the cap. What follows a withdrawal
-is bounded by the ratchet — `RATCHET_FACTOR` × the anchor — and the anchor was
-held at the stop. On the M3 Max, CLIP holds at 32 units in the unit test and 64
-on a real job, and knees at 15 and 31, where the unstopped ramp reached 2 557
-units and 83 111 MiB; wd-vit holds at 16 in the test and 64 on a real job,
-and knees at 3 in both.
-
-**A replica's first settled window contributes no throughput observations.**
-cuDNN autotune, first-of-shape kernels, lazy module init and the JIT'd
-preprocessing path all happen exactly once and none of them is a property of
-the batch size; the high-water exclusion catches the pool growth and nothing
-else. (This is *not* what produced wd-vit's knee of 3 — its first window
-contributed
-nothing anyway — but a first window's rates are not on the curve, and one of
-them landing in a bucket of two is enough to move a cap.)
-
-**After a small first window, the next few batches are warm-up too.** A
-batch is also marked warm-up (`warmup_tail`) while the replica's batch count,
-the first window's included, is at most `KNEE_WARMUP_BATCHES`. That constant
-equals `WINDOW_DEPTH_MULTIPLIER` (3), one full-depth window, so it marks
-nothing for a replica whose first window ran at depth; after a one-batch first
-window it marks the next two batches. It exists for that case. On the CPU
-device, wd-vit's first window is a single 1-image batch, and the batches
-right after it are ONNX Runtime still warming its thread pool and arena:
-three 2-image batches at relative MAD 0.292. Under the 0.20 band, before the
-CPU device had its own, that bucket failed the (c) filter and blocked every
-knee fit for the rest of a 2 000-item job. Under today's 0.35 CPU band it
-passes, which is worse: its median would then help place the cap. Only the
-knee fit drops the marked samples, because the cap it reads off a bucket
-median lasts. The ramp still reads them: its doubling test needs the ring to
-hold measured sizes from its first rungs on.
-
-**A knee this process never measured is provisional.** "Never measured here"
-is exactly `!knee_is_local`, which the store and seed paths already set: while
-it holds, the expiry counter is `KNEE_SEED_REVALIDATION_WINDOWS = 4` rather
-than 12. A knee restored from disk is backed by nothing this process has seen
-— the hardware, the driver, the corpus and the neighbours may all have moved
-— so it brakes, because it is still the best evidence there is until this run
-has better, but it goes on trial at once. A local refit installing a knee is
-what makes it this run's measurement and restores the full twelve. The
-seeded second job above is what treating the two alike costs.
-
-**What the recorded rings do under these rules.** Every ring is rebuilt from
-its job's `panoptikon.log` and replayed sample by sample; the two wd-vit
-rebuilds reproduce every logged fit of the original job exactly, which is what
-makes them replays rather than models.
-
-| ring | what the job fitted | under these rules |
-|---|---|---|
-| wd-vit cold ramp (218 obs) | 3, five times | **no knee at any point** |
-| wd-vit, second job seeded from it (205 obs) | 7, four times | **no knee at any point** |
-| MiniLM (993 obs) | none | none (the variance filter, unchanged) |
-| three models contending for one GPU | 15 / 31 / 16 383 | none — two of the three models have *no* sole-occupancy observations at all |
-| MobileCLIP (23 obs) | 127 | **no knee on this ring** — see below |
-
-The two wd-vit rows are the ones rule 2's plateau exception reverses: the same
-rings, once their frontier holds two observations, now knee at their floor
-bucket, which is the intended answer for a curve flat from 2 units to 136 and
-the reason the exception exists.
-
-MobileCLIP is the one-sided cost, and it is worth stating plainly. Its bend is
-real (31 units/s at 2 units, 94 at 64) and 127 describes its curve correctly.
-The fit rules decline it because the ring has exactly **one** quiet bucket
-above the bend: the ramp stalled at 136 units for reasons that have nothing to
-do with throughput (queue depth under multiplexed h2c), so nothing at 256
-units was ever measured. Two observations there and the same ring answers 127.
-This is a knee found late, not a knee lost — and the job that fitted it ran at
-0.94x master, where a job on the same model with no knee at all ran at 1.00x.
+- **Full batches.** A batch must carry `FULL_BATCH_RATIO` (80 %) of its
+  window's granted budget, or be one the next item would have pushed past it
+  (`next_over_budget`): window tails and user-capped batches ran small for
+  want of work. A batch that filled a deflated grant, or one the room or
+  host RAM cut, counts at the size it ran.
+- **A window that could not be measured is excluded**: a memory-blind one
+  (the grant's `mb` is 0), one run under memory pressure, and any batch the
+  worker's defensive clamp or a shape limit shrank (per batch). All still
+  feed the cost fit and the ratchet.
+- **Like is compared with like.** Every observation carries the conditions
+  it was taken in: whether another replica held a window on the device while
+  its own was out, and whether the batch grew the allocator pool (one that
+  left it as it was and one that reported no pool count alike). A batch that
+  grows the pool pays `cudaMalloc`
+  for the size it is reaching; one beside a neighbour shares the device. The
+  reading is the pool **after** the batch (`reserved_after_mb`) against the
+  pool before it, never a peak: MPS has no peak counter, and
+  `max_memory_reserved()` on CUDA exceeds the post-batch pool whenever the
+  allocator released cached blocks to retry. A rate is read from the
+  observations taken in the conditions of most of the last six, so a replica
+  that always runs beside another, whose pool grows with every batch, or
+  whose windows are one batch deep after a release is still measured, against
+  itself.
+- **No rate out of scattered evidence.** A size's rate is known only from at
+  least two observations whose relative MAD (`MAD / median`) is within
+  `KNEE_MAX_BUCKET_DISPERSION`, 0.20: four times the 5 % band, and between the
+  0.003–0.05 quiet GPUs measure and the 0.9 of three models contending for
+  one. The CPU device ships 0.35 (a quiet CPU host measures 0.13–0.20); both
+  are overridden by `knee_max_bucket_dispersion` in `[inference_local.vram]`.
+- **Warm-up decides nothing**: a replica's first settled window (cuDNN
+  autotune, first-of-shape kernels, lazy init), and the batches up to
+  `KNEE_WARMUP_BATCHES` after a first window of one small batch (ONNX
+  Runtime on the CPU device still warming its thread pool).
 
 ### Shape ceiling: the third brake
 
-The knee and the extrapolation ratchet are both statements the *ledger* makes
-about a model. An easyOCR job found a third constraint that the ledger
+The working size and the extrapolation ratchet are both statements the
+*ledger* makes about a model. An easyOCR job found a third constraint that the ledger
 cannot derive at all, because it is a property of the impl's kernels: CRAFT's
 first `MaxPool2d` (`vgg16_bn.features[6]`) launches over its output element
 count as a signed `int32`, so `64 × ⌊H/2⌋ × ⌊W/2⌋ × B` may not exceed
@@ -603,24 +288,18 @@ the window was priced under.
 The ledger keeps that as a per-(model, GPU) **shape ceiling** and does five
 things with it:
 
-1. **`admitted_units` is min'd with it** — a second pure `min` beside the
-   knee. Every unit admitted above it is admission the model cannot spend: the
+1. **`admitted_units` is min'd with it** — a pure `min` beside the ratchet.
+   Every unit admitted above it is admission the model cannot spend: the
    worker plans a bigger batch, trims it back to the same size, and the grant
    reserved memory for a batch that never existed. That over-admission was
    measured, and was invisible while the trim was silent.
-2. **The ramp takes no step past it.** The knee and the ratchet cap the budget
-   and leave the exponent free to climb; this one stops the exponent too,
-   because a window trimmed back to the ceiling is no evidence that a bigger
-   batch would work and never can be — every window from here on is trimmed to
-   the same size. Otherwise the ramp walks to `MAX_RAMP_STEP` against a wall
-   and the budget jumps straight to the ratchet ceiling the moment the ceiling
-   clears, with nothing measured in between.
-3. **A clipped run is never read as a plateau.** A clamped batch is already
-   out of the throughput ring, so no bucket, frontier or `observed_top` is
-   built from one; additionally, a window the *ceiling* held down is not
-   credited to the knee's expiry (the `knee_bound` comparand keeps the ceiling
-   applied and drops only the knee), or a run of clipped windows would widen a
-   knee on evidence the knee had nothing to do with.
+2. **No size is earned past it.** A trial of the next size is cut to the
+   ceiling like any other budget, so no window runs above the working size,
+   the trial has nothing to judge and no larger size is kept. Nothing is
+   banked against the wall for the moment the ceiling clears.
+3. **A clipped run is no measurement.** A clamped batch is out of the
+   throughput ring, so a run of clipped windows neither starts a trial nor
+   moves the working size.
 4. **It never deflates anything.** An `index_limit` clamp carries no `oom` —
    the impl said "not this shape", not "not this much memory". The trap is the
    throughput-collapse flag: a batch trimmed from 200 units to 28 runs a
@@ -657,9 +336,9 @@ frame for the rest — therefore holds until the model is reloaded. The cost is
 throughput, never a failure, and for a `sum` model it is small: the ceiling in
 *units* is close to shape-invariant (`B × 16·H·W ≤ 2^31` means
 `units ≈ B·H·W ≤ 2^31/16`), which is exactly why it is denominated in units
-rather than in items. Letting a model climb back out would need a knee-style
-expiry probe — one deliberately over-wide window every N, which the impl
-trims, prices and reports harmlessly. That is not implemented.
+rather than in items. Letting a model climb back out would need a probe of
+its own — one deliberately over-wide window every N, which the impl trims,
+prices and reports harmlessly. That is not implemented.
 
 ## Core decision: learn a cost model, not a max batch size
 
@@ -701,8 +380,8 @@ measured usage is. All calibration derives from the latter.
 "Ideal" is bounded by a second observation: some models stop gaining (or
 lose) throughput past a certain batch size. Calibration therefore also
 records units/sec per tried size (rollout item 4: heterogeneous batches
-make *items*/sec noisy for `sum` models) and caps at the **throughput
-knee** even when memory would allow more.
+make *items*/sec noisy for `sum` models) and keeps a larger size only when
+it measures faster, even when memory would allow more.
 
 ## Cost dimension taxonomy
 
@@ -1239,17 +918,17 @@ booked centrally on the CPU device. It is never a throughput signal.
   caps each batch at one item whatever the cost unit, and nothing is booked.
   The item cap only limits the batch. To the GPU side an item-capped window
   is a window of that size, as a queue-sized one is: it feeds the fit, the
-  knee ring (the first window is warm-up, as always), the anchor and the
-  ramp. So a cold load without a profile doubles from the single item, each
-  window at most twice the largest size run (1, 2, 4, 8, 16, …), which is
-  where a model whose rate stops rising early gets its knee: a tagger bound
-  by CPU preprocessing is held at 7 units, where starting at its seed of 64
-  it doubled to the edge of a 16 GB card before the ring had three sizes.
+  throughput ring (the first window is warm-up, as always) and the anchor.
+  So a cold load without a profile grows from the single item, each size at
+  most twice the largest run and each kept only while it measures faster
+  (1, 2, 2, 4, 8, …), which is where a model whose rate stops rising early
+  stops: a tagger bound by CPU preprocessing stays at 4 units, where
+  starting at its seed of 64 it doubled to the edge of a 16 GB card.
   And beside another process that leaves 2 GB of a card, the sizes run
   give the fit before a batch could pass the room. The single-item window
   is one batch deep; any other capped window holds at most
-  `WINDOW_DEPTH_MULTIPLIER` batches of the cap, whatever the ramp's budget
-  (under a stored anchor it would otherwise run hundreds of two-item
+  `WINDOW_DEPTH_MULTIPLIER` batches of the cap, whatever the unit budget
+  (under a stored working size it would otherwise run hundreds of two-item
   batches).
   What that item keeps is start-up and gives no RAM sample, so the cost stays
   unknown, and further windows stay item-capped with the cap doubling after
@@ -1270,12 +949,12 @@ booked centrally on the CPU device. It is never a throughput signal.
   of several items still runs whole in its window, at the cap per batch; for
   a count-priced model the cap is the unit budget too.
 - **What a capped window changes.** The grant reads `squeezed` for the
-  dispatcher and `/health` reports `ram_ceiling_binding`. The window earns
-  no ramp step, feeds no knee sample, counts toward neither
-  `max_units_measured_here` nor knee expiry, and records no negative. Its
+  dispatcher and `/health` reports `ram_ceiling_binding`. The window feeds
+  no throughput sample, counts toward neither `max_units_measured_here` nor
+  a trial of a larger size, and records no negative. Its
   batches still feed the GPU fit and the anchor, since they ran clean. Below
   the ceiling nothing differs; at it, growth stops as at the edge of a full
-  card and resumes from the same ramp position when RAM frees up. The item
+  card and resumes from the same working size when RAM frees up. The item
   cap of a cold start is not this ceiling: `ram_ceiling_binding` is set only
   when the RAM ceiling itself is below the batch the GPU side asked for.
 - **Not covered.** CPU-device replicas (RSS is their device memory);
@@ -1312,12 +991,12 @@ Under auto:
   queue to the first free replica) and keeps the failure blast radius
   small (a window is the unit of fallback and of fatal-error loss). There
   is no time bound anywhere: `predict` keeps its no-deadline semantics.
-  A window the byte wall closes short of the admitted rung is **full, not
-  starved**: it still records `max_units_measured_here`, the only figure the
+  A window the byte wall closes short of the admitted size is **full, not
+  starved**: it still records `max_units_measured_here`, which the
   calibration store receives — otherwise a model whose items exceed the byte
   budget on their own (whole audio tracks, RAW scans) would persist nothing
-  and re-ramp from the seed every process — while still earning the ramp no
-  step, because the wall bounds the next window just as hard.
+  — while it is no window at its budget for the gain rule, because the wall
+  bounds the next window just as hard.
 - **Dispatcher-side unit counts are estimates, and safety never depends
   on them.** Window sizing and grant pricing need per-item units before
   any worker has decoded anything: `pixel` models use image-header
@@ -1479,19 +1158,19 @@ headroom  = limit − Σ charge(residents) − Σ load_reservations  # may go ne
 room(w)   = headroom + max(0, growth(w) − Σ grants(w))  # w's own pool is free
 price(u)  = pool margin × (max(0, intercept) + slope × u)
 grant     = min(min(headroom share of w + own pool of w, room(w)),
-                ramp step, price(knee_units),
+                price(batch size),
                 price(shape_ceiling_units),
                 priced content of the window itself)
 ```
 
-The `price(knee_units)` term is written on the MB side here and enforced
-on the **unit** side in the implementation (`admitted_units`): post-fit the
-two are the same constraint, since a grant's MB figure is `price(units)`,
-and the unit-side form needs no fit to be in force — so a knee still binds
-on a model that has not been fitted yet. The `shape_ceiling_units` term is
-the same shape and is enforced in the same place ("Shape ceiling: the third
-brake"): the size the impl's own kernels have said they cannot
-execute at this corpus's shapes.
+The batch size is the working size, or the size a trial runs next ("Batch
+size: growing only on a measured gain"), under the ratchet. Its term is
+written on the MB side here and enforced on the **unit** side in the
+implementation (`admitted_units`): post-fit the two are the same constraint,
+since a grant's MB figure is `price(units)`, and the unit-side form needs no
+fit to be in force. The `shape_ceiling_units` term is the same shape and is
+enforced in the same place ("Shape ceiling: the third brake"): the size the
+impl's own kernels have said they cannot execute at this corpus's shapes.
 
 - **The ledger runs in one currency: driver MB.** A worker's charge is
   its `footprint` — process-level `base` (context + workspaces +
@@ -1913,20 +1592,14 @@ execute at this corpus's shapes.
   multiplying it away. Safety never depends on a human reading a
   Desktop label; the future tab's "verified" badge is presentation on
   top of the same number.
-- **Ramp**: until the fit has enough samples, grants ramp geometrically
-  (seed, ×2 per clean window) instead of jumping to the predicted
-  ceiling, measuring each step. A too-low seed costs a logarithmic number
-  of windows, which is why seeds don't need per-GPU tuning. A step is earned
-  only by a window that actually **produced** a high-water measurement, not by
-  the mere absence of bad news: a model whose batches all run on a warm pool
-  reports nothing about a bigger batch's cost, and doubling per window
-  regardless would walk the budget to its ceiling on hope alone. **And a step
-  is taken only while the last ones paid**: once the size the ramp has
-  reached sets no new best in the ring and its two doublings below are flat
-  within `KNEE_RATIO`, the exponent holds there — on a device large enough
-  (110 GiB unified) memory stops nothing, and CLIP was granted 2 557 units and
-  83 111 MiB for throughput that had been flat since 16.
-- **Extrapolation ratchet**: the ramp never ends by handing control to
+- **Growth**: the batch size starts at the seed and grows by doublings
+  that each have to measure faster than the size below ("Batch size:
+  growing only on a measured gain"), instead of jumping to the predicted
+  ceiling. A too-low seed costs a logarithmic number of windows when the
+  rate rises, which is why seeds don't need per-GPU tuning. On a device
+  large enough (110 GiB unified) memory stops nothing: CLIP was once granted
+  2 557 units and 83 111 MiB for throughput that had been flat since 16.
+- **Extrapolation ratchet**: growth never ends by handing control to
   extrapolation. Even after the fit converges, a grant's unit budget
   never exceeds ~2× the largest *locally measured* clean high-water
   batch; the measured range extends itself geometrically under real
@@ -1935,29 +1608,18 @@ execute at this corpus's shapes.
   evidence, which is exactly where nonlinear effects (allocator
   behaviour, attention memory, workspace growth) break linearity, and
   where WDDM gives no clean failure (see Backstop). The ratchet counts
-  only local samples, so a fresh install ramps from seed even with a
-  shipped profile: profiles govern pricing, `base` accounting, and the
-  knee cap — not growth. The ratchet anchor **persists**: the local
-  store records the largest locally measured clean high-water batch
-  (see Calibration store), so a restart resumes from the measured range
-  instead of re-ramping from seed — otherwise the "ramp cost is
-  logarithmic and one-time" argument silently becomes "per restart" on
-  desktops. A persisted anchor still enters every window through the
-  defensive clamp against live free memory, and deflation state remains
-  runtime-only. The anchor floors the ramp **exponent** rather than the
-  budget: a replica resuming at a surviving anchor runs its windows on an
-  already-grown pool, which produces no high-water sample, so if its
-  earned doublings had to walk back up to the anchor first they never
-  would — the budget would pin at the anchor and the ratchet's own 2×
-  ceiling would be unreachable. The floor rounds **down** (`seed << k <=
-  anchor`), so the resumed window opens at or under the anchor and the
-  next doubling carries it past.
+  only local samples. The ratchet anchor **persists**: the local store
+  records the largest locally measured clean batch (see Calibration store).
+  It is memory evidence only: where a run opens is the stored working size
+  (`knee_units`), and a row without one opens at the seed. A persisted
+  anchor still enters every window through the defensive clamp against live
+  free memory, and deflation state remains runtime-only.
 - **Shape ceiling**: a batch size the impl's own kernels have said
   they cannot execute at this corpus's shapes, learned from a
-  `clamped.reason = "index_limit"` report. A pure `min` on the unit budget
-  beside the knee, and the one brake that also stops the ramp **exponent** —
-  a window trimmed back to the ceiling is no evidence about a bigger batch and
-  never can be. It is not a memory condition and never deflates anything, and
+  `clamped.reason = "index_limit"` report. A pure `min` on the unit budget,
+  under which no larger size is earned: a window trimmed back to the ceiling
+  is no evidence about a bigger batch and never can be. It is not a memory
+  condition and never deflates anything, and
   it is runtime-only: it depends on this corpus's padded dims and on the canvas
   the window was priced under, so it travels in no profile and a restart
   re-learns it. See "Shape ceiling: the third brake".
@@ -2657,9 +2319,9 @@ base_method       = "nvml"             # nvml | fdinfo | free_delta | alloc_delt
 slope_mb_per_unit = 0.79               # marginal cost in MiB per unit, fitted
                                        # on allocated deltas (peak_allocated −
                                        # allocated_at_load; see Measurement)
-knee_units        = 512                # optional: throughput stopped improving
-                                       # here — the knee as fitted, never a
-                                       # size the expiry is probing with
+knee_units        = 512                # optional: the working batch size, the
+                                       # smallest whose rate measured within
+                                       # 5 % of the best; a run opens here
 samples           = 38
 residual_mb       = 96                 # fit scatter → confidence / safety margin
 measured_at       = "2026-07-30T00:00:00Z"
@@ -2673,9 +2335,12 @@ max_units_measured = 1024              # ratchet anchor: the largest clean
 # they carry local authority a foreign measurement cannot):
 local_samples      = 12                # local clean samples; also the
                                        # non-local-profile confirmation gate
-knee_clean_windows = 7                 # clean windows already run
-                                       # at knee_units, with memory to spare,
-                                       # towards re-widening it
+knee_trials_failed = 3                 # optional: trials in a row that left
+knee_retest_after  = 84                # knee_units in place, and the windows
+                                       # to wait before the next (absent: 0)
+knee_rate_units    = [64, 128, 128]    # optional: what a trial had measured
+knee_rates         = [29.7, 30.1, 31.4] # when its run ended, as units and
+                                       # units a second, for the next start
 ```
 
 Key tuple for lookup: `(inference_id, epoch, arch, unit, aggregation,
@@ -2685,29 +2350,25 @@ platform, backend, torch, dtype)`.
 follows which kernels run, and kernel choice follows compute capability: a 5070
 and a 5090 pick the same attention path and the same cuDNN algorithms. What
 differs between two SKUs of one architecture is throughput and total memory,
-and the store holds neither — totals are read from the driver at runtime, the
-throughput knee is provisional until this process re-measures it.
+and the store holds neither — totals are read from the driver at runtime, and
+a stored working size is where the run opens, re-tested by this process.
 
 **Any matching profile with a fit confers its anchor, as a seeded claim.**
-`max_units_measured` is a floor on the ramp exponent and, times
-`RATCHET_FACTOR`, the ceiling on extrapolation, and it travels on a shipped
-baseline exactly as it does on a local entry. The card name is not a gate on
+`max_units_measured`, times `RATCHET_FACTOR`, is the ceiling on
+extrapolation, and it travels on a shipped baseline exactly as it does on a
+local entry. It does not say where a run opens: that is `knee_units`, adopted
+under the same "no fit, nothing conferred" rule, and without one the seed. The card name is not a gate on
 it: any card becomes "the same architecture with less memory" the moment
 another process is on it, so gating on the SKU would protect nothing the live
 figures do not already protect — the budget is re-derived from this card's own
-headroom and slope, and the worker's pre-batch clamp is under that. Four rules
+headroom and slope, and the worker's pre-batch clamp is under that. Three rules
 bound what a conferred number can do:
 
 - **No anchor without a fit.** A row whose `slope_mb_per_unit` is zero or
   absent confers nothing: with no slope there is nothing to convert the anchor
-  into MB with, so this card's headroom could not bound it and the ramp value
+  into MB with, so this card's headroom could not bound it and the batch size
   would *be* the unit budget. The loader says so once, at DEBUG, and
   `baselines.py` refuses to emit such a row.
-- **The exponent floor rounds down.** `ramp_floor_step` is the largest `k` with
-  `seed << k <= anchor`, so the first window never asks for more than the
-  anchor claims anyone measured (3 072 under a seed of 64 opens at 2 048, not
-  4 096). The `RATCHET_FACTOR ×` ceiling above it is unchanged, and the ramp's
-  own doublings pass the anchor as soon as a clean window earns one.
 - **Seeded until this card runs it.** Every adopted anchor starts seeded,
   whichever file it came from: the store is keyed by the *architecture*, so
   even the machine's own store may hold a number its 96 GB card measured and
@@ -2730,9 +2391,9 @@ batch on this GPU has reached is a batch size it has actually run and no OOM
 unmeasures it, but a seeded one is a claim about another card and
 an OOM is the evidence against it. Both corrections are runtime-only; a seeded
 anchor never travels into the local store under our own generator stamp,
-exactly as a seeded knee and a seeded fit do not. The local store's other
-fields — the ring, `local_samples`, `knee_clean_windows` — still confer nothing
-from a baseline: a file dropped into the *local* store is by definition this
+exactly as a seeded working size and a seeded fit do not. The local store's
+other fields — the ring, `local_samples` — still confer nothing from a
+baseline: a file dropped into the *local* store is by definition this
 machine's own evidence, and copying into it asserts that. The SKU name stays in
 the file as `gpu`, a provenance field nothing matches on.
 
@@ -2924,7 +2585,7 @@ The current single number splits three ways:
    constraint (see the dispatcher section). Inferio stores nothing per
    user/core, so one server serves differently-capped jobs from several
    cores concurrently. Capping only lowers; there is no override above
-   the calibrated/knee ceiling.
+   the calibrated batch size.
 2. **Core in-flight sizing** — no longer user-facing. Core sizes requests
    by request-level concerns (payload bytes in flight — the existing
    byte-budget pipelining — and keeping the server fed), not by the cap
@@ -2933,13 +2594,10 @@ The current single number splits three ways:
    order, because the seed and the profile answer different questions.
    The seed batch size is `metadata.cost.seed_units`, falling back to the
    global conservative constant; a profile never supplies it. What a
-   profile supplies is where the ramp *starts from*: a **local** profile's
-   ratchet anchor is restored and acts as a floor on the budget (and on
-   the ramp exponent), so the first window after a restart resumes at the
-   largest batch this machine has actually measured rather than at the
-   seed. A **shipped** profile deliberately does not — it prices the
-   window (slope, `base`, the knee cap) but confers no growth, so a fresh
-   install still ramps from the seed even with a baseline present.
+   profile supplies is where the run *opens*: its `knee_units`, the working
+   batch size, whether the row is local or shipped. A row
+   without one prices the window (slope, `base`) and bounds growth (the
+   ratchet anchor), and the run opens at the seed.
 
 Schema/plumbing (verified): `CronJob.batch_size`, model-config
 `default_batch_size`, and job-request `batch_size` are already
