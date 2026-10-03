@@ -2240,10 +2240,7 @@ def test_while_the_mac_pages_a_cpu_worker_on_it_has_nothing_free() -> None:
     counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 4, 0)
     memory_info = SimpleNamespace(total=128 * 1024 * MIB, available=40 * 1024 * MIB)
     with mac_counters(counters):
-        with (
-            mock.patch("psutil.virtual_memory", return_value=memory_info),
-            mock.patch.object(sys, "platform", "darwin"),
-        ):
+        with mock.patch("psutil.virtual_memory", return_value=memory_info):
             assert memory.ram_free_total_mb()[0] == 0
 
 

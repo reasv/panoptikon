@@ -1304,9 +1304,11 @@ def _ram_bounds_bytes(root: str | None = None) -> tuple[int | None, int | None]:
         return (None, None)
     if total <= 0:
         return (None, None)
-    for platform_available in (mac_available_bytes(), windows_available_bytes()):
-        if platform_available is not None:
-            available = platform_available
+    for reader in (mac_available_bytes, windows_available_bytes):
+        value = reader()
+        if value is not None:
+            available = value
+            break
     available = max(available - _reclaimable_slab_bytes(), 0)
     limit, used = cgroup_limit_used_bytes(root)
     if limit is not None:
