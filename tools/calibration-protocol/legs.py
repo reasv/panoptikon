@@ -226,7 +226,7 @@ SMOKE_IMAGES = sum(group.count for group in corpus_tiers.tier_groups("smoke")
 #: table would FAIL every fixture but one for working as designed. A fixture
 #: that OOMs on every batch logs at most one OOM negative per item, and `oom`
 #: runs no clean window, so its deflation does not return to 0 within the
-#: leg's settle (time repayment returns it after cap x 30 s).
+#: leg's settle, and the model is unloaded when its job ends.
 S5_FIXTURES: Dict[str, Fixture] = {
     "oom_second_batch": Fixture(("--expect-ooms", "1")),
     "oom": Fixture(("--expect-ooms", str(SMOKE_IMAGES),
@@ -237,7 +237,8 @@ S5_FIXTURES: Dict[str, Fixture] = {
                           "--expect-failed-jobs", "1")),
     "failbatch": Fixture(),
     "failbatch_oomtext": Fixture(),
-    "dying": Fixture(("--expect-deaths", "200", "--expect-failures", "200",
+    "dying": Fixture(("--expect-deaths", "200",
+                      "--expect-failures", str(SMOKE_IMAGES),
                       "--expect-failed-jobs", "1")),
     "dies_on_load": Fixture(("--expect-failed-jobs", "1",
                              "--expect-empty-setters"), no_items=True),

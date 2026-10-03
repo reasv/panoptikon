@@ -315,13 +315,14 @@ def test_utilization_falls_back_to_the_published_budget_and_says_so():
 # trial left in place as learning.
 
 
-def _trial_over(units, moved=False):
+def _trial_over(units, moved=False, largest=64):
+    fields = {"model": MODEL, "gpu": GPU, "units": units, "moved": moved,
+              "retest_after_windows": 12}
+    if largest is not None:
+        fields["largest_units"] = largest
     return {"ts": "2026-09-07T03:33:40.929674Z", "t_wall": 100.0,
             "level": "INFO", "target": "panoptikon::inferio::ledger::ramp",
-            "message": "a batch size trial is over",
-            "fields": {"model": MODEL, "gpu": GPU, "units": units,
-                       "moved": moved, "largest_units": 64,
-                       "retest_after_windows": 12},
+            "message": "a batch size trial is over", "fields": fields,
             "line": ""}
 
 
@@ -335,10 +336,11 @@ def _settle(max_units_measured):
 
 
 def test_utilization_scores_a_size_left_in_place_against_the_largest_it_ran():
-    """64 issued, working size 3, largest batch 64, probe boundary 512."""
+    """64 issued, working size 3, largest trial size 64, probe boundary 512;
+    the settle lines' seeded anchor of 256 is not a size that ran."""
     ctx = _utilization_context(
         [_worker_health(64)],
-        log=[_budget_grant(64), _trial_over(3), _settle(64)],
+        log=[_budget_grant(64), _trial_over(3), _settle(256)],
         probes=[_bisect_probe(512)])
     verdict = analyze.check_utilization(ctx)
     assert verdict.verdict == "PASS"
@@ -351,7 +353,7 @@ def test_utilization_scores_a_size_left_in_place_against_the_largest_it_ran():
 def test_a_batch_size_that_stopped_short_of_the_boundary_still_fails():
     """The same numbers with no trial to show for them."""
     ctx = _utilization_context([_worker_health(64)],
-                               log=[_budget_grant(64), _settle(64)],
+                               log=[_budget_grant(64)],
                                probes=[_bisect_probe(512)])
     verdict = analyze.check_utilization(ctx)
     assert verdict.verdict == "FAIL"
@@ -369,7 +371,7 @@ def test_a_size_resumed_from_the_store_is_read_from_health_alone():
                                probes=[_bisect_probe(512)])
     verdict = analyze.check_utilization(ctx)
     assert verdict.verdict == "PASS"
-    assert verdict.numbers["models"][0]["denominator_units"] == 64
+    assert verdict.numbers["models"][0]["denominator_units"] == 7
 
 
 def test_a_size_no_trial_left_in_place_is_scored_against_the_boundary():
@@ -379,8 +381,7 @@ def test_a_size_no_trial_left_in_place_is_scored_against_the_boundary():
     health = _worker_health(2)
     health["health"]["workers"][0].update(knee_units=2, knee_is_local=False)
     ctx = _utilization_context([health],
-                               log=[_budget_grant(2), _trial_over(2, True),
-                                    _settle(4)],
+                               log=[_budget_grant(2), _trial_over(2, True)],
                                probes=[_bisect_probe(512)])
     verdict = analyze.check_utilization(ctx)
     assert verdict.verdict == "FAIL"
@@ -391,8 +392,8 @@ def test_a_size_no_trial_left_in_place_is_scored_against_the_boundary():
 def test_the_denominator_never_exceeds_the_probe_boundary():
     """A size above the OOM boundary would score against absent memory."""
     ctx = _utilization_context([_worker_health(64)],
-                               log=[_budget_grant(64), _trial_over(3),
-                                    _settle(4096)],
+                               log=[_budget_grant(64),
+                                    _trial_over(3, largest=4096)],
                                probes=[_bisect_probe(512)])
     row = analyze.check_utilization(ctx).numbers["models"][0]
     assert row["denominator_units"] == 512
@@ -401,33 +402,34 @@ def test_the_denominator_never_exceeds_the_probe_boundary():
 
 
 def test_the_denominator_is_bounded_by_the_room_a_hog_leaves():
-    """Probe boundary 512 at 20 MiB a unit reserved (10 allocated). While the
-    model ran the hog held at least 3800 MiB, plus a 200 MiB context: room
-    512 - 4000 / 20 = 312, so a 100-unit grant is 0.32, not 0.20. Its fill
-    before the first grant and release after the last do not count. No room
-    bound for grants on two GPUs, a GPU hog on another GPU, or a RAM hog
-    unless the GPU is unified (no context then). A headline fit prices the
-    hog unless its basis is allocated memory; under one unit of room, or with
-    no slope to price the hog, the row is not decidable."""
+    """Room = probe boundary - (least hog held + context) / reserved slope,
+    while the model ran, on its GPU."""
     probe = {**_bisect_probe(512),
              "fit": {"basis": "peak_allocated_mb", "slope_mb_per_unit": 10.0},
              "fit_reserved": {"basis": "delta_mb", "slope_mb_per_unit": 20.0}}
 
     def utilization(target="gpu", held=3800, gpus=(GPU, GPU), unified=False,
-                    hog_gpu=GPU, fit=None):
+                    hog_gpu=GPU, fit=None, states=None, logged=True,
+                    extra_gpus=()):
+        states = states or [(10.0, 0), (50.0, held + 400), (110.0, held),
+                            (150.0, 0)]
         hog = [{"kind": "header", "target": target, "gpu_uuid": hog_gpu,
-                "context_mb": 200},
-               {"kind": "state", "t_wall": 10.0, "held_mb": 0},
-               {"kind": "state", "t_wall": 50.0, "held_mb": held + 400},
-               {"kind": "state", "t_wall": 110.0, "held_mb": held},
-               {"kind": "state", "t_wall": 150.0, "held_mb": 0}]
+                "context_mb": 200}] + [
+            {"kind": "state", "t_wall": t_wall, "held_mb": held_mb}
+            for t_wall, held_mb in states]
         log = [{**_budget_grant(100), "t_wall": t_wall,
                 "fields": {**_budget_grant(100)["fields"], "gpu": gpu}}
                for t_wall, gpu in zip((100.0, 120.0), gpus)]
-        vramrec = [{"kind": "header", "gpus": [{"uuid": GPU,
-                                                "unified": unified}]}]
+        healthrec = [_worker_health(100)]
+        if not logged:
+            log, healthrec = [], [{**_worker_health(100), "t_wall": t_wall}
+                                  for t_wall in (100.0, 120.0)]
+            for sample in healthrec:
+                sample["health"]["workers"][0]["gpu_uuid"] = GPU
+        vramrec = [{"kind": "header", "gpus": [
+            {"uuid": GPU, "unified": unified}, *extra_gpus]}]
         verdict = analyze.check_utilization(_utilization_context(
-            [_worker_health(100)], log=log, vramrec=vramrec, hog=hog,
+            healthrec, log=log, vramrec=vramrec, hog=hog,
             probes=[{**_bisect_probe(512), "fit": fit} if fit else probe]))
         return (verdict.verdict,
                 verdict.numbers["models"][0]["denominator_units"])
@@ -443,11 +445,17 @@ def test_the_denominator_is_bounded_by_the_room_a_hog_leaves():
     assert utilization(fit={"basis": "peak_allocated_mb",
                             "slope_mb_per_unit": 10.0}) == ("INFO", None)
     assert utilization(held=20000) == ("INFO", None)
+    constant = [(10.0, 0), (50.0, 3800), (150.0, 0)]
+    assert utilization(states=constant) == ("PASS", 312)
+    assert utilization(states=constant, logged=False) == ("PASS", 312)
+    assert utilization(target="ram", extra_gpus=(
+        {"uuid": "GPU-APU", "unified": True},)) == ("FAIL", 512)
 
 
-def test_a_size_with_no_settle_line_falls_back_to_itself():
+def test_a_size_with_no_trial_size_falls_back_to_itself():
     ctx = _utilization_context([_worker_health(8)],
-                               log=[_budget_grant(8), _trial_over(15)],
+                               log=[_budget_grant(8),
+                                    _trial_over(15, largest=None)],
                                probes=[_bisect_probe(512)])
     verdict = analyze.check_utilization(ctx)
     row = verdict.numbers["models"][0]
@@ -457,8 +465,7 @@ def test_a_size_with_no_settle_line_falls_back_to_itself():
 
 def test_the_probeless_leg_still_skips_with_a_size_left_in_place():
     ctx = _utilization_context([_worker_health(64)],
-                               log=[_budget_grant(64), _trial_over(3),
-                                    _settle(64)])
+                               log=[_budget_grant(64), _trial_over(3)])
     verdict = analyze.check_utilization(ctx)
     assert verdict.verdict == "SKIP"
     assert "no probe boundary for any model" in verdict.detail
@@ -693,27 +700,25 @@ def test_oracle_agreement_skips_the_samples_after_the_hog_stop():
     assert (verdict.verdict, verdict.numbers["teardown_samples"]) == ("PASS", 1)
 
 
-def _learning_context(seed, largest, queue_bound=7):
+def _learning_context(seed, queue_bound=7):
     health = _worker_health(seed)
     health["health"]["workers"][0].update(fit_samples=12, max_units_measured=6293)
     health["health"]["models"] = [{"inference_id": MODEL, "total_batches": 7,
                                    "queue_bound_windows": queue_bound}]
-    ctx = _utilization_context([health],
-                               log=[_settle(largest)] if largest else [])
+    ctx = _utilization_context([health])
     ctx.args.learning = True
     ctx.after = {"profile": [{"inference_id": MODEL}]}
     return ctx
 
 
 def test_calibration_learned_cannot_judge_a_seed_no_window_reached():
-    """Only when every window was short for want of work and the settle
-    lines say the largest stayed under the seed."""
-    verdict = analyze.check_calibration_learned(_learning_context(120000, 6293))
-    assert verdict.verdict == "INFO"
-    assert "no window reached the seed" in verdict.detail
-    for stuck in (_learning_context(64, 64), _learning_context(120000, None),
-                  _learning_context(120000, 6293, queue_bound=6)):
-        assert analyze.check_calibration_learned(stuck).verdict == "FAIL"
+    """Only when every window was short of the budget for want of work."""
+    for seed in (64, 120000):
+        verdict = analyze.check_calibration_learned(_learning_context(seed))
+        assert verdict.verdict == "INFO"
+        assert "no window reached the seed" in verdict.detail
+    stuck = _learning_context(120000, queue_bound=6)
+    assert analyze.check_calibration_learned(stuck).verdict == "FAIL"
 
 
 def test_batch_coverage_counts_every_batch_from_each_workers_seq_1():
@@ -870,10 +875,14 @@ def test_deflation_recovery_reads_the_settle_lines_before_health():
         assert stuck.verdict == "FAIL"
         assert stuck.numbers["clean_windows_at_level"] == {f"{MODEL}@{GPU}": 3}
     # Short of three clean windows at the end: the third window repays a level
-    # the clock already lowered; one window short; a worker that left at 1.
+    # the clock already lowered; one window short; a time repay restarts the
+    # count; a worker that left at 1.
     for log in ([_deflation(3, "negative"), _deflation(3), _deflation(3),
                  _deflation(2, None), _deflation(1)],
                 two_levels[:-1],
+                [_deflation(2, "negative"), _deflation(2, clean_windows=1),
+                 _deflation(1, None), _deflation(1, clean_windows=2),
+                 _deflation(1, clean_windows=3)],
                 replaced + [_deflation(1, "negative", gpu="GPU-1111")]):
         assert _deflation_recovery(log, [_deflated_health(0)]).verdict == "WARN"
     # Another target at DEBUG, the ledger's at INFO: only negatives logged.

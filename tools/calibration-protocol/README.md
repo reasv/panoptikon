@@ -690,7 +690,7 @@ last one closes a hole in `base_accuracy` itself):
   resident, so its setter records 0 items by construction, and
   `--expect-deflated` for `deflation_recovery`: `calibfixture/oom_cuda` runs
   no clean window, so its deflation does not return to 0 within the leg's
-  settle (time repayment returns it after cap × 30 s).
+  settle, and the model is unloaded when its job ends.
 - **`ledger_invariant` has two forms and reports both.** The strict form —
   Σ charges + load reservations ≤ `limit_mb` — cannot hold on a nearly-full
   GPU, because `limit = total − external × (1 + margin)` reaches **0** while
@@ -734,9 +734,8 @@ last one closes a hole in `base_accuracy` itself):
   local size this leg measured** (a budget held where a trial left it is
   learning, not a stall). A budget the job itself never filled (every window
   formed short of it for want of queued work, `queue_bound_windows ==
-  total_batches`, and the settle lines' largest `max_units_measured` below
-  the seed) cannot rise, and reads INFO, not FAIL, unless the budget was held
-  at a rung the ring never certified. The three numbers are exactly the ones
+  total_batches`) cannot rise, and reads INFO, not FAIL.
+  The three numbers are exactly the ones
   `ramp_progress` prints as INFO — the check only promotes them to a verdict,
   which is what closes the whole class of "the instrument stopped reporting"
   faults. Undeclared, the row is report-only.
@@ -872,7 +871,7 @@ line: this machine's store resumed it, and this leg measured nothing. A trial
 line with no local size is not enough either: a failed or put-off trial logs
 it too. `utilization` reads the same flag: only a size
 a trial left in place lowers its denominator from the probe boundary to the
-largest batch that ran.
+largest size this leg's trials ran.
 
 `peak_fds` is report-only and exists because, with local
 inference every in-flight predict is loopback HTTP inside one process and so

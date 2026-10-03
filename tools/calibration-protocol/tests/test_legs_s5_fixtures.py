@@ -122,16 +122,22 @@ def _verdicts(directory: Path, model: str, expect, counts,
             for row in json.loads(out.read_text())["verdicts"]}
 
 
+def _thresholds(expect):
+    return {flag: int(expect[expect.index(flag) + 1]) if flag in expect else 0
+            for flag in COUNTS}
+
+
 @pytest.mark.parametrize("name", sorted(legs.S5_FIXTURES))
 def test_each_fixture_passes_at_its_thresholds_and_fails_one_past(tmp_path,
                                                                  name):
     model = f"calibfixture/{name}_cuda"
     expect = list(_leg(model).expectations())
-    at = {flag: int(expect[expect.index(flag) + 1]) if flag in expect else 0
-          for flag in COUNTS}
-    # One OOM negative per item: every one of the smoke tier's 180 images.
+    at = _thresholds(expect)
+    # One OOM negative per item: every image of the smoke tier.
     if name in ("oom", "oom_timed"):
-        assert at["--expect-ooms"] == 180
+        assert at["--expect-ooms"] == legs.SMOKE_IMAGES
+    # A failed-item threshold is the item count.
+    assert at["--expect-failures"] in (0, legs.SMOKE_IMAGES)
     verdicts = _verdicts(tmp_path / "at", model, expect, at)
     assert verdicts["failures"] in ("PASS", "WARN")
     assert verdicts["job_outcome"] == "PASS"
@@ -139,12 +145,17 @@ def test_each_fixture_passes_at_its_thresholds_and_fails_one_past(tmp_path,
     assert ("--expect-deflated" in expect) == (name == "oom")
     assert verdicts["deflation_recovery"] == ("PASS" if name == "oom"
                                               else "WARN")
-    # A job cut at `--job-cap`, or one legs.py never saw end.
-    for ends in (["cap_exceeded"], [None]):
-        unfinished = _verdicts(tmp_path / f"ends-{ends[0]}", model, expect,
-                              at, ends)
-        assert unfinished["job_outcome"] == "FAIL"
     for flag, check in COUNTS.items():
         over = _verdicts(tmp_path / flag, model, expect,
                          {**at, flag: at[flag] + 1})
         assert over[check] == "FAIL", flag
+
+
+def test_a_job_that_did_not_drain_fails_job_outcome(tmp_path):
+    """A job cut at `--job-cap`, or one legs.py never saw end."""
+    model = "calibfixture/oom_second_batch_cuda"
+    expect = list(_leg(model).expectations())
+    for ends in (["cap_exceeded"], [None]):
+        verdicts = _verdicts(tmp_path / f"ends-{ends[0]}", model, expect,
+                             _thresholds(expect), ends)
+        assert verdicts["job_outcome"] == "FAIL"

@@ -1464,7 +1464,9 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
     # Per worker: peak and final deflation, consecutive clean windows at the
     # final level, and the highest level that outlasted
     # CLEAN_WINDOWS_TO_RESTORE. The window that repays a level is logged at
-    # the new level and does not count toward it.
+    # the new level and does not count toward it. A time repay restarts the
+    # count, because its line is logged inside the ledger lock and can print
+    # ahead of the settle line of a window that settled first.
     rows: Dict[str, Dict[str, int]] = {}
     for event in ctx.log if from_log else []:
         fields = event["fields"]
@@ -1576,18 +1578,22 @@ def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
     size trial is over` lines with `moved=false`, the `knee_units` of every
     `/health` sample marked `knee_is_local` (the only one a leg that *resumed*
     a stored size has), and the local store's own `knee_units`, which is
-    written only for a size a trial placed. The rung is the settle lines'
-    `max_units_measured` -- the largest batch that ran -- with the store's
-    copy of that field as the fallback.
+    written only for a size a trial placed. The rung is the largest size this
+    leg's trials ran (`largest_units`); the settle lines' `max_units_measured`
+    is the anchor, which a seeded or stored profile raises, so it is not read.
     """
     rows: Dict[str, Dict[str, int]] = {}
 
     def row(model: str) -> Dict[str, int]:
         return rows.setdefault(model, {"knee": 0, "knee_named": 0, "rung": 0})
 
+    ran: Dict[str, int] = {}
     for event in ctx.log_matching("a batch size trial is over"):
         fields = event["fields"]
         model, knee = fields.get("model"), fields.get("units")
+        largest = fields.get("largest_units")
+        if model is not None and isinstance(largest, (int, float)):
+            ran[str(model)] = max(ran.get(str(model), 0), int(largest))
         if (model is None or not isinstance(knee, (int, float))
                 or fields.get("moved") not in (False, "false")):
             continue
@@ -1600,22 +1606,15 @@ def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
             row(model)["knee"] = max(row(model)["knee"], knee_row["knee"])
     for profile in (ctx.after or {}).get("profile") or []:
         model = str(profile.get("inference_id"))
-        knee, rung = profile.get("knee_units"), profile.get("max_units_measured")
+        knee = profile.get("knee_units")
         if isinstance(knee, (int, float)) and knee:
             entry = row(model)
             entry["knee"] = max(entry["knee"], int(knee))
             # The store's figure is the size the leg ended on, so it is the
             # one the detail names when the trial lines disagree.
             entry["knee_named"] = int(knee)
-        if isinstance(rung, (int, float)) and model in rows:
-            rows[model]["rung"] = int(rung)
-    for event in ctx.log_events("settled a granted window"):
-        fields = event["fields"]
-        model, rung = fields.get("model"), fields.get("max_units_measured")
-        if model is None or not isinstance(rung, (int, float)):
-            continue
-        if str(model) in rows:
-            rows[str(model)]["rung"] = max(rows[str(model)]["rung"], int(rung))
+    for model, entry in rows.items():
+        entry["rung"] = ran.get(model, 0)
     return {model: entry for model, entry in rows.items() if entry["knee"]}
 
 
@@ -1671,8 +1670,8 @@ def check_utilization(ctx: Context) -> Verdict:
     0.06-0.12 against it -- a FAIL for obeying the design. Where a trial
     measured the sizes next to the working size and left it in place
     (`_knee_holds`), the denominator is what the ledger actually tried: the
-    largest batch the settle lines measured, or the working size itself when
-    none was recorded, and never above the probe boundary. A leg whose batch
+    largest size this leg's trials ran, or the working size itself when no
+    trial line names one, and never above the probe boundary. A leg whose batch
     size no trial has left in place -- one stuck at the size it opened at
     included -- is scored against the probe boundary.
 
@@ -2288,8 +2287,8 @@ def check_calibration_learned(ctx: Context) -> Verdict:
     == 0` for some model, no `[[profile]]` in `calibration.after.toml`, a peak
     `unit_budget` no higher than the first recorded. See the README's "Checks".
 
-    **A trial that ended is learning.** The seed is a starting guess, not a
-    floor: a batch grows only on a measured gain, so a model that gains
+    **A size this leg measured is learning.** The seed is a starting guess,
+    not a floor: a batch grows only on a measured gain, so a model that gains
     nothing from larger batches stays at or *under* its seed on purpose. A
     worker deliberately running at 3-7 units would otherwise read "peak
     unit_budget never left the seed (seed 64, peak 64)" and FAIL for doing
@@ -2319,29 +2318,20 @@ def check_calibration_learned(ctx: Context) -> Verdict:
         measured = {model for model, row in rows.items() if row["measured"]}
         flat = [model for model, row in rows.items()
                 if row["peak"] <= row["first"] and model not in measured]
-        # The budget steps up only after a window measured at it: a job that
-        # formed every window short of the budget for want of queued work,
-        # and whose largest window stayed under the seed, cannot show it
-        # rising.
+        # The budget steps up only after a window measured at it: a window
+        # is queue-bound when it ran under its budget, so a flat model whose
+        # every window was queue-bound never had a window reach the seed and
+        # cannot show it rising.
         counts: Dict[str, Tuple[int, int]] = {}
         for sample in ctx.health_samples:
             for entry in (sample.get("health") or {}).get("models") or []:
                 counts[str(entry.get("inference_id"))] = (
                     int(entry.get("queue_bound_windows") or 0),
                     int(entry.get("total_batches") or 0))
-        largest: Dict[str, int] = {}
-        for event in ctx.log_events("settled a granted window"):
-            units = event["fields"].get("max_units_measured")
-            if isinstance(units, (int, float)):
-                model = str(event["fields"].get("model"))
-                largest[model] = max(largest.get(model, 0), int(units))
         short = {model: total for model, (bound, total) in counts.items()
                  if 0 < total == bound}
-        job_bound = {model for model in flat
-                     if model in short
-                     and 0 < largest.get(model, 0) < rows[model]["first"]}
-        unreached = sorted(f"{model} (seed {rows[model]['first']}, largest "
-                           f"window measured {largest[model]}, all "
+        job_bound = {model for model in flat if model in short}
+        unreached = sorted(f"{model} (seed {rows[model]['first']}, all "
                            f"{short[model]} windows short of the budget)"
                            for model in job_bound)
         if unreached:
