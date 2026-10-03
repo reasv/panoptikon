@@ -151,14 +151,17 @@ def test_a_unified_gpu_totals_and_prices_its_gtt(tmp_path):
 # --- per-process sources ----------------------------------------------------
 
 
-@pytest.mark.parametrize("host_pid_ns,kfd_proc,expected", [
-    (True, True, ("kfd", {700: 300}, [])),
-    (True, False, ("fdinfo", {700: 150, 701: 64, 702: 32}, [])),
-    (False, True, ("fdinfo", {700: 150, 701: 64, 702: 32}, [])),
+@pytest.mark.parametrize("host_pid_ns,kfd_proc,gpu_id,expected", [
+    (True, True, True, ("kfd", {700: 300}, [])),
+    (True, True, False, ("fdinfo", {700: 150, 701: 64, 702: 32}, [])),
+    (True, False, True, ("fdinfo", {700: 150, 701: 64, 702: 32}, [])),
+    (False, True, True, ("fdinfo", {700: 150, 701: 64, 702: 32}, [])),
 ])
 def test_kfd_where_its_pids_are_ours_else_fdinfo(tmp_path, host_pid_ns,
-                                                 kfd_proc, expected):
+                                                 kfd_proc, gpu_id, expected):
     host = Host(tmp_path, host_pid_ns, kfd_proc).gpu(1, 0x0300)
+    if not gpu_id:
+        (tmp_path / "kfd/topology/nodes/1/gpu_id").unlink()
     if kfd_proc:
         host.kfd(700, 1, 300 * MIB)
     # Two descriptors of one client count once; the older key spelling

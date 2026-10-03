@@ -267,7 +267,7 @@ def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = N
         read_int(os.path.join(kfd_root, str(entry), "pasid")):
         os.path.join(kfd_root, str(entry)) for entry in _numbered(kfd_root)}
     texts: Dict[int, Optional[List[str]]] = {}
-    if not by_pid or any(gpu.unified for gpu in gpus):
+    if not by_pid or any(gpu.unified or gpu.gpu_id is None for gpu in gpus):
         texts = {pid: _drm_fdinfo(roots, pid)
                  for pid in (pids if pids is not None else _numbered(roots.proc))}
     if by_pid:
