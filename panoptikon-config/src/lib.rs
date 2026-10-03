@@ -14,7 +14,9 @@ use std::{
     str::FromStr as _,
     sync::atomic::{AtomicU64, Ordering},
 };
-use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
+use toml_edit::{
+    Array, ArrayOfTables, Decor, DocumentMut, InlineTable, Item, RawString, Table, Value,
+};
 
 /// An editable TOML document which retains comments, whitespace, key order,
 /// table order, and the spelling of every unchanged value.
@@ -56,7 +58,26 @@ impl TomlDocument {
         let after = after
             .as_table()
             .context("new TOML document value is not a table")?;
-        patch_table(self.document.as_table_mut(), before, after)
+        let mut orphans = Vec::new();
+        patch_table(self.document.as_table_mut(), before, after, &mut orphans)?;
+        for (owner, block) in orphans {
+            self.prepend_after_table_body(owner.unwrap_or(0), &block);
+        }
+        Ok(())
+    }
+
+    /// Puts `block` in front of what renders after the body of the table at
+    /// `owner` (the root is at 0): the next table header, or the end of file.
+    fn prepend_after_table_body(&mut self, owner: usize, block: &str) {
+        let root = self.document.as_table_mut();
+        match next_table_position(root, owner).and_then(|next| table_at_position(root, next)) {
+            Some(table) => prepend_prefix(table.decor_mut(), block, "\n"),
+            None => {
+                let trailing = self.document.trailing().as_str().unwrap_or("");
+                let trailing = format!("{block}{trailing}");
+                self.document.set_trailing(trailing);
+            }
+        }
     }
 
     pub fn write_atomic(&self, path: &Path) -> Result<()> {
@@ -81,9 +102,37 @@ impl std::fmt::Display for TomlDocument {
     }
 }
 
-fn patch_table(concrete: &mut Table, before: &toml::Table, after: &toml::Table) -> Result<()> {
+/// Comment blocks of removed keys that were last in their table body, with
+/// the position of that table; placed once the whole document is patched.
+type Orphans = Vec<(Option<usize>, String)>;
+
+fn patch_table(
+    concrete: &mut Table,
+    before: &toml::Table,
+    after: &toml::Table,
+    orphans: &mut Orphans,
+) -> Result<()> {
+    let first_orphan = orphans.len();
     for key in before.keys().filter(|key| !after.contains_key(*key)) {
-        concrete.remove(key);
+        // The lines above a key-value are its key's decor: hand them to the
+        // next key-value of this table, else to what follows the table body.
+        let Some(index) = concrete.iter().position(|(name, _)| name == key) else {
+            continue;
+        };
+        let block = concrete.key(key).and_then(|key| key.leaf_decor().prefix());
+        let block = block.and_then(RawString::as_str).unwrap_or("").to_owned();
+        if !concrete.remove(key).is_some_and(|item| item.is_value()) || block.is_empty() {
+            continue;
+        }
+        let owner = concrete.position();
+        match concrete
+            .iter_mut()
+            .skip(index)
+            .find(|(_, item)| item.is_value())
+        {
+            Some((mut next, _)) => prepend_prefix(next.leaf_decor_mut(), &block, ""),
+            None => orphans.push((owner, block)),
+        }
     }
     for (key, new_value) in after {
         let old_value = before.get(key);
@@ -91,19 +140,68 @@ fn patch_table(concrete: &mut Table, before: &toml::Table, after: &toml::Table) 
             continue;
         }
         match (concrete.get_mut(key), old_value) {
-            (Some(item), Some(old_value)) => patch_item(item, old_value, new_value)?,
+            (Some(item), Some(old_value)) => patch_item(item, old_value, new_value, orphans)?,
             _ => {
                 concrete.insert(key, item_from_toml(new_value)?);
             }
         }
     }
+    // A dotted-key table (no position of its own) renders inside this body.
+    for (owner, _) in &mut orphans[first_orphan..] {
+        *owner = owner.or(concrete.position());
+    }
     Ok(())
 }
 
-fn patch_item(concrete: &mut Item, before: &toml::Value, after: &toml::Value) -> Result<()> {
+fn prepend_prefix(decor: &mut Decor, block: &str, default: &str) {
+    let prefix = decor
+        .prefix()
+        .and_then(RawString::as_str)
+        .unwrap_or(default);
+    let prefix = format!("{block}{prefix}");
+    decor.set_prefix(prefix);
+}
+
+/// The lowest table position above `after`: tables render in position order,
+/// and only tables with a header have one.
+fn next_table_position(table: &Table, after: usize) -> Option<usize> {
+    let own = table.position().filter(|position| *position > after);
+    table
+        .iter()
+        .flat_map(|(_, item)| {
+            let tables = item
+                .as_array_of_tables()
+                .into_iter()
+                .flat_map(ArrayOfTables::iter);
+            item.as_table().into_iter().chain(tables)
+        })
+        .filter_map(|child| next_table_position(child, after))
+        .chain(own)
+        .min()
+}
+
+fn table_at_position(table: &mut Table, position: usize) -> Option<&mut Table> {
+    if table.position() == Some(position) {
+        return Some(table);
+    }
+    table.iter_mut().find_map(|(_, item)| match item {
+        Item::Table(child) => table_at_position(child, position),
+        Item::ArrayOfTables(children) => children
+            .iter_mut()
+            .find_map(|child| table_at_position(child, position)),
+        _ => None,
+    })
+}
+
+fn patch_item(
+    concrete: &mut Item,
+    before: &toml::Value,
+    after: &toml::Value,
+    orphans: &mut Orphans,
+) -> Result<()> {
     match (concrete, before, after) {
         (Item::Table(table), toml::Value::Table(before), toml::Value::Table(after)) => {
-            patch_table(table, before, after)?
+            patch_table(table, before, after, orphans)?
         }
         (
             Item::Value(Value::InlineTable(table)),
@@ -119,7 +217,7 @@ fn patch_item(concrete: &mut Item, before: &toml::Value, after: &toml::Value) ->
             if before.iter().all(toml::Value::is_table)
                 && after.iter().all(toml::Value::is_table) =>
         {
-            patch_array_of_tables(tables, before, after)?
+            patch_array_of_tables(tables, before, after, orphans)?
         }
         (slot, _, after) => replace_item_preserving_decor(slot, item_from_toml(after)?),
     }
@@ -190,6 +288,7 @@ fn patch_array_of_tables(
     concrete: &mut ArrayOfTables,
     before: &[toml::Value],
     after: &[toml::Value],
+    orphans: &mut Orphans,
 ) -> Result<()> {
     let shared = before.len().min(after.len()).min(concrete.len());
     for index in 0..shared {
@@ -198,6 +297,7 @@ fn patch_array_of_tables(
                 concrete.get_mut(index).expect("shared table index exists"),
                 before[index].as_table().expect("guarded above"),
                 after[index].as_table().expect("guarded above"),
+                orphans,
             )?;
         }
     }
@@ -785,6 +885,59 @@ mod tests {
             source.replace("port = 6342", "port = 7777")
         );
         assert!(!document.to_string().contains("absent_default"));
+    }
+
+    /// Resetting a key to its default removes only its line: the comment block
+    /// above it stays where it was, before the comments of whatever follows.
+    #[test]
+    fn removing_a_key_keeps_the_comment_block_above_it() {
+        let cases: [(&str, &[&str]); 6] = [
+            // Next key in the same table.
+            (
+                "[vram]\n# margin note\nmargin = 0.10\n# cap note\ncap_fraction = 0.90\n",
+                &["margin = 0.10\n"],
+            ),
+            // Last key of its table, before the next table header (the
+            // implicit `vram.gpu` renders nothing).
+            (
+                "[vram]\nkeep = 1\n\n# margin note\nmargin = 0.10 # inline\n# cap_fraction = 0.90\n\n\
+                 # overrides\n[vram.gpu.CPU]\nmargin = 0.25\n",
+                &["margin = 0.10 # inline\n"],
+            ),
+            // Last key of the document.
+            (
+                "[vram]\n# margin note\nmargin = 0.10\n# cap_fraction = 0.90\n",
+                &["margin = 0.10\n"],
+            ),
+            // A root key.
+            (
+                "# top\n\n# margin note\nmargin = 0.10\n\n[vram]\nkeep = 1\n",
+                &["margin = 0.10\n"],
+            ),
+            // Two adjacent keys, the second one last in its table.
+            (
+                "[vram]\n# m\nmargin = 0.10\n# c\ncap_fraction = 0.90\n# k\n[next]\n",
+                &["margin = 0.10\n", "cap_fraction = 0.90\n"],
+            ),
+            // Last key of a dotted-key table, which renders in its parent's body.
+            (
+                "[vram]\ngpu.a = 1\n# b note\ngpu.b = 2\n# k\n[next]\n",
+                &["gpu.b = 2\n"],
+            ),
+        ];
+        for (source, removed) in cases {
+            let expected = removed
+                .iter()
+                .fold(source.to_owned(), |text, line| text.replace(line, ""));
+            let mut document = TomlDocument::parse(source).unwrap();
+            document
+                .patch_values(
+                    &toml::from_str(source).unwrap(),
+                    &toml::from_str(&expected).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(document.to_string(), expected, "source:\n{source}");
+        }
     }
 
     /// A CRLF source (a Windows-authored or autocrlf-checked-out file) must
