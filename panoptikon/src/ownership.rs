@@ -82,6 +82,30 @@ pub(crate) fn explain(err: anyhow::Error, tree: &Path, paths: &[PathBuf]) -> any
     }
 }
 
+/// [`explain`] for a failure to create or replace `path`: what
+/// [`create_problem`] says.
+pub(crate) fn explain_create(err: anyhow::Error, tree: &Path, path: &Path) -> anyhow::Error {
+    match create_problem(tree, path) {
+        Some(reason) => err.context(reason),
+        None => err,
+    }
+}
+
+/// Why `path` cannot be created or replaced, if it cannot: what [`explain`]
+/// would add over `path` and the folder it is created in, its nearest
+/// existing ancestor. That folder replaces `tree` when it lies above it.
+pub(crate) fn create_problem(tree: &Path, path: &Path) -> Option<String> {
+    let (tree, paths) = create_paths(&absolute(tree), &absolute(path))?;
+    reason(&tree, &paths, true)
+}
+
+fn create_paths(tree: &Path, path: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let folder = path.ancestors().skip(1).find(|folder| folder.is_dir())?;
+    let tree = Some(tree).filter(|tree| folder.starts_with(tree));
+    let paths = vec![path.to_path_buf(), folder.to_path_buf()];
+    Some((tree.unwrap_or(folder).to_path_buf(), paths))
+}
+
 /// Why a database kept in a `folder` of its own cannot be written, if it
 /// cannot: what [`explain`] would add, over the folder, the database and its
 /// `-wal` and `-shm` (the folder's parent while the folder does not exist).
@@ -520,6 +544,37 @@ pub(crate) mod tests {
             assert_eq!(quoted, named, "{explained}");
         }
         assert!(migration_paths(&anyhow::anyhow!("disk full")).is_empty());
+    }
+
+    /// A file that cannot be created or replaced is explained by itself or
+    /// by the nearest folder that exists, which is also the folder to hand
+    /// over when it lies above the tree.
+    #[test]
+    fn a_file_is_explained_by_itself_or_the_folder_it_is_created_in() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        std::fs::create_dir_all(root.join("conf/old")).unwrap();
+        std::fs::write(root.join("conf/old/a.toml"), b"").unwrap();
+        for (tree, path, owned, target) in [
+            ("", "conf/old/a.toml", "conf/old/a.toml", Some("")),
+            ("", "conf/old/b.toml", "conf/old", Some("")),
+            ("", "conf/old/b.toml", "conf", None),
+            ("", "conf/new/b.toml", "conf", Some("")),
+            ("conf/new", "conf/new/b.toml", "conf", Some("conf")),
+        ] {
+            let owned = root.join(owned);
+            let access = |path: &Path| {
+                if path == owned {
+                    Access::Denied { owner: 0 }
+                } else {
+                    Access::Writable
+                }
+            };
+            let (tree, paths) = create_paths(&root.join(tree), &root.join(path)).unwrap();
+            let expected = target.map(|target| owned_by(&owned, 0, 1000, &root.join(target)));
+            let reason = unix::reason(&tree, &paths, true, 1000, access);
+            assert_eq!(reason, expected, "{path}");
+        }
     }
 
     /// The transcode cache's shape: a folder holding one database.

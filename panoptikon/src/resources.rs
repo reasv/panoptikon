@@ -241,7 +241,9 @@ fn write_default_configs_in(base: &Path) -> Result<Vec<String>> {
         ),
     ] {
         let path = base.join(rel);
-        if let Some(written) = write_if_absent(&path, content)? {
+        let written = write_if_absent(&path, content)
+            .map_err(|err| crate::ownership::explain_create(err, base, &path))?;
+        if let Some(written) = written {
             messages.push(format!(
                 "first run: wrote the {what} to '{}' (edit it and restart to reconfigure; it \
                  will never be overwritten)",
@@ -306,9 +308,17 @@ fn marker_matches(dest: &Path, hash: &str) -> bool {
 /// write the marker, rename into place — so `dest` either carries a valid
 /// marker or is fair game to be replaced (stale version content, partial
 /// state from a meddled-with dir). Returns `true` when a fresh extraction
-/// happened.
+/// happened. A failure names another user owning, or a read-only filesystem
+/// holding, `dest` or the folder it is made in; the folder whose owner to
+/// change is the server root (the working directory).
 #[cfg(any(feature = "bundled", feature = "bundled-ui", test))]
 pub(crate) fn ensure_extracted_archive(archive_gz: &[u8], dest: &Path, what: &str) -> Result<bool> {
+    extract_archive(archive_gz, dest, what)
+        .map_err(|err| crate::ownership::explain_create(err, Path::new("."), dest))
+}
+
+#[cfg(any(feature = "bundled", feature = "bundled-ui", test))]
+fn extract_archive(archive_gz: &[u8], dest: &Path, what: &str) -> Result<bool> {
     let hash = archive_hash(archive_gz);
     if marker_matches(dest, &hash) {
         return Ok(false);
@@ -669,6 +679,33 @@ mod tests {
         assert!(!foreign_temp.exists(), "stale foreign temp removed");
         assert!(own_temp.exists(), "own temp dir never swept");
         assert!(version_dir.exists(), "version dirs never swept");
+    }
+
+    /// An extraction or a config dump into a folder another user owns names
+    /// the folder and its owner above the failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_another_user_owns_is_named() {
+        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        let Some((folder, owner)) = foreign_folder(false) else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let link = root.path().join("runtime");
+        std::os::unix::fs::symlink(folder, &link).unwrap();
+        let archive = tar_gz(&[("a.txt", "")]);
+        let error = ensure_extracted_archive(&archive, &link.join("pysrc/1.0.0"), "test set");
+        let error = format!("{:#}", error.unwrap_err());
+        let expected = owned_by_another_user(&link, owner, folder);
+        assert!(error.starts_with(&expected), "{error}");
+        #[cfg(feature = "bundled")]
+        {
+            let link = root.path().join("config");
+            std::os::unix::fs::symlink(folder, &link).unwrap();
+            let error = format!("{:#}", write_default_configs_in(root.path()).unwrap_err());
+            let expected = owned_by_another_user(&link, owner, folder);
+            assert!(error.starts_with(&expected), "{error}");
+        }
     }
 
     /// The config dump writes each default config only when absent and
