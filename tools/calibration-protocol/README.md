@@ -807,7 +807,7 @@ that move them are in `analyze.py --help`.
 | `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) unless the leg declared it, and so does a job `legs.json` shows did not drain (`job_end` outcome other than `drained`, e.g. cut at `--job-cap`, or no `job_end`) | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs), `--expect-empty-setters` | PASS/FAIL |
 | `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | FAIL on an `over_grant` breach, WARN on a `limit_fell` one |
 | `peak_fds` | peak open descriptors and sockets against the process's own limit | — | INFO; SKIP when nothing recorded them |
-| `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form |
+| `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form; SKIP when `legs.json` marks a hog event `hog_event_void` (it asked for no memory beyond what the hog held) |
 | `ramp_progress` | `unit_budget` / `fit_samples` / the working size over time | — | INFO |
 | `calibration_learned` | the same three numbers, as a verdict | see below | FAIL only under `--learning` |
 | `batch_coverage` | the `seq` of each replica's `recent_batches` across health samples: a number no sample showed is a lost batch; batches a worker runs after its last sample are not counted, so PASS means no gap between samples, not that every batch was seen | none lost | PASS/WARN |

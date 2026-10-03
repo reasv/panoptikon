@@ -1187,15 +1187,22 @@ class Leg:
             self.mark("hog_event_request", label=event["label"], query=query,
                       at_s=event["at_s"])
             try:
-                request(self.hog_url(f"/set?{query}"), method="POST",
-                        timeout=10)
+                _, reply = request(self.hog_url(f"/set?{query}"),
+                                   method="POST", timeout=10)
             except HttpError as exc:
                 self.mark("hog_event_failed", label=event["label"],
                           error=str(exc))
                 continue
             self.mark("hog_event_ack", label=event["label"])
+            # The reply is the state before the hog's next tick applies the
+            # change: a later `seq` carries the new target.
+            try:
+                before = json.loads(reply)
+            except ValueError:
+                before = {}
             # Record the fill, so `legs.json` states how long the board took
             # to change and `analyze.py`'s hog_tracking has a wall clock.
+            applied: Optional[Dict[str, Any]] = None
             for _ in range(40):
                 try:
                     state = get_json(self.hog_url("/state"), timeout=5)
@@ -1207,11 +1214,24 @@ class Leg:
                           free_mb=state.get("free_mb"))
                 target = state.get("target_mb") or 0
                 held = state.get("held_mb") or 0
+                if state.get("seq", 0) <= before.get("seq", -1):
+                    time.sleep(1.0)
+                    continue
+                applied = state
                 if target == 0 and held == 0:
                     break
                 if target and held >= target - 256:
                     break
                 time.sleep(1.0)
+            # An event meant to add pressure that asked for no more than the
+            # hog already held (free was already under `leave_free`).
+            if (applied is not None
+                    and ("leave_free_mb" in event or event.get("mb", 0) > 0)
+                    and (applied.get("target_mb") or 0)
+                    <= (before.get("held_mb") or 0)):
+                self.mark("hog_event_void", label=event["label"],
+                          held_mb=before.get("held_mb"),
+                          target_mb=applied.get("target_mb"))
 
     # -- gateway ------------------------------------------------------------
 

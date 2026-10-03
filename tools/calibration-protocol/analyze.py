@@ -229,6 +229,8 @@ class Context:
     fds: List[Dict[str, Any]] = field(default_factory=list)
     # When `legs.py` asked the hog to stop: the gateway is idle from then on.
     teardown_t: Optional[float] = None
+    # Labels of the hog events `legs.py` marked `hog_event_void`.
+    void_hog_events: List[str] = field(default_factory=list)
     # How far the wall clock stepped during the first job, the one jobs.json
     # records, from `legs.json`.
     clock_step: Optional[float] = None
@@ -2193,6 +2195,12 @@ def check_hog_tracking(ctx: Context) -> Verdict:
     """
     if not ctx.hog_samples or not ctx.health_samples:
         return Verdict("hog_tracking", "SKIP", "needs hog.jsonl and healthrec.jsonl")
+    if ctx.void_hog_events:
+        return Verdict("hog_tracking", "SKIP",
+                       "the hog event(s) " + ", ".join(ctx.void_hog_events)
+                       + " asked for no memory beyond what the hog held, so "
+                       "the leg applied no pressure (`hog_event_void` in "
+                       "legs.json)")
     header = next((row for row in ctx.hog if row.get("kind") == "header"), {})
     gpu_uuid = header.get("gpu_uuid")
     if header.get("target") == "ram":
@@ -2806,6 +2814,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         probes=probes,
         fds=read_fds(pick(None, "fds.jsonl")) or read_fds(pick(None, "fdrec.txt")),
         teardown_t=_iso_epoch(hog_stop) if hog_stop else None,
+        void_hog_events=[str(event.get("label")) for event
+                         in (legs or {}).get("events") or []
+                         if event.get("event") == "hog_event_void"],
         clock_step=None if args.jobs else _clock_step(legs),
         unfinished_jobs=_unfinished_jobs(legs),
     )
