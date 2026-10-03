@@ -674,6 +674,23 @@ def wait_for(predicate: Callable[[], bool], timeout: float,
     return False
 
 
+#: How long the gateway's start waits for the recorders' first samples.
+RECORDER_START_S = 30.0
+
+
+def unsampled(paths: Sequence[Path], timeout: float) -> List[str]:
+    """Waits up to `timeout` for every JSONL file to hold a sample record;
+    returns the names of those that still hold none."""
+    def sampled(path: Path) -> bool:
+        try:
+            return '"kind": "sample"' in path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+
+    wait_for(lambda: all(map(sampled, paths)), timeout, interval=0.1)
+    return [path.name for path in paths if not sampled(path)]
+
+
 def port_is_open(host: str, port: int, timeout: float = 1.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -2040,6 +2057,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             health_argv.append("--full")
         leg.supervisor.start("healthrec", health_argv)
         leg.mark("healthrec_started")
+        missing = unsampled([leg.path("vramrec.jsonl"),
+                             leg.path("healthrec.jsonl")], RECORDER_START_S)
+        if missing:
+            leg.mark("recorder_sample_timeout", files=missing,
+                     waited_s=RECORDER_START_S)
 
         gateway = leg.start_gateway()
         fds = FdRecorder(gateway.pid, leg.path("fds.jsonl"))

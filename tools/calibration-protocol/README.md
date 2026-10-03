@@ -115,7 +115,8 @@ of job control, and no shell anywhere.
 
 In order: `newrun.py` for the results directory and `host.json`; `vramrec.py`;
 `hog.py` filled to its target before the gateway sees the board; `healthrec.py`;
-the binary with `--config <toml> --root <dir>/root --disable-update-check`;
+a wait of up to 30 s for a sample in both recordings (a
+`recorder_sample_timeout` event if one never comes); the binary with `--config <toml> --root <dir>/root --disable-update-check`;
 `fds.jsonl` sampled from a thread; wait for `/api/client-config`; create the
 `cal` databases and point the job config at the corpus; rescan; post the
 extraction job — one per `--models` id, in order, in the same database — and
