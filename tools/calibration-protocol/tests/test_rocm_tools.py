@@ -159,7 +159,7 @@ def test_a_unified_gpu_totals_and_prices_its_gtt(tmp_path):
 ])
 def test_kfd_where_its_pids_are_ours_else_fdinfo(tmp_path, host_pid_ns,
                                                  kfd_proc, gpu_id, expected):
-    host = Host(tmp_path, host_pid_ns, kfd_proc).gpu(1, 0x0300)
+    host = Host(tmp_path, host_pid_ns, kfd_proc).gpu(1, 0x0300).gpu(2, 0x0C00)
     if not gpu_id:
         (tmp_path / "kfd/topology/nodes/1/gpu_id").unlink()
     if kfd_proc:
@@ -176,8 +176,8 @@ def test_kfd_where_its_pids_are_ours_else_fdinfo(tmp_path, host_pid_ns,
     host.fdinfo(702, 3, _fd(BDF_03, None, 32 * 1024, "memory", pasid=32769))
     host.fdinfo(702, 4, _fd(BDF_03, None, 32 * 1024, "memory", pasid=32769))
     host.fdinfo(702, 5, _fd(BDF_03, None, 999 * 1024, "memory"))
-    (gpu,) = rocm_sysfs.inventory(host.roots)
-    assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == expected
+    gpus = rocm_sysfs.inventory(host.roots)
+    assert rocm_sysfs.process_vram_mb(host.roots, gpus)[gpus[0].key] == expected
 
 
 def test_in_a_container_kfd_is_found_by_the_fdinfo_pasid(tmp_path):
@@ -592,7 +592,7 @@ def test_selftest_reads_free_until_it_settles():
     reads = iter(range(1000, 2000))
     assert selftest.settled_free_mb(memory, lambda s: None, reads=5) == (
         1005, "amdgpu-sysfs", 1.25, False)
-    for source, unified in (("ram", False), ("amdgpu-sysfs", True)):
+    for source, unified in (("nvml", False), ("amdgpu-sysfs", True)):
         reads = iter([1000, 2000])
         memory = types.SimpleNamespace(
             free_total_mb=lambda: (next(reads), 4096, source),
