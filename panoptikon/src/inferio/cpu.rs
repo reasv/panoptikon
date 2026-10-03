@@ -240,9 +240,8 @@ mod sys {
         status().map(|status| available_bytes(&status) / MIB)
     }
 
-    /// Free physical memory, bounded by the commit available at the
-    /// pagefile's current size (RAM plus pagefile), which is lower than what
-    /// Windows delivers when the pagefile can grow.
+    /// Free physical memory, bounded by the commit left before Windows must
+    /// grow the pagefile.
     fn available_bytes(status: &MEMORYSTATUSEX) -> u64 {
         status.ullAvailPhys.min(status.ullAvailPageFile)
     }

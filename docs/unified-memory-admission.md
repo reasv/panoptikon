@@ -115,14 +115,13 @@ the orchestrator's staleness refresh).
 
 `ram_available` sources: worker-side, the same per-platform figure as the
 orchestrator (docs/inferio-worker-protocol.md, "`"ram"` is the CPU-priced
-host's reading"); orchestrator-side
-`host_statistics64` via `libc` on macOS, `sysinfo`-free reads of
-`/proc/meminfo` (`MemAvailable`; the CPU device subtracts `SReclaimable`
-on both sides) on Linux, `GlobalMemoryStatusEx` via
-`windows-sys` on Windows. No new crates. The two producers must sum the
-**same terms** — on macOS RAM less wired, compressed and anonymous pages,
-on Windows the smaller of `ullAvailPhys` and `ullAvailPageFile`; counting
-anything more on the orchestrator side
+host's reading"); orchestrator-side `host_statistics64` via `libc` on
+macOS, `sysinfo`-free reads of `/proc/meminfo` (`MemAvailable`) on Linux,
+`GlobalMemoryStatusEx` via `windows-sys` on Windows. On Linux the CPU
+device subtracts `SReclaimable` on both sides. No new crates. The two
+producers must sum the **same terms** — on macOS RAM less wired,
+compressed and anonymous pages, on Windows the smaller of `ullAvailPhys`
+and `ullAvailPageFile`; counting anything more on the orchestrator side
 (purgeable, compressed) would make its refresh the looser of the two and
 systematically understate external pressure, the one error direction the
 ledger cannot absorb.

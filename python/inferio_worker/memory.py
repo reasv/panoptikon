@@ -1245,9 +1245,8 @@ def _reclaimable_slab_bytes() -> int:
 
 def windows_available_bytes() -> int | None:
     """RAM a new allocation could get on Windows, or None off it: free
-    physical memory, bounded by the commit available at the pagefile's
-    current size (RAM plus pagefile), which is lower than what Windows
-    delivers when the pagefile can grow. Same as `cpu.rs`.
+    physical memory, bounded by the commit left before Windows must grow the
+    pagefile. Same as `cpu.rs`.
     """
     status = _windows_memory_status()
     if status is None:

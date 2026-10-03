@@ -759,9 +759,9 @@ therefore differs from a GPU in six ways.
   `min(SReclaimable / 2, low watermark)`, the part `MemAvailable` already
   leaves out. Shared memory is in neither figure. Windows reads
   `min(ullAvailPhys, ullAvailPageFile)`: free physical memory bounded by the
-  commit available at the pagefile's current size (RAM plus pagefile), which
-  is lower than what Windows delivers when the pagefile can grow. macOS reads
-  RAM less wired, compressed and anonymous pages, as before.
+  commit left at the pagefile's current size, so a grant does not make
+  Windows grow it. macOS reads RAM less wired, compressed and anonymous
+  pages, as before.
 - **A replica's footprint is the memory it holds now.** A CPU worker reports
   its lifetime peak resident set as `reserved` (the knee's warm/high-water
   split needs it), and its heap is trimmed after every batch, so the peak is
@@ -829,10 +829,10 @@ Known limits:
   down (0.4 to 2 s for a process of several GiB) still reads as a death in
   the middle of its window. On Linux the leader's zombie state shows it
   within a millisecond.
-- Windows free RAM is bounded by the commit left at the pagefile's current
-  size, but footprints are working set, so commit our workers hold beyond it
-  reads as external. The pagefile grows only past that limit, which grants
-  stay below, so this persists. It errs low and never over-grants.
+- On Windows free RAM is also bounded by the commit left at the pagefile's
+  current size, so grants do not make Windows grow the pagefile. Prices are
+  working set, so a batch that commits more than it touches is covered only
+  by the reserve.
 
 ### RAM ceiling for GPU models
 
