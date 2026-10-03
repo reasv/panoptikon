@@ -2236,10 +2236,12 @@ mod tests {
                 "and nothing else gets the marker"
             );
             // Its memory is priced as resident set, like a CPU host's workers:
-            // the CPU thresholds, not the GPU workers' arena cap.
+            // the CPU thresholds the operator did not set, not the GPU
+            // workers' arena cap.
+            let operator_set = std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_some();
             assert_eq!(
                 env_of(&on_cpu, Some(""), "MALLOC_MMAP_THRESHOLD_").as_deref(),
-                Some("131072")
+                (!operator_set).then_some("131072")
             );
             assert_eq!(env_of(&on_cpu, Some(""), "MALLOC_ARENA_MAX"), None);
         }

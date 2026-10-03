@@ -408,6 +408,16 @@ mod tests {
         Vec::new()
     }
 
+    /// The CPU thresholds a CPU-device worker gets on this host: those the
+    /// operator did not set.
+    fn cpu_thresholds() -> Vec<(String, String)> {
+        GLIBC_MALLOC_ENV
+            .into_iter()
+            .filter(|(key, _)| env::var_os(key).is_none())
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect()
+    }
+
     #[test]
     fn worker_env_only_for_resolved_rocm() {
         // No NVIDIA wheels under this interpreter, so the CUDA arm carries
@@ -420,14 +430,9 @@ mod tests {
         assert!(worker_env(Accelerator::Auto, &bare_python()).is_empty());
         // `cpu` carries the device marker and the glibc thresholds, and
         // nothing else — no HIP paths, no MPS watermarks.
-        assert_eq!(
-            worker_env(Accelerator::Cpu, &bare_python()),
-            vec![
-                ("INFERIO_DEVICE".to_string(), "cpu".to_string()),
-                ("MALLOC_MMAP_THRESHOLD_".to_string(), "131072".to_string()),
-                ("MALLOC_TRIM_THRESHOLD_".to_string(), "131072".to_string()),
-            ]
-        );
+        let mut cpu = vec![("INFERIO_DEVICE".to_string(), "cpu".to_string())];
+        cpu.extend(cpu_thresholds());
+        assert_eq!(worker_env(Accelerator::Cpu, &bare_python()), cpu);
         // Rocm may be empty of HIP libs on hosts without ROCm, but on Linux
         // still carries MIOpen defaults when those env vars are unset. Off
         // Linux the whole HIP env is empty by design.
@@ -511,13 +516,8 @@ mod tests {
     #[test]
     fn only_a_cpu_host_pins_the_glibc_malloc_thresholds() {
         let cpu = worker_env(Accelerator::Cpu, &bare_python());
-        for (key, value) in GLIBC_MALLOC_ENV {
-            assert_eq!(
-                cpu.iter()
-                    .find(|(name, _)| name == key)
-                    .map(|(_, set)| set.as_str()),
-                Some(value)
-            );
+        for threshold in cpu_thresholds() {
+            assert!(cpu.contains(&threshold), "{threshold:?}");
         }
         for accelerator in [
             Accelerator::Cuda,
