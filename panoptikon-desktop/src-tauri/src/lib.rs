@@ -436,7 +436,12 @@ fn on_exit(app: &AppHandle) {
     runtime.shutdown.park_main_thread();
     tauri::async_runtime::block_on(supervised_shutdown(app, "the host"));
     tracing::info!(target: "panoptikon_desktop", "Desktop shell exiting");
-    if let Some(guard) = runtime.log_guard.lock().ok().and_then(|mut guard| guard.take()) {
+    if let Some(guard) = runtime
+        .log_guard
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
+    {
         drop(guard);
     }
 }
@@ -2449,7 +2454,9 @@ pub(crate) async fn supervised_shutdown(app: &AppHandle, origin: &'static str) {
     }
     let supervisor = app.state::<Arc<Supervisor>>().inner().clone();
     supervisor
-        .record(format!("quit requested by {origin}; stopping Relay and Server sidecar"))
+        .record(format!(
+            "quit requested by {origin}; stopping Relay and Server sidecar"
+        ))
         .await;
     if let Some(handle) = runtime.relay_handle.lock().await.take() {
         handle.shutdown().await;
