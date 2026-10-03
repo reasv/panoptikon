@@ -1351,9 +1351,9 @@ impl's own kernels have said they cannot execute at this corpus's shapes.
   but not in `total − free`, so `external` reads too low (0 once the spill
   exceeds other processes' use). The driver spills only when the card is
   full, so on a spilling GPU, while free reads below `DEFAULT_RESERVE_CAP_MB`
-  (1 GiB), `external` is at least its value at the last reading that did
-  not. When a replica
-  leaves the GPU its footprint is credited back to the freshest free
+  (1 GiB) or after a departure credit, `external` is at least its value at
+  the last pool refresh that was neither. When a replica leaves the GPU its
+  footprint is credited back to the freshest free
   reading as it drops out of the sum — nothing samples a GPU *because*
   a worker left, so without the credit the departed replica's whole
   footprint would be reattributed to `external` and margin-inflated

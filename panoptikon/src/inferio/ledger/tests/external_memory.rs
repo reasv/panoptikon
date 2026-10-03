@@ -390,7 +390,8 @@ fn external_clamps_at_zero() {
 /// A full GPU that spills to system RAM puts part of our pool off the card:
 /// it is in our footprint but not in the GPU's used memory, so `external`
 /// reads too low. While the GPU reads full or is credited for a departure,
-/// `external` is at least its value at the last reading that was neither.
+/// `external` is at least its value at the last pool refresh that was
+/// neither.
 #[test]
 fn a_spilling_gpu_holds_external_while_it_reads_full() {
     const TOTAL: u64 = 24_000;
@@ -405,13 +406,15 @@ fn a_spilling_gpu_holds_external_while_it_reads_full() {
         let read = |handle: &TelemetryHandle, free_mb, pool_mb| {
             push_memory_with_total(handle, free_mb, pool_mb, Some(TOTAL), "nvml");
             ledger.ingest_all_for_test();
-            ledger.health()[0].external_mb
+            let gpu = &ledger.health()[0];
+            assert_eq!(gpu.limit_mb, TOTAL - gpu.external_mb);
+            gpu.external_mb
         };
         let mut externals = [
             (12_000, 1_000),
             (17_000, 1_000),
             (0, 19_000),
-            (0, 21_000),
+            (500, 20_500),
             (0, 24_000),
         ]
         .map(|(free_mb, pool_mb)| read(&a, free_mb, pool_mb))

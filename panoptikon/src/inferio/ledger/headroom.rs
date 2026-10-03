@@ -224,8 +224,8 @@ impl VramLedger {
     /// domain (`hw.memsize − available`) and not clipped to the device total.
     /// On a GPU that spills to system RAM, while its free reading is below
     /// [`DEFAULT_RESERVE_CAP_MB`] or credited for a departure it is at least
-    /// its value at the last reading that was neither, since our pool may
-    /// then be partly off the card.
+    /// its value at the last pool refresh that was neither, since our pool
+    /// may then be partly off the card.
     pub(super) fn external_locked(&self, state: &LedgerState, gpu: &str) -> Option<u64> {
         let measured = Self::measured_external_locked(state, gpu)?;
         let gpu_ledger = state.gpus.get(gpu)?;
