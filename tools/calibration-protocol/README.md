@@ -32,6 +32,7 @@ schema; this table is the index, not the reference.
 | `analyze.py` | Joins the recordings and prints the verdict table. |
 | `oracle_calibrate.py` | The instrument calibration: does the oracle see a known allocation? One command, PASS/FAIL. |
 | `newrun.py` | Creates `results/<run-id>/<scenario>/` and records `host.json`. |
+| `sizing_traces.py`, `sizing_table.py` | The batch-size simulator's traces and its acceptance table (below). No GPU. |
 | `config/` | `run-gateway.sh`, which starts a gateway under one of `legs.py`'s generated configurations (C0–C3, C7, C7nc, and R1–R3, R7 on ROCm), the user registries (`registry-C7/`, `registry-C7nc/`, `registry-R3/`, `registry-R7/`) and the `nvidia-smi` shims (`nvidia-smi-shims/`). |
 | `fixtures/` | CUDA-touching fixture impls, their user registry, and `install-fixtures.sh`. |
 | `tests/` | The unit tests these tools own; today, the `nvidia-smi` oracle's parser. `python/.venv/bin/python -m pytest tools/calibration-protocol/tests -q`. |
@@ -1385,3 +1386,28 @@ Corpora under `results/corpus/` (all git-ignored, all regenerable from
 `text` (2 000, for the token model via `loadgen.py`; `.txt` is not indexable,
 so it cannot be driven by a job), `poison`, `poisonmix`, `pixmix`, `ocr` and
 `audio`. `soak` is not generated.
+
+## Batch-size simulator
+
+`sizing_sim` (`panoptikon/src/inferio/ledger/tests/sizing_sim.rs`, an ignored
+test) drives the real ledger window by window: a synthetic rate curve or a
+recorded trace says how long each batch takes, and the ledger sizes the next
+window. It writes one line per process start. Traces come from archived real
+runs and hold private data, so they live outside the repository.
+
+```bash
+# Traces from ~/panoptikon-archive into ~/panoptikon-archive/sizing-traces (needs `zstd`)
+python3 tools/calibration-protocol/sizing_traces.py
+# The test binary (its path is the "Executable" line)
+cargo test -p panoptikon --bin panoptikon sizing_sim --no-run
+# The acceptance table, per device class and sizing mode (CPU only; ~7 min at 8 seeds, 12 jobs)
+python3 tools/calibration-protocol/sizing_table.py --bin target/debug/deps/panoptikon-<hash> --jobs 12
+# The 2026-10-02 trace-replay cells, to check the simulator still reproduces them
+python3 tools/calibration-protocol/sizing_table.py --bin ... --set verify4 --seeds 100
+```
+
+The gains a larger batch must show per doubling are parameters (`--gpu`,
+`--strict` for CPU and unified memory, `--throughput`); they set the
+"implied W" columns. The scenario keys are listed on `Scenario` in the test.
+Results vary by a few tenths of a percent between runs: the ledger's own
+clocks run in real time, only the window wall time is simulated.
