@@ -153,7 +153,9 @@ pub(super) fn build(
     let count = openable.nodes.len();
     if count == 0 {
         return Err(ProbeFailure::undiagnosed(
-            if gpu_nodes == 0 {
+            if gpu_nodes == 0 && openable.hidden > 0 {
+                "every KFD GPU node is hidden by a device cgroup (/dev/dri not granted)"
+            } else if gpu_nodes == 0 {
                 "no KFD GPU nodes (this host has no amdgpu topology)"
             } else {
                 "no openable render node"
@@ -277,19 +279,25 @@ fn is_set(value: Option<&str>) -> bool {
 struct OpenableNodes {
     /// Every KFD node with SIMDs, whether or not it survived the filter.
     gpu_nodes: usize,
+    /// Nodes skipped because a device cgroup hides them; not in `gpu_nodes`.
+    hidden: usize,
     /// The survivors, in ascending KFD node order.
     nodes: Vec<(u32, HashMap<String, u64>)>,
 }
 
 /// GPU nodes this process can open, in ascending KFD node order (assumed to
-/// be HIP's order). A container granted a `/dev/dri` subset still sees the
-/// whole host topology, so skipping nodes it cannot open reproduces ROCr's
-/// enumeration.
+/// be HIP's order). A container granted a `/dev/dri` subset still lists the
+/// whole host topology, but its device cgroup also hides the other GPUs from
+/// KFD, so ROCr enumerates exactly the nodes kept here. A render node this
+/// process cannot open while KFD still exposes the GPU is different: on ROCm
+/// 7.2, with that restriction emulated, ROCr enumerated no GPU at all, which
+/// the worker's pin check refuses.
 fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure> {
     let mut nodes = node_dirs(&roots.kfd_nodes);
     // Numeric order: a string sort would put node 10 before node 2.
     nodes.sort_by_key(|(node, _)| *node);
     let mut gpu_nodes = 0usize;
+    let mut hidden = 0usize;
     let mut out = Vec::new();
     for (node, dir) in nodes {
         let text = match fs::read_to_string(dir.join("properties")) {
@@ -302,6 +310,7 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
                      the GPU from this process, so ROCr will not enumerate \
                      it either — excluding it from the ROCm inventory"
                 );
+                hidden += 1;
                 continue;
             }
             Err(err) => {
@@ -365,6 +374,7 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
     }
     Ok(OpenableNodes {
         gpu_nodes,
+        hidden,
         nodes: out,
     })
 }
@@ -386,6 +396,24 @@ fn node_dirs(root: &Path) -> Vec<(u32, PathBuf)> {
         .filter_map(|entry| {
             let node = entry.file_name().to_str()?.parse::<u32>().ok()?;
             Some((node, entry.path()))
+        })
+        .collect()
+}
+
+/// The ISA name (`gfx1100`) of every GPU node in the KFD topology, in node
+/// order, for the startup accelerator report. Quiet and best-effort: it names
+/// what the kernel lists, whether or not this process can open it.
+pub(super) fn topology_gfx_names(kfd_nodes: &Path) -> Vec<String> {
+    let mut nodes = node_dirs(kfd_nodes);
+    nodes.sort_by_key(|(node, _)| *node);
+    nodes
+        .into_iter()
+        .filter_map(|(_, dir)| {
+            let props = parse_properties(&fs::read_to_string(dir.join("properties")).ok()?);
+            if props.get("simd_count").copied().unwrap_or(0) == 0 {
+                return None;
+            }
+            gfx_name(u32::try_from(*props.get("gfx_target_version")?).ok()?)
         })
         .collect()
 }
@@ -1201,6 +1229,28 @@ mod tests {
             ..empty.roots.clone()
         };
         assert!(build(&rootless, [None; VISIBILITY_VARS.len()]).is_err());
+        // Every GPU node denied by KFD (a container without `/dev/dri`) says
+        // so. Mode bits produce the denial unless privileges ignore them.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let hidden = Fixture::new();
+            hidden
+                .node(0, &[("cpu_cores_count", 32), ("simd_count", 0)])
+                .dgpu(1, LOC_03_00, 128, GB24);
+            let props = hidden.roots.kfd_nodes.join("1/properties");
+            fs::set_permissions(&props, fs::Permissions::from_mode(0o000)).unwrap();
+            if fs::read_to_string(&props).is_err() {
+                assert_eq!(
+                    hidden.bucket(),
+                    Some("every KFD GPU node is hidden by a device cgroup (/dev/dri not granted)")
+                );
+                // A visible GPU node whose render node cannot be opened is
+                // a permissions problem, not a hidden one.
+                hidden.node(2, &gpu_props(LOC_0C_00, 129, 0, 110000));
+                assert_eq!(hidden.bucket(), Some("no openable render node"));
+            }
+        }
     }
 
     /// Any of the four visibility vars blanks the inventory; empty and
@@ -1236,6 +1286,20 @@ mod tests {
         // Wider than the kernel writes: the encoding changed under us.
         assert_eq!(format_bdf(0, 0x1_0000), None);
         assert_eq!(format_bdf(0x1_0000, 0x0300), None);
+    }
+
+    /// The report's names: GPU nodes only, in numeric node order, with no
+    /// render node or VRAM counter needed; no topology names nothing.
+    #[test]
+    fn topology_names_every_gpu_node_in_node_order() {
+        let fixture = Fixture::new();
+        fixture
+            .node(0, &[("cpu_cores_count", 32), ("simd_count", 0)])
+            .node(10, &gpu_props(LOC_0C_00, 129, 0, 120001))
+            .node(2, &gpu_props(LOC_03_00, 128, 0, 110000));
+        let names = topology_gfx_names(&fixture.roots.kfd_nodes);
+        assert_eq!(names, ["gfx1100", "gfx1201"]);
+        assert!(topology_gfx_names(&fixture.roots.kfd_nodes.join("absent")).is_empty());
     }
 
     /// major*10000 + minor*100 + stepping, rendered major-decimal then

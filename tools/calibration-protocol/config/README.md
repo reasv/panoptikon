@@ -11,7 +11,8 @@ server TOMLs are seeded once and user-owned).
 the binary, `python/.venv`, the inference sources and `.env` all come from
 it, and C0's tree is `panoptikon-master` beside it. From a worktree with no
 venv of its own, pass `--repo /path/to/main/checkout` (or `--python`);
-`run-gateway.sh` takes the same as `CALIB_REPO=<checkout>`. A missing
+`run-gateway.sh` takes the same as `CALIB_REPO=<checkout>` (or
+`CALIB_WORKER_PYTHON=<python>`). A missing
 `config/server/default.toml` or venv stops the leg with a message naming it.
 A caller's `PANOPTIKON_BIN` picks the binary for every id except C0, which
 always runs its own tree's build.
@@ -24,13 +25,22 @@ always runs its own tree's build.
 | `C3` | C1 + `CUDA_VISIBLE_DEVICES=1` (index form) | 6372 / 6373 / 6369, 6370 | this checkout |
 | `C7` | C1 + the user registry `registry-C7/registry-C7.toml` (MobileCLIP-S1 pinned to GPU 1; `enable_batching = true` on `doctr/easyocr_standard_en`) | 6382 / 6383 / 6379, 6380 | this checkout |
 | `C7nc` | C7 with its registry's `metadata.cost.canvas_pixels` removed **and** `config.canvas_size = 40000` — the control that separates the per-item pixel cap from the `enable_batching` flag (diagnostic, not a proposed configuration; see "Running an uncapped control" below for why both halves are needed) | 6392 / 6393 / 6389, 6390 | this checkout |
+| `R1` | C1 on ROCm: `accelerator = "rocm"` in `[inference_local.python_env]`, no cuDNN `LD_LIBRARY_PATH`, `RUST_LOG` adds `panoptikon::db::batch_auto=debug` | 6402 / 6403 / 6399, 6400 | this checkout |
+| `R2` | R7 + `HIP_VISIBLE_DEVICES=1`: an ambient HIP-layer restriction, so the inventory stays unknown (unpriced) and the pin is dropped | 6412 / 6413 / 6409, 6410 | this checkout |
+| `R3` | R1 + `ROCR_VISIBLE_DEVICES=1` + `registry-R3/registry-R3.toml` (MobileCLIP-S1 pinned to HIP device 0, the only one left): the same at the ROCr layer, which keeps the pin | 6422 / 6423 / 6419, 6420 | this checkout |
+| `R7` | R1 + `registry-R7/registry-R7.toml` (MobileCLIP-S1 pinned to HIP device 1) | 6432 / 6433 / 6429, 6430 | this checkout |
 
 C4–C6 are not here: they are Docker configurations (image build args and
 compose overlays, `../compose/`).
 
-`registry-C7/` and `registry-C7nc/` are directories of their own because
-`[inference_local].config_dirs` scans **every** `*.toml` in each directory it
-is given. The registry file sets `allow_override = true` and restates each
+A ROCm configuration (`R*`) refuses to start when `HIP_VISIBLE_DEVICES`,
+`ROCR_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES` or `GPU_DEVICE_ORDINAL` is
+inherited and the configuration does not set it itself: the gateway would
+leave every GPU unpriced.
+
+`registry-C7/`, `registry-C7nc/`, `registry-R3/` and `registry-R7/` are
+directories of their own because `[inference_local].config_dirs` scans
+**every** `*.toml` in each directory it is given. The registry file sets `allow_override = true` and restates each
 redefined id in full — redefinition replaces the id's config *and* its
 id-level metadata, so an omitted `metadata.cost` would silently fall back to
 the group's default.

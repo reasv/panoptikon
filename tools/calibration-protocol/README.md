@@ -32,7 +32,7 @@ schema; this table is the index, not the reference.
 | `analyze.py` | Joins the recordings and prints the verdict table. |
 | `oracle_calibrate.py` | The instrument calibration: does the oracle see a known allocation? One command, PASS/FAIL. |
 | `newrun.py` | Creates `results/<run-id>/<scenario>/` and records `host.json`. |
-| `config/` | `run-gateway.sh`, which starts a gateway under one of `legs.py`'s generated configurations (C0–C3, C7, C7nc), the C7 registries (`registry-C7/`, `registry-C7nc/`) and the `nvidia-smi` shims (`nvidia-smi-shims/`). |
+| `config/` | `run-gateway.sh`, which starts a gateway under one of `legs.py`'s generated configurations (C0–C3, C7, C7nc, and R1–R3, R7 on ROCm), the user registries (`registry-C7/`, `registry-C7nc/`, `registry-R3/`, `registry-R7/`) and the `nvidia-smi` shims (`nvidia-smi-shims/`). |
 | `fixtures/` | CUDA-touching fixture impls, their user registry, and `install-fixtures.sh`. |
 | `tests/` | The unit tests these tools own; today, the `nvidia-smi` oracle's parser. `python/.venv/bin/python -m pytest tools/calibration-protocol/tests -q`. |
 | `compose/` | Copies of any docker compose files used for pressure, and the C4/C5/C6 compose files plus their overlays (raised `nofile`, master image); never the user's own files. |
@@ -646,15 +646,25 @@ absent); the exit code is 1 if anything FAILed. Every row prints the numbers
 behind it so a near-miss can be adjudicated by a human.
 
 **The check that decides safety is `grant_safety`, and within it the oracle
-clause**, which joins every `issued a memory grant` line to `vramrec.jsonl` and
-compares the grant with the GPU's *live free memory* at that instant. That
+clause**, which joins every `issued a memory grant` line to the latest
+`vramrec.jsonl` sample at or before it (a later one can already hold the
+granted batch) and compares the grant with the GPU's *live free memory* at that
+instant. A grant over that free memory is a FAIL, unless the next sample,
+within `--join-tolerance` of the grant, shows a release that covers the
+shortfall: the release may have come first, so the grant is listed and the
+check reads **WARN**. Only processes other than the requester that are still
+alive count as releasing; the requester emptying its cache after an
+out-of-memory error, or a worker that died, is a consequence of the grant. A
+grant with no sample within `--join-tolerance` before it is not decidable, and
+also keeps the check at WARN. Grants on the CPU device are left out: the oracle
+records GPUs only. That
 clause needs `vramrec.jsonl`, and without it `grant_safety` reports **WARN**,
 never PASS, so a silently skipped safety clause is visible in the table. Its
 other clause — grant ≤ the headroom it was priced against — only re-checks the
 ledger's arithmetic against itself, and `ledger_invariant`'s strict form is not
 a substitute either: with `external` deliberately hard-zeroed in the binary,
 `limit_mb` became `total_mb` and `ledger_invariant` passed on **0 of 498**
-GPU-samples while the oracle clause caught **335 of 335** grants. Record
+GPU-samples while the oracle clause caught **334 of 335** grants. Record
 `vramrec.jsonl` on every leg.
 
 `analyze.py` reconstructs the ledger's behaviour primarily from the structured
@@ -714,7 +724,11 @@ last one closes a hole in `base_accuracy` itself):
   `fit samples == 0`, no `[[profile]]` in `calibration.after.toml`, or a peak
   `unit_budget` that never rose above the first value recorded **and no
   plateau knee was learned** (a budget held at its knee is learning, not a
-  stall). The three
+  stall). A budget the job itself never filled (every window formed short of
+  it for want of queued work, `queue_bound_windows == total_batches`, and the
+  settle lines' largest `max_units_measured` below the seed) cannot rise, and
+  reads INFO, not FAIL, unless the budget was held at a rung the ring never
+  certified. The three
   numbers are exactly the ones `ramp_progress` prints as INFO — the check only
   promotes them to a verdict, which is what closes the whole class of "the
   instrument stopped reporting" faults. Undeclared, the row is report-only.
@@ -767,11 +781,11 @@ that move them are in `analyze.py --help`.
 
 | check | compares | threshold | tiers |
 |---|---|---|---|
-| `oracle_agreement` | the ledger's `external_mb` against (GPU `used` − the NVML usage of our own worker PIDs) | ±1 GiB or 2 % | PASS/FAIL, SKIP without both recordings **and SKIP where the oracle priced no PID** (WDDM: subtracting nothing would report our own footprint as the disagreement) |
-| `base_accuracy` | a replica's reported `base_mb` against the oracle's per-process reading for *its* process | ±10 % (`nvml` method only) | PASS/FAIL; INFO when the window is empty or the method is not `nvml` |
+| `oracle_agreement` | the ledger's `external_mb` against (GPU `used` − the NVML usage of our own worker PIDs), up to `legs.py`'s hog stop (the idle gateway keeps its last figure after it) | ±1 GiB or 2 % | PASS/FAIL, SKIP without both recordings **and SKIP where the oracle priced no PID** (WDDM: subtracting nothing would report our own footprint as the disagreement) |
+| `base_accuracy` | a replica's reported `base_mb` against the oracle's per-process reading for *its* process | ±10 % (`nvml` method, or `fdinfo` against `amdgpu-kfd`; one oracle source per window, KFD preferred) | PASS/FAIL; INFO when the window is empty or the pair is neither |
 | `footprint_agreement` | per GPU, `footprints_mb` against the summed NVML usage of our PIDs | ±1 GiB or 2 % | PASS/FAIL |
 | `slope_accuracy` | the persisted slope against `ceiling_probe.py`'s **allocated** slope (`fit` where `fit.basis` names it, else the probe's whole-batch `peak_allocated_mb` rows refitted here) | −30 % .. +100 % | PASS/FAIL; WARN (FAIL under `--learning`) when no store was written; SKIP when no probe was passed, or when no probe names a model the store holds |
-| `grant_safety` | every grant against the headroom it was priced against **and** against the oracle's live free memory | no grant over either | PASS/FAIL; WARN without `vramrec.jsonl` |
+| `grant_safety` | every grant against the headroom it was priced against **and** against the oracle's live free memory | no grant over either | PASS/FAIL; WARN without `vramrec.jsonl`, or when a grant has no sample before it or is over free with a covering release |
 | `failures` | OOM negatives, worker deaths and merged-window fallbacks in the log | `--expect-ooms` / `--expect-deaths` | PASS/FAIL |
 | `deflation_recovery` | how long deflation takes to return to 0 | 3 clean windows per level | PASS/FAIL |
 | `idle_liveness` | `grants_outstanding` in the trailing `--idle-window` | must reach 0 | PASS/FAIL |
@@ -1118,7 +1132,7 @@ $V $T/analyze.py --scenario $T/results/<run>/S2 --checks all --learning \
 |---|---|---|---|
 | interpreter | `python/.venv/bin/python` | same | `python\.venv\Scripts\python.exe` |
 | binary | `target/release/panoptikon` | same | `target\release\panoptikon.exe` |
-| the oracle | NVML per-process (`oracle_source: "nvml"`), or amdgpu sysfs + DRM fdinfo on ROCm | no per-process GPU counter at all. `vramrec.py` runs its darwin branch with no NVML: one `GPU-MPS` row whose free is `min(total, RAM available)`, per-sample RAM from psutil or `vm_stat`, and our workers listed with RSS only — `oracle_source: "mps-ram"`. Its **total is the worker's recommended-max**, resolved best-first and named in `gpu_total_source`: the gateway's `/health` `vram` row under `--health-url` (which `legs.py` passes on macOS), else `torch.mps.recommended_max_memory()` in a child process, else `sysctl iogpu.wired_limit_mb`, else `hw.memsize × 0.75` — the last a seed that under-states (98 304 against the M3 Max's real 110 100) and failed `grant_safety` on seven legs of an idle machine, on which `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. The GPU-side self-reports are `selftest.py`'s `mps` tier (`torch.mps.driver_allocated_memory()`, per-process by construction) and the worker's own `driver_allocated` from `/health` | **no per-process oracle at all**: NVML answers N/A for every process and `nvidia-smi --query-compute-apps` answers `[N/A]` too (measured on driver 610.74), so the oracle is GPU-level used/free from NVML plus our own worker's footprint from its `/health` figures, and `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. NVML is also the only trustworthy *free* reading here: torch's `mem_get_info` over-reports free memory by the desktop's own usage (30 577 vs 25 354 MiB at the same instant, 5.2 GB), so the `torch` free tier is a last resort on WDDM, not a second opinion |
+| the oracle | NVML per-process (`oracle_source: "nvml"`). On ROCm, `mem_info_vram_*` (+`gtt` on a unified GPU) with the gateway's arithmetic, keyed from `/health` `gpus[]` under `--health-url` (which `legs.py` passes on ROCm), so `oracle_agreement` is a consistency check there; per process, KFD's `proc/<pid>/vram_<gpu_id>` (`"amdgpu-kfd"`, discrete GPUs only; found by PID in the host PID namespace, else by the PASID in the process's DRM fdinfo) or DRM fdinfo (`"amdgpu-fdinfo"`, the worker's own counter, so `base_accuracy` reports an `fdinfo` base against it without judging). A row whose `unreadable_pids` (another user's processes, without CAP_SYS_PTRACE) names one of our workers prices no PID for `oracle_agreement` | no per-process GPU counter at all. `vramrec.py` runs its darwin branch with no NVML: one `GPU-MPS` row whose free is `min(total, RAM available)`, per-sample RAM from psutil or `vm_stat`, and our workers listed with RSS only — `oracle_source: "mps-ram"`. Its **total is the worker's recommended-max**, resolved best-first and named in `gpu_total_source`: the gateway's `/health` `vram` row under `--health-url` (which `legs.py` passes on macOS), else `torch.mps.recommended_max_memory()` in a child process, else `sysctl iogpu.wired_limit_mb`, else `hw.memsize × 0.75` — the last a seed that under-states (98 304 against the M3 Max's real 110 100) and failed `grant_safety` on seven legs of an idle machine, on which `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. The GPU-side self-reports are `selftest.py`'s `mps` tier (`torch.mps.driver_allocated_memory()`, per-process by construction) and the worker's own `driver_allocated` from `/health` | **no per-process oracle at all**: NVML answers N/A for every process and `nvidia-smi --query-compute-apps` answers `[N/A]` too (measured on driver 610.74), so the oracle is GPU-level used/free from NVML plus our own worker's footprint from its `/health` figures, and `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. NVML is also the only trustworthy *free* reading here: torch's `mem_get_info` over-reports free memory by the desktop's own usage (30 577 vs 25 354 MiB at the same instant, 5.2 GB), so the `torch` free tier is a last resort on WDDM, not a second opinion |
 | expected `base_method` | `nvml` (CUDA), `fdinfo` (ROCm) | `mps` (`driver_allocated_memory()` after the load — tier-1, no delta fallback on the happy path) | **`free_delta`** — the degraded tier, untested anywhere so far, and the reason this platform matters |
 | pressure | `hog.py --target gpu` | `hog.py --target mps` (torch tensors on the unified device, released with `torch.mps.empty_cache()`) **and** `--target ram` (numpy on the RAM term of the same budget). Prefer `--target ram`: an `mps` hold decays out of every free reading at ~1.5 GiB/min while holding, and `--touch-period` was measured and does not fix it | `hog.py --target gpu` |
 | over-admission looks like | an OOM exception the classifier tiers | an OOM exception, or jetsam killing the process | **a throughput collapse, never an exception** — read `throughput_collapse` and per-batch `duration_ms`, and run S4c a second time with the driver's "Prefer No Sysmem Fallback" set |

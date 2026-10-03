@@ -1123,6 +1123,22 @@ def fdinfo(pdev: str, client: int, vram: str | None, key: str = "drm-resident-vr
     return "\n".join(lines) + "\n"
 
 
+# A render node's fdinfo from amdgpu DKMS 6.8.5 on kernel 5.15: no
+# `drm-client-id`, so `pasid` is the client identity.
+NO_CLIENT_ID_FDINFO = (
+    "pos:\t0\nflags:\t02100002\n"
+    "mnt_id:\t528\nino:\t13\n"
+    "drm-driver:\tamdgpu\ndrm-pdev:\t0000:01:00.0\n"
+    "pasid:\t32769\ndrm-memory-vram:\t1048640 KiB\n"
+    "drm-memory-gtt: \t6180 KiB\ndrm-memory-cpu: \t4108 KiB\n"
+    "amd-memory-visible-vram:\t1048640 KiB\namd-evicted-vram:\t0 KiB\n"
+    "amd-evicted-visible-vram:\t0 KiB\namd-requested-vram:\t1048640 KiB\n"
+    "amd-requested-visible-vram:\t64 KiB\namd-requested-gtt:\t6184 KiB\n"
+    "drm-shared-vram:\t0 KiB\ndrm-shared-gtt:\t0 KiB\n"
+    "drm-shared-cpu:\t0 KiB\n"
+)
+
+
 def test_the_fdinfo_parser_reads_only_what_the_format_defines() -> None:
     # The documented grammar is `<uint> [KiB|MiB]`, and `drm-memory-<region>`
     # is the kernel docs' deprecated alias for `drm-resident-<region>`.
@@ -1149,6 +1165,12 @@ def test_the_fdinfo_parser_reads_only_what_the_format_defines() -> None:
     ):
         record = memory.parse_drm_fdinfo(*(text, regions) if regions else (text,))
         assert (record[2] if record else None) == expected, label
+    assert memory.parse_drm_fdinfo(NO_CLIENT_ID_FDINFO) == (
+        "0000:01:00.0", ("pasid", 32769), 1048640 * 1024
+    )
+    assert memory.parse_drm_fdinfo(NO_CLIENT_ID_FDINFO, ("vram", "gtt"))[2] == (
+        (1048640 + 6180) * 1024
+    )
     # Upper-case addresses compare against ours, which are lower-case.
     assert memory.parse_drm_fdinfo(fdinfo("0000:0C:00.0", 1, "1 KiB"))[0] == (
         "0000:0c:00.0"
@@ -1162,12 +1184,13 @@ def test_fdinfo_records_that_are_not_readings() -> None:
     # would hand dominance to a different GPU.
     assert memory.parse_drm_fdinfo(fdinfo("0000:03:00.0", 7, None)) == (
         "0000:03:00.0",
-        7,
+        ("drm-client-id", 7),
         0,
     )
     for text, label in (
         ("pos:\t0\nflags:\t02\nmnt_id:\t24\n", "a non-DRM fd"),
-        ("drm-pdev:\t0000:03:00.0\n", "no client id"),
+        ("drm-pdev:\t0000:03:00.0\n", "neither a client id nor a pasid"),
+        ("drm-pdev:\t0000:03:00.0\npasid:\tnone\n", "a pasid that is not one"),
         ("drm-client-id:\t7\n", "no address"),
         ("not a fdinfo at all", "junk"),
         (fdinfo("0000:03:00.0", "seven", "1 KiB"), "a client id that is not one"),
@@ -1190,6 +1213,17 @@ def test_fdinfo_records_that_are_not_readings() -> None:
             "not a drm fd at all\n",
         ]
     ) == {"0000:03:00.0": (1024 + 512) * 1024, "0000:0c:00.0": 8 * 1024 * 1024}
+    # Without `drm-client-id` the PASID dedupes, and a PASID never matches a
+    # client id of the same number. KFD puts one PASID on every GPU, so the
+    # same PASID on another GPU is another client.
+    assert memory.fdinfo_vram_by_pdev(
+        [
+            NO_CLIENT_ID_FDINFO,
+            NO_CLIENT_ID_FDINFO,  # the same DRM file, dup()ed
+            fdinfo("0000:01:00.0", 32769, "1 MiB"),
+            NO_CLIENT_ID_FDINFO.replace("0000:01:00.0", "0000:0c:00.0"),
+        ]
+    ) == {"0000:01:00.0": (1048640 + 1024) * 1024, "0000:0c:00.0": 1048640 * 1024}
     assert memory.fdinfo_vram_by_pdev([]) == {}
 
 

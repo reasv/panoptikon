@@ -353,6 +353,9 @@ jobs:
           # runtime; the image itself builds and boots without a GPU.
           - accelerator: cuda
             suffix: "-cuda"
+          # ROCm image: :latest-rocm / :vX.Y.Z-rocm (deploy/docker-compose.rocm.yml).
+          - accelerator: rocm
+            suffix: "-rocm"
     env:
       IMAGE: ghcr.io/${{ github.repository }}
     steps:
@@ -360,10 +363,10 @@ jobs:
         with:
           submodules: recursive
 
-      # The CUDA venv (torch + nvidia-* wheels) is several GB; the default
-      # hosted-runner free space is too tight for that image build.
+      # The CUDA and ROCm venvs (torch + vendor libraries) are several GB;
+      # the default hosted-runner free space is too tight for those builds.
       - name: Free disk space
-        if: matrix.accelerator == 'cuda'
+        if: matrix.accelerator != 'cpu'
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
             /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true

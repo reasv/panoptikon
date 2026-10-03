@@ -98,6 +98,18 @@ this platform is the worker's own `driver_allocated` in `/health`, which is
 `torch.mps.driver_allocated_memory()` and per-process by construction.
 `analyze.py` reads `oracle_source` and SKIPs its per-process checks here for
 the same reason it SKIPs them on WDDM.
+
+**The ROCm oracle** (`AmdgpuOracle`) runs where NVML does not answer and the
+KFD topology lists GPUs this process can open (`rocm_sysfs.py`). Total, used
+and free come from `mem_info_vram_*` (plus `mem_info_gtt_*` on a unified GPU)
+with the gateway's own arithmetic. Per process, `oracle_source` names the
+instrument: `"amdgpu-kfd"` is KFD's `proc/<pid>/vram_<gpu_id>`, found by PID
+in the initial PID namespace (KFD names processes by host PID) and elsewhere
+by the PASID in the process's DRM fdinfo, and never used on a unified GPU (it
+counts no GTT); `"amdgpu-fdinfo"` is DRM fdinfo, the same counter the
+worker's own `fdinfo` base reads. `unreadable_pids` lists the processes whose
+descriptors could not be read (another user's, without CAP_SYS_PTRACE): what
+they hold is missing from `procs`.
 """
 
 from __future__ import annotations
@@ -113,7 +125,11 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from dataclasses import replace
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rocm_sysfs  # noqa: E402
 
 MIB = 1024 * 1024
 
@@ -893,6 +909,89 @@ class MpsOracle:
         }]
 
 
+# --- The ROCm oracle: amdgpu sysfs, and KFD or DRM fdinfo per process ----
+
+
+def health_keys(payload: Any) -> Dict[str, str]:
+    """`{bdf: device key}` from the `gpus` inventory of `/health`."""
+    rows = payload.get("gpus") if isinstance(payload, dict) else None
+    return {row["bdf"]: row["uuid"] for row in rows or []
+            if isinstance(row, dict) and row.get("bdf") and row.get("uuid")}
+
+
+class AmdgpuOracle:
+    """GPU rows from amdgpu sysfs, for a ROCm host (no NVML).
+
+    Total/free is the gateway's own arithmetic on the same files, so there
+    `oracle_agreement` is a consistency check. The independent figure is per
+    process: KFD's counter (`oracle_source: "amdgpu-kfd"`), or DRM fdinfo when
+    a process cannot be tied to its KFD entry or the GPU is unified
+    (`"amdgpu-fdinfo"`). Rows carry the key `/health` gives the GPU's BDF once
+    `--health-url` answers, and until then the key `rocm.rs` would derive.
+    """
+
+    unified = False  # `build_sample`'s MPS flag
+
+    def __init__(self, gpus: List["rocm_sysfs.Gpu"],
+                 roots: "rocm_sysfs.Roots" = rocm_sysfs.Roots(),
+                 health_url: Optional[str] = None, health_interval: float = 5.0,
+                 fetch: Optional[Callable[[str], Optional[Any]]] = None) -> None:
+        self.available = False
+        self.error: Optional[str] = "no NVML on this host (ROCm)"
+        self.driver_version: Optional[str] = None
+        self.nvml_version: Optional[str] = None
+        self.roots = roots
+        self.gpus = list(gpus)
+        self.health_url = health_url_for(health_url) if health_url else None
+        self.health_interval = max(0.0, health_interval)
+        self._fetch = fetch or fetch_health
+        self._next_health = 0.0
+        self.key_source = "derived"
+        self._adopt_health()
+
+    @property
+    def meta(self) -> List[Dict[str, Any]]:
+        return [{"index": gpu.index, "uuid": gpu.key, "name": None,
+                 "total_mb": None, "pci_bus_id": gpu.bdf,
+                 "unified": gpu.unified, "key_source": self.key_source,
+                 "error": None} for gpu in self.gpus]
+
+    def _adopt_health(self) -> None:
+        """Take `/health`'s keys once; the gateway keys a GPU for its life."""
+        if not self.health_url or self.key_source == "health":
+            return
+        self._next_health = time.monotonic() + self.health_interval
+        keys = health_keys(self._fetch(self.health_url))
+        if keys:
+            self.gpus = [replace(gpu, key=keys.get(gpu.bdf, gpu.key))
+                         for gpu in self.gpus]
+            self.key_source = "health"
+
+    def shutdown(self) -> None:
+        return None
+
+    def sample(self) -> List[Dict[str, Any]]:
+        if time.monotonic() >= self._next_health:
+            self._adopt_health()
+        procs = rocm_sysfs.process_vram_mb(self.roots, self.gpus)
+        rows = []
+        for gpu in self.gpus:
+            memory = rocm_sysfs.memory_mb(self.roots, gpu)
+            source, held, unreadable = procs[gpu.key]
+            total, free = memory if memory else (None, None)
+            rows.append({
+                "index": gpu.index, "uuid": gpu.key, "name": None,
+                "total_mb": total, "free_mb": free,
+                "used_mb": None if memory is None else total - free,
+                "error": None if memory else "mem_info_* unreadable",
+                "oracle_source": f"amdgpu-{source}", "oracle_age_ms": None,
+                "unreadable_pids": unreadable,
+                "_procs": [{"pid": pid, "used_mb": mb, "type": "compute"}
+                           for pid, mb in held.items()],
+            })
+        return rows
+
+
 # --- The Windows oracle: nvidia-smi where NVML has no per-process figure ---
 
 
@@ -1116,7 +1215,7 @@ def build_sample(
         # so a Windows recording is never read as if NVML had answered. NVML
         # wins the merge: the fallback only ever fills a null.
         nvml_priced = sum(1 for entry in raw if entry["used_mb"] is not None)
-        if not unified:
+        if not unified and "oracle_source" not in row:
             row["oracle_source"] = ("nvml" if raw and nvml_priced == len(raw)
                                     else "none")
             row["oracle_age_ms"] = None
@@ -1241,7 +1340,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="regex matched against /proc/<pid>/cmdline for the "
                              "RSS/VmHWM process list; empty string disables it")
     parser.add_argument("--gpu", type=int, action="append", dest="gpus",
-                        help="restrict to this NVML index (repeatable; default: all)")
+                        help="restrict to this NVML or HIP index (repeatable; "
+                             "default: all)")
     parser.add_argument("--env-key", action="append", dest="env_keys", default=[],
                         help="extra environment variable to capture (repeatable)")
     parser.add_argument("--no-env", action="store_true",
@@ -1262,9 +1362,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--flush-every", type=int, default=1,
                         help="fsync-free flush cadence in samples")
     parser.add_argument("--health-url", default=None,
-                        help="macOS only: take the device total from this "
+                        help="macOS: take the device total from this "
                              "gateway's /health `vram` row (a base URL or the "
-                             "endpoint), instead of the 0.75 seed")
+                             "endpoint), instead of the 0.75 seed. ROCm: key "
+                             "each GPU as that gateway's `gpus` row with its "
+                             "PCI address does")
     parser.add_argument("--health-total-interval", type=float, default=5.0,
                         help="seconds between /health re-reads (default 5)")
     parser.add_argument("--quiet", action="store_true",
@@ -1285,9 +1387,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     nvml: Any = (MpsOracle(health_url=args.health_url,
                            health_interval=args.health_total_interval)
                  if IS_DARWIN else Nvml(args.gpus))
+    amdgpu = [] if IS_DARWIN or nvml.available else rocm_sysfs.inventory()
+    if amdgpu:
+        nvml.shutdown()
+        nvml = AmdgpuOracle([gpu for gpu in amdgpu
+                             if not args.gpus or gpu.index in args.gpus],
+                            health_url=args.health_url,
+                            health_interval=args.health_total_interval)
     cache = ProcCache(tuple(DEFAULT_ENV_KEYS) + tuple(args.env_keys),
                       not args.no_env)
-    smi = (None if args.smi == "never" or IS_DARWIN
+    smi = (None if args.smi == "never" or IS_DARWIN or amdgpu
            else SmiOracle(args.nvidia_smi, max(0.0, args.smi_interval)))
 
     sink = open(args.out, "a", encoding="utf-8") if args.out else sys.stdout

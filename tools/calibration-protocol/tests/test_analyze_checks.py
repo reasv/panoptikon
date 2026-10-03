@@ -550,3 +550,119 @@ def test_grant_safety_still_fails_a_grant_past_free_plus_that_pool():
     verdict = analyze.check_grant_safety(ctx)
     assert verdict.verdict == "FAIL"
     assert verdict.numbers["over_free"][0]["own_pool_mb"] == 8455.0
+
+
+def _timed(t_wall, free_mb):
+    return {**_free_sample(free_mb), "t_wall": t_wall}
+
+
+def test_grant_safety_never_joins_a_sample_taken_after_the_grant():
+    """The next sample already holds the batch this grant admitted."""
+    ctx = _safety_context([_room_grant(100.0, 15700, 15700)],
+                          [_timed(99.8, 15900), _timed(100.1, 15600)])
+    verdict = analyze.check_grant_safety(ctx)
+    assert (verdict.verdict, verdict.numbers["joined"]) == ("PASS", 1)
+
+
+def test_grant_safety_never_passes_a_grant_a_release_may_have_covered():
+    """Over the free memory seen before it, with a release in the next sample
+    that covers it: WARN, whatever else the leg holds. No release, or one that
+    comes later than the join tolerance: FAIL."""
+    released = _safety_context([_room_grant(100.0, 15000, 15000),
+                                _room_grant(100.0, 100, 100)],
+                               [_timed(99.8, 10000), _timed(100.1, 15500)])
+    verdict = analyze.check_grant_safety(released)
+    assert (verdict.verdict, verdict.numbers["joined"]) == ("WARN", 2)
+    assert verdict.numbers["covered_by_release"][0]["released_mb"] == 5500
+    no_sample_before = _safety_context([_room_grant(100.0, 100, 100)],
+                                       [_timed(100.1, 15500)])
+    assert analyze.check_grant_safety(no_sample_before).verdict == "WARN"
+    for later in (_timed(100.1, 12000), _timed(160.0, 15500)):
+        held = _safety_context([_room_grant(100.0, 15000, 15000)],
+                               [_timed(99.8, 10000), later])
+        assert analyze.check_grant_safety(held).verdict == "FAIL"
+
+
+def _spawn(pid, model):
+    return {"ts": "2026-09-06T07:12:08.000000Z", "t_wall": 90.0,
+            "level": "INFO", "target": "panoptikon::inferio",
+            "message": "spawned an inferio worker",
+            "fields": {"pid": pid, "inference_id": model, "worker": "w"},
+            "line": ""}
+
+
+def _worker_sample(t_wall, workers):
+    """Workers 900 (the requester) and 901, over 16607 MiB of other use."""
+    sample = _timed(t_wall, 16000 - sum(workers.values()))
+    sample["gpus"][0]["procs"] = [_proc(pid, mb, "inferio-worker")
+                                  for pid, mb in workers.items()]
+    return sample
+
+
+def test_grant_safety_counts_only_releases_by_other_live_processes():
+    """The requester emptying its cache after an out-of-memory error, or a
+    worker the grant killed, is no release; another worker's is."""
+    log = [_spawn(900, MODEL), _spawn(901, "other/model"),
+           _room_grant(100.0, 5000, 5000)]
+    before = _worker_sample(99.8, {900: 10000, 901: 6000})
+    verdicts = [analyze.check_grant_safety(analyze.Context(
+        args=_args(), vramrec=[before, _worker_sample(100.1, workers)],
+        healthrec=[], hog=[], log=log, before=None, after=None, jobs=None,
+        probes=[])).verdict
+        for workers in ({900: 6000, 901: 6000}, {900: 10000},
+                        {900: 10000, 901: 500})]
+    assert verdicts == ["FAIL", "FAIL", "WARN"]
+
+
+def test_grant_safety_leaves_cpu_grants_to_the_ledger():
+    """The oracle records GPUs only: a host-RAM grant is not undecided."""
+    cpu = {**_room_grant(100.0, 160970, 160970), "fields": {
+        **_room_grant(100.0, 160970, 160970)["fields"], "gpu": "CPU"}}
+    verdict = analyze.check_grant_safety(_safety_context(
+        [cpu, _room_grant(100.0, 100, 100)], [_timed(99.8, 10000)]))
+    assert verdict.verdict == "PASS"
+    assert (verdict.numbers["cpu_grants"], verdict.numbers["undecided"]) == (1, 0)
+
+
+def test_grant_safety_decides_a_zero_grant_without_a_sample():
+    """A grant of 0 MiB cannot exceed free memory, sample or not."""
+    verdict = analyze.check_grant_safety(_safety_context(
+        [_room_grant(99.0, 0, 0), _room_grant(100.0, 100, 100)],
+        [_timed(99.8, 10000)]))
+    assert verdict.verdict == "PASS"
+    assert (verdict.numbers["joined"], verdict.numbers["undecided"]) == (1, 0)
+
+
+def test_oracle_agreement_skips_the_samples_after_the_hog_stop():
+    """The idle gateway keeps the hog's last figure until the next refresh."""
+    procs = [_proc(900, 1000, "inferio-worker")]
+    stale = {**_health_sample(14000), "t_wall": 101.0}
+    ctx = _context(vramrec=[_vram_sample(procs, used_mb=1000)],
+                   healthrec=[_health_sample(0), stale])
+    assert analyze.check_oracle_agreement(ctx).verdict == "FAIL"
+    ctx.teardown_t = 100.5
+    verdict = analyze.check_oracle_agreement(ctx)
+    assert (verdict.verdict, verdict.numbers["teardown_samples"]) == ("PASS", 1)
+
+
+def _learning_context(seed, largest, queue_bound=7):
+    health = _worker_health(seed)
+    health["health"]["workers"][0].update(fit_samples=12, max_units_measured=6293)
+    health["health"]["models"] = [{"inference_id": MODEL, "total_batches": 7,
+                                   "queue_bound_windows": queue_bound}]
+    ctx = _utilization_context([health],
+                               log=[_settle(largest)] if largest else [])
+    ctx.args.learning = True
+    ctx.after = {"profile": [{"inference_id": MODEL}]}
+    return ctx
+
+
+def test_calibration_learned_cannot_judge_a_seed_no_window_reached():
+    """Only when every window was short for want of work and the settle
+    lines say the largest stayed under the seed."""
+    verdict = analyze.check_calibration_learned(_learning_context(120000, 6293))
+    assert verdict.verdict == "INFO"
+    assert "no window reached the seed" in verdict.detail
+    for stuck in (_learning_context(64, 64), _learning_context(120000, None),
+                  _learning_context(120000, 6293, queue_bound=6)):
+        assert analyze.check_calibration_learned(stuck).verdict == "FAIL"

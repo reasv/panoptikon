@@ -85,7 +85,10 @@ unbounded ladder would spill host RAM rather than exhaust a device.
 **On MPS the device total *is* host RAM**, so the overshoot is dropped and the
 ladder additionally stops while 16 GiB of host memory is still available
 (`oom.kind = "ram_floor"`), rather than letting macOS reach for jetsam and
-kill processes this test has nothing to do with. `--oom-cap-mb N` lowers the
+kill processes this test has nothing to do with. The same bounds apply on a
+unified ROCm GPU, which the tool pins like the spawner does
+(`HIP_VISIBLE_DEVICES`, plus `PANOPTIKON_UNIFIED_GPU=<bdf>` on an APU).
+`--oom-cap-mb N` lowers the
 bound further, which is how a 128 GB laptop is asked for a small experiment.
 Where the failure is *meant* to come from there is the watermark: with the
 1.0/1.0 ratios the spawner pins (`accelerator_env.rs`), torch raises
@@ -111,6 +114,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rocm_sysfs  # noqa: E402
 
 MIB = 1024 * 1024
 SCHEMA = "selftest/1"
@@ -170,6 +176,28 @@ def load_probe(here: Path) -> Any:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def rocm_pin(device: int, environ: Dict[str, str],
+             roots: rocm_sysfs.Roots = rocm_sysfs.Roots()) -> Dict[str, str]:
+    """The variables the spawner would give a worker on HIP device `device`:
+    `HIP_VISIBLE_DEVICES` and, on a unified GPU, `PANOPTIKON_UNIFIED_GPU`.
+    A single index already in `HIP_VISIBLE_DEVICES` is kept and names the
+    device; any other visibility variable leaves the process unpinned."""
+    hip = (environ.get("HIP_VISIBLE_DEVICES") or "").strip()
+    others = ("ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL")
+    if any((environ.get(name) or "").strip() for name in others) or (
+            hip and not hip.isdigit()):
+        return {}
+    gpu = next((gpu for gpu in rocm_sysfs.inventory(roots)
+                if gpu.index == (int(hip) if hip else device)), None)
+    if gpu is None:
+        return {}
+    out = {"HIP_VISIBLE_DEVICES": str(gpu.index),
+           "PANOPTIKON_DEVICE_PIN": str(gpu.index)}
+    if gpu.unified:
+        out["PANOPTIKON_UNIFIED_GPU"] = gpu.bdf
+    return out
 
 
 def synth_items(count: int, pixels: int, out_dir: Path) -> List[Dict[str, Any]]:
@@ -466,6 +494,8 @@ def device_block(memory: Any, pin: Optional[str]) -> Dict[str, Any]:
         "gpu_total_mb": _safe(memory.gpu_total_mb),
         "gpu_bdf": _safe(memory.device_bdf),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "hip_visible_devices": os.environ.get("HIP_VISIBLE_DEVICES"),
+        "unified_gpu": os.environ.get("PANOPTIKON_UNIFIED_GPU"),
         "pin": pin,
         "pinned_device_missing": _safe(memory.pinned_device_missing),
     }
@@ -543,7 +573,7 @@ def induce_oom(
 
     # A unified device's "total" is host RAM: overshooting it swaps the
     # machine instead of exhausting a board.
-    unified = device == "mps"
+    unified = device == "mps" or bool(_safe(memory._unified_gpu))
     cap_mb = total_mb if unified else total_mb + FILLER_OVERSHOOT_MB
     if cap_mb_override:
         cap_mb = min(cap_mb, cap_mb_override)
@@ -600,7 +630,8 @@ def induce_oom(
             result["message_head"] = (
                 f"stopped at {held_mb} MiB with "
                 f"{result.get('ram_available_mb')} MiB of host RAM left: the "
-                f"allocator had not refused, and past this point macOS kills "
+                f"allocator had not refused, and past this point "
+                f"{'macOS' if device == 'mps' else 'the OOM killer'} kills "
                 f"processes rather than raising")
             if not quiet:
                 print(f"  {result['message_head']}", file=sys.stderr)
@@ -688,7 +719,11 @@ def verdict_line(document: Dict[str, Any]) -> Tuple[str, List[str]]:
     oom = document.get("oom") or {}
     backend = (document.get("platform") or {}).get("backend")
     if oom.get("requested"):
-        if oom.get("kind") == "ram_floor":
+        if oom.get("kind") == "ram_floor" and backend != "mps":
+            degraded.append(
+                "oom:the allocator did not refuse before the host RAM floor "
+                "on a unified GPU - the ladder was stopped by this tool")
+        elif oom.get("kind") == "ram_floor":
             high = (oom.get("watermark") or {}).get(
                 "PYTORCH_MPS_HIGH_WATERMARK_RATIO")
             degraded.append(
@@ -798,7 +833,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--model", default=DEFAULT_MODEL,
                         help="inference id loaded through the real impl loader")
     parser.add_argument("--device", type=int, default=0,
-                        help="NVML GPU index; ignored where NVML has no device")
+                        help="NVML GPU index, or HIP device index on ROCm "
+                             "(a single-index HIP_VISIBLE_DEVICES wins)")
     parser.add_argument("--batch", type=int, default=DEFAULT_BATCH,
                         help="items in the measured batch")
     parser.add_argument("--corpus",
@@ -860,6 +896,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         pin = gpu["uuid"]
         os.environ["CUDA_VISIBLE_DEVICES"] = pin
         os.environ.setdefault("PANOPTIKON_DEVICE_PIN", pin)
+    else:
+        hip_env = rocm_pin(args.device, dict(os.environ))
+        pin = hip_env.get("HIP_VISIBLE_DEVICES")
+        for name, value in hip_env.items():
+            os.environ.setdefault(name, value)
     sys.path.insert(0, str(repo / "python"))
 
     import logging
@@ -1017,7 +1058,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # --- induced failure ---
         if args.induce_oom:
-            board_total = document["device"].get("gpu_total_mb") or total_mb
+            # A unified ROCm GPU's total is carve-out plus GTT, which HIP's
+            # `total_memory` may not report; `free_total_mb` does.
+            board_total = ((total_mb if _safe(memory._unified_gpu) else None)
+                           or document["device"].get("gpu_total_mb") or total_mb)
             if board_total is None:
                 print("VERDICT: --induce-oom refused: no board total resolved, "
                       "so the filler ladder has no bound")

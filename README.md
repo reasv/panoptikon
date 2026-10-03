@@ -393,10 +393,11 @@ reference: every key, the templating syntax, and policies and rulesets.
 The official image (`ghcr.io/reasv/panoptikon`, linux/amd64) packages
 everything in one container: the Rust binary, a native Node.js for the web
 UI, and the Python inference environment — no nginx, no separate UI services.
-Two variants are published: a CPU image (`:latest`) and a **CUDA/GPU image**
-(`:latest-cuda`) — most users want the GPU one, see [GPU (CUDA)](#gpu-cuda)
-below. Both include the optional PDF and HTML renderers (bundled `libpdfium`
-and a headless Chrome).
+Three variants are published: a CPU image (`:latest`), a **CUDA image**
+(`:latest-cuda`) for NVIDIA GPUs and a **ROCm image** (`:latest-rocm`) for
+AMD GPUs — most users want a GPU one, see [GPU (CUDA)](#gpu-cuda) and
+[GPU (AMD ROCm)](#gpu-amd-rocm) below. All include the optional PDF and HTML
+renderers (bundled `libpdfium` and a headless Chrome).
 
 You do **not** need to clone the repository. Download the compose file into
 an empty directory and start it (this uses the CPU image):
@@ -483,9 +484,29 @@ docker compose -f docker-compose.cuda.yml up -d
 The CUDA compose passes the host GPU(s) into the container; everything else
 (ports, volumes, media mounts) matches the CPU compose.
 
+### GPU (AMD ROCm)
+
+For AMD GPUs, use the published ROCm image
+(`ghcr.io/reasv/panoptikon:latest-rocm`). It needs a Linux host with the
+`amdgpu` kernel driver and a GPU that ROCm 7.2 supports; the image carries its
+own ROCm libraries, so nothing ROCm needs to be installed on the host. The
+container user must be in the host's `render` group, whose id differs between
+distributions, so record it in a `.env` file next to the compose file first:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/reasv/panoptikon/master/deploy/docker-compose.rocm.yml
+echo "RENDER_GID=$(getent group render | cut -d: -f3)" > .env
+docker compose -f docker-compose.rocm.yml up -d
+```
+
+The ROCm compose passes `/dev/kfd` and `/dev/dri` (every AMD GPU) into the
+container; everything else matches the CPU compose.
+
 **Building from source instead of pulling** — for development or local
 changes — use the repo-root `docker-compose.yml`, which builds the image with
-the `ACCELERATOR` build arg (`cuda` by default, `cpu` to override):
+the `ACCELERATOR` build arg (`cuda` by default, `cpu` or `rocm` to override;
+for `rocm`, swap its NVIDIA `deploy:` block for the ROCm compose's `devices:`
+and `group_add:`):
 
 ```bash
 git clone --recurse-submodules https://github.com/reasv/panoptikon.git

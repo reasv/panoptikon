@@ -377,9 +377,11 @@ def pinned_device_missing() -> str | None:
         "GPU the ROCm userspace does not enumerate (an unsupported gfx "
         "target — an integrated GPU alongside a discrete one is the common "
         "case, and HSA_OVERRIDE_GFX_VERSION is how such a part is usually "
-        "made usable) or a device index that does not exist in this "
-        "process's visible set. Pin this model to a GPU that works "
-        "(inference_local `devices`), or make the pinned one enumerable"
+        "made usable), a render node this process cannot open "
+        "(`/dev/dri/renderD*` permissions or the render group), or a device "
+        "index that does not exist in this process's visible set. Pin this "
+        "model to a GPU that works (inference_local `devices`), or make the "
+        "pinned one enumerable"
     )
 
 
@@ -599,11 +601,15 @@ def gpu_total_mb() -> int | None:
 
 def parse_drm_fdinfo(
     text: str, regions: tuple[str, ...] = ("vram",)
-) -> tuple[str, int, int] | None:
-    """`(pdev, client_id, bytes)` for one fdinfo file, or None.
+) -> tuple[str, tuple[str, int], int] | None:
+    """`(pdev, client, bytes)` for one fdinfo file, or None.
 
-    Requires `drm-pdev` and `drm-client-id` (the id deduplicates fds of one
-    client). `drm-resident-*` is preferred over the deprecated `drm-memory-*`.
+    Requires `drm-pdev` and a client identity that deduplicates fds of one
+    client: `("drm-client-id", id)`, else amdgpu's `("pasid", id)` (older
+    amdgpu drivers print no `drm-client-id`). One DRM file has one PASID, but
+    a PASID identifies one client only per GPU: KFD puts its per-process PASID
+    on every GPU's render node, so callers key on `(pdev, client)`.
+    `drm-resident-*` is preferred over the deprecated `drm-memory-*`.
     A missing memory key counts as 0; an unparseable one makes the record None.
     """
     fields: dict[str, str] = {}
@@ -612,14 +618,14 @@ def parse_drm_fdinfo(
         if not separator:
             continue
         key = key.strip().lower()
-        if key.startswith("drm-"):
+        if key.startswith("drm-") or key == "pasid":
             fields[key] = value.strip()
     pdev = fields.get("drm-pdev")
-    client_id = fields.get("drm-client-id")
-    if not pdev or client_id is None:
+    kind = "drm-client-id" if "drm-client-id" in fields else "pasid"
+    if not pdev or kind not in fields:
         return None
     try:
-        client = int(client_id)
+        client = (kind, int(fields[kind]))
     except ValueError:
         return None
     prefix = (
@@ -662,7 +668,7 @@ def fdinfo_vram_by_pdev(
     texts: Iterable[str], regions: tuple[str, ...] = ("vram",)
 ) -> dict[str, int]:
     """Per-GPU VRAM this process holds in bytes, keyed by PCI address."""
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, tuple[str, int]]] = set()
     totals: dict[str, int] = {}
     for text in texts:
         record = parse_drm_fdinfo(text, regions)

@@ -29,6 +29,11 @@ host.json
                 "torch_cuda": str|null},
      "env": {"CUDA_VISIBLE_DEVICES": ..., ...},
      "ffmpeg": str|null}
+
+On a host whose KFD topology lists GPUs, also `"rocm": {"amdgpu_version",
+"gpu_nodes": [{"node", "gpu_id", "properties", "openable", "bdf", "index",
+"key", "mem_info": {"mem_info_vram_total", ...}}]}` (bytes). The kernel is
+`platform.release`.
 """
 
 from __future__ import annotations
@@ -45,11 +50,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import rocm_sysfs  # noqa: E402
+
 ENV_KEYS = (
     "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "HIP_VISIBLE_DEVICES",
     "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL", "PYTORCH_CUDA_ALLOC_CONF",
     "RUST_LOG", "INFERIO_WORKER_LOG_LEVEL", "PANOPTIKON_CONFIG_PATH",
-    "HF_HOME", "LOGLEVEL",
+    "HF_HOME", "LOGLEVEL", "HSA_OVERRIDE_GFX_VERSION",
 )
 
 
@@ -108,6 +116,31 @@ def nvidia_facts() -> Dict[str, Any]:
             "gpus": gpus, "error": None}
 
 
+def rocm_facts(roots: rocm_sysfs.Roots = rocm_sysfs.Roots(),
+               module: str = "/sys/module/amdgpu/version") -> Optional[Dict[str, Any]]:
+    """KFD GPU nodes and their amdgpu counters, or None without KFD GPUs."""
+    nodes = rocm_sysfs.gpu_nodes(roots)
+    if not nodes:
+        return None
+    keyed = {gpu.bdf: gpu for gpu in rocm_sysfs.inventory(roots)}
+    for node in nodes:
+        props = node["properties"]
+        bdf = (rocm_sysfs.format_bdf(props["domain"], props["location_id"])
+               if "domain" in props and "location_id" in props else None)
+        gpu = keyed.get(bdf)
+        node.update(bdf=bdf, index=gpu and gpu.index, key=gpu and gpu.key)
+        node["mem_info"] = {
+            name: rocm_sysfs.read_int(os.path.join(roots.pci_devices, bdf, name))
+            for name in ("mem_info_vram_total", "mem_info_vram_used",
+                         "mem_info_vis_vram_total", "mem_info_gtt_total",
+                         "mem_info_gtt_used")} if bdf else {}
+    try:
+        version: Optional[str] = Path(module).read_text(encoding="utf-8").strip()
+    except OSError:
+        version = None  # the in-tree driver publishes no version
+    return {"amdgpu_version": version, "gpu_nodes": nodes}
+
+
 def _int(text: str) -> Optional[int]:
     try:
         return int(float(text))
@@ -153,6 +186,7 @@ def host_facts(run_id: str, repo: Path) -> Dict[str, Any]:
         "mem_total_mb": mem_total_mb(),
         "git": git_facts(repo),
         "nvidia_smi": nvidia_facts(),
+        **({"rocm": facts} if (facts := rocm_facts()) else {}),
         "python": python_facts(),
         "env": {key: os.environ.get(key) for key in ENV_KEYS},
         "ffmpeg": shutil.which("ffmpeg"),

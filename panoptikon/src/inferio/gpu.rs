@@ -167,6 +167,12 @@ pub struct HostGpus {
     pub inventory: GpuInventory,
 }
 
+/// ISA names of the GPUs in the KFD topology (`gfx1100`), for the startup
+/// accelerator report; empty without amdgpu.
+pub fn rocm_topology_gfx_names() -> Vec<String> {
+    rocm::topology_gfx_names(&rocm::SysfsRoots::default().kfd_nodes)
+}
+
 /// Probe once at startup; never fails. `accelerator` must be the resolved
 /// one. The CPU device is added on every host whose RAM can be read.
 pub fn probe(accelerator: Accelerator) -> HostGpus {
