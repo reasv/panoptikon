@@ -152,29 +152,26 @@ def test_a_ramp_that_never_started_fails_without_any_working_size():
     assert "peak unit_budget never left the seed" in verdict.detail
 
 
-TRIAL = {"ts": "", "t_wall": 110.0, "level": "INFO", "target": "",
-         "message": "a batch size trial is over", "line": "",
-         "fields": {"model": MODEL, "units": 64, "moved": False}}
-
-
-@pytest.mark.parametrize("samples, trial, expected", [
+@pytest.mark.parametrize("samples, trial_gpu, expected", [
     # Fresh and flat, with a trial that placed no size (failed or put off).
-    ([{"A": None}] * 20, True, "FAIL"),
-    # Resumed from the store, with and without a trial.
-    ([{"A": 64}] * 20, True, "PASS"),
-    ([{"A": 64}] * 20, False, "FAIL"),
+    ([{"A": None}] * 20, "A", "FAIL"),
+    # Resumed from the store, with and without a trial; the trial on another
+    # GPU.
+    ([{"A": 64}] * 20, "A", "PASS"),
+    ([{"A": 64}] * 20, None, "FAIL"),
+    ([{"B": 64}] * 20, "A", "FAIL"),
     # Fresh, turned local mid-leg; resumed, then moved.
-    ([{"A": None}] * 10 + [{"A": 64}] * 10, False, "PASS"),
-    ([{"A": 64}] * 10 + [{"A": 32}] * 10, False, "PASS"),
+    ([{"A": None}] * 10 + [{"A": 64}] * 10, None, "PASS"),
+    ([{"A": 64}] * 10 + [{"A": 32}] * 10, None, "PASS"),
     # A second GPU's replica resuming a stored size later; two replicas
     # resuming different stored sizes.
-    ([{"A": None}] * 10 + [{"A": None, "B": 32}] * 10, False, "FAIL"),
-    ([{"A": 64}] * 10 + [{"A": 64, "B": 32}] * 10, False, "FAIL"),
+    ([{"A": None}] * 10 + [{"A": None, "B": 32}] * 10, None, "FAIL"),
+    ([{"A": 64}] * 10 + [{"A": 64, "B": 32}] * 10, None, "FAIL"),
 ])
 def test_a_size_resumed_from_the_store_is_learned_only_with_a_trial(
-        samples, trial, expected):
+        samples, trial_gpu, expected):
     """A local size counts when this leg measured it: it moved, turned local
-    after its worker's first sample, or the model logged a trial. Each sample
+    after its worker's first sample, or its GPU logged a trial. Each sample
     is `{gpu: knee_units}`, at unit_budget 64."""
     ctx = _context([])
     ctx.health_samples = [
@@ -184,7 +181,10 @@ def test_a_size_resumed_from_the_store_is_learned_only_with_a_trial(
              "knee_is_local": knee is not None}
             for gpu, knee in workers.items()]}}
         for index, workers in enumerate(samples)]
-    ctx.log = [TRIAL] if trial else []
+    ctx.log = [{"ts": "", "t_wall": 110.0, "level": "INFO", "target": "",
+                "message": "a batch size trial is over", "line": "",
+                "fields": {"model": MODEL, "gpu": trial_gpu, "units": 64,
+                           "moved": False}}] if trial_gpu else []
     assert analyze.check_calibration_learned(ctx).verdict == expected
     note = "REQUEST_UNIT_BUDGET" in analyze.check_ramp_progress(ctx).detail
     assert note == (expected == "FAIL")

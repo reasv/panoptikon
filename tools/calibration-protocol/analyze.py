@@ -579,15 +579,21 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
     Only a working size `/health` marks `knee_is_local` counts: a trial on
     this machine measured the sizes next to it and moved to it or left it in
     place. The size a replica merely opened at, or one seeded from a shipped
-    profile, is "not measured yet". A worker is a model on one GPU: a local
-    size its first sample already carried was resumed from this machine's
-    store, and `knee_late` is 1 when a worker's size turned local after its
-    first sample.
+    profile, is "not measured yet". A worker is a model on one GPU, and a
+    model's size is `measured` when one of its workers has a local size that
+    moved, turned local after the worker's first sample (a local size the
+    first sample already carried was resumed from this machine's store), or
+    has an `a batch size trial is over` line for its model and GPU. That
+    line alone is not enough: a failed or put-off trial logs it too and
+    places no size.
     """
     series: Dict[str, List[int]] = {}
     fits: Dict[str, int] = {}
     knees: Dict[str, Dict[str, int]] = {}
-    # Per worker: whether its first sample carried a local size, and its last.
+    trials = {(str(event["fields"].get("model")), event["fields"].get("gpu"))
+              for event in ctx.log_events("a batch size trial is over")}
+    # Per worker: whether its first sample carried a local size, its last
+    # local size, and whether this leg measured it.
     workers: Dict[Tuple[str, Any], Dict[str, int]] = {}
     for sample in ctx.health_samples:
         for worker in (sample.get("health") or {}).get("workers") or []:
@@ -599,39 +605,33 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
             knee = (int(worker.get("knee_units") or 0)
                     if worker.get("knee_is_local") else 0)
             row = knees.setdefault(key, {"knee": 0, "knee_first": 0,
-                                         "knee_moves": 0, "knee_late": 0})
-            seen = workers.setdefault((key, worker.get("gpu_uuid")),
-                                      {"from_start": int(knee > 0), "last": 0})
+                                         "knee_moves": 0, "measured": 0})
+            gpu = worker.get("gpu_uuid")
+            seen = workers.setdefault(
+                (key, gpu), {"from_start": int(knee > 0), "last": 0,
+                             "measured": int((key, gpu) in trials)})
             if knee:
                 if not row["knee_first"]:
                     row["knee_first"] = knee
                 # A later trial moved it, up or down.
                 if knee != seen["last"] and seen["last"]:
                     row["knee_moves"] += 1
+                    seen["measured"] = 1
                 if not seen["from_start"]:
-                    row["knee_late"] = 1
+                    seen["measured"] = 1
                 row["knee"] = max(row["knee"], knee)
                 seen["last"] = knee
+                row["measured"] |= seen["measured"]
     return series, fits, knees
 
 
 def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
-    """`_budget_series` per model. `measured` is 1 for a local size this leg
-    measured: it moved, turned local after its worker's first sample, or the
-    model logged `a batch size trial is over`. That line alone is not enough:
-    a failed or put-off trial logs it too and places no size."""
+    """`_budget_series` per model."""
     series, fits, knees = _budget_series(ctx)
-    trials = {str(event["fields"].get("model"))
-              for event in ctx.log_events("a batch size trial is over")}
     return {
         model: {"first": values[0], "peak": max(values), "last": values[-1],
                 "low": min(values), "fit_samples": fits.get(model, 0),
-                "knee": knees[model]["knee"],
-                "knee_first": knees[model]["knee_first"],
-                "knee_moves": knees[model]["knee_moves"],
-                "measured": int(bool(knees[model]["knee"]) and bool(
-                    knees[model]["knee_moves"] or knees[model]["knee_late"]
-                    or model in trials))}
+                **knees[model]}
         for model, values in series.items()
     }
 
@@ -2262,8 +2262,8 @@ def check_ramp_progress(ctx: Context) -> Verdict:
     rows = _budget_rows(ctx)
     if not rows:
         return Verdict("ramp_progress", "SKIP", "no workers in any health sample")
-    # A model whose working size a trial left at the seed can sit there
-    # forever and be right, so it is not a candidate for the note below.
+    # A size this leg measured can sit at the seed and be right; a size
+    # resumed from the store or opened at 64 still gets the note below.
     stalled_at_64 = [model for model, row in rows.items()
                      if row["peak"] == 64 and not row["measured"]]
     detail = "; ".join(

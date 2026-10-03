@@ -732,14 +732,14 @@ last one closes a hole in `base_accuracy` itself):
   `fit samples == 0`, no `[[profile]]` in `calibration.after.toml`, or a peak
   `unit_budget` that never rose above the first value recorded **and no
   local size this leg measured** (a budget held where a trial left it is
-  learning, not a stall). A budget the job itself never filled (every window formed short of
-  it for want of queued work, `queue_bound_windows == total_batches`, and the
-  settle lines' largest `max_units_measured` below the seed) cannot rise, and
-  reads INFO, not FAIL, unless the budget was held at a rung the ring never
-  certified. The three
-  numbers are exactly the ones `ramp_progress` prints as INFO — the check only
-  promotes them to a verdict, which is what closes the whole class of "the
-  instrument stopped reporting" faults. Undeclared, the row is report-only.
+  learning, not a stall). A budget the job itself never filled (every window
+  formed short of it for want of queued work, `queue_bound_windows ==
+  total_batches`, and the settle lines' largest `max_units_measured` below
+  the seed) cannot rise, and reads INFO, not FAIL, unless the budget was held
+  at a rung the ring never certified. The three numbers are exactly the ones
+  `ramp_progress` prints as INFO — the check only promotes them to a verdict,
+  which is what closes the whole class of "the instrument stopped reporting"
+  faults. Undeclared, the row is report-only.
   Pass `--learning` on every S2/S3 cold-ramp leg.
 - **`hog_tracking` is INFO with one FAIL form.** `external` is a
   window-boundary quantity with a real staleness, so a GPU that
@@ -795,9 +795,9 @@ that move them are in `analyze.py --help`.
 | `slope_accuracy` | the persisted slope against `ceiling_probe.py`'s **allocated** slope (`fit` where `fit.basis` names it, else the probe's whole-batch `peak_allocated_mb` rows refitted here) | −30 % .. +100 % | PASS/FAIL; WARN (FAIL under `--learning`) when no store was written; SKIP when no probe was passed, or when no probe names a model the store holds |
 | `grant_safety` | every grant against the headroom it was priced against **and** against the oracle's live free memory | no grant over either | PASS/FAIL; WARN without `vramrec.jsonl`, or when a grant has no sample before it or is over free with a covering release |
 | `failures` | OOM negatives, worker deaths and merged-window fallbacks in the log | `--expect-ooms` / `--expect-deaths` | PASS/FAIL |
-| `deflation_recovery` | each worker's deflation, from the settle and time-repay lines (`/health` samples when the log has no DEBUG settle or repay line); a worker that died restarts at 0, and one missing from the last `/health` sample is not judged | a level repaid within 3 clean windows; 0 at the end, unless `--expect-deflated` | FAIL on a level held through 3 clean windows (from `/health`: on a worker still deflated at the end); WARN when the recording ended deflated; with `--expect-deflated`, FAIL when it never deflated |
+| `deflation_recovery` | each worker's deflation, from the settle and time-repay lines (`/health` samples when the log has no DEBUG ledger line); a worker that died restarts at 0, and one that left keeps its last value; the window that repays a level does not count toward the next | a level repaid within 3 clean windows; 0 at the end, unless `--expect-deflated` | FAIL on a level held through 3 clean windows; WARN when the recording ended deflated; with `--expect-deflated`, FAIL when it never deflated |
 | `idle_liveness` | `grants_outstanding` in the trailing `--idle-window` | must reach 0 | PASS/FAIL |
-| `utilization` | the largest `unit_budget` a grant actually carried against the probe's OOM boundary (or knee), the boundary less the least a hog on that GPU held while the model ran (with its context; a RAM hog only on a unified device), over the probe's reserved slope | `--utilization-floor` (0.25) | PASS/FAIL; a model the hog left no room for one unit is not decidable; the same result-versus-omission split as `slope_accuracy` |
+| `utilization` | the largest `unit_budget` a grant actually carried against the probe's OOM boundary (or knee), the boundary less the least a hog on that GPU held while the model ran (with its context; a RAM hog only on a unified device), over the probe's reserved slope | `--utilization-floor` (0.25) | PASS/FAIL; a model the hog left no room for one unit, or whose probe has no reserved slope to price the hog, is not decidable; the same result-versus-omission split as `slope_accuracy` |
 | `throughput` | items/s from the job `LogRecord`s against a C0 baseline, their start-to-end spans less the wall-clock step `legs.json`'s marks measured (`iso` against `t_mono`, the first job's `job_posted` to `job_end`; not with an explicit `--jobs`); both sides corrected, or neither when one recording has no `t_mono` | `--throughput-floor` (0.9) | PASS/FAIL; INFO without a baseline |
 | `persistence` | the store write against the anchor advance that queued it | within 30 s | PASS/FAIL; same split again |
 | `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) unless the leg declared it, and so does a job `legs.json` shows did not drain (`job_end` outcome other than `drained`, e.g. cut at `--job-cap`, or no `job_end`) | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs), `--expect-empty-setters` | PASS/FAIL |
@@ -855,12 +855,12 @@ starting guess, not a floor: a batch grows only on a measured gain, so a model
 that gains nothing from larger batches stays at or *under* its seed on purpose,
 trying the sizes next to it every so often. A model whose `knee_units`
 `/health` marks `knee_is_local`, and which this leg measured (the size moved,
-turned local after its worker's first sample, or the model logged an `a batch
-size trial is over` line), is therefore never counted as "never left the
-seed"; the
-detail instead names the seed, the size a trial first left in place, how many
-times it moved and how low the budget actually ran, and `ramp_progress`
-withholds its `REQUEST_UNIT_BUDGET` note for the same models.
+turned local after its worker's first sample, or an `a batch size trial is
+over` line names its model and GPU), is therefore never counted as "never
+left the seed"; the detail instead names the seed, the size a trial first
+left in place, how many times it moved and how low the budget actually ran,
+and `ramp_progress` withholds its `REQUEST_UNIT_BUDGET` note for the same
+models.
 
 **A size no trial has left in place is a stall.** `knee_units` alone is not
 evidence: it is set the moment a replica opens, and it may come from a shipped
