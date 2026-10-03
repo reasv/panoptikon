@@ -1063,6 +1063,7 @@ mod route_tests {
             .unwrap_err();
         let error = format!("{error:#}");
         assert!(error.starts_with(&expected), "{error}");
+        assert_ne!(error, expected);
         assert!(
             !error.contains("migrated"),
             "refused before migrating: {error}"
