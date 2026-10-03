@@ -375,9 +375,10 @@ impl VramLedger {
         limit
     }
 
-    /// The room a load is refused against, with no reserve: what the card
-    /// has left over other processes, or on a unified-memory device its whole
-    /// capacity, since other processes' RAM there is transient.
+    /// The room a load is refused against, with no margin reserve: what the
+    /// card has left over other processes, or on a unified-memory device its
+    /// whole capacity, since other processes' RAM there is transient. A
+    /// device whose memory is host RAM keeps [`cpu::ram_reserve_mb`] of it.
     pub(super) fn refusal_room_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
         let unified = state
             .gpus
@@ -388,7 +389,8 @@ impl VramLedger {
         } else {
             Self::external_locked(state, gpu).unwrap_or(0)
         };
-        self.limit_over_locked(state, gpu, external, 0)
+        let reserve = Self::host_ram_mb_locked(state, gpu).map_or(0, cpu::ram_reserve_mb);
+        self.limit_over_locked(state, gpu, external, reserve)
     }
 
     pub(super) fn headroom_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
