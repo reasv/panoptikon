@@ -145,6 +145,10 @@ def test_a_unified_gpu_totals_and_prices_its_gtt(tmp_path):
     (gpu,) = rocm_sysfs.inventory(host.roots)
     assert gpu.unified
     assert rocm_sysfs.memory_mb(host.roots, gpu) == (512 + 65536, 256 + 7168)
+    # SReclaimable above MemAvailable leaves no free GTT.
+    (tmp_path / "proc/meminfo").write_text(
+        "MemAvailable: 1048576 kB\nSReclaimable: 2097152 kB\n")
+    assert rocm_sysfs.memory_mb(host.roots, gpu) == (512 + 65536, 256 + 0)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
         "fdinfo", {700: 1224}, [])
     assert legs.rocm_total_mb(0, host.roots) == 66048
@@ -296,21 +300,23 @@ def test_used_that_moves_during_the_process_scan_is_flagged_and_not_judged(
     assert sample() == [(1024, 0), (2048, 0)]
     scan = vramrec.rocm_sysfs.process_vram_mb
 
-    def growing(*args):
+    def moving(*args):
         (tmp_path / "pci" / BDF_03 / "mem_info_vram_used").write_text(
             f"{6 * GIB}\n")
+        (tmp_path / "pci" / BDF_0C / "mem_info_vram_used").write_text(
+            f"{GIB // 2}\n")
         return scan(*args)
 
-    monkeypatch.setattr(vramrec.rocm_sysfs, "process_vram_mb", growing)
-    assert sample() == [(6144, 5120), (2048, 0)]
+    monkeypatch.setattr(vramrec.rocm_sysfs, "process_vram_mb", moving)
+    assert sample() == [(6144, 5120), (512, 1536)]
 
     # The allowance on this 24 GiB GPU is 1 GiB; the measured difference is
-    # 3800 MiB with `external_mb` 0, and 1800 MiB with 2000.
+    # 3800 MiB with `external_mb` 0, 1800 MiB with 2000 and 1200 with 5000.
     ctx = _amdgpu_ctx("amdgpu-kfd", [(900, 1200)])
     gpu = ctx.health_samples[0]["health"]["vram"][0]
     row = ctx.vram_samples[0]["gpus"][0]
     for external, skew, verdict in ((0, 1024, "FAIL"), (2000, 1024, "PASS"),
-                                    (0, 1025, "SKIP")):
+                                    (5000, 1024, "PASS"), (0, 1025, "SKIP")):
         gpu["external_mb"], row["skew_mb"] = external, skew
         result = analyze.check_oracle_agreement(ctx)
         assert result.verdict == verdict, (external, skew)

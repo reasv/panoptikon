@@ -730,10 +730,13 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                     "oracle_external_mb": oracle_external,
                     "gpu_used_mb": oracle.get("used_mb"),
                     "our_pids_mb": ours,
+                    "skew_mb": skew,
                     "allowance_mb": round(allowance),
                 }
             if delta > allowance:
                 breaches += 1
+    skipped = (f"; {skewed} samples read while GPU used moved past the "
+               "allowance were skipped" if skewed else "")
     if joined == 0 and unpriced:
         return Verdict(
             "oracle_agreement", "SKIP",
@@ -742,17 +745,13 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             "no per-process attribution to check `external_mb` against -- "
             "the WDDM signature (or MPS, which has no per-process GPU "
             "counter at all, or ROCm with a worker whose descriptors the "
-            "oracle could not read), not a disagreement"
-            + (f"; {skewed} samples read while GPU used moved past the "
-               "allowance were skipped" if skewed else ""),
+            "oracle could not read), not a disagreement" + skipped,
             {"joined": 0, "unpriced_samples": unpriced,
              "oracle_sources": unpriced_sources, "skewed_samples": skewed})
     if joined == 0:
         return Verdict("oracle_agreement", "SKIP",
                        "no health sample could be joined to a vramrec sample "
-                       f"within {ctx.args.join_tolerance}s"
-                       + (f" ({skewed} were read while GPU used moved past "
-                          "the allowance)" if skewed else ""),
+                       f"within {ctx.args.join_tolerance}s" + skipped,
                        {"joined": 0, "skewed_samples": skewed})
     verdict = "PASS" if breaches == 0 else "FAIL"
     return Verdict(
@@ -763,8 +762,7 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
            if unpriced else "")
         + (f"; {teardown} health samples after the hog stop were not joined"
            if teardown else "")
-        + (f"; {skewed} samples read while GPU used moved past the allowance "
-           "were skipped" if skewed else ""),
+        + skipped,
         {"joined": joined, "breaches": breaches, "worst_mb": worst,
          "unpriced_samples": unpriced, "teardown_samples": teardown,
          "skewed_samples": skewed,
@@ -1995,7 +1993,8 @@ def check_hog_tracking(ctx: Context) -> Verdict:
     if header.get("target") == "ram":
         return Verdict("hog_tracking", "INFO",
                        "the hog pressured RAM, not a GPU; see the vramrec "
-                       "MemAvailable series", {"header": header})
+                       "MemAvailable and SReclaimable series",
+                       {"header": header})
     rows = []
     worst_lag = 0.0
     worst = None
