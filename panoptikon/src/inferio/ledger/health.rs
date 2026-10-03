@@ -232,9 +232,9 @@ pub struct LedgerWorkerHealth {
     pub retest_after_windows: u32,
     /// Shape ceiling from `index_limit` clamps: caps `unit_budget`; runtime-only.
     pub shape_ceiling_units: Option<u64>,
-    /// Half the batch, and at least one item, a replica of this model was
-    /// running here when it was killed for memory outside a paging window:
-    /// caps `unit_budget` until the server restarts.
+    /// Caps `unit_budget` until the server restarts: half the batch a replica
+    /// of this model was running here when it was killed for memory outside a
+    /// paging window, at least that window's smallest item.
     pub death_cap_units: Option<u64>,
     /// Throughput observations held (all occupancies); runtime-only.
     pub throughput_samples: usize,

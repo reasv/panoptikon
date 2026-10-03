@@ -8987,7 +8987,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Half the batch, and at least one item, a replica of this model was\nrunning here when it was killed for memory outside a paging window:\ncaps `unit_budget` until the server restarts.",
+            "description": "Caps `unit_budget` until the server restarts: half the batch a replica\nof this model was running here when it was killed for memory outside a\npaging window, at least that window's smallest item.",
             "minimum": 0
           },
           "deflation": {
