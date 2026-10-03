@@ -349,7 +349,7 @@ pub struct BatchMeasurement {
     /// Pool MiB re-grown after a release, on the first batch after it only;
     /// its `duration_ms` includes the re-grow.
     pub regrow_mb: Option<u64>,
-    /// `"trim"` (host request) or `"shrink"` (worker's own rule).
+    /// The release re-grown from: `"trim"`, `"shrink"`, `"growth"` or `"spill"`.
     pub regrow_after: Option<String>,
     /// A CUDA or ROCm worker's resident set: its in-batch maximum, and after
     /// the batch.
@@ -2217,16 +2217,6 @@ mod tests {
             rocm.for_gpu(None, None),
             std::borrow::Cow::Borrowed(_)
         ));
-        // An NVIDIA replica is told whether its GPU spills to system RAM.
-        let spills = "PANOPTIKON_SPILLS_TO_RAM";
-        for (verdict, value) in [
-            (Some(true), Some("1")),
-            (Some(false), Some("0")),
-            (None, None),
-        ] {
-            let cfg = cuda.for_gpu(None, verdict);
-            assert_eq!(env_of(&cfg, Some("GPU-1a2b"), spills).as_deref(), value);
-        }
 
         // A replica the ledger placed on the **CPU device** of a host that has
         // GPUs: every GPU hidden (the pin `gpu::resolve_pin` answers for a

@@ -6121,7 +6121,7 @@
           },
           "spilled": {
             "type": "boolean",
-            "description": "More than 512 MiB of the pool was in system RAM after this batch."
+            "description": "The pool exceeded NVML's used memory on the GPU by more than 512 MiB\nafter this batch: part of it was in system RAM."
           },
           "units": {
             "type": [
@@ -6129,7 +6129,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Size in cost-dimension units; absent without a grant or when the batch\nwas unpriced.",
+            "description": "Size in cost-dimension units; `None` without a grant or when the batch\nwas unpriced.",
             "minimum": 0
           }
         }
