@@ -570,6 +570,15 @@ fn a_one_item_oom_with_room_to_spare_condemns_nothing() {
             token.grant().mb > 0,
             "the GPU has room; the window is priced"
         );
+        // An out-of-memory batch right after a pool release is not a spill.
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                oom: true,
+                regrow_after: Some("spill".to_owned()),
+                ..warm_batch(1, 1.0)
+            }]);
         assert!(
             token
                 .finish(WindowOutcome::Responded {
@@ -584,7 +593,7 @@ fn a_one_item_oom_with_room_to_spare_condemns_nothing() {
 /// Where a full GPU spills to system RAM, a model too big for it never runs
 /// out of memory: one-unit windows whose one-item batch spilled right after a
 /// pool release condemn it, whatever room the ledger saw. A spill with no
-/// release before it, or of a batch that can still shrink, is no strike.
+/// release before it is no strike.
 #[test]
 fn one_item_windows_that_spill_condemn_the_replica() {
     let ledger = ledger(24_576, no_margin());
@@ -594,7 +603,7 @@ fn one_item_windows_that_spill_condemn_the_replica() {
         .expect("registers");
     push_memory(&handle, 4_000, 0);
     ledger.ingest_all_for_test();
-    let window = |units, spilled, items, regrow_after: Option<&str>| {
+    let window = |units, spilled, regrow_after: Option<&str>| {
         let token = admission.request_grant(units, None, 1, 0).expect("granted");
         let unit_budget = token.grant().unit_budget;
         handle
@@ -602,7 +611,7 @@ fn one_item_windows_that_spill_condemn_the_replica() {
             .unwrap()
             .record_measurements(vec![BatchMeasurement {
                 spilled,
-                items: Some(items),
+                items: Some(1),
                 regrow_after: regrow_after.map(str::to_owned),
                 ..warm_batch(1, 1.0)
             }]);
@@ -612,20 +621,17 @@ fn one_item_windows_that_spill_condemn_the_replica() {
         )
     };
     let spill = Some("spill");
-    assert!(window(1, false, 1, None).1.is_none(), "a clean window");
-    let (unit_budget, verdict) = window(4, true, 1, spill);
+    assert!(window(1, false, None).1.is_none(), "a clean window");
+    let (unit_budget, verdict) = window(4, true, spill);
     assert!(
         unit_budget > 1 && verdict.is_none(),
         "a grant of {unit_budget}"
     );
-    assert!(window(1, true, 1, None).1.is_none(), "no release before it");
-    // A window run in one call of several items (an impl with batching off,
-    // which runs one input at a time) can still shrink to one item.
-    assert!(window(1, true, 4, spill).1.is_none(), "not one item");
+    assert!(window(1, true, None).1.is_none(), "no release before it");
     for _ in 1..OOM_WINDOWS_AT_FLOOR {
-        assert!(window(1, true, 1, spill).1.is_none());
+        assert!(window(1, true, spill).1.is_none());
     }
-    let verdict = window(1, true, 1, spill).1.expect("three one-item spills");
+    let verdict = window(1, true, spill).1.expect("three one-item spills");
     assert_eq!(verdict.base_mb, 20_000);
     assert!(verdict.needs_mb > verdict.room_mb, "{verdict}");
 }

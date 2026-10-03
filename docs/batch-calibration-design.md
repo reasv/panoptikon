@@ -1233,11 +1233,10 @@ impl's own kernels have said they cannot execute at this corpus's shapes.
   on the 5090, where all 8 002 out-of-memory lines were priced windows. A
   one-item out-of-memory with room to spare stays the backstop's
   ordinary business. Where the driver spills instead of failing (WDDM's
-  sysmem fallback), a one-unit window whose one-item batch spilled right
-  after a pool release is a strike whatever the room: that spill is live
-  memory that does not fit. A window run in one call of several items (an
-  impl with batching off, which runs one input at a time) is not: it can
-  still shrink to one item.
+  sysmem fallback), a one-unit window whose batch spilled right after a pool
+  release is a strike whatever the room: that spill is live memory that does
+  not fit. Unpriced (`none`) models have no admission, are outside this rule
+  and still run, releasing the pool once per window.
 
   **The pre-fit price of one item.** With no slope there is no measured
   price for one item, and both obvious stand-ins fail. The whole base
@@ -2100,9 +2099,9 @@ unpriced and without spill handling, and the host warns at startup.
     and deflates. It needs no other corroboration: U includes all of our
     pool that is on the card, so evicting other processes cannot make
     P − U positive. The batch's outputs are kept.
-  - The worker also releases the pool and, unless the batch was one item,
-    runs the rest of the window at half that batch's size (never above the
-    grant), instead of more spilled batches until settle.
+  - The worker also releases the pool and runs the rest of the window at
+    half that batch's size (never above the grant), instead of more spilled
+    batches until settle.
     A spill that the release does not clear, or that no release could, is
     live memory that does not fit (weights larger than the card): it is
     warned of once, then logged at debug, and still flagged each batch.
@@ -2266,9 +2265,9 @@ limit   = min(total × cap_fraction, total − external − reserve)
   the speed; the last gigabyte buys no throughput, since the knee ends the
   ramp before it. The host probe decides this once per GPU
   (`GpuInventory::spilling_gpus`, `spill_verdict`), and the worker's own
-  growth release follows the same verdict. The CPU device is not a CUDA GPU and takes its
-  own floor ("Host RAM on the CPU device"); the refusal room still reserves
-  nothing.
+  growth release follows the same verdict. The CPU device is not a CUDA GPU
+  and takes its own floor ("Host RAM on the CPU device"); the refusal room
+  still reserves nothing.
 
 Keeping the two distinguishable is also what makes the default *changeable*
 later without overriding somebody's deliberate `margin = 0.10`, per the

@@ -1475,8 +1475,7 @@ def run_window(
             reserved_mb = sample["reserved_mb"]
             released = memory.empty_cache(memory.SPILL_RELEASE)
             if released:
-                if len(batch) > 1:
-                    budget = max(1, min(budget, priced // 2))
+                budget = max(1, min(budget, priced // 2))
                 sample = memory.device_memory_sample()
             _log_spill(reserved_mb, off_device_mb, released, pool_off_device_mb(sample))
         if emit_memory is not None and pending:
