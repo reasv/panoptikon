@@ -442,6 +442,12 @@ fn a_one_item_window_is_the_floor_whatever_the_unit() {
             assert_eq!(death_cap(&ledger), Some(item));
         }
         assert_eq!(verdicts, [false, false, true]);
+        // A later kill of larger items never raises the cap.
+        let token = admission
+            .request_grant_byte_bound(4 * item, 2 * item, None, 1, 0, false)
+            .expect("granted");
+        token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
+        assert_eq!(death_cap(&ledger), Some(item));
     }
 
     // Token items of 2000, 50, 50 and 50, in a budget that holds the three

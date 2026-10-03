@@ -720,6 +720,27 @@ fn a_death_in_a_booked_item_capped_window_caps() {
         let held = (cal.death_cap_units, cal.pressure_cap.map(|cap| cap.units));
         assert_eq!(held, caps);
     }
+
+    // A pixel-priced first window holds one item by the ledger's item cap,
+    // whatever its budget, so its death counts toward condemning the model.
+    const ITEM: u64 = 2_000_000;
+    let ledger = host(&[GPU], None);
+    let pixels = CostDimension {
+        unit: CostUnit::Pixel,
+        aggregation: Some(CostAggregation::Sum),
+        seed_units: Some(4 * ITEM as u32),
+        ..item_cost(1)
+    };
+    let (_handle, admission) = cold_gpu_replica(&ledger, "g/capped", GPU, pixels);
+    cpu_free_to_book(&ledger, 45_000);
+    assert_eq!(item_bound(&admission), 1);
+    let token = admission
+        .request_grant_byte_bound(4 * ITEM, ITEM, None, 1, 0, false)
+        .expect("granted");
+    assert!(token.grant().unit_budget >= 2 * ITEM);
+    token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
+    let cal = &ledger.lock().calibration[&("g/capped".to_owned(), GPU.to_owned())];
+    assert_eq!(cal.floor_strikes, 1);
 }
 
 /// A probe stub answering `free_mb` for the CPU device.
