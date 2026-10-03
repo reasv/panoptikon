@@ -1237,6 +1237,10 @@ fn the_limit_is_the_ram_domains_room_under_the_allocators_own_ceiling() {
     const RECOMMENDED_MAX: u64 = 122_880;
     const HOG: u64 = 99_968;
     let ledger = mac_ledger(MAC_RAM_MB, RECOMMENDED_MAX);
+    assert_eq!(
+        ledger.refusal_room_locked(&ledger.lock(), MPS_GPU),
+        MAC_RAM_MB - cpu::ram_reserve_mb(MAC_RAM_MB)
+    );
     let handle = loaded_mps(Some(RECOMMENDED_MAX));
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)

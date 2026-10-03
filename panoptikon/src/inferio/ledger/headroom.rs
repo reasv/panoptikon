@@ -248,12 +248,19 @@ impl VramLedger {
         )
     }
 
-    /// `hw.memsize` from the freshest free reading's [`RamBasis`], on a Metal
-    /// allocator; `None` otherwise.
+    /// `hw.memsize` on a Metal allocator: from the freshest free reading's
+    /// [`RamBasis`], else the inventory's; `None` otherwise.
     fn ram_domain_locked(state: &LedgerState, gpu_ledger: &GpuLedger) -> Option<u64> {
         state
             .metal_allocator
-            .then(|| gpu_ledger.free.as_ref()?.ram.map(|ram| ram.total_mb))
+            .then(|| {
+                gpu_ledger
+                    .free
+                    .as_ref()
+                    .and_then(|sample| sample.ram)
+                    .map(|ram| ram.total_mb)
+                    .or(gpu_ledger.unified_ram_mb)
+            })
             .flatten()
     }
 
