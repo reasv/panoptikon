@@ -74,6 +74,9 @@ impl VramLedger {
     /// A worker that `died` running one unit counts whatever room the ledger
     /// saw, where a death may be a host RAM kill ([`death_may_be_ram`]): the
     /// batch cannot shrink further. The count passes to the next replica.
+    /// A one-unit window that `spilled` to system RAM counts whatever the
+    /// room: a one-item batch's pool is never released, so its spill is live
+    /// memory that does not fit.
     ///
     /// Condemning remembers the model's working set on this GPU: the next load
     /// is refused while the refusal room ([`Self::refusal_room_locked`],
@@ -84,20 +87,22 @@ impl VramLedger {
         worker: WorkerId,
         charge: Option<GrantCharge>,
         failed: bool,
+        spilled: bool,
         died: bool,
         clean: bool,
     ) -> Option<UnrunnableReplica> {
         let entry = state.workers.get(&worker)?;
         let one_unit = self.one_unit_appetite_mb_locked(state, entry);
         let key = (entry.inference_id.clone(), entry.gpu.clone());
-        let at_floor = failed
-            && charge
-                .filter(|charge| !charge.pressure.paging())
-                .is_some_and(|charge| {
-                    charge.unit_budget <= 1
-                        && ((charge.room as f64) < one_unit
-                            || (died && death_may_be_ram(state, &key.1, &charge)))
-                });
+        let at_floor = charge
+            .filter(|charge| !charge.pressure.paging())
+            .is_some_and(|charge| {
+                charge.unit_budget <= 1
+                    && (spilled
+                        || failed
+                            && ((charge.room as f64) < one_unit
+                                || (died && death_may_be_ram(state, &key.1, &charge))))
+            });
         let entry = state.workers.get_mut(&worker)?;
         if clean {
             entry.oom_at_floor = 0;
