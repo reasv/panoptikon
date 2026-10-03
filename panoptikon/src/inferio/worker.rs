@@ -1523,7 +1523,7 @@ impl Worker {
             core_dumped = death.core_dumped,
             attribution = death.attribution.as_str(),
             killed_by_gateway = death.attribution.killed_by_gateway(),
-            kind = ?death.kind(),
+            kind = death.kind().map_or("gateway", DeathKind::as_str),
             "an inferio worker process is gone. Cause: {}. stderr tail:\n{}",
             death.why,
             death.stderr_tail,

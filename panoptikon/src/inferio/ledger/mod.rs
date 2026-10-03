@@ -565,6 +565,15 @@ pub enum DeathKind {
     Crash,
 }
 
+impl DeathKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeathKind::MemoryKill => "memory_kill",
+            DeathKind::Crash => "crash",
+        }
+    }
+}
+
 /// Opaque worker identity inside the ledger.
 type WorkerId = u64;
 
