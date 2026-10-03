@@ -866,12 +866,13 @@ def test_a_cpu_priced_worker_credits_nothing(monkeypatch):
         assert live.free_source == "ram"
 
 
-def test_a_cpu_priced_worker_keeps_the_ram_reserve_free(tmp_path):
+def test_a_cpu_priced_worker_keeps_the_ram_reserve_free(tmp_path, monkeypatch):
     """Free RAM counts only above the reserve the grant carries, so a batch
     cannot take the memory the orchestrator left for the rest of the machine.
-    A 128 GiB host with 30 605 MiB available, 6 000 of it reclaimable slab,
-    and a 12 864 MiB reserve has 11 741 MiB to spend.
+    A 128 GiB Linux host with 30 605 MiB available, 6 000 of it reclaimable
+    slab, and a 12 864 MiB reserve has 11 741 MiB to spend.
     """
+    monkeypatch.setattr(sys, "platform", "linux")
     meminfo = tmp_path / "meminfo"
     meminfo.write_text("SReclaimable:    6144000 kB\n")
     ram = FakeRam(total_mb=128_649, available_mb=30_605, rss_mb=1_200)

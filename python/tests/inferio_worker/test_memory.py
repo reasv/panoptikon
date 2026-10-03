@@ -2367,7 +2367,8 @@ def cpu_host(
     `INFERIO_DEVICE=cpu`, which is the whole of the signal. `cgroup` points at
     a fake cgroup root and `meminfo` at a fake `/proc/meminfo`; absent, at
     nothing, so the host running the suite cannot lend its own limit or slab
-    to a test that says nothing about one."""
+    to a test that says nothing about one. The macOS reading is stubbed out
+    for the same reason: psutil is the RAM on every host."""
     ram = ram if ram is not None else FakeRam()
     with isolated(torch_module):
         os.environ.pop("PANOPTIKON_DEVICE_PIN", None)
@@ -2389,6 +2390,7 @@ def cpu_host(
             mock.patch.object(
                 memory, "PROC_MEMINFO", meminfo or "/nonexistent/meminfo"
             ),
+            mock.patch.object(memory, "_mac_memory_counters", return_value=None),
         ):
             yield ram
 
@@ -2521,9 +2523,12 @@ def test_a_cpu_worker_reports_the_resident_set_a_batch_left() -> None:
     assert measurement["rss_after_mb"] == 600, "what it still holds"
 
 
-def test_linux_free_ram_leaves_out_reclaimable_slab(tmp_path) -> None:
+def test_linux_free_ram_leaves_out_reclaimable_slab(
+    tmp_path, monkeypatch
+) -> None:
     # `MemAvailable` (psutil's `available`) counts slab the kernel may not
     # free in time; `cpu.rs` subtracts the same row.
+    monkeypatch.setattr(sys, "platform", "linux")
     meminfo = tmp_path / "meminfo"
     meminfo.write_text(
         "MemTotal:       131737460 kB\nMemAvailable:   31339520 kB\n"
