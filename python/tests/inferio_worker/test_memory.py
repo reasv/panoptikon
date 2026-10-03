@@ -13,7 +13,9 @@ import inspect
 import logging
 import os
 import platform
+import re
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -22,6 +24,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+# psutil picks its platform module at import, so it must be imported before
+# any test fakes `sys.platform`.
+import psutil  # noqa: F401
 import pytest
 
 from inferio_worker import memory, packing
@@ -2173,12 +2178,27 @@ def test_the_swap_out_counter_is_followed_at_every_pressure_level() -> None:
         assert available(5, 2, 700) == 0
 
 
-def test_the_vm_statistics_fields_are_read_by_name() -> None:
+def test_the_vm_statistics_fields_are_read_at_their_positions() -> None:
     # wire_count, compressor_page_count, internal_page_count and swapouts:
     # each value is its own 1-based position in `vm_statistics64_data_t`
     # (<mach/vm_statistics.h>).
     raw = struct.pack("@4I9Q2I4Q4IQ", *range(1, 25))
     assert memory._vm_statistics(raw) == (4, 20, 23, 19)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="vm_stat is macOS's")
+def test_the_swapouts_count_matches_vm_stat() -> None:
+    def vm_stat_swapouts() -> int:
+        out = subprocess.run(
+            ["vm_stat"], capture_output=True, text=True, check=True
+        ).stdout
+        return int(re.search(r"Swapouts:\s+(\d+)", out).group(1))
+
+    before = vm_stat_swapouts()
+    counters = memory._mac_memory_counters()
+    after = vm_stat_swapouts()
+    assert counters is not None
+    assert before <= counters[5] <= after
 
 
 def test_an_unreadable_pressure_level_counts_as_normal() -> None:
@@ -2590,6 +2610,14 @@ def test_windows_free_ram_is_bounded_by_available_commit() -> None:
                 memory, "_windows_memory_status", return_value=status
             ):
                 assert memory.ram_free_total_mb() == (free_mb, 64 * 1024)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a Windows API")
+def test_the_windows_memory_status_is_read() -> None:
+    status = memory._windows_memory_status()
+    assert status is not None
+    assert 0 < status.ullAvailPhys <= status.ullTotalPhys
+    assert 0 < status.ullAvailPageFile <= status.ullTotalPageFile
 
 
 def test_freed_host_memory_is_returned_before_the_resident_readings(

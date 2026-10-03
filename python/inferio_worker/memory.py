@@ -1042,7 +1042,6 @@ def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
         return None
     pressure = _mac_pressure_level()
     try:
-        import ctypes
         import ctypes.util
 
         libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
@@ -1070,7 +1069,7 @@ def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
 def _vm_statistics(raw: bytes) -> tuple[int, int, int, int]:
     """`(wire_count, compressor_page_count, internal_page_count, swapouts)`
     from a packed `vm_statistics64_data_t`."""
-    stats = struct.unpack(_VM_STATISTICS64, raw[: struct.calcsize(_VM_STATISTICS64)])
+    stats = struct.unpack(_VM_STATISTICS64, raw)
     return (
         stats[_VM_WIRE],
         stats[_VM_COMPRESSOR],
@@ -1118,7 +1117,6 @@ def _sysctl(name: str, size: int) -> bytes | None:
     if sys.platform != "darwin":
         return None
     try:
-        import ctypes
         import ctypes.util
 
         libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
@@ -1420,8 +1418,6 @@ def _malloc_trim() -> Any | None:
     if not sys.platform.startswith("linux"):
         return None
     try:
-        import ctypes
-
         return ctypes.CDLL(None).malloc_trim
     except (OSError, AttributeError):
         return None
