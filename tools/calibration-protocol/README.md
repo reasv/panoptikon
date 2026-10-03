@@ -794,7 +794,7 @@ that move them are in `analyze.py --help`.
 | `deflation_recovery` | how long deflation takes to return to 0 | 3 clean windows per level | PASS/FAIL |
 | `idle_liveness` | `grants_outstanding` in the trailing `--idle-window` | must reach 0 | PASS/FAIL |
 | `utilization` | the largest `unit_budget` a grant actually carried against the probe's OOM boundary (or knee) | `--utilization-floor` (0.25) | PASS/FAIL; the same result-versus-omission split as `slope_accuracy` |
-| `throughput` | items/s from the job `LogRecord`s against a C0 baseline, their start-to-end spans less the wall-clock step `legs.json`'s marks measured (`iso` against `t_mono`, first `job_posted` to last `job_end`; not with an explicit `--jobs`) | `--throughput-floor` (0.9) | PASS/FAIL; INFO without a baseline |
+| `throughput` | items/s from the job `LogRecord`s against a C0 baseline, their start-to-end spans less the wall-clock step `legs.json`'s marks measured (`iso` against `t_mono`, the first job's `job_posted` to `job_end`; not with an explicit `--jobs`) | `--throughput-floor` (0.9) | PASS/FAIL; INFO without a baseline |
 | `persistence` | the store write against the anchor advance that queued it | within 30 s | PASS/FAIL; same split again |
 | `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) unless the leg declared it | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs), `--expect-empty-setters` | PASS/FAIL |
 | `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | FAIL on an `over_grant` breach, WARN on a `limit_fell` one |

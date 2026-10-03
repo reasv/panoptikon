@@ -693,6 +693,8 @@ def test_batch_coverage_counts_every_batch_from_each_workers_seq_1():
 
 def test_throughput_subtracts_the_clock_step_legs_measured(tmp_path):
     def leg(name, items, server_s, marks):
+        """jobs.json holds the first job's LogRecord; a mark is (event, wall
+        seconds[, t_mono])."""
         directory = tmp_path / name
         directory.mkdir()
         (directory / "jobs.json").write_text(json.dumps({"history": [
@@ -700,16 +702,17 @@ def test_throughput_subtracts_the_clock_step_legs_measured(tmp_path):
              "end_time": f"2026-10-03T10:00:{server_s:04.1f}"}]}))
         (directory / "legs.json").write_text(json.dumps({"events": [
             {"event": event, "iso": f"2026-10-03T10:00:{wall:06.3f}Z",
-             "t_mono": mono} for event, wall, mono in marks]}))
+             **({"t_mono": mono[0]} if mono else {})}
+            for event, wall, *mono in marks]}))
         return directory / "jobs.json"
 
-    # Two jobs; the wall clock stepped back 1.8 s during the second.
+    # The wall clock stepped back 1.8 s in the first job and forward 5 s in
+    # the second, which jobs.json does not record.
     ours = leg("ours", 100, 8.2, [
-        ("job_posted", 0.0, 1000.25), ("job_end", 3.0, 1003.25),
-        ("job_posted", 3.5, 1003.75), ("job_end", 8.45, 1010.5)])
-    # The baseline's clock stepped forward 2 s.
-    baseline = leg("c0", 100, 22.0, [
-        ("job_posted", 0.0, 50.5), ("job_end", 24.0, 72.5)])
+        ("job_posted", 0.0, 1000.25), ("job_end", 8.45, 1010.5),
+        ("job_posted", 9.0, 1011.0), ("job_end", 17.0, 1014.0)])
+    # An older recording: marks without t_mono, so the server span stands.
+    baseline = leg("c0", 100, 20.0, [("job_posted", 0.0), ("job_end", 24.0)])
 
     def throughput(*argv):
         out = tmp_path / "verdicts.json"
@@ -721,6 +724,7 @@ def test_throughput_subtracts_the_clock_step_legs_measured(tmp_path):
     numbers = throughput("--baseline-jobs", str(baseline))
     assert numbers["items_per_s"] == pytest.approx(10.0)
     assert numbers["baseline_items_per_s"] == pytest.approx(5.0)
+    assert numbers["baseline_clock_step_s"] is None
     # An explicit --jobs may be another job's: no step is subtracted.
     assert throughput("--jobs", str(ours))["items_per_s"] == pytest.approx(
         100 / 8.2)

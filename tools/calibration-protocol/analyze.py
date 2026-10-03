@@ -1712,13 +1712,13 @@ def _log_records(payload: Any) -> List[Dict[str, Any]]:
 
 
 def _clock_step(legs: Optional[Dict[str, Any]]) -> Optional[float]:
-    """How far the wall clock stepped from the first `job_posted` to the last
-    `job_end`: their `iso` span less their `t_mono` span, or None without
-    `t_mono`."""
-    events = (legs or {}).get("events") or []
+    """How far the wall clock stepped from the first `job_posted` to the
+    `job_end` after it, the job jobs.json records: their `iso` span less their
+    `t_mono` span, or None without `t_mono`."""
+    events = iter((legs or {}).get("events") or [])
     posted = next((event for event in events
                    if event.get("event") == "job_posted"), {})
-    end = next((event for event in reversed(events)
+    end = next((event for event in events
                 if event.get("event") == "job_end"), {})
     start_wall = _iso_epoch(str(posted.get("iso", "")))
     end_wall = _iso_epoch(str(end.get("iso", "")))
