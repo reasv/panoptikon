@@ -760,6 +760,7 @@ mod ram_budget;
 mod ramp;
 mod registration;
 mod shape_ceiling;
+mod sizing_sim;
 mod throughput_knee;
 mod trims;
 mod unified_memory;
