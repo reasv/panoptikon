@@ -567,6 +567,20 @@ def test_selftest_says_not_a_rocm_host_only_without_a_kfd_gpu(tmp_path,
     assert not any("not a ROCm host" in reason for reason in reasons())
 
 
+def test_selftest_reads_free_until_it_settles():
+    """Free rises over three reads after teardown, then holds; a figure that
+    never holds stops at the read bound."""
+    reads = iter([1000, 1500, 2000, 2000])
+    memory = types.SimpleNamespace(
+        free_total_mb=lambda: (next(reads), 24576, "amdgpu-sysfs"))
+    free, source, _, settled = selftest.settled_free_mb(memory, lambda s: None)
+    assert (free, source, settled) == (2000, "amdgpu-sysfs", True)
+    reads = iter(range(1000, 2000))
+    free, _, _, settled = selftest.settled_free_mb(memory, lambda s: None,
+                                                   reads=5)
+    assert (free, settled) == (1005, False)
+
+
 def test_newrun_records_the_gpu_nodes(tmp_path):
     host = Host(tmp_path).gpu(1, 0x0300).gpu(2, 0x0C00, openable=False)
     facts = newrun.rocm_facts(host.roots, module=str(tmp_path / "absent"))

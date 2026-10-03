@@ -256,6 +256,24 @@ def probe_free_tiers(memory: Any) -> List[Dict[str, Any]]:
     return rows
 
 
+def settled_free_mb(memory: Any, sleep: Callable[[float], None] = time.sleep,
+                    interval_s: float = 0.25, reads: int = 40
+                    ) -> Tuple[Optional[int], Optional[str], float, bool]:
+    """Device free once two reads `interval_s` apart agree, at most `reads`
+    more reads: amdgpu lowers its used counter some time after a release.
+    Returns `(free_mb, source, seconds, settled)`."""
+    started = time.monotonic()
+    free_mb, _, source = memory.free_total_mb()
+    settled = False
+    for _ in range(reads):
+        sleep(interval_s)
+        again, _, source = memory.free_total_mb()
+        settled, free_mb = again == free_mb, again
+        if settled:
+            break
+    return free_mb, source, round(time.monotonic() - started, 2), settled
+
+
 def rocm_reason(on_rocm: str) -> str:
     """`on_rocm` where KFD lists a GPU this process can open, else "not a
     ROCm host"."""
@@ -1097,16 +1115,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             pass
 
-    free_after_mb, _, free_after_source = memory.free_total_mb()
+    free_after_mb, free_after_source, settle_s, settled = settled_free_mb(memory)
     document["released"] = {"free_mb": free_after_mb,
-                            "free_source": free_after_source}
+                            "free_source": free_after_source,
+                            "settle_s": settle_s, "settled": settled}
     line, degraded = verdict_line(document)
     document["degraded"] = degraded
     document["verdict"] = line
 
     print_document(document, sys.stdout)
     print(f"device free after teardown: {free_after_mb} MiB "
-          f"({free_after_source})")
+          f"({free_after_source}), "
+          f"{'settled' if settled else 'still changing'} after {settle_s} s")
     if args.json_path:
         path = Path(args.json_path)
         path.parent.mkdir(parents=True, exist_ok=True)
