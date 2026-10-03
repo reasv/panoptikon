@@ -71,7 +71,7 @@ NOISE = {"scatter 35 %, rising": "curve=knee:1.3:256:8 noise=0.35 ndist=g win=30
 FLAT_JOBS = [("s12", "win=12 starts=40"), ("s60", "win=60 starts=40"),
              ("six", "win=20000 items=12000 starts=6")]
 DAILY_ITEMS = [1, 10, 30, 50, 100, 200, 500, 1000]
-IDEAL_SIZES = [8, 16, 32, 64, 128, 256]  # a daily job's ideal: the best of these, from a load
+IDEAL_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256]  # a daily job's ideal: the best of these, from a load
 MAC8 = "dev=mac room=4000 total=6144 queue=first1"
 MAC_REAL = "dev=mac room=105956 total=110100 queue=first1"
 # Desktop memory cases: device, model and what happens to memory.

@@ -1415,8 +1415,9 @@ from the runs, in `models.txt`).
 python3 tools/calibration-protocol/sizing_traces.py
 # The test binary (its path is the "Executable" line)
 cargo test -p panoptikon --bin panoptikon sizing_sim --no-run
-# The acceptance tables, per device class and sizing mode, CUDA on both days' traces
-python3 tools/calibration-protocol/sizing_table.py --bin target/debug/deps/panoptikon-<hash> --jobs 12
+# The acceptance tables, per device class and sizing mode, CUDA on both days' traces;
+# --rows keeps the simulator's output, and a rerun with it only prints the tables
+python3 tools/calibration-protocol/sizing_table.py --bin target/debug/deps/panoptikon-<hash> --jobs 12 --rows rows.txt
 # Real jobs of the sizing code under test beside their replay
 python3 tools/calibration-protocol/sizing_table.py --bin ... --set fidelity --seeds 40
 # The batches behind each traced size and the gains per doubling; the earlier study's cells
