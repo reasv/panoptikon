@@ -829,6 +829,10 @@ Known limits:
   down (0.4 to 2 s for a process of several GiB) still reads as a death in
   the middle of its window. On Linux the leader's zombie state shows it
   within a millisecond.
+- Windows free RAM is bounded by the commit left at the pagefile's current
+  size, but footprints are working set, so commit our workers hold beyond it
+  reads as external. The pagefile grows only past that limit, which grants
+  stay below, so this persists. It errs low and never over-grants.
 
 ### RAM ceiling for GPU models
 

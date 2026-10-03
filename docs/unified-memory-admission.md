@@ -120,8 +120,9 @@ host's reading"); orchestrator-side
 `/proc/meminfo` (`MemAvailable`; the CPU device subtracts `SReclaimable`
 on both sides) on Linux, `GlobalMemoryStatusEx` via
 `windows-sys` on Windows. No new crates. The two producers must sum the
-**same terms** — on macOS that is free + inactive pages, which is what
-psutil's `available` is; counting anything more on the orchestrator side
+**same terms** — on macOS RAM less wired, compressed and anonymous pages,
+on Windows the smaller of `ullAvailPhys` and `ullAvailPageFile`; counting
+anything more on the orchestrator side
 (purgeable, compressed) would make its refresh the looser of the two and
 systematically understate external pressure, the one error direction the
 ledger cannot absorb.
