@@ -280,6 +280,37 @@ def test_vramrec_rows_take_the_gateways_keys_and_name_their_source(tmp_path):
     assert [(proc["pid"], proc["used_mb"]) for proc in row["procs"]] == [(700, 300)]
 
 
+def test_used_that_moves_during_the_process_scan_is_flagged_and_not_judged(
+        tmp_path, monkeypatch):
+    host = Host(tmp_path).gpu(1, 0x0300)
+    host.kfd(700, 1, 300 * MIB)
+    oracle = vramrec.AmdgpuOracle(rocm_sysfs.inventory(host.roots), host.roots)
+
+    def sample():
+        (row,) = vramrec.build_sample(0, oracle, vramrec.ProcCache((), False),
+                                      None, 0.0)["gpus"]
+        return row["used_mb"], row["skew_mb"]
+
+    assert sample() == (1024, 0)
+    scan = vramrec.rocm_sysfs.process_vram_mb
+
+    def growing(*args):
+        (tmp_path / "pci" / BDF_03 / "mem_info_vram_used").write_text(
+            f"{6 * GIB}\n")
+        return scan(*args)
+
+    monkeypatch.setattr(vramrec.rocm_sysfs, "process_vram_mb", growing)
+    assert sample() == (6144, 5120)
+
+    # The allowance on this 24 GiB GPU is 1 GiB.
+    ctx = _amdgpu_ctx("amdgpu-kfd", [(900, 1200)])
+    ctx.health_samples[0]["health"]["vram"][0]["external_mb"] = 0
+    row = ctx.vram_samples[0]["gpus"][0]
+    for skew, verdict in ((1024, "FAIL"), (1025, "SKIP")):
+        row["skew_mb"] = skew
+        assert analyze.check_oracle_agreement(ctx).verdict == verdict, skew
+
+
 def test_vramrec_selects_the_amdgpu_oracle_without_nvml(tmp_path, monkeypatch):
     host = Host(tmp_path).gpu(1, 0x0300).gpu(2, 0x0C00)
 

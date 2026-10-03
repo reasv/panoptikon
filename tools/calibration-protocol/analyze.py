@@ -675,6 +675,7 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     unpriced_sources: Dict[str, int] = {}
     per_gpu: Dict[str, float] = {}
     teardown = 0
+    skewed = 0
     for sample in ctx.health_samples:
         health = sample.get("health") or {}
         if not health.get("ok"):
@@ -704,11 +705,16 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                 source = str(oracle.get("oracle_source"))
                 unpriced_sources[source] = unpriced_sources.get(source, 0) + 1
                 continue
+            total = int(gpu.get("total_mb") or oracle.get("total_mb") or 0)
+            allowance = max(1024.0, 0.02 * total)
+            # `used` moved past the allowance while the processes were read,
+            # so the two figures are not from one instant.
+            if (oracle.get("skew_mb") or 0) > allowance:
+                skewed += 1
+                continue
             ours, _ = ctx.our_pids_mb(oracle)
             oracle_external = max(0, int(oracle["used_mb"]) - ours)
             delta = abs(int(gpu.get("external_mb") or 0) - oracle_external)
-            total = int(gpu.get("total_mb") or oracle.get("total_mb") or 0)
-            allowance = max(1024.0, 0.02 * total)
             joined += 1
             per_gpu[uuid] = max(per_gpu.get(uuid, 0.0), float(delta))
             if delta > worst:
@@ -737,7 +743,10 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     if joined == 0:
         return Verdict("oracle_agreement", "SKIP",
                        "no health sample could be joined to a vramrec sample "
-                       f"within {ctx.args.join_tolerance}s")
+                       f"within {ctx.args.join_tolerance}s"
+                       + (f" ({skewed} were read while GPU used moved past "
+                          "the allowance)" if skewed else ""),
+                       {"joined": 0, "skewed_samples": skewed})
     verdict = "PASS" if breaches == 0 else "FAIL"
     return Verdict(
         "oracle_agreement", verdict,
@@ -746,9 +755,12 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
         + (f"; {unpriced} further samples priced no PID and were skipped"
            if unpriced else "")
         + (f"; {teardown} health samples after the hog stop were not joined"
-           if teardown else ""),
+           if teardown else "")
+        + (f"; {skewed} samples read while GPU used moved past the allowance "
+           "were skipped" if skewed else ""),
         {"joined": joined, "breaches": breaches, "worst_mb": worst,
          "unpriced_samples": unpriced, "teardown_samples": teardown,
+         "skewed_samples": skewed,
          "per_gpu_worst_mb": per_gpu, "worst_sample": worst_row},
     )
 

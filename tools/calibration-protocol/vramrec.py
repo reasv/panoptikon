@@ -109,7 +109,9 @@ by the PASID in the process's DRM fdinfo, and never used on a unified GPU (it
 counts no GTT); `"amdgpu-fdinfo"` is DRM fdinfo, the same counter the
 worker's own `fdinfo` base reads. `unreadable_pids` lists the processes whose
 descriptors could not be read (another user's, without CAP_SYS_PTRACE): what
-they hold is missing from `procs`.
+they hold is missing from `procs`. `skew_mb` is how far the GPU's `used`
+moved during the per-process scan, which reads every PID's descriptors and
+so is not one instant.
 """
 
 from __future__ import annotations
@@ -973,9 +975,12 @@ class AmdgpuOracle:
     def sample(self) -> List[Dict[str, Any]]:
         if time.monotonic() >= self._next_health:
             self._adopt_health()
+        # The device counters are read on both sides of the per-process scan;
+        # `skew_mb` is how far `used` moved while the processes were read.
+        before = [rocm_sysfs.memory_mb(self.roots, gpu) for gpu in self.gpus]
         procs = rocm_sysfs.process_vram_mb(self.roots, self.gpus)
         rows = []
-        for gpu in self.gpus:
+        for gpu, first in zip(self.gpus, before):
             memory = rocm_sysfs.memory_mb(self.roots, gpu)
             source, held, unreadable = procs[gpu.key]
             total, free = memory if memory else (None, None)
@@ -983,6 +988,8 @@ class AmdgpuOracle:
                 "index": gpu.index, "uuid": gpu.key, "name": None,
                 "total_mb": total, "free_mb": free,
                 "used_mb": None if memory is None else total - free,
+                "skew_mb": (None if memory is None or first is None
+                            else abs((total - free) - (first[0] - first[1]))),
                 "error": None if memory else "mem_info_* unreadable",
                 "oracle_source": f"amdgpu-{source}", "oracle_age_ms": None,
                 "unreadable_pids": unreadable,

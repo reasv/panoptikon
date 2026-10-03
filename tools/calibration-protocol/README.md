@@ -781,7 +781,7 @@ that move them are in `analyze.py --help`.
 
 | check | compares | threshold | tiers |
 |---|---|---|---|
-| `oracle_agreement` | the ledger's `external_mb` against (GPU `used` − the NVML usage of our own worker PIDs), up to `legs.py`'s hog stop (the idle gateway keeps its last figure after it) | ±1 GiB or 2 % | PASS/FAIL, SKIP without both recordings **and SKIP where the oracle priced no PID** (WDDM: subtracting nothing would report our own footprint as the disagreement) |
+| `oracle_agreement` | the ledger's `external_mb` against (GPU `used` − the NVML usage of our own worker PIDs), up to `legs.py`'s hog stop (the idle gateway keeps its last figure after it); a ROCm sample whose `used` moved past the allowance during its per-process scan (`skew_mb`) is skipped | ±1 GiB or 2 % | PASS/FAIL, SKIP without both recordings **and SKIP where the oracle priced no PID** (WDDM: subtracting nothing would report our own footprint as the disagreement) |
 | `base_accuracy` | a replica's reported `base_mb` against the oracle's per-process reading for *its* process | ±10 % (`nvml` method, or `fdinfo` against `amdgpu-kfd`; one oracle source per window, KFD preferred) | PASS/FAIL; INFO when the window is empty or the pair is neither |
 | `footprint_agreement` | per GPU, `footprints_mb` against the summed NVML usage of our PIDs | ±1 GiB or 2 % | PASS/FAIL |
 | `slope_accuracy` | the persisted slope against `ceiling_probe.py`'s **allocated** slope (`fit` where `fit.basis` names it, else the probe's whole-batch `peak_allocated_mb` rows refitted here) | −30 % .. +100 % | PASS/FAIL; WARN (FAIL under `--learning`) when no store was written; SKIP when no probe was passed, or when no probe names a model the store holds |
