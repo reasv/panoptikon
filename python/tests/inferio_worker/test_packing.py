@@ -20,7 +20,7 @@ import pytest
 from inferio.impl import utils as impl_utils
 from inferio_worker import memory, packing
 from inferio_worker.inputs import PredictionInput
-from test_memory import FakeRam, cpu_host, isolated, mps_host
+from test_memory import FakeMpsAllocator, FakeRam, cpu_host, isolated, mps_host
 
 MIB = 1024 * 1024
 
@@ -2218,6 +2218,32 @@ def test_a_clean_pool_of_the_same_size_is_still_released(fake_torch):
     assert fake_torch.empty_cache_calls == 1
     assert second["measurements"][0]["trimmed"] is True
     assert fake_torch.reserved == 32 * MIB, "the live tensors stayed"
+
+
+def test_after_a_release_that_returned_nothing_the_slack_must_grow_first():
+    """Metal keeps part of the pool through `empty_cache()` and publishes no
+    counter for it, so slack can be claimed that a release does not return.
+    After such a release the rule waits for the slack to grow past what it
+    left, instead of releasing it again every other window."""
+
+    class FragmentedMps(FakeMpsAllocator):
+        kept = 0
+
+        def empty_cache(self):
+            self.empty_cache_calls += 1
+            self.driver = min(self.driver, self.allocated + self.kept)
+
+    mps = FragmentedMps()
+    with mps_host(available_mb=40 * 1024, mps=mps):
+        mps.allocate(3000, driver_mb=5000)
+        mps.kept = 2000 * MIB
+        for _ in range(6):
+            packing.maybe_shrink(100)
+        assert mps.empty_cache_calls == 1, "the 2000 MiB slack never came back"
+        mps.driver += 500 * MIB
+        packing.maybe_shrink(100)
+        packing.maybe_shrink(100)
+        assert mps.empty_cache_calls == 2, "the slack grew"
 
 
 def test_the_clamp_credits_a_split_pool_the_release_decision_refuses(fake_torch):

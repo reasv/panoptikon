@@ -145,6 +145,10 @@ _spill_persists = False
 _under_grant_windows = 0
 # Set by a release the blind rule caused; a grant with memory clears it.
 _blind_released = False
+# The slack a shrink release that returned nothing left behind (the pool is
+# fragmented where no counter says so, as on MPS); no shrink release runs
+# until the slack grows past it.
+_unreleased_slack_mb: int | None = None
 
 
 class WindowFailure(Exception):
@@ -172,9 +176,10 @@ def reset_comparator() -> None:
 
 def reset_shrink_state() -> None:
     """Forget the reactive-shrink hysteresis."""
-    global _under_grant_windows, _blind_released
+    global _under_grant_windows, _blind_released, _unreleased_slack_mb
     _under_grant_windows = 0
     _blind_released = False
+    _unreleased_slack_mb = None
 
 
 def note_trimmed() -> None:
@@ -204,9 +209,11 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     A memory-blind window (`mb == 0`) counts as a squeeze, so a pool that
     itself filled the device is released. It counts only above
     `SHRINK_BLIND_SLACK_MB`, and only until the first release it causes, so a
-    busy shared device does not release on every other window.
+    busy shared device does not release on every other window. After a release
+    that returned nothing, neither rule counts until the slack grows past what
+    it left.
     """
-    global _under_grant_windows, _blind_released
+    global _under_grant_windows, _blind_released, _unreleased_slack_mb
     if grant_mb is None or grant_mb < 0:
         _under_grant_windows = 0
         return False
@@ -216,9 +223,12 @@ def maybe_shrink(grant_mb: int | None) -> bool:
         return False
     split_mb = memory.unreturnable_split_mb() or 0
     slack_mb = max(0, reserved_mb - allocated_mb - split_mb)
-    if slack_mb <= 0:
+    if slack_mb <= 0 or (
+        _unreleased_slack_mb is not None and slack_mb <= _unreleased_slack_mb
+    ):
         _under_grant_windows = 0
         return False
+    _unreleased_slack_mb = None
     if grant_mb == 0:
         if _blind_released or slack_mb < SHRINK_BLIND_SLACK_MB:
             _under_grant_windows = 0
@@ -257,6 +267,8 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     )
     note_trimmed()
     _blind_released = grant_mb == 0
+    if memory.last_release()[0] == 0:
+        _unreleased_slack_mb = slack_mb
     return True
 
 

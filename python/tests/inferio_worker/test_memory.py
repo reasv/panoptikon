@@ -3328,8 +3328,8 @@ def test_the_mps_release_decision_has_no_split_term_to_net(fake_torch) -> None:
     """The MPS half, as a known limit rather than a fix. The CUDA
     release decision nets `inactive_split_bytes.all.current`; torch.mps
     publishes no fragmentation counter at all, so `unreturnable_split_mb()` is
-    `None` there and the MPS reading keeps the over-read: most releases can
-    claim slack that returns nothing.
+    `None` there and the MPS reading keeps the over-read: a release can claim
+    slack that returns nothing (`maybe_shrink` then waits for it to grow).
     """
     mps = FakeMpsAllocator()
     with mps_host(available_mb=40 * 1024, mps=mps):
