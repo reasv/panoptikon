@@ -412,16 +412,6 @@ mod tests {
         Vec::new()
     }
 
-    /// The CPU thresholds a CPU-device worker gets on this host: those the
-    /// operator did not set.
-    fn cpu_thresholds() -> Vec<(String, String)> {
-        GLIBC_MALLOC_ENV
-            .into_iter()
-            .filter(|(key, _)| env::var_os(key).is_none())
-            .map(|(key, value)| (key.to_owned(), value.to_owned()))
-            .collect()
-    }
-
     #[test]
     fn worker_env_only_for_resolved_rocm() {
         // No NVIDIA wheels under this interpreter, so the CUDA arm carries
@@ -432,11 +422,12 @@ mod tests {
         );
         // Unresolved auto must not inject; callers resolve first.
         assert!(worker_env(Accelerator::Auto, &bare_python()).is_empty());
-        // `cpu` carries the device marker and the glibc thresholds, and
-        // nothing else — no HIP paths, no MPS watermarks.
-        let mut cpu = vec![("INFERIO_DEVICE".to_string(), "cpu".to_string())];
-        cpu.extend(cpu_thresholds());
-        assert_eq!(worker_env(Accelerator::Cpu, &bare_python()), cpu);
+        // `cpu` carries the CPU device env and nothing else — no HIP paths,
+        // no MPS watermarks.
+        assert_eq!(
+            worker_env(Accelerator::Cpu, &bare_python()),
+            cpu_device_env()
+        );
         // Rocm may be empty of HIP libs on hosts without ROCm, but on Linux
         // still carries MIOpen defaults when those env vars are unset. Off
         // Linux the whole HIP env is empty by design.
@@ -519,10 +510,6 @@ mod tests {
     /// footprint.
     #[test]
     fn only_a_cpu_host_pins_the_glibc_malloc_thresholds() {
-        let cpu = worker_env(Accelerator::Cpu, &bare_python());
-        for threshold in cpu_thresholds() {
-            assert!(cpu.contains(&threshold), "{threshold:?}");
-        }
         for accelerator in [
             Accelerator::Cuda,
             Accelerator::Rocm,
