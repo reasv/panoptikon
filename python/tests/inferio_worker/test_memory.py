@@ -26,7 +26,7 @@ from unittest import mock
 
 # psutil picks its platform module at import, so it must be imported before
 # any test fakes `sys.platform`.
-import psutil  # noqa: F401
+import psutil
 import pytest
 
 from inferio_worker import memory, packing
@@ -2195,6 +2195,8 @@ def test_the_swapouts_count_matches_vm_stat() -> None:
         return int(re.search(r"Swapouts:\s+(\d+)", out).group(1))
 
     before = vm_stat_swapouts()
+    if before == 0:
+        pytest.skip("no swap-outs since boot to compare")
     counters = memory._mac_memory_counters()
     after = vm_stat_swapouts()
     assert counters is not None
@@ -2618,6 +2620,7 @@ def test_the_windows_memory_status_is_read() -> None:
     assert status is not None
     assert 0 < status.ullAvailPhys <= status.ullTotalPhys
     assert 0 < status.ullAvailPageFile <= status.ullTotalPageFile
+    assert status.ullTotalPhys == psutil.virtual_memory().total
 
 
 def test_freed_host_memory_is_returned_before_the_resident_readings(
