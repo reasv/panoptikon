@@ -1245,15 +1245,15 @@ def run_window(
     instance: Any,
     inputs: Sequence[Any],
     grant: dict[str, Any],
-    emit_memory: Callable[[dict[str, Any]], None] | None = None,
+    emit_memory: Callable[[int, dict[str, Any] | None], None] | None = None,
 ) -> dict[str, Any]:
     """Run one granted window and build the `predict` `ok` payload: outputs in
     input order, measurements and a memory sample. Raises `WindowFailure` when
     a batch fails, carrying what ran.
 
-    `emit_memory` (handshake `batch_memory_frames`) receives a fresh memory
-    sample after every batch but the last, so the orchestrator sees the pool
-    grow mid-window."""
+    `emit_memory` (handshake `batch_memory_frames`) receives each batch's
+    units and a fresh memory sample before the batch runs, so the orchestrator
+    knows the batch in flight and sees the pool grow mid-window."""
     unit = str(grant.get("unit") or "item")
     aggregation = str(grant.get("aggregation") or "count")
     budget = grant.get("unit_budget")
@@ -1344,6 +1344,9 @@ def run_window(
             # from a release, so they stay comparable.
             reading = memory.free_total_reading()
             live = live._replace(free_mb=reading.free_mb, free_source=reading.source)
+
+        if emit_memory is not None:
+            emit_memory(priced, memory.device_memory_sample())
 
         state = memory.begin_batch()
         # The `finally` stops this batch's sampler on any raise.
@@ -1482,8 +1485,6 @@ def run_window(
         remaining = set(pending) - set(batch)
         pending = [index for index in pending if index in remaining]
 
-        # Per-batch memory frame while work remains (the reply carries the
-        # last). A fresh reading, so free and pool describe the same instant.
         if measurement.get("spilled"):
             reserved_mb = sample["reserved_mb"]
             released = len(batch) > 1 and memory.empty_cache(memory.SPILL_RELEASE)
@@ -1491,11 +1492,6 @@ def run_window(
                 budget = max(1, min(budget, priced // 2))
                 sample = memory.device_memory_sample()
             _log_spill(reserved_mb, off_device_mb, released, pool_off_device_mb(sample))
-        if emit_memory is not None and pending:
-            if sample is None:
-                sample = memory.device_memory_sample()
-            if sample is not None:
-                emit_memory(sample)
 
     payload: dict[str, Any] = {"outputs": outputs, "measurements": measurements}
     sample = memory.device_memory_sample()

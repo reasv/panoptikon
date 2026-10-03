@@ -2481,30 +2481,25 @@ def test_a_ceiling_that_cannot_be_trusted_is_no_ceiling_at_all():
 # --- Per-batch memory frames ---
 
 
-def test_a_granted_window_reports_its_pool_after_every_batch_but_the_last(
-    fake_torch,
-):
-    """The frame the ledger needs mid-window: one sample per batch boundary,
-    carrying the pool *as it grew* and a free reading taken beside it.
-
-    The last batch is deliberately silent — the `ok` reply that follows it
-    microseconds later carries the same sample, so a frame there would buy
-    nothing and cost one more driver query."""
-    emitted: list[dict] = []
+def test_a_granted_window_states_each_batch_before_it_runs(fake_torch):
+    """The frame the ledger needs mid-window: before each batch, its units and
+    a sample carrying the pool *as it grew* with a free reading beside it."""
+    emitted: list[tuple] = []
     model = Recorder(grow=lambda count: fake_torch.grow_pool(100 * count))
     payload = packing.run_window(
-        model, items(6), grant(unit_budget=2), emitted.append
+        model, items(5), grant(unit_budget=2),
+        lambda units, sample: emitted.append((units, sample)),
     )
 
-    assert [len(batch) for batch in model.batches] == [2, 2, 2]
-    assert len(emitted) == 2, "three batches, two batch boundaries"
+    assert [len(batch) for batch in model.batches] == [2, 2, 1]
+    assert [units for units, _ in emitted] == [2, 2, 1]
     # The pool the orchestrator would otherwise not hear about until the reply.
-    assert [sample["reserved_mb"] for sample in emitted] == [200, 400]
-    assert payload["memory"]["reserved_mb"] == 600, "the reply is still last"
+    assert [sample["reserved_mb"] for _, sample in emitted] == [0, 200, 400]
+    assert payload["memory"]["reserved_mb"] == 500, "the reply is still last"
     # The free reading is the frame's own, taken with the pool reading and not
-    # borrowed from the clamp's pre-batch one: pairing a pre-batch free with a
-    # post-batch pool understates external usage.
-    for sample in emitted:
+    # borrowed from the clamp's: pairing an older free with a newer pool
+    # understates external usage.
+    for _, sample in emitted:
         assert sample["free_source"] == "torch"
         assert sample["free_mb"] is not None
         assert sample["total_mb"] is not None
@@ -2514,11 +2509,12 @@ def test_a_window_runs_identically_with_and_without_the_emitter(fake_torch):
     """The old-orchestrator direction of the skew: no emitter, no frames, and
     a payload that is the same object graph either way."""
     without = packing.run_window(Recorder(), items(5), grant(unit_budget=2))
-    emitted: list[dict] = []
+    emitted: list[tuple] = []
     with_frames = packing.run_window(
-        Recorder(), items(5), grant(unit_budget=2), emitted.append
+        Recorder(), items(5), grant(unit_budget=2),
+        lambda units, sample: emitted.append((units, sample)),
     )
-    assert len(emitted) == 2
+    assert len(emitted) == 3
     for payload in (without, with_frames):
         payload["measurements"] = [
             {key: value for key, value in measurement.items()
@@ -2528,12 +2524,14 @@ def test_a_window_runs_identically_with_and_without_the_emitter(fake_torch):
     assert without == with_frames
 
 
-def test_a_worker_that_can_measure_nothing_emits_nothing():
-    """No torch, no sample, no frame — the same silence a worker with no GPU
-    answers every other memory-sensing field with."""
-    emitted: list[dict] = []
-    packing.run_window(Recorder(), items(6), grant(unit_budget=2), emitted.append)
-    assert emitted == []
+def test_a_worker_that_can_measure_nothing_still_states_its_batches():
+    """No torch, no sample, but each batch's units all the same."""
+    emitted: list[tuple] = []
+    packing.run_window(
+        Recorder(), items(6), grant(unit_budget=2),
+        lambda units, sample: emitted.append((units, sample)),
+    )
+    assert emitted == [(2, None)] * 3
 
 
 def test_the_emitter_is_bound_to_the_request_in_flight():
@@ -2547,12 +2545,12 @@ def test_the_emitter_is_bound_to_the_request_in_flight():
 
     stream = io.BytesIO()
     emit = worker_main._memory_frame_emitter(stream, 7, True)
-    emit({"free_mb": 10, "reserved_mb": 3})
+    emit(4, {"free_mb": 10, "reserved_mb": 3})
     stream.seek(0)
-    frame = protocol.read_frame(stream)
-    assert frame == {
+    assert protocol.read_frame(stream) == {
         "type": "memory",
         "id": 7,
+        "units": 4,
         "memory": {"free_mb": 10, "reserved_mb": 3},
     }
     assert protocol.read_frame(stream) is None, "exactly one frame"
@@ -2691,16 +2689,18 @@ def test_the_spill_backstop_fires_above_the_tolerance_only(
 def test_a_spill_mid_window_releases_and_halves_the_rest_of_it(spill_host):
     """A batch of 8 at 1100 MiB each overshoots the card by 608 MiB. The pool
     is released and the other 8 items run as two batches of 4."""
-    emitted: list[dict] = []
+    emitted: list[tuple] = []
     impl = caching_impl(spill_host, [1100])
     payload = packing.run_window(
-        impl, items(16), grant(unit_budget=8), emitted.append
+        impl, items(16), grant(unit_budget=8),
+        lambda units, sample: emitted.append((units, sample)),
     )
     measurements = payload["measurements"]
     assert [m["items"] for m in measurements] == [8, 4, 4]
     assert [m.get("spilled", False) for m in measurements] == [True, False, False]
     assert measurements[1]["reserved_before_mb"] == 0
-    assert emitted[0]["reserved_mb"] == 0, "the frame after the release"
+    units, sample = emitted[1]
+    assert (units, sample["reserved_mb"]) == (4, 0), "the batch after the release"
     assert payload["outputs"] == list(range(16))
     assert spill_host.empty_cache_calls == 1
 

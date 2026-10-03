@@ -782,10 +782,12 @@ therefore differs from a GPU in six ways.
   own SIGKILL of a live worker settles as an abort. A crash says nothing
   about memory and is accounted as an aborted window: no cap, no anchor
   change, no failed trial. A memory kill with a granted window in flight caps
-  its (model, device) at half that window's unit budget, at least the dying
-  window's smallest item. (A unified-memory device also halves the anchor,
-  but the next replica is admitted for twice the anchor, which is the batch
-  that died, and deflation is lost with the replica.) The cap holds for the
+  its (model, device) at half the batch that died, at least the dying
+  window's smallest item. The worker states each batch's units before
+  running it; with no such statement yet the window's unit budget stands
+  in. (A unified-memory device also halves the anchor, but the next replica
+  is admitted for twice the anchor, which is the batch that died, and
+  deflation is lost with the replica.) The cap holds for the
   life of the server process, halves again at each further kill, and stops
   the ramp like a shape ceiling; `/health` shows it as `death_cap_units`. It
   applies on every device. On a GPU with its own memory the kill was for host

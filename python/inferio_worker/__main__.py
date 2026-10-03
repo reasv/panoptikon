@@ -26,7 +26,7 @@ State machine (protocol v2):
 - A failed handshake is the one error the worker does not survive (exit
   non-zero).
 - With the handshake's `batch_memory_frames` flag, a granted `predict` writes
-  a `memory` frame (with the request id) after each batch but the last.
+  a `memory` frame (with the request id) before each batch, stating its units.
 """
 
 from __future__ import annotations
@@ -97,19 +97,23 @@ def _send_error(
 
 def _memory_frame_emitter(
     proto_out: BinaryIO, req_id: int, wanted: bool
-) -> Callable[[dict[str, Any]], None] | None:
-    """The per-batch `memory` frame writer for one in-flight `predict`, or None
-    when not wanted. Only valid until that request's reply is sent.
+) -> Callable[..., None] | None:
+    """The `memory` frame writer for one in-flight `predict`, or None when not
+    wanted. Only valid until that request's reply is sent. `units` is the
+    batch about to run.
     """
     if not wanted:
         return None
 
     from inferio_worker import protocol
 
-    def emit(sample: dict[str, Any]) -> None:
-        protocol.write_frame(
-            proto_out, {"type": "memory", "id": req_id, "memory": sample}
-        )
+    def emit(units: int | None = None, sample: dict[str, Any] | None = None) -> None:
+        frame: dict[str, Any] = {"type": "memory", "id": req_id}
+        if units is not None:
+            frame["units"] = units
+        if sample is not None:
+            frame["memory"] = sample
+        protocol.write_frame(proto_out, frame)
 
     return emit
 
@@ -292,6 +296,7 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 _send_error(proto_out, req_id, str(e), traceback.format_exc())
 
         elif mtype == "predict":
+            emit = _memory_frame_emitter(proto_out, req_id, batch_memory_frames)
             if instance is None:
                 _send_error(
                     proto_out,
@@ -337,14 +342,7 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     _send_ok(
                         proto_out,
                         req_id,
-                        **packing.run_window(
-                            instance,
-                            inputs,
-                            grant,
-                            _memory_frame_emitter(
-                                proto_out, req_id, batch_memory_frames
-                            ),
-                        ),
+                        **packing.run_window(instance, inputs, grant, emit),
                     )
             except Exception as e:
                 # Includes serialization failures from write_frame (bad

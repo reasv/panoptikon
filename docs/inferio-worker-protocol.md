@@ -172,7 +172,7 @@ Normal spawn flow: `handshake` → `configure` → `load`. Pooled flow:
 |---|---|---|
 | `ok` | request-specific payload (below) | Success for the echoed `id`. |
 | `error` | `message` (str), `traceback` (str, may be empty) | Failure for the echoed `id`. The worker stays alive and serviceable after an `error` (a failed predict/load must not require a respawn) — except a failed `handshake`, after which it exits non-zero. |
-| `memory` | `memory` (a memory sample map) | **Not a response.** Telemetry for the request whose `id` it echoes, written *before* that request's `ok`/`error` — the only frame that may precede a terminal reply. Sent only from inside a granted `predict`, and only when the orchestrator set `batch_memory_frames` in the handshake. Host tolerance is wider than worker behaviour: the reference orchestrator accepts such a frame for the id in flight on **any** request type, not only `predict`, so an impl that emits one elsewhere is absorbed rather than killed — but the frame is still specified as `predict`-only and nothing in tree sends one otherwise. See "Per-batch memory frames". |
+| `memory` | `memory` (a memory sample map, optional), `units` (int, optional) | **Not a response.** Telemetry for the request whose `id` it echoes, written *before* that request's `ok`/`error` — the only frame that may precede a terminal reply. Sent only from inside a granted `predict`, one per batch, and only when the orchestrator set `batch_memory_frames` in the handshake. Host tolerance is wider than worker behaviour: the reference orchestrator accepts such a frame for the id in flight on **any** request type, not only `predict`, so an impl that emits one elsewhere is absorbed rather than killed — but the frame is still specified as `predict`-only and nothing in tree sends one otherwise. See "Per-batch memory frames". |
 
 ### Memory grants (optional `predict` request fields)
 
@@ -1332,16 +1332,20 @@ whole grant — as another process's memory. Measured on a 4 h soak: on a
 GPU with two residents, 29 % of samples breached the external-usage oracle,
 median shortfall 52 GB, `headroom` pinned at 0 for 23.8 % of busy samples.
 
-So a granted `predict` may write, on the same stream and **before** its
-terminal reply, frames of the form:
+So a granted `predict` writes, on the same stream and **before** its terminal
+reply, frames of the form:
 
 ```
-{"type": "memory", "id": <the request now in flight>, "memory": <a memory sample>}
+{"type": "memory", "id": <the request now in flight>, "units": <the batch about to run>, "memory": <a memory sample>}
 ```
 
-The payload is the same memory sample map as everywhere else in this section —
-no new vocabulary, and no sequence number, since ordering is stream order and
-every consumer rule is by capture instant. The rules:
+It writes one frame before each batch, stating that batch's `units` (in the
+grant's cost unit) and, when the worker can measure anything, a memory sample.
+The orchestrator keeps the last `units` as the batch in flight, clearing it as
+it sends each request: a worker killed for memory caps the model at half that
+batch rather than half the window's budget. The sample map is the same as
+everywhere else in this section — no sequence number, since ordering is stream
+order and every consumer rule is by capture instant. The rules:
 
 - **Opt-in, one-way.** The frame is written only when the handshake request
   carried `batch_memory_frames: true`. An orchestrator that predates the
@@ -1357,19 +1361,17 @@ every consumer rule is by capture instant. The rules:
   frame exactly as it would have without the capability.
 - **Only from inside the window.** A frame written after a request's terminal
   reply desynchronizes the stream permanently, so a worker emits them only
-  from the packing harness, bound to the id it was entered with. The
-  grantless `predict` path emits none (it has no batch boundaries).
+  while handling the request, bound to its id. The grantless `predict` path
+  emits none (it has no batch boundaries).
 - **The sample is taken whole, at the frame.** Both halves — the pool figure
   and the free reading — come from one instant. Reusing the defensive clamp's
-  *pre-batch* free reading beside a post-batch pool figure would understate
+  free reading beside a later pool figure would understate
   external usage, which is the one direction it is not safe to be wrong in, so
   the frame pays its own driver query — the same query the clamp already pays
   once per batch.
 - **Telemetry, never a measurement.** The frame states where the pool is, not
   what a batch cost. It contributes nothing to the cost fit and moves no
   measurement watermark.
-- Frames are skipped after the window's **last** batch: the reply that follows
-  carries the same sample.
 - **The reference orchestrator applies the frame on arrival.** Its free reading
   moves the GPU's external-usage figure — and the limit the next grant is
   priced against — before the window settles, and is read ahead of the

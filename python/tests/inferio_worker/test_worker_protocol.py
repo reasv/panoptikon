@@ -891,13 +891,9 @@ def test_the_batch_memory_frames_capability_is_read_off_the_handshake() -> None:
         assert negotiated(batch_memory_frames=hostile) == (True, False), hostile
 
 
-def test_a_worker_that_can_measure_nothing_answers_the_capability_in_silence(
-    worker: WorkerProcess,
-) -> None:
-    """The old-worker/new-host and no-torch directions in one exchange: the
-    extra handshake key is an unknown key to anything that does not want it,
-    and a granted window on a host with no accelerator writes exactly one
-    frame for the request — the `ok`."""
+def test_a_granted_window_states_each_batch(worker: WorkerProcess) -> None:
+    """A granted window on a host with no accelerator: one frame per batch
+    with its units and no sample, then the `ok`."""
     worker.send({**handshake_msg(req_id=1), "batch_memory_frames": True})
     assert worker.recv()["type"] == "ok"
     worker.send(configure_msg(req_id=2))
@@ -916,10 +912,12 @@ def test_a_worker_that_can_measure_nothing_answers_the_capability_in_silence(
             },
         }
     )
+    for _ in range(4):
+        assert worker.recv() == {"type": "memory", "id": 4, "units": 1}
     resp = worker.recv()
     assert resp["type"] == "ok", resp
     assert resp["id"] == 4
-    assert len(resp["measurements"]) == 4, "four batches, and still no frames"
+    assert len(resp["measurements"]) == 4
 
     # The next frame on the stream is the next reply, not a straggler.
     worker.send({"type": "ping", "id": 5})

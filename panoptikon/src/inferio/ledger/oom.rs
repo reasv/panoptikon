@@ -241,10 +241,11 @@ impl VramLedger {
     /// A replica whose process was killed for memory holding a granted window
     /// (`charge`).
     ///
-    /// The (model, device) is capped at half that window's unit budget, at
-    /// least its smallest item: for the life of this process, or, while macOS
-    /// was paging, through the [`PressureCap`], which lifts as the batch grows
-    /// back at normal pressure. Without the cap the next replica is admitted
+    /// The (model, device) is capped at half the batch that died (the units
+    /// the worker last said it was running, else the window's unit budget),
+    /// at least the window's smallest item: for the life of this process, or,
+    /// while macOS was paging, through the [`PressureCap`], which lifts as the
+    /// batch grows back at normal pressure. Without the cap the next replica is admitted
     /// for the batch that died, and dies again. A window the queue sized sets
     /// no cap: its size says nothing about the batch the model can run. An
     /// item-capped window does, since the cap sized it. On a GPU with its own
@@ -262,9 +263,15 @@ impl VramLedger {
         let entry = state.workers.get(&worker)?;
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let unified_ram_mb = state.gpus.get(&key.1)?.unified_ram_mb;
+        let died_at = entry
+            .telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .batch_units
+            .map_or(charge.unit_budget, |units| units.min(charge.unit_budget));
         let sized_by_queue = charge.queue_bound && !charge.squeezed && charge.item_cap.is_none();
         let paging = charge.pressure.paging();
-        let mut cap = (!sized_by_queue).then(|| (charge.unit_budget / 2).max(charge.item_units));
+        let mut cap = (!sized_by_queue).then(|| (died_at / 2).max(charge.item_units));
         if !paging && let Some(halved) = cap {
             let cal = state.calibration.entry(key.clone()).or_default();
             let held = cal.death_cap_units.map_or(halved, |held| held.min(halved));
@@ -312,7 +319,7 @@ impl VramLedger {
             tracing::warn!(
                 model = %key.0,
                 gpu = %key.1,
-                died_at_units = charge.unit_budget,
+                died_at_units = died_at,
                 batch_cap_units = cap,
                 paging,
                 "a worker was killed for memory while running a granted window; \

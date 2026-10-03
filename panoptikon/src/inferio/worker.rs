@@ -66,7 +66,8 @@ const PROTOCOL_VERSION: u64 = 2;
 /// older worker venv over an additive key.
 const BATCH_MEMORY_FRAMES_FIELD: &str = "batch_memory_frames";
 
-/// That frame's type: the in-flight request id and a memory sample.
+/// That frame's type: the in-flight request id, and a memory sample and the
+/// units of the batch about to run when it has them.
 const MEMORY_FRAME_TYPE: &str = "memory";
 
 /// Max frame size (2 GiB; must stay below the u32 length-prefix ceiling).
@@ -403,6 +404,9 @@ pub struct WorkerTelemetry {
     pub load: Option<Timestamped<LoadReport>>,
     /// Freshest sample, from whichever response carried one last.
     pub memory: Option<Timestamped<MemorySample>>,
+    /// Units of the batch the worker said it is running for the request in
+    /// flight; cleared as each request is sent.
+    pub batch_units: Option<u64>,
     /// Bounded ring of the most recent measurements, oldest first.
     measurements: VecDeque<BatchSample>,
     recorded: u64,
@@ -1330,13 +1334,16 @@ impl Worker {
         };
 
         self.in_flight = true;
+        if let Ok(mut telemetry) = self.telemetry.lock() {
+            telemetry.batch_units = None;
+        }
         let stdin = &mut self.stdin;
         let stdout = &mut self.stdout;
         let telemetry = &self.telemetry;
         let cycle = async {
             send_bytes(stdin, &bytes).await?;
-            // Skip this request's per-batch `memory` frames; any other frame
-            // falls through to the checks below. The deadline covers the loop.
+            // Skip this request's `memory` frames; any other frame falls
+            // through to the checks below. The deadline covers the loop.
             loop {
                 let frame = read_frame(stdout).await?;
                 if !is_batch_memory_frame(&frame, id) {
@@ -1769,8 +1776,8 @@ fn field_string(map: &[(Value, Value)], key: &str) -> Option<String> {
     map_get(map, key)?.as_str().map(str::to_owned)
 }
 
-/// Whether this is the per-batch `memory` frame for the in-flight request;
-/// one for any other id is a desync.
+/// Whether this is a `memory` frame for the in-flight request; one for any
+/// other id is a desync.
 fn is_batch_memory_frame(frame: &Value, id: u64) -> bool {
     let Value::Map(map) = frame else {
         return false;
@@ -1779,17 +1786,22 @@ fn is_batch_memory_frame(frame: &Value, id: u64) -> bool {
         && map_get(map, "id").and_then(Value::as_u64) == Some(id)
 }
 
-/// Fold such a frame's sample into the telemetry as the freshest reading. Not
-/// a measurement: the cost fit is untouched.
+/// Fold such a frame's sample into the telemetry as the freshest reading, and
+/// its units as the batch in flight. Not a measurement: the cost fit is
+/// untouched.
 fn record_memory_frame(telemetry: &TelemetryHandle, frame: &Value) {
     let Value::Map(map) = frame else {
         return;
     };
-    let Some(sample) = MemorySample::parse(map_get(map, "memory")) else {
-        return;
-    };
+    let sample = MemorySample::parse(map_get(map, "memory"));
+    let units = field_u64(map, "units");
     if let Ok(mut telemetry) = telemetry.lock() {
-        telemetry.memory = Some(Timestamped::now(sample));
+        if let Some(sample) = sample {
+            telemetry.memory = Some(Timestamped::now(sample));
+        }
+        if units.is_some() {
+            telemetry.batch_units = units;
+        }
     }
 }
 
@@ -2502,6 +2514,11 @@ mod tests {
             .await
             .expect("capped predict");
         assert_eq!(sizes(&outputs), vec![1, 1, 1, 1, 1]);
+        let batch_units = || telemetry.lock().unwrap().batch_units;
+        assert_eq!(batch_units(), Some(1), "the last batch, as its frame said");
+        // A request without a grant states no batch, so none is in flight.
+        worker.predict(&inputs, None, None).await.expect("predict");
+        assert_eq!(batch_units(), None);
 
         worker.shutdown().await.expect("graceful shutdown");
     }
