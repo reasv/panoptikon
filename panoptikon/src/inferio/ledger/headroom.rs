@@ -322,8 +322,8 @@ impl VramLedger {
     }
 
     /// The host RAM behind a device that allocates from it directly: the CPU
-    /// device and, on a Metal allocator, the MPS device. `None` for a GPU
-    /// with its own memory.
+    /// device and, on a Metal allocator, the MPS device. `None` for every
+    /// other GPU, an APU included.
     pub(super) fn host_ram_mb_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let device = state.gpus.get(gpu)?;
         if gpu == cpu::DEVICE_KEY {
