@@ -21,9 +21,7 @@ use utoipa::ToSchema;
 use crate::{
     api_error::ApiError,
     db::{
-        DbConnection, ReadOnly,
-        migrations::migrate_databases_on_disk,
-        open_index_db_read,
+        DbConnection, ReadOnly, open_index_db_read,
         setup::{
             FolderValidation, is_ready_for_desktop, validate_continuous_folders, validate_folders,
         },
@@ -1258,27 +1256,11 @@ pub(crate) async fn complete_setup(
 
     let (index_db, user_data_db) = if let Some(new_index_db) = request.new_index_db.as_deref() {
         validate_new_database_name(new_index_db)?;
-        let new_index_db = new_index_db.to_owned();
-        let selected_user_data_db = conn.user_data_db.clone();
-        let handle = tokio::runtime::Handle::current();
-        let paths = tokio::task::spawn_blocking(move || {
-            handle.block_on(migrate_databases_on_disk(
-                Some(&new_index_db),
-                Some(&selected_user_data_db),
-            ))
-        })
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "failed to join Desktop database creation task");
-            ApiError::internal("Failed to create index database")
-        })?
-        .map_err(|error| {
-            tracing::error!(
-                error = %format_args!("{error:#}"),
-                "failed to create Desktop index database"
-            );
-            ApiError::internal("Failed to create index database")
-        })?;
+        let paths = crate::api::db::create_databases(
+            Some(new_index_db.to_owned()),
+            Some(conn.user_data_db.clone()),
+        )
+        .await?;
         (paths.index_db, paths.user_data_db)
     } else {
         (conn.index_db.clone(), conn.user_data_db.clone())

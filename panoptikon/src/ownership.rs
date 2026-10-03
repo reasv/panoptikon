@@ -82,6 +82,33 @@ pub(crate) fn explain(err: anyhow::Error, tree: &Path, paths: &[PathBuf]) -> any
     }
 }
 
+/// Why creating databases failed, if another user owns or a read-only
+/// filesystem holds what it writes: the database a migration failed on, or
+/// else the folder a missing `index/<index_db>` or `user_data/` is made in.
+pub(crate) fn creation_problem(
+    err: &anyhow::Error,
+    data_folder: &Path,
+    index_db: &str,
+) -> Option<String> {
+    let data_folder = absolute(data_folder);
+    let paths = creation_paths(err, &data_folder, index_db);
+    reason(&data_folder, &paths, true)
+}
+
+fn creation_paths(err: &anyhow::Error, data_folder: &Path, index_db: &str) -> Vec<PathBuf> {
+    let paths = migration_paths(err);
+    if !paths.is_empty() {
+        return paths;
+    }
+    let index = data_folder.join("index").join(index_db);
+    [index, data_folder.join("user_data")]
+        .iter()
+        .filter(|folder| !folder.is_dir())
+        .filter_map(|folder| folder.ancestors().find(|folder| folder.is_dir()))
+        .map(Path::to_path_buf)
+        .collect()
+}
+
 /// [`explain`] for a failure to create or replace `path`: what
 /// [`create_problem`] says.
 pub(crate) fn explain_create(err: anyhow::Error, tree: &Path, path: &Path) -> anyhow::Error {
@@ -544,6 +571,31 @@ pub(crate) mod tests {
             assert_eq!(quoted, named, "{explained}");
         }
         assert!(migration_paths(&anyhow::anyhow!("disk full")).is_empty());
+    }
+
+    /// A failed database create is explained by the database a migration
+    /// failed on, or else by the folder a missing database folder is made in.
+    #[test]
+    fn a_failed_create_is_explained_by_its_database_or_the_folder_it_is_made_in() {
+        let data = data_folder();
+        let index = data.path().join("index");
+        let access = |path: &Path| {
+            if path == index {
+                Access::Denied { owner: 0 }
+            } else {
+                Access::Writable
+            }
+        };
+        let explained = |err: &anyhow::Error, index_db: &str| {
+            let paths = creation_paths(err, data.path(), index_db);
+            unix::reason(data.path(), &paths, true, 1000, access)
+        };
+        let denied = anyhow::anyhow!("permission denied");
+        let named = Some(owned_by(&index, 0, 1000, data.path()));
+        assert_eq!(explained(&denied, "new"), named);
+        assert_eq!(explained(&denied, "second"), None, "nothing to create");
+        let failed = FailedDatabase(index.join("second/index.db"));
+        assert_eq!(explained(&denied.context(failed), "second"), None);
     }
 
     /// A file that cannot be created or replaced is explained by itself or
