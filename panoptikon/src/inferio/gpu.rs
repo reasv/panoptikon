@@ -250,15 +250,15 @@ impl DriverPlatform {
 }
 
 /// Whether a full NVIDIA GPU moves memory to system RAM instead of failing
-/// the allocation. The Windows display driver model (WDDM) does; TCC and
-/// MCDM, the compute-only models, fail it. A driver model nvidia-smi did not
-/// report counts as WDDM, the model every display GPU runs.
+/// the allocation. The Windows display driver model (WDDM) does; TCC fails
+/// a full allocation, and MCDM is treated the same, unmeasured. A driver
+/// model nvidia-smi did not report counts as WDDM, the model every display
+/// GPU runs.
 fn spills(platform: DriverPlatform, driver_model: Option<&str>) -> bool {
     match platform {
         DriverPlatform::Other => false,
         DriverPlatform::Wsl => true,
         DriverPlatform::Windows => !driver_model.is_some_and(|model| {
-            let model = model.trim();
             model.eq_ignore_ascii_case("TCC") || model.eq_ignore_ascii_case("MCDM")
         }),
     }
@@ -1471,7 +1471,7 @@ mod tests {
             (Wsl, None, true),
             (Wsl, Some("TCC"), true),
             (Windows, Some("WDDM"), true),
-            (Windows, Some(" tcc "), false),
+            (Windows, Some("tcc"), false),
             (Windows, Some("MCDM"), false),
             (Windows, Some("[N/A]"), true),
             (Windows, None, true),
