@@ -384,8 +384,9 @@ fn fitted_alone(
 /// [`OOM_WINDOWS_AT_FLOOR`]: a memory kill whatever the room, an
 /// out-of-memory error when the room was short of the item. A kill in a
 /// window memory cut below two items caps the batch at that one item, not at
-/// half the cut budget. A budget that holds two of the window's smallest
-/// items is no floor, whatever its largest item.
+/// half the cut budget. A user cap of one item is the floor whatever the
+/// budget. A budget that holds two of the window's smallest items is no
+/// floor, whatever its largest item.
 #[test]
 fn a_one_item_window_is_the_floor_whatever_the_unit() {
     // (cost, one item's units, MiB per unit: one item costs 20 000 MiB)
@@ -401,7 +402,7 @@ fn a_one_item_window_is_the_floor_whatever_the_unit() {
                 .expect("admitted");
             push_memory_with_total(&handle, 40_000, 0, Some(CPU_RAM_MB), "ram");
             let token = admission
-                .request_grant_byte_bound(item, item, 1, None, 1, 0, false)
+                .request_grant_byte_bound(item, item, None, 1, 0, false)
                 .expect("granted");
             assert_eq!(token.grant().unit_budget, item);
             token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill))
@@ -412,9 +413,18 @@ fn a_one_item_window_is_the_floor_whatever_the_unit() {
         // Two items in a budget of one and three quarters.
         let (ledger, _handle, admission) = fitted_alone(cost, mb_per_unit, 48_000);
         let token = admission
-            .request_grant_byte_bound(2 * item, item, 2, None, 1, 0, false)
+            .request_grant_byte_bound(2 * item, item, None, 1, 0, false)
             .expect("granted");
         assert!((3 * item / 2..2 * item).contains(&token.grant().unit_budget));
+        token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
+        assert_eq!(floor_strikes(&ledger), 1);
+
+        // A user cap of one item in a budget of more than two.
+        let (ledger, _handle, admission) = fitted_alone(cost, mb_per_unit, 64_000);
+        let token = admission
+            .request_grant_byte_bound(4 * item, item, Some(1), 1, 0, false)
+            .expect("granted");
+        assert!(token.grant().unit_budget >= 2 * item);
         token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
         assert_eq!(floor_strikes(&ledger), 1);
 
@@ -425,7 +435,7 @@ fn a_one_item_window_is_the_floor_whatever_the_unit() {
         let mut verdicts = Vec::new();
         for outcome in [WindowOutcome::WorkerDied(DeathKind::MemoryKill), oom, oom] {
             let token = admission
-                .request_grant_byte_bound(4 * item, item, 4, None, 1, 0, false)
+                .request_grant_byte_bound(4 * item, item, None, 1, 0, false)
                 .expect("granted");
             assert!((2..item).contains(&token.grant().unit_budget));
             verdicts.push(token.finish(outcome).is_some());
@@ -439,7 +449,7 @@ fn a_one_item_window_is_the_floor_whatever_the_unit() {
     let token_priced = priced_in(CostUnit::Token, 4096);
     let (ledger, _handle, admission) = fitted_alone(token_priced, 40.0, 20_000);
     let token = admission
-        .request_grant_byte_bound(2150, 50, 4, None, 1, 0, false)
+        .request_grant_byte_bound(2150, 50, None, 1, 0, false)
         .expect("granted");
     let budget = token.grant().unit_budget;
     assert!((150..2000).contains(&budget), "{budget}");
@@ -1147,7 +1157,7 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
         requests: 1,
         unit_budget: 8,
         item_units: 1,
-        items: 8,
+        batch_item_cap: None,
         size_asked: 8,
         granted_at: Instant::now(),
         squeezed: false,
@@ -1243,7 +1253,7 @@ fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
         requests: 1,
         unit_budget: 512,
         item_units: 1,
-        items: 512,
+        batch_item_cap: None,
         size_asked: 512,
         granted_at: Instant::now(),
         squeezed: false,
@@ -1752,7 +1762,7 @@ fn an_out_of_memory_window_the_room_did_not_size_leaves_the_pool_margin() {
     let pixel_priced = priced_in(CostUnit::Pixel, 8_000_000);
     let (ledger, _handle, admission) = fitted_alone(pixel_priced, 0.01, 12_000);
     let token = admission
-        .request_grant_byte_bound(item, item, 1, None, 1, 0, false)
+        .request_grant_byte_bound(item, item, None, 1, 0, false)
         .expect("granted");
     assert!(token.grant().squeezed && token.grant().unit_budget >= 2);
     token.finish(OUT_OF_MEMORY);

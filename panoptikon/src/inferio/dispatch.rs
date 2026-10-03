@@ -608,7 +608,6 @@ pub(crate) async fn run_dispatcher(
                     let grant = admission.request_grant_byte_bound(
                         window_units,
                         smallest_item_units,
-                        window_items,
                         cap,
                         window.len(),
                         queue.len(),
@@ -2297,7 +2296,7 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "no window granted");
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        assert_eq!(grants, [(25, 4)]);
+        assert_eq!(grants, [25]);
         for answer in answers {
             answer.await.expect("replied").expect("succeeded");
         }

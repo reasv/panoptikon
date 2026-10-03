@@ -179,10 +179,9 @@ impl VramLedger {
         self.lock().workers.get(&worker)?.last_trim_at
     }
 
-    /// `(smallest item's units, item count)` of each window `worker` holds a
-    /// grant for.
+    /// The smallest item's units of each window `worker` holds a grant for.
     #[cfg(test)]
-    pub(in crate::inferio) fn open_grant_items_for_test(&self, worker: u64) -> Vec<(u64, usize)> {
+    pub(in crate::inferio) fn open_grant_items_for_test(&self, worker: u64) -> Vec<u64> {
         let state = self.lock();
         let grants = state
             .workers
@@ -191,7 +190,7 @@ impl VramLedger {
         grants
             .into_iter()
             .flatten()
-            .map(|charge| (charge.item_units, charge.items))
+            .map(|charge| charge.item_units)
             .collect()
     }
 

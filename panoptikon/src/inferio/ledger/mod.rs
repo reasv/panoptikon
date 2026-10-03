@@ -590,8 +590,8 @@ struct GrantCharge {
     unit_budget: u64,
     /// The units of the window's smallest item; at least 1.
     item_units: u64,
-    /// The window's item count.
-    items: usize,
+    /// The items per batch the worker packs to ([`Grant::user_cap_items`]).
+    batch_item_cap: Option<u32>,
     /// The batch size the gain rule asked for this window
     /// ([`VramLedger::size_locked`]), before anything cut it.
     size_asked: u64,
@@ -633,10 +633,10 @@ struct GrantCharge {
 }
 
 impl GrantCharge {
-    /// The window's batches held one item: the window held at most one, or
-    /// its budget is under two of its smallest items.
+    /// The window's batches held one item: the worker packs one item per
+    /// batch, or the budget is under two of the window's smallest items.
     fn one_item(&self) -> bool {
-        self.items <= 1 || self.unit_budget < self.item_units.saturating_mul(2)
+        self.batch_item_cap == Some(1) || self.unit_budget < self.item_units.saturating_mul(2)
     }
 }
 

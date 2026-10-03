@@ -356,7 +356,7 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         requests: 1,
         unit_budget: 64,
         item_units: 1,
-        items: 64,
+        batch_item_cap: None,
         size_asked: 64,
         granted_at: Instant::now(),
         squeezed: false,
