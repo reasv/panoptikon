@@ -41,21 +41,3 @@ def test_the_gateway_waits_for_a_late_recorder_and_names_a_silent_one(tmp_path):
     writer.join()
     assert legs.unsampled([late, silent], 0.3) == ["healthrec.jsonl"]
 
-
-def test_throughput_times_the_job_on_the_monotonic_clock(tmp_path, monkeypatch):
-    analyze = _load("analyze")
-    leg = types.SimpleNamespace(events=[])
-    for name, mono in (("job_posted", 1000.0), ("job_end", 1010.0)):
-        monkeypatch.setattr(legs.time, "monotonic", lambda: mono)
-        legs.Leg.mark(leg, name)
-    (tmp_path / "legs.json").write_text(json.dumps({"events": leg.events}))
-    # The wall clock stepped back 1.8 s during the 10 s job.
-    (tmp_path / "jobs.json").write_text(json.dumps({"history": [
-        {"total_segments": 100, "start_time": "2026-10-03T10:00:00",
-         "end_time": "2026-10-03T10:00:08.2"}]}))
-    out = tmp_path / "verdicts.json"
-    monkeypatch.undo()
-    analyze.main(["--scenario", str(tmp_path), "--checks", "throughput",
-                  "--json", str(out), "--quiet"])
-    (verdict,) = json.loads(out.read_text())["verdicts"]
-    assert verdict["numbers"]["items_per_s"] == 10.0

@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import sys
 from pathlib import Path
+
+import pytest
 
 ANALYZE = Path(__file__).resolve().parents[1] / "analyze.py"
 
@@ -686,3 +689,38 @@ def test_batch_coverage_counts_every_batch_from_each_workers_seq_1():
     # A seq that goes back is a new worker, counted from its seq 1.
     assert coverage(range(1, 5), (2, 3)) == ("WARN", 6, 1)
     assert coverage((), (), check=analyze.CHECKS["batch_coverage"])[0] == "SKIP"
+
+
+def test_throughput_subtracts_the_clock_step_legs_measured(tmp_path):
+    def leg(name, items, server_s, marks):
+        directory = tmp_path / name
+        directory.mkdir()
+        (directory / "jobs.json").write_text(json.dumps({"history": [
+            {"total_segments": items, "start_time": "2026-10-03T10:00:00",
+             "end_time": f"2026-10-03T10:00:{server_s:04.1f}"}]}))
+        (directory / "legs.json").write_text(json.dumps({"events": [
+            {"event": event, "iso": f"2026-10-03T10:00:{wall:06.3f}Z",
+             "t_mono": mono} for event, wall, mono in marks]}))
+        return directory / "jobs.json"
+
+    # Two jobs; the wall clock stepped back 1.8 s during the second.
+    ours = leg("ours", 100, 8.2, [
+        ("job_posted", 0.0, 1000.25), ("job_end", 3.0, 1003.25),
+        ("job_posted", 3.5, 1003.75), ("job_end", 8.45, 1010.5)])
+    # The baseline's clock stepped forward 2 s.
+    baseline = leg("c0", 100, 22.0, [
+        ("job_posted", 0.0, 50.5), ("job_end", 24.0, 72.5)])
+
+    def throughput(*argv):
+        out = tmp_path / "verdicts.json"
+        analyze.main(["--scenario", str(ours.parent), "--checks", "throughput",
+                      "--json", str(out), "--quiet", *argv])
+        (verdict,) = json.loads(out.read_text())["verdicts"]
+        return verdict["numbers"]
+
+    numbers = throughput("--baseline-jobs", str(baseline))
+    assert numbers["items_per_s"] == pytest.approx(10.0)
+    assert numbers["baseline_items_per_s"] == pytest.approx(5.0)
+    # An explicit --jobs may be another job's: no step is subtracted.
+    assert throughput("--jobs", str(ours))["items_per_s"] == pytest.approx(
+        100 / 8.2)

@@ -657,8 +657,8 @@ class FdRecorder(threading.Thread):
 
 
 def iso_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
-        f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def wait_for(predicate: Callable[[], bool], timeout: float,
@@ -901,7 +901,7 @@ class Leg:
     # -- recording ----------------------------------------------------------
 
     def mark(self, name: str, **detail: Any) -> None:
-        # `t_mono` times durations: the wall clock can step (WSL2 steps it).
+        # `t_mono` measures how far the wall clock steps (WSL2 steps it).
         record = {"iso": iso_now(), "t_mono": round(time.monotonic(), 3),
                   "event": name, **detail}
         self.events.append(record)
@@ -936,9 +936,7 @@ class Leg:
             if time.monotonic() - started > cap:
                 self.mark("job_cap_exceeded", cap_s=cap)
                 return "cap_exceeded"
-            # `job_end` ends the job's measured duration: polled often enough
-            # that a short job's rate is not off by the poll.
-            time.sleep(0.25)
+            time.sleep(2.0)
 
     def prepare_database(self, corpus: Path, db: Optional[str] = None,
                          tag: str = "") -> int:
