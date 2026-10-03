@@ -806,13 +806,14 @@ remain manageable by the Python server during the transition.
 
 On Linux and macOS, before migrating, the server checks that it can write every
 database in `data_folder` (with its `-wal` and `-shm` files and its folder) and
-the folders it still has to create databases in; this runs the same way inside
-and outside Docker. After a run as another user (`sudo panoptikon`), what that
-user created belongs to it, and the next start stops with an error naming the
-file and its owner. Change the owner of the folder the error names back (`sudo
-chown -R "$USER" <folder>`); behind a symlink, that folder is the link's
-target, since `chown -R` does not follow links. To keep a database another user
-owns unchanged (an archive), move it out of `data_folder`. The check lets a
+the folders it still has to create databases in, inside Docker too. After a run
+as another user (`sudo panoptikon`), the next start stops with an error naming a
+file that user created and its owner. Change the owner of the folder the error
+names back (`sudo chown -R "$USER" <folder>`; Docker volumes: "Running as
+another user" in the [root README](../README.md#docker)); behind a symlink, that
+folder is the link's target, since `chown -R` does not follow links. For an
+archive another user owns, the error offers moving out a linked index folder's
+link or a `user_data` database file with its `-wal` and `-shm`. The check lets a
 read-only filesystem through; it is named when a migration then fails on it.
 
 ## Production UI

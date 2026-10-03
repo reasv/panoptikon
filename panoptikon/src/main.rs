@@ -1024,7 +1024,8 @@ mod route_tests {
     /// The refusal comes before any migration: the default database's folder
     /// is a symlink to a folder another user owns, whose owner is the one to
     /// change. A failed migration (here, after that folder appears) is
-    /// explained by it only when it failed on the default database.
+    /// explained by it only when it failed on the default database. The data
+    /// folder is relative, as shipped.
     #[cfg(unix)]
     #[tokio::test]
     async fn startup_refuses_or_explains_a_database_folder_another_user_owns() {
@@ -1034,8 +1035,11 @@ mod route_tests {
             return;
         };
         let data = tempfile::tempdir().unwrap();
-        let default = data.path().join("index/default");
-        std::fs::create_dir_all(data.path().join("user_data")).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let up: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
+        let relative = up.join(data.path().strip_prefix("/").unwrap());
+        let default = std::path::absolute(relative.join("index/default")).unwrap();
+        std::fs::create_dir_all(relative.join("user_data")).unwrap();
         std::fs::create_dir(default.parent().unwrap()).unwrap();
         let expected = owned_by_another_user(&default, owner, folder);
 
@@ -1046,10 +1050,10 @@ mod route_tests {
             let _ = std::fs::remove_file(&default);
             let migrate = async {
                 std::os::unix::fs::symlink(folder, &default)?;
-                let failed = FailedDatabase(data.path().join(db));
+                let failed = FailedDatabase(relative.join(db));
                 Err::<(), anyhow::Error>(anyhow::anyhow!("migration failed").context(failed))
             };
-            let error = migrate_at_startup(data.path(), "default", migrate)
+            let error = migrate_at_startup(&relative, "default", migrate)
                 .await
                 .unwrap_err();
             let error = format!("{error:#}");
@@ -1058,7 +1062,7 @@ mod route_tests {
         }
 
         let migrate = async { Err(anyhow::anyhow!("migrated")) };
-        let error = migrate_at_startup(data.path(), "default", migrate)
+        let error = migrate_at_startup(&relative, "default", migrate)
             .await
             .unwrap_err();
         let error = format!("{error:#}");

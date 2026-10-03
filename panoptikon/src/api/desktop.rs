@@ -1273,7 +1273,10 @@ pub(crate) async fn complete_setup(
             ApiError::internal("Failed to create index database")
         })?
         .map_err(|error| {
-            tracing::error!(%error, "failed to create Desktop index database");
+            tracing::error!(
+                error = %format_args!("{error:#}"),
+                "failed to create Desktop index database"
+            );
             ApiError::internal("Failed to create index database")
         })?;
         (paths.index_db, paths.user_data_db)

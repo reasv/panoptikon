@@ -19,9 +19,9 @@ pub(crate) fn check_databases(data_folder: &Path, index_db: &str) -> anyhow::Res
     }
 }
 
-/// The first of `paths` with a `problem`, as a message. An index database's
-/// folder, or a user-data database file, can instead be moved out of the data
-/// folder while its own folder is writable.
+/// The first of `paths` with a `problem`, as a message. A symlinked index
+/// database folder, or a user-data database file, can instead be moved out of
+/// the data folder while the folder holding it is writable.
 fn refusal(
     data_folder: &Path,
     paths: &[PathBuf],
@@ -32,9 +32,10 @@ fn refusal(
         .find_map(|path| problem(path).map(|reason| (path, reason)))?;
     let (index, user_data) = (data_folder.join("index"), data_folder.join("user_data"));
     let extension = path.extension().and_then(|extension| extension.to_str());
-    let movable = (path.parent() == Some(index.as_path()) && problem(&index).is_none())
-        || (path.parent() == Some(user_data.as_path())
-            && extension.is_some_and(|extension| extension.eq_ignore_ascii_case("db")));
+    let movable =
+        (path.parent() == Some(index.as_path()) && path.is_symlink() && problem(&index).is_none())
+            || (path.parent() == Some(user_data.as_path())
+                && extension.is_some_and(|extension| extension.eq_ignore_ascii_case("db")));
     if !movable {
         return Some(reason);
     }
@@ -64,8 +65,9 @@ fn migration_paths(err: &anyhow::Error) -> Vec<PathBuf> {
 
 /// Adds to `err` the first of `paths` the current user cannot write because
 /// another user owns it or because its filesystem is read-only; `err`
-/// unchanged without one. `tree` is the folder whose owner to change in the
-/// first case.
+/// unchanged without one. In the first case the folder whose owner to change
+/// is `tree` (the data folder for a migration), or the target of a symlink
+/// below it (`chown_target`).
 pub(crate) fn explain(err: anyhow::Error, tree: &Path, paths: &[PathBuf]) -> anyhow::Error {
     #[cfg(unix)]
     {
@@ -394,21 +396,22 @@ pub(crate) mod tests {
         );
     }
 
-    /// An index database's folder or a user-data database can instead be
-    /// moved out of the data folder while the folder holding it is writable;
-    /// a file inside a database's folder, a `-wal` or `-shm`, and a folder the
-    /// server creates databases in cannot.
+    /// A user-data database can instead be moved out of the data folder while
+    /// `user_data/` is writable; a real index database folder (it cannot be
+    /// moved without write access on it), a file inside it, a `-wal` or `-shm`,
+    /// and a folder the server creates databases in cannot.
     #[test]
     fn a_database_its_wal_files_or_its_folder_owned_by_root_refuses() {
         let data = data_folder();
         for (owned, database) in [
-            ("index/default", true),
+            ("index/default", false),
             ("index/default/index.db", false),
             ("index/default/storage.db-shm", false),
-            ("index/second", true),
+            ("index/second", false),
             ("index/second/index.db", false),
             ("user_data", false),
             ("user_data/default.db", true),
+            ("user_data/other.DB", true),
             ("user_data/other.DB-wal", false),
         ] {
             let owned = data.path().join(owned);
