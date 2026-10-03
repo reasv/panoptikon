@@ -693,17 +693,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let link = root.path().join("runtime");
         std::os::unix::fs::symlink(folder, &link).unwrap();
+        let share = link.join("share");
+        if !share.is_dir() {
+            return;
+        }
         let archive = tar_gz(&[("a.txt", "")]);
-        let error = ensure_extracted_archive(&archive, &link.join("pysrc/1.0.0"), "test set");
+        let error = ensure_extracted_archive(&archive, &share.join("pysrc/1.0.0"), "test set");
         let error = format!("{:#}", error.unwrap_err());
-        let expected = owned_by_another_user(&link, owner, folder);
+        let expected = owned_by_another_user(&share, owner, &share);
         assert!(error.starts_with(&expected), "{error}");
         #[cfg(feature = "bundled")]
         {
-            let link = root.path().join("config");
-            std::os::unix::fs::symlink(folder, &link).unwrap();
-            let error = format!("{:#}", write_default_configs_in(root.path()).unwrap_err());
-            let expected = owned_by_another_user(&link, owner, folder);
+            let error = format!("{:#}", write_default_configs_in(&share).unwrap_err());
             assert!(error.starts_with(&expected), "{error}");
         }
     }

@@ -2413,7 +2413,10 @@ sample_delta_mb = [80, 160]
             "nothing was written over the unread store"
         );
         assert!(!store.local_is_loaded(), "and the failure was not cached");
-        assert_eq!(reasons.lock().unwrap().len(), 1, "one cause, one WARN");
+        assert!(
+            matches!(reasons.lock().unwrap()[..], [Some(_)]),
+            "one cause, one WARN"
+        );
 
         // The file becomes readable again, carrying another model this
         // process never saw. The retry merges rather than truncating.
@@ -2449,33 +2452,57 @@ sample_delta_mb = [80, 160]
     }
 
     /// A store folder another user owns is warned about once, naming it and
-    /// its owner, however many writes fail, and again after a write succeeds;
-    /// the update stays in memory.
+    /// its owner, however many writes fail, again after a write succeeds, and
+    /// once for a new cause; the update stays in memory.
     #[cfg(unix)]
     #[test]
     fn a_store_folder_another_user_owns_is_warned_about_once() {
         use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
         let Some((folder, owner)) = foreign_folder(false) else {
             return;
         };
+        if !folder.join("share").is_dir() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let data = root.path().join("data");
-        std::os::unix::fs::symlink(folder, &data).unwrap();
-        let store = store(root.path());
+        symlink(folder, &data).unwrap();
+        let store = CalibrationStore::with_debounce(
+            StorePaths {
+                shipped_dirs: vec![root.path().join("shipped")],
+                local_path: data.join("share/inferio/calibration.toml"),
+            },
+            env(),
+            Duration::ZERO,
+        );
         let (_guard, reasons) = crate::test_utils::warned_reasons();
         for slope in [0.5, 0.6, 0.7] {
             store.record(update("clip/vit", "fp16", slope));
         }
         approx(lookup(&store, "clip/vit").unwrap().slope_mb_per_unit, 0.7);
+        let relink = |target: &Path| {
+            fs::remove_file(&data).unwrap();
+            symlink(target, &data).unwrap();
+        };
         let writable = tempfile::tempdir().unwrap();
-        fs::remove_file(&data).unwrap();
-        std::os::unix::fs::symlink(writable.path(), &data).unwrap();
-        store.record(update("clip/vit", "fp16", 0.8));
-        fs::remove_file(&data).unwrap();
-        std::os::unix::fs::symlink(folder, &data).unwrap();
+        relink(writable.path());
+        CalibrationProfiles::flush(store.as_ref());
+        relink(folder);
         store.record(update("clip/vit", "fp16", 0.9));
-        let expected = Some(owned_by_another_user(&data, owner, folder));
-        assert_eq!(*reasons.lock().unwrap(), [expected.clone(), expected]);
+        let own = tempfile::tempdir().unwrap();
+        fs::create_dir_all(own.path().join("share/inferio")).unwrap();
+        let read_only = fs::Permissions::from_mode(0o555);
+        fs::set_permissions(own.path().join("share/inferio"), read_only).unwrap();
+        relink(own.path());
+        store.record(update("clip/vit", "fp16", 1.0));
+        store.record(update("clip/vit", "fp16", 1.1));
+        let reasons = reasons.lock().unwrap();
+        let share = data.join("share");
+        let expected = Some(owned_by_another_user(&share, owner, &share));
+        assert_eq!(reasons[..2], [expected.clone(), expected]);
+        assert_eq!(reasons.len(), 3);
+        assert_ne!(reasons[2], reasons[1]);
     }
 
     /// A local entry with no fit of its own — what the ledger writes while it

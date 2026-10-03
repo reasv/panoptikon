@@ -142,9 +142,13 @@ base_url = "http://127.0.0.1:6342"
         let root = tempfile::tempdir().unwrap();
         let link = root.path().join("logs");
         std::os::unix::fs::symlink(folder, &link).unwrap();
-        let error = open_logs_file(&link.join("panoptikon.log")).unwrap_err();
+        let share = link.join("share");
+        if !share.is_dir() {
+            return;
+        }
+        let error = open_logs_file(&share.join("panoptikon.log")).unwrap_err();
         let error = format!("{error:#}");
-        let expected = owned_by_another_user(&link, owner, folder);
+        let expected = owned_by_another_user(&share, owner, &share);
         assert!(error.starts_with(&expected), "{error}");
     }
 
