@@ -240,8 +240,7 @@ pub struct OversizedLoad {
     /// The base, or the working set ([`UnrunnableReplica::needs_mb`]) once a
     /// replica here was condemned.
     pub needs_mb: u64,
-    /// What is left after other processes, before the reserve and our own
-    /// residents.
+    /// The refusal room ([`VramLedger::refusal_room_locked`]), before our own residents.
     pub room_mb: u64,
     /// Refused because its worker kept dying at one item
     /// ([`UnrunnableReplica::died`]), not for its size: `needs_mb` is 0.
