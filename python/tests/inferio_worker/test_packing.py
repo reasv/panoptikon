@@ -2567,6 +2567,7 @@ def nvml_card(cuda, monkeypatch, total_mb=8192, others_mb=1000):
 
     monkeypatch.setattr(memory, "_nvml_memory", reading)
     monkeypatch.setitem(memory._release_state, "largest_units", None)
+    monkeypatch.setitem(memory._release_state, "largest_input", None)
 
 
 @pytest.fixture
@@ -2638,8 +2639,9 @@ def test_no_release_or_spill_flag_off_a_spill_capable_host(
     payloads = run_growing_windows(fake_torch)
     impl = caching_impl(fake_torch, [8192 + 1000])
     payloads.append(packing.run_window(impl, items(1), grant(unit_budget=1)))
+    payloads.append(packing.run_grantless_window(impl, items(2)))
     assert [m["items"] for m in payloads[2]["measurements"]] == [4, 1]
-    assert fake_torch.reserved == (8192 + 1000) * MIB
+    assert fake_torch.reserved == 2 * (8192 + 1000) * MIB
     assert fake_torch.empty_cache_calls == 0
     assert not any(m.get("spilled") for p in payloads for m in p["measurements"])
 
@@ -2653,6 +2655,36 @@ def test_the_backstop_needs_nvml(fake_torch, monkeypatch):
     assert payload["memory"]["free_source"] == "torch"
     assert "spilled" not in payload["measurements"][0]
     assert fake_torch.empty_cache_calls == 0
+
+
+def test_a_grantless_window_releases_the_pool_before_a_larger_input_only(
+    spill_host,
+):
+    """The grantless path runs a window in one call: the pool is released
+    before a window whose largest input is larger than any since the last
+    release."""
+    impl = caching_impl(spill_host, [100])
+    payloads = [
+        packing.run_grantless_window(
+            impl, [PredictionInput(data=0, file=png_bytes(w, h)) for w, h in window]
+        )
+        for window in ([(40, 30)], [(40, 30), (30, 40)], [(100, 100)], [(40, 30)])
+    ]
+    assert spill_host.empty_cache_calls == 1
+    assert [p["measurements"][0].get("regrow_after") for p in payloads] == [
+        None, None, memory.GROWTH_RELEASE, None
+    ]
+
+
+def test_a_grantless_window_that_spills_is_flagged_and_warned_of_once(
+    spill_host, caplog
+):
+    impl = caching_impl(spill_host, [8192 + 1000])
+    with caplog.at_level(logging.DEBUG, logger="inferio_worker.packing"):
+        payloads = [packing.run_grantless_window(impl, items(1)) for _ in range(2)]
+    assert [p["measurements"][0].get("spilled") for p in payloads] == [True, True]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, "a spill no release could clear: warned of once"
 
 
 def test_any_release_restarts_the_largest_batch_record(spill_host):

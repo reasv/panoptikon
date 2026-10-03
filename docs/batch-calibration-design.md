@@ -2109,6 +2109,11 @@ unpriced and without spill handling, and the host warns at startup.
   - **Tolerance.** The largest P − U seen without a spill was −533 MiB under
     WSL2, −717 MiB on Linux and −5986 MiB on a native-Windows display GPU.
     The spills read +2.9 to +5.4 GB on their first spilled batch.
+- **Grantless windows.** A window that runs in one `predict` call (a model
+  with no admission, or an impl that batches internally) gets the same
+  release, before a window whose largest input (an image's pixels, else its
+  bytes) is larger than any since the last release, and the same backstop
+  flag and warning. Nothing is halved: the window is one call.
 - **Blind spot.** U also counts our CUDA context and other processes'
   resident memory, so a spill smaller than those reads as negative. A spill
   of about 1 GB ran for 165 s at 0.63× the smaller size's rate and read

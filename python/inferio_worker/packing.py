@@ -922,16 +922,43 @@ def clamp_to_live_memory(
 # --- Running a window ---
 
 
+def _input_size(entry: Any) -> int:
+    """An input's size for comparing grantless windows: an image's pixel
+    count, else the bytes of its file or text."""
+    file = getattr(entry, "file", None)
+    shape = _shape(file)
+    if shape is not None:
+        return shape[0] * shape[1]
+    return _text_bytes(file if file is not None else getattr(entry, "data", None))
+
+
 def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]:
     """The grantless path: the whole window in one GPU batch. The `finally`
     stops the batch's peak sampler if `predict` raises.
+
+    Where a full GPU spills to system RAM, the pool is released before a
+    window whose largest input is larger than any since the last release (as
+    `run_window` does before a growing batch), and a window whose pool ends
+    above NVML's used memory is flagged `spilled`.
     """
+    spill_host = memory.spill_capable()
+    largest = max(map(_input_size, inputs), default=0) if spill_host else 0
+    if spill_host and memory.outgrows_pool(largest, "largest_input"):
+        memory.empty_cache(memory.GROWTH_RELEASE)
     state = memory.begin_batch()
     try:
         outputs = list(instance.predict(inputs))
-        return {"outputs": outputs, **memory.finish_batch(state, items=len(inputs))}
+        payload = {"outputs": outputs, **memory.finish_batch(state, items=len(inputs))}
     finally:
         memory.abandon_batch(state)
+    if spill_host:
+        memory.note_batch_units(largest, "largest_input")
+        off_device_mb = pool_off_device_mb(payload.get("memory"))
+        if off_device_mb is not None and off_device_mb > SPILL_TOLERANCE_MB:
+            payload["measurements"][0]["spilled"] = True
+            reserved_mb = payload["memory"]["reserved_mb"]
+            _log_spill(reserved_mb, off_device_mb, False, off_device_mb)
+    return payload
 
 
 
