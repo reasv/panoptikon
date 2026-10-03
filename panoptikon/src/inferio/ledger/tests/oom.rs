@@ -593,7 +593,7 @@ fn one_item_windows_that_spill_condemn_the_replica() {
         .expect("registers");
     push_memory(&handle, 4_000, 0);
     ledger.ingest_all_for_test();
-    let window = |spilled| {
+    let window = |spilled, items| {
         let token = admission.request_grant(1, None, 1, 0).expect("granted");
         assert_eq!(token.grant().unit_budget, 1, "one item in hand");
         handle
@@ -601,17 +601,23 @@ fn one_item_windows_that_spill_condemn_the_replica() {
             .unwrap()
             .record_measurements(vec![BatchMeasurement {
                 spilled,
+                items: Some(items),
                 ..warm_batch(1, 1.0)
             }]);
         token.finish(WindowOutcome::Responded { oom: None })
     };
     for _ in 0..(2 * OOM_WINDOWS_AT_FLOOR) {
-        assert!(window(false).is_none(), "a clean window");
+        assert!(window(false, 1).is_none(), "a clean window");
+    }
+    // A window run in one call of several items (an impl that batches
+    // internally) spilled what a smaller call might not.
+    for _ in 0..(2 * OOM_WINDOWS_AT_FLOOR) {
+        assert!(window(true, 4).is_none(), "not one item");
     }
     for _ in 1..OOM_WINDOWS_AT_FLOOR {
-        assert!(window(true).is_none());
+        assert!(window(true, 1).is_none());
     }
-    let verdict = window(true).expect("three one-item spills condemn it");
+    let verdict = window(true, 1).expect("three one-item spills condemn it");
     assert_eq!(verdict.base_mb, 20_000);
     assert!(verdict.needs_mb > verdict.room_mb, "{verdict}");
 }

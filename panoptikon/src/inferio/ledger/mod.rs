@@ -1108,6 +1108,8 @@ struct Ingested {
     oom: bool,
     throughput_collapse: bool,
     spill: bool,
+    /// A batch of one item spilled.
+    one_item_spill: bool,
     /// The first trusted OOM classification, and how many measurements had one.
     oom_evidence: Option<OomEvidence>,
     oom_samples: usize,

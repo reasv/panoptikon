@@ -517,7 +517,7 @@ impl VramLedger {
             worker,
             charge,
             frame_oom.is_some() || ingested.oom || died,
-            responded_negative && ingested.spill,
+            responded_negative && ingested.one_item_spill,
             died,
             matches!(outcome, WindowOutcome::Responded { .. }) && !responded_negative,
         );

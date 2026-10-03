@@ -1233,9 +1233,10 @@ impl's own kernels have said they cannot execute at this corpus's shapes.
   on the 5090, where all 8 002 out-of-memory lines were priced windows. A
   one-item out-of-memory with room to spare stays the backstop's
   ordinary business. Where the driver spills instead of failing (WDDM's
-  sysmem fallback), a one-item window whose batch spilled is a strike
-  whatever the room: a one-item batch's pool is never released, so its spill
-  is live memory that does not fit.
+  sysmem fallback), a one-unit window whose one-item batch spilled is a
+  strike whatever the room: a one-item batch's pool is never released, so
+  its spill is live memory that does not fit. A window run in one call of
+  several items (an impl that batches internally) is not.
 
   **The pre-fit price of one item.** With no slope there is no measured
   price for one item, and both obvious stand-ins fail. The whole base

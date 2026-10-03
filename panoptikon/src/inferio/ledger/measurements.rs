@@ -348,6 +348,7 @@ impl VramLedger {
         let mut saw_oom = false;
         let mut saw_collapse = false;
         let mut saw_spill = false;
+        let mut saw_one_item_spill = false;
         let mut new_watermark = watermark;
         let mut fit_samples: Vec<FitSample> = Vec::new();
         let mut ram_samples: Vec<FitSample> = Vec::new();
@@ -562,6 +563,7 @@ impl VramLedger {
                 saw_oom |= oom;
                 saw_collapse |= collapse;
                 saw_spill |= measurement.spilled;
+                saw_one_item_spill |= measurement.spilled && measurement.items == Some(1);
                 continue;
             }
             if collapse_suppressed || uncorroborated {
@@ -900,6 +902,7 @@ impl VramLedger {
             oom: saw_oom,
             throughput_collapse: saw_collapse,
             spill: saw_spill,
+            one_item_spill: saw_one_item_spill,
             oom_evidence: trusted_oom,
             oom_samples: trusted_ooms,
             clamps,
