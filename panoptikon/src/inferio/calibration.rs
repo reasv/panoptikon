@@ -2452,7 +2452,7 @@ sample_delta_mb = [80, 160]
             store.record(update("clip/vit", "fp16", slope));
         }
         let expected = owned_by_another_user(&data, owner, folder);
-        assert_eq!(*reasons.lock().unwrap(), [expected]);
+        assert_eq!(*reasons.lock().unwrap(), [Some(expected)]);
         approx(lookup(&store, "clip/vit").unwrap().slope_mb_per_unit, 0.7);
     }
 

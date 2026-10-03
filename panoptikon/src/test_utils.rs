@@ -144,11 +144,11 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AskEveryEvent {
     }
 }
 
-/// The `reason` field of every WARN event this thread logs while the guard
-/// lives.
+/// One entry per WARN event this thread logs while the guard lives: its
+/// `reason` field, if any.
 pub(crate) fn warned_reasons() -> (
     tracing::subscriber::DefaultGuard,
-    std::sync::Arc<Mutex<Vec<String>>>,
+    std::sync::Arc<Mutex<Vec<Option<String>>>>,
 ) {
     use tracing_subscriber::layer::SubscriberExt;
     install_ask_every_event();
@@ -157,22 +157,24 @@ pub(crate) fn warned_reasons() -> (
     (tracing::subscriber::set_default(subscriber), reasons)
 }
 
-struct WarnedReasons(std::sync::Arc<Mutex<Vec<String>>>);
+struct WarnedReasons(std::sync::Arc<Mutex<Vec<Option<String>>>>);
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnedReasons {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         if *event.metadata().level() == tracing::Level::WARN {
-            event.record(&mut Reason(&self.0));
+            let mut reason = Reason(None);
+            event.record(&mut reason);
+            self.0.lock().unwrap().push(reason.0);
         }
     }
 }
 
-struct Reason<'a>(&'a Mutex<Vec<String>>);
+struct Reason(Option<String>);
 
-impl tracing::field::Visit for Reason<'_> {
+impl tracing::field::Visit for Reason {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "reason" {
-            self.0.lock().unwrap().push(value.to_owned());
+            self.0 = Some(value.to_owned());
         }
     }
 

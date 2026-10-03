@@ -313,6 +313,9 @@ async fn acquire_read_conn(
 
     pool.acquire().await.map_err(|err| {
         tracing::error!(error = %err, "failed to acquire read connection");
+        if let Ok(paths) = db_paths(&names.index_db, &names.user_data_db) {
+            log_open_problem(&paths, attach_user_data);
+        }
         ApiError::internal("Failed to open database")
     })
 }
@@ -333,7 +336,7 @@ async fn build_read_pool(paths: &DbPaths, attach_user_data: bool) -> Result<Sqli
     };
     if let Err(err) = opened.await {
         tracing::error!(error = %err, "failed to open read connection");
-        log_open_problem(paths);
+        log_open_problem(paths, attach_user_data);
         return Err(ApiError::internal("Failed to open database"));
     }
     let pool = SqlitePoolOptions::new()
@@ -638,21 +641,23 @@ async fn connect_db(
 ) -> Result<SqliteConnection, ApiError> {
     let conn = open_db(paths, write_lock, user_data_wl, attach_user_data).await;
     if conn.is_err() {
-        log_open_problem(paths);
+        log_open_problem(paths, attach_user_data);
     }
     conn
 }
 
-/// Logs, once per cause, why a database in `paths` cannot be written:
-/// another user owns it or its filesystem is read-only.
-fn log_open_problem(paths: &DbPaths) {
+/// Logs, once per cause for the life of the process, why a database in
+/// `paths` cannot be written: another user owns it or its filesystem is
+/// read-only. The user-data file is checked only when it was attached.
+fn log_open_problem(paths: &DbPaths, attach_user_data: bool) {
     static LOGGED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    let user_db_file = attach_user_data.then_some(&paths.user_db_file);
     let files = [
-        &paths.index_db_file,
-        &paths.storage_db_file,
-        &paths.user_db_file,
+        Some(&paths.index_db_file),
+        Some(&paths.storage_db_file),
+        user_db_file,
     ];
-    let Some(reason) = files.into_iter().find_map(|file| {
+    let Some(reason) = files.into_iter().flatten().find_map(|file| {
         let name = file.file_name()?.to_str()?;
         crate::ownership::database_problem(file.parent()?, name)
     }) else {
@@ -905,50 +910,28 @@ mod tests {
         assert_eq!(sync, 1, "synchronous is NORMAL");
     }
 
-    /// A database the server cannot write fails a request at once, and a
+    /// A database that cannot be opened fails a request at once, and a
     /// folder another user owns is logged once, naming the folder and its
     /// owner.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_database_the_server_cannot_write_fails_at_once_naming_the_owner() {
+    async fn a_database_that_cannot_be_opened_fails_at_once_and_names_the_owner() {
         use crate::ownership::tests::{foreign_folder, owned_by_another_user};
-        use std::os::unix::fs::PermissionsExt as _;
         let env = crate::test_utils::test_data_dir();
-        let folder = env.path().join("index/unwritable");
+        let folder = env.path().join("index/index_only");
         fs::create_dir_all(&folder).unwrap();
-        for name in ["index.db", "storage.db"] {
-            let options = SqliteConnectOptions::new()
-                .filename(folder.join(name))
-                .create_if_missing(true);
-            let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
-            let _: String = sqlx::query_scalar("PRAGMA journal_mode=WAL")
-                .fetch_one(&mut conn)
-                .await
-                .unwrap();
-            sqlx::query("CREATE TABLE t (x)")
-                .execute(&mut conn)
-                .await
-                .unwrap();
-            conn.close().await.unwrap();
-        }
-        // A WAL database is read through a `-shm` the folder must hold.
-        let mode = |mode| fs::set_permissions(&folder, fs::Permissions::from_mode(mode)).unwrap();
-        mode(0o555);
-        let unwritable = tempfile::tempfile_in(&folder).is_err();
+        fs::write(folder.join("index.db"), "").unwrap();
         let query = DbQuery {
-            index_db: Some("unwritable".to_owned()),
+            index_db: Some("index_only".to_owned()),
             user_data_db: None,
         };
         let names = resolve_db_names_unchecked(&query);
         let started = std::time::Instant::now();
         let result = acquire_read_conn(&query, &names, false).await;
         let elapsed = started.elapsed();
-        mode(0o755);
         fs::remove_dir_all(&folder).unwrap();
-        if unwritable {
-            assert!(result.is_err());
-            assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
-        }
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
 
         let Some((foreign, owner)) = foreign_folder(false) else {
             return;
@@ -956,16 +939,14 @@ mod tests {
         let link = env.path().join("index/foreign_owned");
         std::os::unix::fs::symlink(foreign, &link).unwrap();
         let (_guard, reasons) = crate::test_utils::warned_reasons();
+        let mut opened = Vec::new();
         for _ in 0..2 {
-            assert!(
-                open_index_db_write_no_user_data("foreign_owned")
-                    .await
-                    .is_err()
-            );
+            opened.push(open_index_db_write_no_user_data("foreign_owned").await);
         }
         fs::remove_file(&link).unwrap();
+        assert!(opened.iter().all(Result::is_err));
         let expected = owned_by_another_user(&link, owner, foreign);
-        assert_eq!(*reasons.lock().unwrap(), [expected]);
+        assert_eq!(*reasons.lock().unwrap(), [Some(expected)]);
     }
 
     /// Pins the `UserDataWrite` connection shape: index (`main`) and
