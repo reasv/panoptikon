@@ -11,6 +11,7 @@
 //! unparseable identity makes the whole result unknown, and unknown leaves
 //! pins untouched.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -36,6 +37,10 @@ pub const HIP_PIN_ENV_VAR: &str = "HIP_VISIBLE_DEVICES";
 /// against the GPU it resolved, falling back to discrete arithmetic on a
 /// mismatch.
 pub const UNIFIED_GPU_ENV_VAR: &str = "PANOPTIKON_UNIFIED_GPU";
+
+/// Set on a worker on an NVIDIA GPU: `1` when a full allocation there spills
+/// to system RAM ([`GpuInventory::spills_to_ram`]), `0` when it fails.
+pub const SPILLS_TO_RAM_ENV_VAR: &str = "PANOPTIKON_SPILLS_TO_RAM";
 
 /// Written next to the visibility variable with the same pin, so the worker
 /// can tell our pin from an operator's ambient one
@@ -138,10 +143,12 @@ pub struct GpuInventory {
 
 /// Which interface answers live-memory queries and which pin vocabulary
 /// applies, set from the resolved accelerator.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 enum MemoryBackend {
-    #[default]
-    NvidiaSmi,
+    NvidiaSmi {
+        /// The GPUs (by UUID) that move memory to system RAM when full.
+        spilling: Arc<[String]>,
+    },
     RocmSysfs {
         /// The PCI device root the probe read, reused by the refresh.
         pci_devices: PathBuf,
@@ -157,6 +164,14 @@ enum MemoryBackend {
     Mps,
     /// No accelerator; only the CPU device. No pins.
     Cpu,
+}
+
+impl Default for MemoryBackend {
+    fn default() -> Self {
+        Self::NvidiaSmi {
+            spilling: Arc::default(),
+        }
+    }
 }
 
 /// Everything one `nvidia-smi` call tells us about this host's GPUs.
@@ -183,10 +198,13 @@ pub fn probe(accelerator: Accelerator) -> HostGpus {
         Accelerator::Cuda | Accelerator::Auto => {
             // nvidia-smi ignores CUDA_VISIBLE_DEVICES, so it is applied here.
             let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
-            let host = build(query(accelerator).as_deref(), visible.as_deref());
-            if host.inventory.gpus().is_some_and(|gpus| !gpus.is_empty())
-                && host.inventory.spills_to_ram()
-            {
+            let mut host = build(query(accelerator).as_deref(), visible.as_deref());
+            let platform = DriverPlatform::current();
+            let models = (platform == DriverPlatform::Windows)
+                .then(query_driver_models)
+                .flatten();
+            host.inventory.set_spilling(platform, models.as_deref());
+            if !host.inventory.spilling_gpus().is_empty() {
                 tracing::warn!(
                     "with the NVIDIA driver's default \"CUDA - Sysmem Fallback Policy\", a GPU \
                      that runs out of memory silently uses system RAM instead of failing, and \
@@ -201,10 +219,70 @@ pub fn probe(accelerator: Accelerator) -> HostGpus {
     with_cpu_device(host)
 }
 
-/// The GPU is driven by the Windows display driver: native Windows, or Linux
-/// under WSL2 or Docker Desktop, which expose it as `/dev/dxg`.
-fn windows_gpu_driver() -> bool {
-    cfg!(windows) || (cfg!(target_os = "linux") && std::path::Path::new("/dev/dxg").exists())
+/// The GPU device WSL2 and Docker Desktop expose: the Windows display driver.
+const WSL_GPU_DEVICE: &str = "/dev/dxg";
+
+/// Where the NVIDIA driver runs, for [`spills`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverPlatform {
+    /// Native Windows: each GPU has its own driver model.
+    Windows,
+    /// Linux under WSL2 or Docker Desktop: every GPU goes through the Windows
+    /// display driver.
+    Wsl,
+    /// Any other host.
+    Other,
+}
+
+impl DriverPlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "linux") && std::path::Path::new(WSL_GPU_DEVICE).exists() {
+            Self::Wsl
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Whether a full NVIDIA GPU moves memory to system RAM instead of failing
+/// the allocation. The Windows display driver model (WDDM) does; TCC and
+/// MCDM, the compute-only models, fail it. A driver model nvidia-smi did not
+/// report counts as WDDM, the model every display GPU runs.
+fn spills(platform: DriverPlatform, driver_model: Option<&str>) -> bool {
+    match platform {
+        DriverPlatform::Other => false,
+        DriverPlatform::Wsl => true,
+        DriverPlatform::Windows => !driver_model.is_some_and(|model| {
+            let model = model.trim();
+            model.eq_ignore_ascii_case("TCC") || model.eq_ignore_ascii_case("MCDM")
+        }),
+    }
+}
+
+/// Each GPU's current driver model (native Windows only). `None` on any
+/// failure, which [`spills`] reads as WDDM.
+fn query_driver_models() -> Option<String> {
+    let mut cmd = Command::new(find_nvidia_smi()?);
+    cmd.args([
+        "--query-gpu=uuid,driver_model.current",
+        "--format=csv,noheader",
+    ]);
+    let output = output_with_timeout(cmd, Duration::from_secs(5))?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `uuid, driver model` rows; unparseable rows are skipped.
+fn parse_driver_models(stdout: &str) -> HashMap<&str, &str> {
+    stdout
+        .lines()
+        .filter_map(|line| line.split_once(','))
+        .map(|(uuid, model)| (uuid.trim(), model.trim()))
+        .collect()
 }
 
 /// Append the CPU device after the accelerators, so a CPU worker on any host
@@ -544,7 +622,7 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
                     gpus: Some(Vec::new().into()),
                     adoptable: None,
                     adopted: Arc::default(),
-                    backend: MemoryBackend::NvidiaSmi,
+                    backend: MemoryBackend::default(),
                     cpu_roots: None,
                     blank_mask: true,
                 },
@@ -557,7 +635,7 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
                     gpus: None,
                     adoptable: Some(reported.into()),
                     adopted: Arc::default(),
-                    backend: MemoryBackend::NvidiaSmi,
+                    backend: MemoryBackend::default(),
                     cpu_roots: None,
                     blank_mask: false,
                 },
@@ -580,7 +658,7 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
             gpus: Some(gpus.into()),
             adoptable: None,
             adopted: Arc::default(),
-            backend: MemoryBackend::NvidiaSmi,
+            backend: MemoryBackend::default(),
             cpu_roots: None,
             blank_mask: false,
         },
@@ -704,7 +782,7 @@ impl GpuInventory {
             gpus: (!gpus.is_empty()).then(|| gpus.into()),
             adoptable: None,
             adopted: Arc::default(),
-            backend: MemoryBackend::NvidiaSmi,
+            backend: MemoryBackend::default(),
             cpu_roots: None,
             blank_mask: false,
         }
@@ -793,17 +871,45 @@ impl GpuInventory {
             return "cpu";
         }
         match self.backend {
-            MemoryBackend::NvidiaSmi => "cuda",
+            MemoryBackend::NvidiaSmi { .. } => "cuda",
             MemoryBackend::RocmSysfs { .. } => "rocm",
             MemoryBackend::Mps => "mps",
             MemoryBackend::Cpu => "cpu",
         }
     }
 
-    /// A full CUDA GPU on this host moves memory to system RAM instead of
-    /// failing the allocation: the driver is the Windows display driver.
-    pub(super) fn spills_to_ram(&self) -> bool {
-        matches!(self.backend, MemoryBackend::NvidiaSmi) && windows_gpu_driver()
+    /// The NVIDIA GPUs, visible or adoptable, that move memory to system RAM
+    /// instead of failing a full allocation ([`spills`]).
+    fn set_spilling(&mut self, platform: DriverPlatform, driver_models: Option<&str>) {
+        let models = driver_models.map(parse_driver_models).unwrap_or_default();
+        let gpus = self.gpus().unwrap_or(&[]).iter().chain(self.adoptable());
+        let verdicts: Arc<[String]> = gpus
+            .filter(|gpu| spills(platform, models.get(gpu.uuid.as_str()).copied()))
+            .map(|gpu| gpu.uuid.clone())
+            .collect();
+        if let MemoryBackend::NvidiaSmi { spilling } = &mut self.backend {
+            *spilling = verdicts;
+        }
+    }
+
+    /// The GPUs (by UUID) a full allocation spills to system RAM on.
+    pub(super) fn spilling_gpus(&self) -> &[String] {
+        match &self.backend {
+            MemoryBackend::NvidiaSmi { spilling } => spilling,
+            _ => &[],
+        }
+    }
+
+    /// Whether a full allocation on this device spills to system RAM.
+    pub(super) fn spills_to_ram(&self, key: &str) -> bool {
+        self.spilling_gpus().iter().any(|uuid| uuid == key)
+    }
+
+    /// What a worker on this device is told about spilling
+    /// ([`SPILLS_TO_RAM_ENV_VAR`]): `None` off NVIDIA or for an unknown device.
+    pub(super) fn spill_verdict(&self, key: Option<&str>) -> Option<bool> {
+        let key = key.filter(|_| matches!(self.backend, MemoryBackend::NvidiaSmi { .. }))?;
+        Some(self.spills_to_ram(key))
     }
 
     /// The GPUs an unmappable ambient mask hid, candidates for adoption.
@@ -853,7 +959,7 @@ impl GpuInventory {
             gpus: None,
             adoptable: (!gpus.is_empty()).then(|| gpus.into()),
             adopted: Arc::default(),
-            backend: MemoryBackend::NvidiaSmi,
+            backend: MemoryBackend::default(),
             cpu_roots: None,
             blank_mask: false,
         }
@@ -1331,6 +1437,46 @@ mod tests {
 
     fn inventory() -> GpuInventory {
         GpuInventory::known(vec![gpu(0, "GPU-1111", "12.0"), gpu(3, "GPU-3333", "12.0")])
+    }
+
+    /// Only the Windows display driver spills a full GPU to system RAM: on
+    /// native Windows per GPU by its driver model, under WSL every GPU.
+    #[test]
+    fn a_gpu_spills_under_the_windows_display_driver_only() {
+        use DriverPlatform::{Other, Windows, Wsl};
+        for (platform, model, spilled) in [
+            (Other, None, false),
+            (Wsl, None, true),
+            (Wsl, Some("TCC"), true),
+            (Windows, Some("WDDM"), true),
+            (Windows, Some(" tcc "), false),
+            (Windows, Some("MCDM"), false),
+            (Windows, Some("[N/A]"), true),
+            (Windows, None, true),
+        ] {
+            assert_eq!(spills(platform, model), spilled, "{platform:?} {model:?}");
+        }
+        // The verdict is per GPU, adoptable rows included, joined by UUID.
+        let rows = "0, GPU-1111, A, 24576, 8.9\n1, GPU-2222, B, 97887, 12.0\n";
+        let models = "GPU-1111, WDDM\nGPU-2222, TCC\nunparseable\n";
+        for visible in [None, Some("1")] {
+            let mut inventory = build(Some(rows), visible).inventory;
+            inventory.set_spilling(Windows, Some(models));
+            assert_eq!(inventory.spilling_gpus(), ["GPU-1111"], "{visible:?}");
+            assert!(inventory.spills_to_ram("GPU-1111") && !inventory.spills_to_ram("GPU-2222"));
+            assert_eq!(inventory.spill_verdict(Some("GPU-2222")), Some(false));
+            assert_eq!(inventory.spill_verdict(None), None, "an unknown device");
+            inventory.set_spilling(Windows, None);
+            assert_eq!(inventory.spilling_gpus().len(), 2, "no models read: WDDM");
+            inventory.set_spilling(Other, Some(models));
+            assert!(inventory.spilling_gpus().is_empty());
+        }
+        let rocm = GpuInventory::known_rocm(vec![gpu(0, "GPU-1111", "")]);
+        assert_eq!(
+            rocm.spill_verdict(Some("GPU-1111")),
+            None,
+            "not an NVIDIA GPU"
+        );
     }
 
     /// The calibration keyspace the host derives for itself: the compute

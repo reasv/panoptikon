@@ -2583,6 +2583,7 @@ def test_only_cuda_under_the_windows_display_driver_can_spill(
     dxg = tmp_path / "dxg"
     monkeypatch.setattr(memory, "DXG_DEVICE", str(dxg))
     monkeypatch.setattr(memory.sys, "platform", "linux")
+    monkeypatch.delenv(memory.SPILL_VERDICT_ENV, raising=False)
     assert not memory.spill_capable(), "Linux"
     dxg.touch()
     assert memory.spill_capable(), "WSL2 or Docker Desktop"
@@ -2594,6 +2595,12 @@ def test_only_cuda_under_the_windows_display_driver_can_spill(
     dxg.unlink()
     monkeypatch.setattr(memory.sys, "platform", "win32")
     assert memory.spill_capable(), "native Windows"
+    # The orchestrator's per-GPU verdict wins over the platform.
+    monkeypatch.setenv(memory.SPILL_VERDICT_ENV, "0")
+    assert not memory.spill_capable(), "a TCC card on native Windows"
+    monkeypatch.setattr(memory.sys, "platform", "linux")
+    monkeypatch.setenv(memory.SPILL_VERDICT_ENV, "1")
+    assert memory.spill_capable()
 
 
 def run_growing_windows(cuda):

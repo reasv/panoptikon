@@ -164,8 +164,12 @@ impl PrewarmPool {
         let spawn = if on_cpu {
             self.spawn.for_cpu_device()
         } else {
+            let key = self.gpus.resolve_device_key(None);
             self.spawn
-                .for_unified_device(self.gpus.unified_pin_bdf(None).as_deref())
+                .for_gpu(
+                    self.gpus.unified_pin_bdf(None).as_deref(),
+                    self.gpus.spill_verdict(key.as_deref()),
+                )
                 .into_owned()
         };
         let task = tokio::spawn(warm_worker_task(

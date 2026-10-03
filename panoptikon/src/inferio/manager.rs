@@ -1683,11 +1683,12 @@ impl ModelManager {
                 let device = device.clone();
                 let unified = unified_devices[replica].clone();
                 let on_cpu = device_keys[replica].as_deref() == Some(super::cpu::DEVICE_KEY);
+                let spills = self.cfg.gpus.spill_verdict(device_keys[replica].as_deref());
                 async move {
                     let spawn = if on_cpu {
                         std::borrow::Cow::Owned(self.cfg.spawn.for_cpu_device())
                     } else {
-                        self.cfg.spawn.for_unified_device(unified.as_deref())
+                        self.cfg.spawn.for_gpu(unified.as_deref(), spills)
                     };
                     let mut worker = match claimed {
                         Some(worker) => {

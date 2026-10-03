@@ -246,7 +246,7 @@ impl InferioState {
         );
         let default_gpu_name = host.inventory.default_gpu_name();
         let default_gpu_arch = host.inventory.default_gpu_arch();
-        let spills_to_ram = host.inventory.spills_to_ram();
+        let spilling = host.inventory.spilling_gpus().to_vec();
         let manager = ModelManager::new(
             ManagerConfig {
                 spawn,
@@ -259,7 +259,7 @@ impl InferioState {
                     always_warm: local.prewarm.always_warm.clone(),
                 },
                 gpus: host.inventory,
-                vram: vram_budgets(&local.vram, spills_to_ram),
+                vram: vram_budgets(&local.vram, spilling),
                 calibration: Some(Arc::clone(&calibration) as Arc<_>),
             },
             Arc::clone(&registry),
@@ -289,14 +289,14 @@ impl InferioState {
 /// `[inference_local.vram]` → the ledger's resolved per-GPU [`VramBudget`]s.
 fn vram_budgets(
     config: &crate::config::VramConfig,
-    spills_to_ram: bool,
+    spilling: Vec<String>,
 ) -> super::ledger::VramBudgets {
     let mut budgets = super::ledger::VramBudgets::uniform(super::ledger::VramBudget {
         margin: config.margin,
         cap_fraction: config.cap_fraction,
         knee_max_bucket_dispersion: config.knee_max_bucket_dispersion,
     });
-    budgets.spills_to_ram = spills_to_ram;
+    budgets.spilling = spilling.into_iter().collect();
     for uuid in config.gpu.keys() {
         let (margin, cap_fraction, knee_max_bucket_dispersion) = config.for_gpu(uuid);
         budgets = budgets.with_gpu(
@@ -2786,9 +2786,9 @@ metadata.cost.unit = "none"
     }
 
     #[test]
-    fn the_budgets_carry_the_hosts_spill_flag() {
+    fn the_budgets_carry_the_hosts_spill_verdicts() {
         let config = crate::config::VramConfig::default();
-        assert!(vram_budgets(&config, true).spills_to_ram);
-        assert!(!vram_budgets(&config, false).spills_to_ram);
+        let budgets = vram_budgets(&config, vec!["GPU-a".to_owned()]);
+        assert!(budgets.spills_to_ram("GPU-a") && !budgets.spills_to_ram("GPU-b"));
     }
 }

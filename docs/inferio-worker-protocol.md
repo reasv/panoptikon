@@ -1718,6 +1718,11 @@ The orchestrator sets for every worker:
   absent, which is the discrete arithmetic and is conservative in both
   directions. MPS workers do not get it: there is one kind of device on a Mac
   and their tiers are unified by construction.
+- `PANOPTIKON_SPILLS_TO_RAM=1|0` — replicas on an NVIDIA GPU the host
+  inventoried: whether a full allocation on that GPU moves memory to system
+  RAM (the Windows display driver model) or fails (Linux, and TCC or MCDM
+  cards on native Windows). The worker's growth release and spill backstop
+  follow it; without it the worker decides from its platform alone.
 - `INFERIO_DEVICE=cpu` — replicas priced against **system RAM**: every worker
   of a host whose resolved accelerator is `cpu`, and — on a host with GPUs —
   every replica of a model whose registry `devices` entry names the CPU device

@@ -277,8 +277,8 @@ impl VramLedger {
     /// `ceil(external × margin)`. Only when the user set no margin for this
     /// GPU it is capped at [`DEFAULT_RESERVE_CAP_MB`], on a GPU other than
     /// Apple's at least [`DEFAULT_RESERVE_FLOOR_FRACTION`] of the card (that
-    /// cap at most), and exactly the cap on a CUDA GPU that spills to system
-    /// RAM. A margin of 0 reserves nothing.
+    /// cap at most), and exactly the cap on a GPU that spills to system RAM.
+    /// A margin of 0 reserves nothing.
     /// On the CPU device the reserve is never below [`cpu::ram_reserve_mb`],
     /// whatever the margin. See docs/batch-calibration-design.md, "The
     /// reserve, and why an unset margin is not the same as `margin = 0.10`".
@@ -296,7 +296,7 @@ impl VramLedger {
         let floored = gpu != cpu::DEVICE_KEY && !state.metal_allocator;
         let (reserve, rule) = if !budget.reserve_is_capped() {
             (raw, RESERVE_RULE_USER_MARGIN)
-        } else if self.budgets.spills_to_ram && gpu != cpu::DEVICE_KEY && margin > 0.0 {
+        } else if self.budgets.spills_to_ram(gpu) && margin > 0.0 {
             (DEFAULT_RESERVE_CAP_MB, RESERVE_RULE_FLAT_DEFAULT)
         } else {
             let capped = raw.min(DEFAULT_RESERVE_CAP_MB);

@@ -378,9 +378,10 @@ pub const RESERVE_RULE_RAM_FLOOR: &str = "ram_floor";
 pub struct VramBudgets {
     pub default: VramBudget,
     per_gpu: HashMap<String, VramBudget>,
-    /// A full CUDA GPU here spills to system RAM instead of failing, so an
-    /// unset margin reserves [`DEFAULT_RESERVE_CAP_MB`] flat on each one.
-    pub spills_to_ram: bool,
+    /// The GPUs (by UUID) that spill to system RAM instead of failing a full
+    /// allocation: an unset margin reserves [`DEFAULT_RESERVE_CAP_MB`] flat
+    /// on each.
+    pub spilling: HashSet<String>,
 }
 
 impl VramBudgets {
@@ -389,7 +390,7 @@ impl VramBudgets {
         Self {
             default: budget,
             per_gpu: HashMap::new(),
-            spills_to_ram: false,
+            spilling: HashSet::new(),
         }
     }
 
@@ -397,6 +398,11 @@ impl VramBudgets {
     pub fn with_gpu(mut self, uuid: impl Into<String>, budget: VramBudget) -> Self {
         self.per_gpu.insert(uuid.into(), budget);
         self
+    }
+
+    /// Whether a full allocation on this GPU spills to system RAM.
+    pub fn spills_to_ram(&self, uuid: &str) -> bool {
+        self.spilling.contains(uuid)
     }
 
     /// The budget in force for one GPU.

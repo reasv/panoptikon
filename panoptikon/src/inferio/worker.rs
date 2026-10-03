@@ -169,16 +169,25 @@ pub struct WorkerSpawnConfig {
 }
 
 impl WorkerSpawnConfig {
-    /// Adds `PANOPTIKON_UNIFIED_GPU=<PCI address>` for a unified GPU.
-    pub fn for_unified_device(&self, bdf: Option<&str>) -> Cow<'_, Self> {
-        let Some(bdf) = bdf else {
+    /// Adds `PANOPTIKON_UNIFIED_GPU=<PCI address>` for a unified GPU and the
+    /// spill verdict of an NVIDIA GPU.
+    pub fn for_gpu(&self, bdf: Option<&str>, spills_to_ram: Option<bool>) -> Cow<'_, Self> {
+        if bdf.is_none() && spills_to_ram.is_none() {
             return Cow::Borrowed(self);
-        };
+        }
         let mut cfg = self.clone();
-        cfg.env.push((
-            super::gpu::UNIFIED_GPU_ENV_VAR.to_owned(),
-            bdf.to_ascii_lowercase(),
-        ));
+        if let Some(bdf) = bdf {
+            cfg.env.push((
+                super::gpu::UNIFIED_GPU_ENV_VAR.to_owned(),
+                bdf.to_ascii_lowercase(),
+            ));
+        }
+        if let Some(spills) = spills_to_ram {
+            cfg.env.push((
+                super::gpu::SPILLS_TO_RAM_ENV_VAR.to_owned(),
+                u8::from(spills).to_string(),
+            ));
+        }
         Cow::Owned(cfg)
     }
 
@@ -2184,7 +2193,7 @@ mod tests {
         // came up on. Lower-cased, the spelling the worker renders its own in;
         // absent, never zero, on a discrete GPU.
         let unified = |cfg: &WorkerSpawnConfig, bdf: Option<&str>, key| {
-            env_of(&cfg.for_unified_device(bdf), Some("0"), key)
+            env_of(&cfg.for_gpu(bdf, None), Some("0"), key)
         };
         let gpu = "PANOPTIKON_UNIFIED_GPU";
         let bdf = Some("0000:03:00.0");
@@ -2205,9 +2214,19 @@ mod tests {
             Some("0")
         );
         assert!(matches!(
-            rocm.for_unified_device(None),
+            rocm.for_gpu(None, None),
             std::borrow::Cow::Borrowed(_)
         ));
+        // An NVIDIA replica is told whether its GPU spills to system RAM.
+        let spills = "PANOPTIKON_SPILLS_TO_RAM";
+        for (verdict, value) in [
+            (Some(true), Some("1")),
+            (Some(false), Some("0")),
+            (None, None),
+        ] {
+            let cfg = cuda.for_gpu(None, verdict);
+            assert_eq!(env_of(&cfg, Some("GPU-1a2b"), spills).as_deref(), value);
+        }
 
         // A replica the ledger placed on the **CPU device** of a host that has
         // GPUs: every GPU hidden (the pin `gpu::resolve_pin` answers for a

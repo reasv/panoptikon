@@ -2051,9 +2051,12 @@ than the margin within one window. The backstop covers the exceptions.
 
 ### Windows display driver: the pool outgrows the card
 
-Applies only to CUDA on native Windows (any driver model, so TCC cards pay
-the release too), and on WSL2 or Docker Desktop, where the GPU is `/dev/dxg`
-(`memory.spill_capable()`). Linux, MPS and the CPU device are unchanged.
+Applies only to CUDA GPUs under the Windows display driver model (WDDM): on
+native Windows per GPU, as nvidia-smi's `driver_model.current` reports it
+(TCC and MCDM cards fail the allocation and are excluded), and every GPU on
+WSL2 or Docker Desktop, where the GPU is `/dev/dxg`. The host decides per GPU
+and tells each worker (`PANOPTIKON_SPILLS_TO_RAM`, read by
+`memory.spill_capable()`). Linux, MPS and the CPU device are unchanged.
 
 - **Mechanism.** There `cudaMalloc` never fails. The driver moves memory to
   system RAM instead. On Linux, a full card makes the caching allocator free
@@ -2238,17 +2241,17 @@ limit   = min(total × cap_fraction, total − external − reserve)
     spare its other usage reads small and a batch is granted to the last
     MiB of what the driver will deliver, where the allocation fails.
   - A margin written in the config is applied as written, 0 included.
-- On a host where a full CUDA GPU spills to system RAM instead of failing
-  the allocation (the Windows display driver: native Windows, or `/dev/dxg`
-  under WSL2 and Docker Desktop), the unset reserve is the 1 GiB cap itself,
-  on each CUDA GPU. Exact pricing lets a ramp reach the physical edge of the
-  card, and there a co-tenant's transient growth spills us without any error,
-  at a fraction of the speed; the last gigabyte buys no throughput, since the
-  knee ends the ramp before it. The host probe decides this once
-  (`GpuInventory::spills_to_ram`), with the same test the worker uses for its
-  own growth release (`memory.spill_capable()`). The CPU device is not a
-  CUDA GPU and takes its own floor ("Host RAM on the CPU device"); the
-  refusal room still reserves nothing.
+- On a CUDA GPU that spills to system RAM instead of failing a full
+  allocation (the Windows display driver model, see "Windows display driver:
+  the pool outgrows the card"), the unset reserve is the 1 GiB cap itself.
+  Exact pricing lets a ramp reach the physical edge of the card, and there a
+  co-tenant's transient growth spills us without any error, at a fraction of
+  the speed; the last gigabyte buys no throughput, since the knee ends the
+  ramp before it. The host probe decides this once per GPU
+  (`GpuInventory::spills_to_ram`), and the worker's own growth release
+  follows the same verdict. The CPU device is not a CUDA GPU and takes its
+  own floor ("Host RAM on the CPU device"); the refusal room still reserves
+  nothing.
 
 Keeping the two distinguishable is also what makes the default *changeable*
 later without overriding somebody's deliberate `margin = 0.10`, per the

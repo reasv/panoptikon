@@ -531,15 +531,18 @@ fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
 /// Where a full CUDA GPU spills to system RAM, an unset margin reserves the
 /// cap itself, whatever other processes use. A margin the user wrote, for all
 /// GPUs or one, still applies uncapped; the CPU device keeps its own floor;
-/// a margin of 0 reserves nothing on a GPU.
+/// a margin of 0 reserves nothing on a GPU. Another GPU on the same host that
+/// fails the allocation keeps the card floor.
 #[test]
 fn a_spilling_gpu_reserves_the_cap_under_an_unset_margin() {
+    const OTHER: &str = "GPU-bbbb";
     let spilling = |budgets: VramBudgets| VramBudgets {
-        spills_to_ram: true,
+        spilling: HashSet::from([GPU.to_owned()]),
         ..budgets
     };
     let devices = [
         (GPU, "TEST 9000", 24_576),
+        (OTHER, "TEST 9000", 24_576),
         (super::cpu::DEVICE_KEY, "CPU", 65_536),
     ];
     // (label, budgets, device, external, reserve, rule)
@@ -586,8 +589,8 @@ fn a_spilling_gpu_reserves_the_cap_under_an_unset_margin() {
         ),
         (
             "a GPU that fails the allocation instead: 3 % of the card",
-            VramBudget::default().into(),
-            GPU,
+            spilling(VramBudget::default().into()),
+            OTHER,
             4_000,
             737,
             RESERVE_RULE_GPU_FLOOR,
@@ -601,7 +604,11 @@ fn a_spilling_gpu_reserves_the_cap_under_an_unset_margin() {
             (reserve, rule),
             "{label}"
         );
-        let floor = if device == GPU { 0 } else { reserve };
+        let floor = if device == super::cpu::DEVICE_KEY {
+            reserve
+        } else {
+            0
+        };
         assert_eq!(
             ledger.reserve_locked(&state, device, external, 0.0).0,
             floor,
