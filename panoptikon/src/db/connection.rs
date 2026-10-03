@@ -313,9 +313,8 @@ async fn acquire_read_conn(
 
     pool.acquire().await.map_err(|err| {
         tracing::error!(error = %err, "failed to acquire read connection");
-        if let Ok(paths) = db_paths(&names.index_db, &names.user_data_db) {
-            log_open_problem(&paths, attach_user_data);
-        }
+        let paths = db_paths_unchecked(&names.index_db, &names.user_data_db);
+        log_open_problem(&paths, attach_user_data);
         ApiError::internal("Failed to open database")
     })
 }
@@ -409,6 +408,16 @@ pub(crate) fn index_storage_paths_unchecked(index_db: &str) -> IndexStoragePaths
     }
 }
 
+fn db_paths_unchecked(index_db: &str, user_data_db: &str) -> DbPaths {
+    let index_paths = index_storage_paths_unchecked(index_db);
+    let user_data_db_dir = crate::config::runtime().data_folder.join("user_data");
+    DbPaths {
+        index_db_file: index_paths.index_db_file,
+        storage_db_file: index_paths.storage_db_file,
+        user_db_file: user_data_db_dir.join(format!("{user_data_db}.db")),
+    }
+}
+
 fn index_storage_paths(index_db: &str) -> Result<IndexStoragePaths, ApiError> {
     let index_paths = index_storage_paths_unchecked(index_db);
     let index_db_dir = index_paths
@@ -435,18 +444,13 @@ fn db_paths_index_only(index_db: &str) -> Result<DbPaths, ApiError> {
 }
 
 fn db_paths(index_db: &str, user_data_db: &str) -> Result<DbPaths, ApiError> {
-    let index_paths = index_storage_paths(index_db)?;
+    index_storage_paths(index_db)?;
     let user_data_db_dir = crate::config::runtime().data_folder.join("user_data");
     fs::create_dir_all(&user_data_db_dir).map_err(|err| {
         tracing::error!(error = %err, "failed to create user data dir");
         ApiError::internal("Failed to prepare database directories")
     })?;
-
-    Ok(DbPaths {
-        index_db_file: index_paths.index_db_file,
-        storage_db_file: index_paths.storage_db_file,
-        user_db_file: user_data_db_dir.join(format!("{user_data_db}.db")),
-    })
+    Ok(db_paths_unchecked(index_db, user_data_db))
 }
 
 fn db_lists() -> Result<(Vec<String>, Vec<String>), ApiError> {
@@ -910,7 +914,7 @@ mod tests {
         assert_eq!(sync, 1, "synchronous is NORMAL");
     }
 
-    /// A database that cannot be opened fails a request at once, and a
+    /// A database that cannot be opened fails a request at once, and each
     /// folder another user owns is logged once, naming the folder and its
     /// owner.
     #[cfg(unix)]
@@ -937,16 +941,31 @@ mod tests {
             return;
         };
         let link = env.path().join("index/foreign_owned");
+        let read_link = env.path().join("index/foreign_read");
         std::os::unix::fs::symlink(foreign, &link).unwrap();
+        std::os::unix::fs::symlink(foreign, &read_link).unwrap();
         let (_guard, reasons) = crate::test_utils::warned_reasons();
+        let no_names = DbQuery {
+            index_db: None,
+            user_data_db: None,
+        };
+        let read_names = resolve_db_names_unchecked(&DbQuery {
+            index_db: Some("foreign_read".to_owned()),
+            user_data_db: None,
+        });
+        let read = acquire_read_conn(&no_names, &read_names, false).await;
         let mut opened = Vec::new();
         for _ in 0..2 {
             opened.push(open_index_db_write_no_user_data("foreign_owned").await);
         }
         fs::remove_file(&link).unwrap();
-        assert!(opened.iter().all(Result::is_err));
-        let expected = owned_by_another_user(&link, owner, foreign);
-        assert_eq!(*reasons.lock().unwrap(), [Some(expected)]);
+        fs::remove_file(&read_link).unwrap();
+        assert!(read.is_err() && opened.iter().all(Result::is_err));
+        let expected = [
+            Some(owned_by_another_user(&read_link, owner, foreign)),
+            Some(owned_by_another_user(&link, owner, foreign)),
+        ];
+        assert_eq!(*reasons.lock().unwrap(), expected);
     }
 
     /// Pins the `UserDataWrite` connection shape: index (`main`) and
