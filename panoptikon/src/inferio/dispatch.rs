@@ -246,6 +246,16 @@ fn smallest_input_units(inputs: &[WorkerInput], cost: &CostDimension) -> u64 {
     }
 }
 
+/// The window's smallest input over all its requests, at least 1.
+fn smallest_item_units(window: &[WindowItem]) -> u64 {
+    window
+        .iter()
+        .map(|item| item.min_input_units)
+        .min()
+        .unwrap_or(1)
+        .max(1)
+}
+
 fn request_bytes(inputs: &[WorkerInput]) -> usize {
     inputs
         .iter()
@@ -596,18 +606,12 @@ pub(crate) async fn run_dispatcher(
                 last_shape = shape;
             }
             let byte_closed = closed_on_bytes(&shapes, take, window_bytes, bounds);
-            let smallest_item_units = window
-                .iter()
-                .map(|queued| queued.shape.min_input_units)
-                .min()
-                .unwrap_or(1)
-                .max(1);
             // Granted before hand-off, so no headroom is promised twice.
             let plan = match &replica.admission {
                 Some(admission) => {
                     let grant = admission.request_grant_byte_bound(
                         window_units,
-                        smallest_item_units,
+                        smallest_item_units(&shapes[..take]),
                         cap,
                         window.len(),
                         queue.len(),
@@ -1532,6 +1536,32 @@ mod tests {
         );
     }
 
+    /// A window's item units are its smallest input over all its requests,
+    /// and 1 when units count inputs.
+    #[test]
+    fn a_windows_item_units_are_its_smallest_input() {
+        let text = |tokens: u64| json_input(json!("x".repeat((tokens * BYTES_PER_TOKEN) as usize)));
+        let requests = [
+            vec![text(50), text(60)],
+            vec![text(100), text(25), text(25)],
+        ];
+        for (unit, aggregation, smallest) in [
+            (CostUnit::Token, CostAggregation::Sum, 25),
+            (CostUnit::Token, CostAggregation::MaxTimesCount, 25),
+            (CostUnit::Item, CostAggregation::Count, 1),
+        ] {
+            let priced = cost(unit, Some(aggregation));
+            let window: Vec<WindowItem> = requests
+                .iter()
+                .map(|inputs| WindowItem {
+                    min_input_units: smallest_input_units(inputs, &priced),
+                    ..shape(0, inputs.len(), None)
+                })
+                .collect();
+            assert_eq!(smallest_item_units(&window), smallest, "{aggregation:?}");
+        }
+    }
+
     /// The host prices a pixel item at `min(raw, canvas)`, the same `min` the
     /// worker applies in `price_inputs`. Without it the window bound and the
     /// grant would be denominated in raw submitted pixels while the batch
@@ -2257,50 +2287,6 @@ mod tests {
         );
         assert_eq!(uncapped.stats.last_grant_units.load(Relaxed), 2);
         uncapped.shutdown().await;
-    }
-
-    /// A priced window's grant carries the units of its smallest item: here
-    /// a request of 100, 25 and 25 tokens and one of 50.
-    #[tokio::test]
-    async fn a_grant_carries_the_windows_smallest_item() {
-        let tokens = CostDimension {
-            unit: CostUnit::Token,
-            aggregation: Some(CostAggregation::Sum),
-            seed_units: Some(4096),
-            ..item_cost(1)
-        };
-        let harness = one_replica(32_768, "slow_test", tokens).await;
-        let text = |tokens: u64| json_input(json!("x".repeat((tokens * BYTES_PER_TOKEN) as usize)));
-        // Queued before the dispatcher task first runs.
-        let answers: Vec<_> = [vec![text(100), text(25), text(25)], vec![text(50)]]
-            .into_iter()
-            .map(|inputs| {
-                let (reply, answer) = oneshot::channel();
-                harness
-                    .tx
-                    .send(DispatchMsg::Predict(DispatchRequest {
-                        inputs,
-                        max_batch: None,
-                        reply,
-                    }))
-                    .expect("queued");
-                answer
-            })
-            .collect();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let grants = loop {
-            let grants = harness.ledger.open_grant_items_for_test(harness.worker_id);
-            if !grants.is_empty() {
-                break grants;
-            }
-            assert!(tokio::time::Instant::now() < deadline, "no window granted");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        assert_eq!(grants, [25]);
-        for answer in answers {
-            answer.await.expect("replied").expect("succeeded");
-        }
-        harness.shutdown().await;
     }
 
     /// End to end: a replica that books host RAM runs its first window as one

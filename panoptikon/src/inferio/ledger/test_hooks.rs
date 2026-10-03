@@ -179,21 +179,6 @@ impl VramLedger {
         self.lock().workers.get(&worker)?.last_trim_at
     }
 
-    /// The smallest item's units of each window `worker` holds a grant for.
-    #[cfg(test)]
-    pub(in crate::inferio) fn open_grant_items_for_test(&self, worker: u64) -> Vec<u64> {
-        let state = self.lock();
-        let grants = state
-            .workers
-            .get(&worker)
-            .map(|entry| entry.grants.values());
-        grants
-            .into_iter()
-            .flatten()
-            .map(|charge| charge.item_units)
-            .collect()
-    }
-
     /// The throughput ring as `(units, units/sec)`.
     #[cfg(test)]
     pub(super) fn throughput_for_test(&self, inference_id: &str, gpu: &str) -> Vec<(u64, f64)> {
