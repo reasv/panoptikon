@@ -53,7 +53,7 @@ use super::registry::SpawnSpec;
 use super::slot_error::{ERROR_SLOT_KEY, SlotError, Unattempted, slot_error_from_parts};
 use crate::process_tree::{
     JobGuard, detach_from_console, die_with_parent, first_oom_victim, kill_process_group,
-    spawn_supervised_tokio,
+    kill_process_group_pid, spawn_supervised_tokio,
 };
 
 /// Protocol version this orchestrator speaks; workers answering anything
@@ -1486,17 +1486,23 @@ impl Worker {
         self.unreachable = matches!(cause, FatalCause::Unreachable);
         self.in_flight = false;
         // Before the kill below, which would read as `signal: 9`.
-        let attribution = self.attribute_death().await;
-        kill_process_group(&self.child);
-        let _ = self.child.start_kill();
-        let status = match timeout(FATAL_REAP_GRACE, self.child.wait()).await {
-            Ok(Ok(status)) => Some(status),
-            Ok(Err(err)) => {
-                tracing::debug!(worker = %self.label, "reaping the dead worker failed: {err}");
-                None
+        let mut attribution = self.attribute_death().await;
+        let mut status = None;
+        if attribution == DeathAttribution::Dying {
+            // One that exits within the grace died by itself and the status
+            // is its own; one still running after it dies by our kill.
+            status = self.reap(FATAL_REAP_GRACE).await;
+            if status.is_none() {
+                attribution = DeathAttribution::StillRunning;
             }
-            Err(_) => None,
-        };
+        }
+        // By pid, for children: a group outlives its reaped leader, and its
+        // id is not reused while it has members.
+        kill_process_group_pid(self.pid);
+        let _ = self.child.start_kill();
+        if status.is_none() {
+            status = self.reap(FATAL_REAP_GRACE).await;
+        }
         self.drain_stderr().await;
         let (signal, core_dumped) = status.as_ref().map(signal_of).unwrap_or((None, false));
         let death = WorkerDeath {
@@ -1524,6 +1530,18 @@ impl Worker {
         );
         self.death = Some(death.clone());
         death
+    }
+
+    /// The child's exit status, waiting at most `grace`.
+    async fn reap(&mut self, grace: Duration) -> Option<ExitStatus> {
+        match timeout(grace, self.child.wait()).await {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(err)) => {
+                tracing::debug!(worker = %self.label, "reaping the dead worker failed: {err}");
+                None
+            }
+            Err(_) => None,
+        }
     }
 
     /// Liveness check for an idle replica: if the child exited, handle the
@@ -2709,6 +2727,8 @@ mod tests {
         for (attribution, signal, code, kind) in [
             (ReapedBeforeSignal, Some(9), None, Some(MemoryKill)),
             (Dying, Some(9), None, Some(MemoryKill)),
+            (Dying, None, Some(3), Some(Crash)),
+            (Dying, Some(11), None, Some(Crash)),
             (StillRunning, Some(9), None, None),
             (ReapedBeforeSignal, Some(11), None, Some(Crash)),
             (ReapedBeforeSignal, None, Some(3), Some(Crash)),

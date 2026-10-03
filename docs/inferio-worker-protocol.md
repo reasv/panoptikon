@@ -1600,7 +1600,9 @@ either way, so a trim never races a batch.
     signal in the status is the gateway's own and says nothing about why.
   - `reaped_before_signal` — `try_wait` already had the exit status: the
     status is how the worker really died.
-  - `dying` — the child was on its way down but not yet reapable. This one
+  - `dying` — the child was on its way down but not yet reapable, and
+    exited by itself within a 5 s grace; one still running after the grace
+    is reported `still_running`. This one
     exists because `waitpid(WNOHANG)` does **not** report a thread-group
     leader while any thread of the group is alive, and a CUDA worker's
     driver threads take hundreds of milliseconds (475 ms measured) to unwind

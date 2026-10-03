@@ -2620,11 +2620,15 @@ mod tests {
     /// The other half: a replica that dies with the window in flight really
     /// is a death, settles as one exactly once, and its exit status names the
     /// kind: a SIGKILL from outside (an out-of-memory killer, from this side
-    /// of the pipe) is a memory kill, an exit code a crash.
+    /// of the pipe) is a memory kill, an exit code a crash, also when the
+    /// worker exits by itself after closing its output.
     #[tokio::test]
     async fn a_worker_that_stopped_answering_settles_as_a_death() {
         use super::super::ledger::DeathKind;
-        let mut cases = vec![(json!({}), DeathKind::Crash)];
+        let mut cases = vec![
+            (json!({}), DeathKind::Crash),
+            (json!({"exit_code": 5}), DeathKind::Crash),
+        ];
         #[cfg(unix)]
         cases.push((json!({"signal": libc::SIGKILL}), DeathKind::MemoryKill));
         for (config, kind) in cases {
