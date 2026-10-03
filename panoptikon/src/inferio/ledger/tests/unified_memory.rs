@@ -1980,12 +1980,12 @@ fn a_window_under_pressure_at_either_end_earns_no_step() {
     }
 }
 
-/// The cap a death left and the cap paging left bound the batch together,
-/// the smaller ruling, and each ends on its own terms. A worker that dies
-/// while the Mac pages sets the death cap like any other death; the paging
-/// cap lifts once the batch has grown back, the death cap stays.
+/// A memory kill while the Mac pages halves the paging cap, as a paging
+/// window sets it, and leaves no cap for the life of the process: once the
+/// pressure is normal the reloaded model grows back by doubling until the
+/// cap lifts.
 #[test]
-fn a_death_cap_and_a_paging_cap_hold_the_smaller_batch() {
+fn a_kill_while_the_mac_pages_caps_until_the_batch_grows_back() {
     let (ledger, handle, admission) = ramped_mac_replica();
     paging_windows(&ledger, &handle, &admission, 2);
     let paged = pressure_cap(&ledger).expect("capped by the paging windows");
@@ -1998,8 +1998,7 @@ fn a_death_cap_and_a_paging_cap_hold_the_smaller_batch() {
     token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
     assert_eq!(
         pressure_cap(&ledger),
-        Some(paged),
-        "a death leaves it alone"
+        Some(PressureCap { units: 4, ..paged })
     );
     drop(admission);
 
@@ -2009,11 +2008,10 @@ fn a_death_cap_and_a_paging_cap_hold_the_smaller_batch() {
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("registers");
     let worker = |ledger: &Arc<VramLedger>| ledger.health().swap_remove(0).workers.swap_remove(0);
-    assert_eq!(worker(&ledger).death_cap_units, Some(4));
-    assert_eq!(worker(&ledger).unit_budget, 4, "the smaller of 4 and 8");
+    assert_eq!(worker(&ledger).death_cap_units, None);
+    assert_eq!(worker(&ledger).unit_budget, 4);
 
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
-    assert_eq!(ramp_windows(&handle, &admission, 4), [4, 4, 4, 4]);
+    assert_eq!(ramp_windows(&handle, &admission, 6), [4, 8, 16, 32, 64, 64]);
     assert_eq!(pressure_cap(&ledger), None, "back at what is admitted");
-    assert_eq!(worker(&ledger).death_cap_units, Some(4), "until restart");
 }

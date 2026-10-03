@@ -228,13 +228,15 @@ impl VramLedger {
     /// A replica whose process was killed for memory holding a granted window
     /// (`charge`).
     ///
-    /// The (model, device) is capped at half that window's unit budget for
-    /// the life of this process, at least one item's units. Without the cap the next
-    /// replica is admitted for the batch that died, and dies again. A window
-    /// the queue sized sets no cap: its size says nothing about the batch
-    /// the model can run. An item-capped window does, since the cap sized it.
-    /// On a GPU with its own memory the kill was for host RAM: nothing else
-    /// about the GPU changes.
+    /// The (model, device) is capped at half that window's unit budget, at
+    /// least one item's units: for the life of this process, or while macOS
+    /// was paging through the [`PressureCap`], which lifts as a paging
+    /// out-of-memory window's does. Without the cap the next replica is
+    /// admitted for the batch that died, and dies again. A window the queue
+    /// sized sets no cap: its size says nothing about the batch the model can
+    /// run. An item-capped window does, since the cap sized it. On a GPU with
+    /// its own memory the kill was for host RAM: nothing else about the GPU
+    /// changes.
     ///
     /// On a unified-memory device the kill is also a negative: the replica
     /// is deflated and its (model, GPU) anchor halved, for this run only.
@@ -251,19 +253,34 @@ impl VramLedger {
         let sized_by_queue = charge.queue_bound && !charge.squeezed && charge.item_cap.is_none();
         if !sized_by_queue {
             let cap = (charge.unit_budget / 2).max(charge.item_units);
-            let cal = state.calibration.entry(key.clone()).or_default();
-            let cap = cal.death_cap_units.map_or(cap, |held| held.min(cap));
-            cal.death_cap_units = Some(cap);
+            let paging = charge.pressure.paging();
+            let cap = if paging {
+                let halved = GrantCharge {
+                    unit_budget: cap,
+                    ..charge
+                };
+                state.calibration.entry(key.clone()).or_default();
+                Self::note_pressure_size_locked(state, worker, halved, false);
+                cap
+            } else {
+                let cal = state.calibration.entry(key.clone()).or_default();
+                let cap = cal.death_cap_units.map_or(cap, |held| held.min(cap));
+                cal.death_cap_units = Some(cap);
+                cap
+            };
             tracing::warn!(
                 model = %key.0,
                 gpu = %key.1,
                 died_at_units = charge.unit_budget,
                 batch_cap_units = cap,
+                paging,
                 "a worker was killed for memory while running a granted window; \
                  this model's batches on this device are capped at half that \
-                 batch until the server restarts"
+                 batch until the server restarts, or after paging until they \
+                 grow back at normal pressure"
             );
         }
+        let entry = state.workers.get(&worker)?;
         let ram_mb = unified_ram_mb?;
         let anchor_before = Self::anchor_locked(state, entry);
         if let Some(entry) = state.workers.get_mut(&worker) {
