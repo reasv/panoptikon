@@ -284,16 +284,16 @@ def test_vramrec_rows_take_the_gateways_keys_and_name_their_source(tmp_path):
 
 def test_used_that_moves_during_the_process_scan_is_flagged_and_not_judged(
         tmp_path, monkeypatch):
-    host = Host(tmp_path).gpu(1, 0x0300)
+    host = Host(tmp_path).gpu(1, 0x0300).gpu(2, 0x0C00, used=2 * GIB)
     host.kfd(700, 1, 300 * MIB)
     oracle = vramrec.AmdgpuOracle(rocm_sysfs.inventory(host.roots), host.roots)
 
     def sample():
-        (row,) = vramrec.build_sample(0, oracle, vramrec.ProcCache((), False),
-                                      None, 0.0)["gpus"]
-        return row["used_mb"], row["skew_mb"]
+        rows = vramrec.build_sample(0, oracle, vramrec.ProcCache((), False),
+                                    None, 0.0)["gpus"]
+        return [(row["used_mb"], row["skew_mb"]) for row in rows]
 
-    assert sample() == (1024, 0)
+    assert sample() == [(1024, 0), (2048, 0)]
     scan = vramrec.rocm_sysfs.process_vram_mb
 
     def growing(*args):
@@ -302,15 +302,19 @@ def test_used_that_moves_during_the_process_scan_is_flagged_and_not_judged(
         return scan(*args)
 
     monkeypatch.setattr(vramrec.rocm_sysfs, "process_vram_mb", growing)
-    assert sample() == (6144, 5120)
+    assert sample() == [(6144, 5120), (2048, 0)]
 
-    # The allowance on this 24 GiB GPU is 1 GiB.
+    # The allowance on this 24 GiB GPU is 1 GiB; the measured difference is
+    # 3800 MiB with `external_mb` 0, and 1800 MiB with 2000.
     ctx = _amdgpu_ctx("amdgpu-kfd", [(900, 1200)])
-    ctx.health_samples[0]["health"]["vram"][0]["external_mb"] = 0
+    gpu = ctx.health_samples[0]["health"]["vram"][0]
     row = ctx.vram_samples[0]["gpus"][0]
-    for skew, verdict in ((1024, "FAIL"), (1025, "SKIP")):
-        row["skew_mb"] = skew
-        assert analyze.check_oracle_agreement(ctx).verdict == verdict, skew
+    for external, skew, verdict in ((0, 1024, "FAIL"), (2000, 1024, "PASS"),
+                                    (0, 1025, "SKIP")):
+        gpu["external_mb"], row["skew_mb"] = external, skew
+        result = analyze.check_oracle_agreement(ctx)
+        assert result.verdict == verdict, (external, skew)
+    assert result.numbers["skewed_samples"] == 1
 
 
 def test_vramrec_selects_the_amdgpu_oracle_without_nvml(tmp_path, monkeypatch):

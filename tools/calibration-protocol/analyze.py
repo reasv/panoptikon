@@ -709,14 +709,17 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                 continue
             total = int(gpu.get("total_mb") or oracle.get("total_mb") or 0)
             allowance = max(1024.0, 0.02 * total)
-            # `used` moved past the allowance while the processes were read,
-            # so the two figures are not from one instant.
-            if (oracle.get("skew_mb") or 0) > allowance:
+            # `used` moved by up to `skew_mb` while the processes were read:
+            # past the allowance the sample is skipped, below it the true
+            # difference is at least the measured one less the skew.
+            skew = oracle.get("skew_mb") or 0
+            if skew > allowance:
                 skewed += 1
                 continue
             ours, _ = ctx.our_pids_mb(oracle)
             oracle_external = max(0, int(oracle["used_mb"]) - ours)
-            delta = abs(int(gpu.get("external_mb") or 0) - oracle_external)
+            delta = max(0, abs(int(gpu.get("external_mb") or 0)
+                               - oracle_external) - skew)
             joined += 1
             per_gpu[uuid] = max(per_gpu.get(uuid, 0.0), float(delta))
             if delta > worst:
@@ -739,9 +742,11 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             "no per-process attribution to check `external_mb` against -- "
             "the WDDM signature (or MPS, which has no per-process GPU "
             "counter at all, or ROCm with a worker whose descriptors the "
-            "oracle could not read), not a disagreement",
+            "oracle could not read), not a disagreement"
+            + (f"; {skewed} samples read while GPU used moved past the "
+               "allowance were skipped" if skewed else ""),
             {"joined": 0, "unpriced_samples": unpriced,
-             "oracle_sources": unpriced_sources})
+             "oracle_sources": unpriced_sources, "skewed_samples": skewed})
     if joined == 0:
         return Verdict("oracle_agreement", "SKIP",
                        "no health sample could be joined to a vramrec sample "
