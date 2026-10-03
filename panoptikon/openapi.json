@@ -6031,7 +6031,8 @@
         "description": "One measured GPU batch in [`ReplicaTelemetryHealth`].",
         "required": [
           "seq",
-          "age_ms"
+          "age_ms",
+          "spilled"
         ],
         "properties": {
           "age_ms": {
@@ -6063,6 +6064,15 @@
             ],
             "format": "double"
           },
+          "free_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Free device memory read before the batch.",
+            "minimum": 0
+          },
           "items": {
             "type": [
               "integer",
@@ -6088,6 +6098,13 @@
             "format": "int64",
             "minimum": 0
           },
+          "regrow_after": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pool release this batch re-grew from (`\"trim\"`, `\"shrink\"`,\n`\"growth\"` or `\"spill\"`), on the first batch after it only."
+          },
           "reserved_before_mb": {
             "type": [
               "integer",
@@ -6100,6 +6117,19 @@
             "type": "integer",
             "format": "int64",
             "description": "Per-worker sequence number; a gap means the ring evicted samples.",
+            "minimum": 0
+          },
+          "spilled": {
+            "type": "boolean",
+            "description": "Part of the pool was in system RAM after this batch."
+          },
+          "units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Size in cost-dimension units; absent without a grant.",
             "minimum": 0
           }
         }
