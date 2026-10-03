@@ -124,13 +124,15 @@ struct Series {
 }
 
 /// A trace file: `first <ms>` (the first batch after a load), `warm <ms>...`
-/// (what each next batch after a load takes on top of its own time), then per
-/// size `size <units> ovh <ms>|- n <count>` and a line of ms-per-unit values.
-/// Lines starting with `#` are comments.
+/// (what each next batch after a load takes on top of its own time),
+/// `levels <factor>...` (each recorded run's speed against the pooled series),
+/// then per size `size <units> ovh <ms>|- n <count>` and a line of
+/// ms-per-unit values. Lines starting with `#` are comments.
 struct Trace {
     series: Vec<Series>,
     first_ms: f64,
     warm_ms: Vec<f64>,
+    run_levels: Vec<f64>,
     /// Nonzero: every size reads its series at the pace of this size, so all
     /// sizes see the same host level at the same time. 0: each its own clock.
     shared_clock: f64,
@@ -143,13 +145,15 @@ impl Trace {
         let mut lines = text
             .lines()
             .filter(|l| !l.trim().is_empty() && !l.starts_with('#'));
-        let (mut series, mut first_ms, mut warm_ms) = (Vec::new(), 0.0, Vec::new());
+        let (mut series, mut first_ms, mut warm_ms, mut run_levels) =
+            (Vec::new(), 0.0, Vec::new(), Vec::new());
         let common = rng.unit();
         while let Some(line) = lines.next() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             match parts[0] {
                 "first" => first_ms = parts[1].parse().unwrap(),
                 "warm" => warm_ms = parts[1..].iter().map(|v| v.parse().unwrap()).collect(),
+                "levels" => run_levels = parts[1..].iter().map(|v| v.parse().unwrap()).collect(),
                 _ => {
                     let ms_per_unit: Vec<f64> = lines
                         .next()
@@ -185,6 +189,7 @@ impl Trace {
             series,
             first_ms,
             warm_ms,
+            run_levels,
             shared_clock: shared,
         }
     }
@@ -231,18 +236,32 @@ impl Trace {
     }
 
     /// The recorded ms per unit at simulated time `clock_ms` for `units`, and
-    /// that series' mean.
-    fn ms_per_unit(&self, units: u64, clock_ms: f64) -> (f64, f64) {
+    /// that series' mean. On a shared clock, the mean of the recorded values
+    /// over the batch's `span_ms` (its series' mean time if `None`), so a
+    /// large batch averages the host's noise as a real one does.
+    fn ms_per_unit(&self, units: u64, clock_ms: f64, span_ms: Option<f64>) -> (f64, f64) {
         let s = self.nearest(units);
         let total = s.starts_ms[s.starts_ms.len() - 1];
-        let pace = match self.shared_clock > 0.0 {
-            true => s.size as f64 / self.shared_clock,
-            false => 1.0,
+        let entry = |t: f64| {
+            let at = s.starts_ms.partition_point(|start| *start <= t);
+            at.saturating_sub(1).min(s.ms_per_unit.len() - 1)
         };
-        let t = (clock_ms * pace + s.offset_ms) % total;
-        let at = s.starts_ms.partition_point(|start| *start <= t);
-        let value = s.ms_per_unit[at.saturating_sub(1).min(s.ms_per_unit.len() - 1)];
-        (value, s.mean)
+        if self.shared_clock <= 0.0 {
+            let value = s.ms_per_unit[entry((clock_ms + s.offset_ms) % total)];
+            return (value, s.mean);
+        }
+        let pace = s.size as f64 / self.shared_clock;
+        let span = span_ms.unwrap_or(units as f64 * s.mean) * pace;
+        let mut at = (clock_ms * pace + s.offset_ms) % total;
+        let (mut i, mut left, mut sum) = (entry(at), span, 0.0);
+        while left > 0.0 {
+            let step = (s.starts_ms[i + 1] - at).clamp(0.0, left);
+            sum += s.ms_per_unit[i] * step;
+            left -= step;
+            i = (i + 1) % s.ms_per_unit.len();
+            at = s.starts_ms[i];
+        }
+        (sum / span.max(1e-9), s.mean)
     }
 }
 
@@ -457,10 +476,10 @@ fn pressure(level: &str) -> mps::MemoryPressure {
 }
 
 /// Every key a scenario line may carry.
-const KEYS: &str = "name dev mode room total base seed pu rsspu win items secs curve curve2 noise \
-    ndist levels nseed queue lag qmul qfloor cap fixed ovh trace trace2 swstart \
-    tseed tmin tshared tref tnoise prof ship starts restart roomsched roomlate \
-    hostram hostfree hostsched pressure die cost upi v compact";
+const KEYS: &str = "name dev mode room total base seed pu ratio rsspu rsssd rssfirst rsshot win \
+    rsslag items secs curve curve2 noise ndist levels nseed queue lag qmul qfloor cap fixed ovh trace \
+    trace2 swstart tseed tmin tshared tref tnoise tlevel prof ship starts restart roomsched \
+    roomlate hostram hostfree hostsched pressure die cost upi v compact";
 
 /// One scenario line. Every key is optional; defaults in [`Scenario::parse`].
 struct Scenario {
@@ -474,10 +493,21 @@ struct Scenario {
     total: u64,
     base: u64,
     seed: u32,
-    /// MiB of pool per unit of the largest batch run.
+    /// MiB a unit allocates, and the pool the allocator holds per MiB
+    /// allocated: one ratio, or `units:ratio` points linear in log2(units)
+    /// and flat outside.
     mb_per_unit: f64,
-    /// Resident-set growth per unit of a GPU worker, MiB.
+    pool_ratio: Curve,
+    /// Resident-set growth per unit of a GPU worker, MiB; each batch's
+    /// growth varies uniformly within ±`rss_spread` of it, and the first
+    /// window of every start takes the top of that range with `rss_hot`.
     rss_per_unit: f64,
+    rss_spread: f64,
+    rss_hot: bool,
+    /// Resident-set growth the first batch after a load keeps, MiB, and how
+    /// far the resident set read after a batch is below the next batch's start.
+    rss_first: u64,
+    rss_lag: u64,
     /// Stop after this many windows, items or simulated seconds.
     windows: usize,
     items: u64,
@@ -511,10 +541,13 @@ struct Scenario {
     trace_shared_clock: f64,
     /// The trace gives only the noise around its mean; the curve the rate.
     trace_noise: bool,
+    /// Every start draws one of the trace's run levels for all its sizes.
+    trace_levels: bool,
     /// A stored local row: `a:<anchor>[:k:<working>[:f:<failed>:w:<wait>]]`.
     profile: Option<String>,
-    /// A shipped row's anchor.
+    /// A shipped row: `<anchor>[:k:<working>]`.
     shipped: u64,
+    shipped_working: Option<u64>,
     starts: usize,
     /// Every start is a new process (true) or a new job in the same one.
     restart: bool,
@@ -580,6 +613,8 @@ impl Scenario {
         let host_free = (45_000 + host_ram / 10).min(host_ram * 4 / 5);
         let upi = get("upi", "1");
         let (lo, hi) = upi.split_once(':').unwrap_or((&upi, &upi));
+        let ship = get("ship", "0");
+        let ship: Vec<&str> = ship.split(':').collect();
         Self {
             name: get("name", "x"),
             device: Device::parse(&get("dev", "gpu-ram")),
@@ -589,7 +624,15 @@ impl Scenario {
             base: num("base", "554") as u64,
             seed: num("seed", "64") as u32,
             mb_per_unit: num("pu", "82"),
+            pool_ratio: match get("ratio", "1") {
+                r if r.contains(':') => Curve::parse(&format!("lad:{}", r.replace(':', "/"))),
+                r => Curve::Flat(r.parse().expect("ratio")),
+            },
             rss_per_unit: num("rsspu", "10"),
+            rss_spread: num("rsssd", "0"),
+            rss_hot: get("rsshot", "0") == "1",
+            rss_first: num("rssfirst", "0") as u64,
+            rss_lag: num("rsslag", "0") as u64,
             windows: num("win", "400") as usize,
             items: num("items", "0") as u64,
             secs: num("secs", "0"),
@@ -618,8 +661,10 @@ impl Scenario {
             trace_same_start: get("tshared", "0") == "1",
             trace_shared_clock: num("tref", "0"),
             trace_noise,
+            trace_levels: get("tlevel", "1") == "1",
             profile: Some(get("prof", "none")).filter(|p| p != "none"),
-            shipped: num("ship", "0") as u64,
+            shipped: ship[0].parse().expect("ship"),
+            shipped_working: ship.get(2).map(|k| k.parse().expect("ship working size")),
             starts: num("starts", "1") as usize,
             restart: get("restart", "1") == "1",
             room_schedule: schedule(&get("roomsched", ""), |r| r.parse().unwrap()),
@@ -803,6 +848,25 @@ fn scaled(budget: u64, spendable_mb: u64, grant_mb: u64, fixed_mb: u64) -> u64 {
     ((budget as f64 * left as f64 / per_units as f64 + 0.5) as u64).clamp(1, budget)
 }
 
+/// The memory sample a worker's reply carries: the device's free reading and
+/// its pool; on the CPU device the peak resident set, with the live one as
+/// allocated.
+fn report_memory(
+    handle: &TelemetryHandle,
+    device: Device,
+    free_mb: u64,
+    pool_mb: u64,
+    live_mb: u64,
+) {
+    handle.lock().unwrap().memory = Some(Timestamped::now(MemorySample {
+        free_mb: Some(free_mb),
+        free_source: Some(device.free_source().to_owned()),
+        reserved_mb: Some(pool_mb),
+        allocated_mb: Some(live_mb),
+        ..MemorySample::default()
+    }));
+}
+
 fn ledger_row(ledger: &Arc<VramLedger>) -> crate::inferio::ledger::health::LedgerWorkerHealth {
     ledger
         .health()
@@ -849,6 +913,9 @@ struct Start {
     trial_peak: u64,
     rss_peak: u64,
     ram_booked_peak: u64,
+    trial_rss_peak: u64,
+    trial_ram_booked_peak: u64,
+    dry: u32,
     least_slack: i64,
     over_room: u32,
     first_at_stored: i64,
@@ -857,6 +924,10 @@ struct Start {
     window_ms: Vec<u64>,
     window_items: Vec<u64>,
     pools: Vec<u64>,
+    pools_after: Vec<u64>,
+    booked: Vec<u64>,
+    ram_booked: Vec<u64>,
+    ram_used: Vec<u64>,
     died_at: Vec<u64>,
 }
 
@@ -891,7 +962,7 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
     if sc.shipped > 0 {
         gpu_only("ship");
         let scratch = store_at(&root.path().join("scratch"), None, env.clone());
-        scratch.record(stored_row(&sc, sc.shipped, None));
+        scratch.record(stored_row(&sc, sc.shipped, sc.shipped_working));
         scratch.write_pending();
         std::fs::create_dir_all(root.path().join("shipped")).unwrap();
         std::fs::copy(
@@ -931,6 +1002,8 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
         until_ms: 0.0,
         rng: Rng(sc.noise_seed ^ 0x1E7E15),
     });
+    let mut level_rng = Rng(sc.trace_seed ^ 0x1E7E_1A11);
+    let mut rss_rng = Rng(sc.noise_seed ^ 0x55AA_55AA);
     let mut clock_ms = 0f64;
     // Every new process reads the store back from disk.
     let mut store = open_store();
@@ -952,6 +1025,11 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
         };
         // A curve gives the job's true rate; a trace alone does not.
         let true_rate = trace.is_none() || sc.trace_noise;
+        // One recorded run's speed for every size of this start.
+        let run_level = match trace.filter(|t| sc.trace_levels && !t.run_levels.is_empty()) {
+            Some(t) => t.run_levels[(level_rng.next() % t.run_levels.len() as u64) as usize],
+            None => 1.0,
+        };
         let (stored_before, _) = stored_working(&local.join("calibration.toml"));
         let (mut handle, mut admission) = register(&ledger, &sc, device_mb);
         let (mut room, mut host_free, mut late_room) = (sc.room, sc.host_free, None);
@@ -964,6 +1042,7 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
             ..Start::default()
         };
         let (mut pool, mut peak_rss, mut under, mut since_load) = (0u64, sc.base, 0u32, 0usize);
+        let mut resident = RSS_AT_LOAD_MB;
         let mut blind_released = false;
         let mut last_grant: Option<Grant> = None;
         let mut now_pressure = mps::MemoryPressure::Normal;
@@ -976,8 +1055,7 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
         // A trim reply carries the worker's memory sample after the release.
         let release = |admission: &Admission, handle: &TelemetryHandle, room: u64, pool: u64| {
             let left = if pool_returned { sc.base } else { 0 };
-            let source = sc.device.free_source();
-            push_memory_with_total(handle, free_now(room, left), left, None, source);
+            report_memory(handle, sc.device, free_now(room, left), left, left);
             admission.note_trimmed(TrimReply {
                 released_mb: Some(pool),
                 release_ms: Some(20.0),
@@ -1030,7 +1108,8 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
                 window_units += units;
                 window.push(units);
             }
-            let queued = (hold - window.len() as u64) as usize;
+            // The caller keeps two windows in flight: at most one more queued.
+            let queued = (hold - window.len() as u64).min(window.len() as u64) as usize;
             let before = (sc.fixed.is_none()).then(|| ledger_row(&ledger));
             let token = match sc.fixed {
                 Some(_) => None,
@@ -1078,6 +1157,7 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
             let (items_before, mut oom, mut died) = (st.items, false, sc.die.contains(&w));
             let (mut measurements, mut out_ms, mut largest, mut window_pool) =
                 (Vec::new(), 0f64, 0u64, pool);
+            let mut window_rss = 0u64;
             let mut at = 0;
             while at < window.len() && !died {
                 // Memory this batch may spend: the room, and the pool the
@@ -1121,7 +1201,14 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
                     && units as f64 >= NEXT_OVER_BUDGET_MIN_RATIO * budget as f64
                     && sc.priced(&window[at..=end]) > budget;
                 let need = (sc.mb_per_unit * units as f64).round() as u64;
-                let rss_need = (sc.rss_per_unit * units as f64).round() as u64;
+                let spread = match sc.rss_hot && w == 0 {
+                    true => 1.0,
+                    false => 2.0 * rss_rng.unit() - 1.0,
+                };
+                let first = if since_load == 0 { sc.rss_first } else { 0 };
+                let rss_need = (sc.rss_per_unit * units as f64 * (1.0 + sc.rss_spread * spread))
+                    .round() as u64
+                    + first;
                 st.least_slack = st.least_slack.min(avail as i64 - need as i64);
                 // Out of host RAM, or out of memory where the kernel kills.
                 if (sc.device == Device::GpuRam && rss_need > host_free)
@@ -1142,24 +1229,29 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
                             as u32;
                 }
                 let pool_before = pool;
+                // The allocator's pool grows to its ratio over what the batch
+                // allocates, within the memory it may take.
+                let pool_need = (need as f64 * sc.pool_ratio.rate(0, units)).round() as u64;
                 match pool_returned {
                     true => window_pool = window_pool.max(need),
-                    false => pool = pool.max(need),
+                    false => pool = pool.max(pool_need.min(avail)),
                 }
                 window_pool = window_pool.max(pool);
                 st.pool_peak = st.pool_peak.max(window_pool);
                 let mut ms = match trace {
                     Some(t) if sc.trace_noise => {
-                        let (value, mean) = t.ms_per_unit(units, clock_ms);
-                        units as f64 * 1000.0 / curve.rate(w, units) * value / mean
+                        let ms = units as f64 * 1000.0 / curve.rate(w, units);
+                        let (value, mean) = t.ms_per_unit(units, clock_ms, Some(ms));
+                        ms * value / mean
                     }
-                    Some(t) => units as f64 * t.ms_per_unit(units, clock_ms).0,
+                    Some(t) => units as f64 * t.ms_per_unit(units, clock_ms, None).0,
                     None => {
                         units as f64 * 1000.0
                             / (curve.rate(w, units) * rng.noise(sc.noise, sc.gauss))
                     }
-                } / level;
-                if let Some(t) = trace {
+                } * run_level
+                    / level;
+                if let Some(t) = trace.filter(|_| !sc.trace_noise) {
                     // The first batches after a load pay their warm-up.
                     match since_load {
                         0 => ms = ms.max(t.first_ms),
@@ -1191,9 +1283,12 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
                 };
                 match sc.device {
                     Device::GpuRam => {
-                        m.peak_rss_mb = Some(RSS_AT_LOAD_MB + rss_need);
-                        m.rss_after_mb = Some(RSS_AT_LOAD_MB);
-                        st.rss_peak = st.rss_peak.max(rss_need);
+                        // What the batch grew over the resident set it found.
+                        let grown = sc.rss_lag + rss_need;
+                        m.peak_rss_mb = Some(resident + grown);
+                        resident += first;
+                        m.rss_after_mb = Some(resident);
+                        window_rss = window_rss.max(grown);
                     }
                     // Peak resident set as the pool, the live one as
                     // allocated; what the batch freed goes back at once.
@@ -1229,6 +1324,9 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
             st.job_ms += out_ms;
             if let (Some(token), Some(before)) = (token, &before) {
                 let grant = grant.expect("a grant");
+                let live = if pool_returned { sc.base } else { 0 };
+                let held = if pool_returned { peak_rss } else { pool };
+                report_memory(&handle, sc.device, free_now(room, pool), held, live);
                 handle.lock().unwrap().record_measurements(measurements);
                 token.finish(match died {
                     true => WindowOutcome::WorkerDied,
@@ -1241,7 +1339,9 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
                     Duration::from_secs_f64(out_ms / 1000.0),
                 );
                 st.ram_booked_peak = st.ram_booked_peak.max(grant.ram_mb);
-                st.queue_bound += (window_units < grant.unit_budget) as u32;
+                st.rss_peak = st.rss_peak.max(window_rss);
+                // As the dispatcher counts it: less than the window target.
+                st.queue_bound += (window_units < target) as u32;
                 let prev = st.ran.last().copied().unwrap_or(0);
                 st.grew_under_pressure += (now_pressure != mps::MemoryPressure::Normal
                     && budget > prev
@@ -1255,21 +1355,40 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
                 st.flips += (w0 > 0 && w1 != w0) as u32;
                 if before.trial_units.is_some() || after.trial_units.is_some() {
                     st.trial_peak = st.trial_peak.max(window_pool);
+                    st.trial_rss_peak = st.trial_rss_peak.max(window_rss);
+                    st.trial_ram_booked_peak = st.trial_ram_booked_peak.max(grant.ram_mb);
                 }
+                st.ram_booked.push(grant.ram_mb);
+                st.ram_used.push(window_rss);
                 if died {
                     st.deaths += 1;
                     st.died_at.push(w as u64);
                     drop(admission);
                     (handle, admission) = register(&ledger, &sc, device_mb);
                     (pool, since_load, under, last_grant) = (0, 0, 0, None);
-                } else if admission.take_trial_trim() {
-                    release(&admission, &handle, room, pool);
-                    pool = 0;
-                    st.trims += 1;
+                    resident = RSS_AT_LOAD_MB;
+                } else {
+                    if admission.take_trial_trim() {
+                        release(&admission, &handle, room, pool);
+                        pool = 0;
+                        st.trims += 1;
+                    }
+                    // The window took all the caller had queued and wanted
+                    // more: the dispatcher finds the queue dry before the
+                    // caller refills it.
+                    let more = items_left.is_none_or(|left| left > st.items - items_before);
+                    if queued == 0 && window_units < target && more {
+                        st.dry += 1;
+                        admission.note_demand(0);
+                        if admission.take_trial_trim() {
+                            release(&admission, &handle, room, pool);
+                            pool = 0;
+                            st.trims += 1;
+                        }
+                    }
                 }
-                // The queue runs dry only when the job has nothing left.
-                let behind = items_left.map_or(DEEP_QUEUE, |left| left - (st.items - items_before));
-                admission.note_demand(behind as usize);
+                st.pools_after.push(pool);
+                st.booked.push(ledger_row(&ledger).reserved_mb.unwrap_or(0));
             }
             st.ooms += oom as u32;
             // The first window at the stored size, or holding the whole queue below it.
@@ -1317,8 +1436,9 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
             "name={} start={start} mode={} windows={} items={} ms={:.0} true_s={:.3} W={working_end} \
              open={opening} ostored={stored_before} firstw={} stored={stored} wait={wait} trial={} \
              trials={} flips={} poolmean={:.0} poolpeak={} trialpeak={} poollast={pool_last} \
-             poolend={pool} rsspeak={} rssbook={} slack={} oom={} deaths={} trims={} releases={} \
-             clamps={} offsize={} qbound={} grewp={} overroom={}",
+             poolend={pool} rsspeak={} rssbook={} trialrss={} trialrssbook={} slack={} oom={} \
+             deaths={} trims={} releases={} clamps={} offsize={} qbound={} dry={} grewp={} \
+             overroom={}",
             sc.name,
             sc.mode,
             st.ran.len(),
@@ -1334,6 +1454,8 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
             st.trial_peak,
             st.rss_peak,
             st.ram_booked_peak,
+            st.trial_rss_peak,
+            st.trial_ram_booked_peak,
             st.least_slack.min(sc.room as i64),
             st.ooms,
             st.deaths,
@@ -1342,6 +1464,7 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
             st.clamps,
             st.offsize,
             st.queue_bound,
+            st.dry,
             st.grew_under_pressure,
             st.over_room,
         );
@@ -1351,12 +1474,17 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
                 false => v.iter().map(u64::to_string).collect::<Vec<_>>().join(","),
             };
             line += &format!(
-                " budgets={} working={} wms={} witems={} pools={} died={}",
+                " budgets={} working={} wms={} witems={} pools={} after={} booked={} rambook={} \
+                 ramused={} died={}",
                 join(&st.ran),
                 join(&st.working),
                 join(&st.window_ms),
                 join(&st.window_items),
                 join(&st.pools),
+                join(&st.pools_after),
+                join(&st.booked),
+                join(&st.ram_booked),
+                join(&st.ram_used),
                 join(&st.died_at),
             );
         }
@@ -1404,7 +1532,8 @@ fn field<'a>(line: &'a str, key: &str) -> &'a str {
 
 /// Every device runs to the end with one line per start; a fixed size holds
 /// its size; the CPU device's batches leave no pool behind; a restart reads
-/// the working size back from disk.
+/// the working size back from disk; the ledger books the pool the worker
+/// holds after every window, a release included.
 #[test]
 fn every_device_simulates_one_line_per_start() {
     let mut spec = String::new();
@@ -1415,11 +1544,13 @@ fn every_device_simulates_one_line_per_start() {
     }
     spec += "name=fixed dev=gpu fixed=48 win=20 lag=2 v=1\n";
     spec += "name=cpu-pool dev=cpu room=40000 total=48000 pu=46 curve=geo:1.2:20 win=300 v=1\n";
+    spec += "name=pool pu=30 ratio=16:1.6,256:1.8 rsssd=0.2 rssfirst=500 rsslag=50 \
+             curve=knee:1.3:256:8 noise=0.05 win=300 lag=2 v=1\n";
     let mut out = Vec::new();
     run_spec(&spec, Path::new(""), &mut out);
     let out = String::from_utf8(out).unwrap();
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 12, "{out}");
+    assert_eq!(lines.len(), 13, "{out}");
     for line in &lines[..10] {
         assert_eq!(field(line, "windows"), "60", "{line}");
     }
@@ -1444,4 +1575,7 @@ fn every_device_simulates_one_line_per_start() {
         largest.unwrap() > 256,
         "the batch memory is not someone else's: {cpu}"
     );
+    let pool = lines[12];
+    assert!(field(pool, "trims").parse::<u32>().unwrap() > 0, "{pool}");
+    assert_eq!(field(pool, "booked"), field(pool, "after"), "{pool}");
 }
