@@ -33,7 +33,7 @@ HEADER = json.dumps({"kind": "header"}) + "\n"
 SAMPLE = json.dumps({"kind": "sample", "seq": 0, "t_wall": 100.0}) + "\n"
 
 
-def test_the_gateway_waits_for_both_recorders_and_marks_a_silent_one(tmp_path):
+def test_the_leg_waits_for_both_recorders_and_marks_a_silent_one(tmp_path):
     sampled, late = tmp_path / "vramrec.jsonl", tmp_path / "healthrec.jsonl"
     sampled.write_text(HEADER + SAMPLE)
     late.write_text(HEADER)
