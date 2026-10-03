@@ -2,6 +2,7 @@
 //! left behind by a run as root, a container started under a different uid),
 //! or its filesystem is read-only.
 
+use crate::db::migrations::FailedDatabase;
 use std::path::{Path, PathBuf};
 
 /// Fails when another user owns one of [`database_paths`] and the current
@@ -15,14 +16,22 @@ pub(crate) fn check_databases(data_folder: &Path, index_db: &str) -> anyhow::Res
     }
 }
 
-/// [`explain`] for a failed database open or migration, over [`database_paths`].
-pub(crate) fn explain_databases(
-    err: anyhow::Error,
-    data_folder: &Path,
-    index_db: &str,
-) -> anyhow::Error {
-    let data_folder = absolute(data_folder);
-    explain(err, &data_folder, &database_paths(&data_folder, index_db))
+/// [`explain`] for a failed migration, over the database it failed on.
+pub(crate) fn explain_migration(err: anyhow::Error, data_folder: &Path) -> anyhow::Error {
+    let paths = migration_paths(&err);
+    explain(err, &absolute(data_folder), &paths)
+}
+
+/// The database a migration error names, with its `-wal` and `-shm` and the
+/// folder it is kept in; empty when the error names none.
+fn migration_paths(err: &anyhow::Error) -> Vec<PathBuf> {
+    let Some(FailedDatabase(db)) = err.downcast_ref() else {
+        return Vec::new();
+    };
+    let db = absolute(db);
+    let mut paths: Vec<_> = db.parent().map(Path::to_path_buf).into_iter().collect();
+    push_database(&mut paths, db);
+    paths
 }
 
 /// Adds to `err` the first of `paths` the current user cannot write because
@@ -414,6 +423,35 @@ pub(crate) mod tests {
         assert_eq!(format!("{unexplained:#}"), "open failed");
     }
 
+    /// A failed migration is explained by the database it failed on, never
+    /// by another one: here the default database's folder is read-only.
+    #[test]
+    fn a_failed_migration_is_explained_by_its_own_database_only() {
+        let data = data_folder();
+        let read_only = data.path().join("index/default");
+        let access = |path: &Path| {
+            if path == read_only {
+                Access::ReadOnly
+            } else {
+                Access::Writable
+            }
+        };
+        for (db, blamed) in [
+            ("index/default/storage.db", true),
+            ("index/second/index.db", false),
+            ("user_data/default.db", false),
+        ] {
+            let failed = FailedDatabase(data.path().join(db));
+            let err = anyhow::anyhow!("disk full").context(failed);
+            let paths = migration_paths(&err);
+            let explained = unix::explain(err, data.path(), &paths, 1000, access);
+            let explained = format!("{explained:#}");
+            let named = explained.contains(&format!("'{}'", read_only.display()));
+            assert_eq!(named, blamed, "{explained}");
+        }
+        assert!(migration_paths(&anyhow::anyhow!("disk full")).is_empty());
+    }
+
     /// The transcode cache's shape: a folder holding one database.
     #[test]
     fn a_database_in_its_own_folder_names_the_folder_or_its_parent() {
@@ -486,8 +524,13 @@ pub(crate) mod tests {
         std::os::unix::fs::symlink(folder, &default).unwrap();
         let expected = owned_by_another_user(&default, owner, data.path());
         let refused = check_databases(data.path(), "default").unwrap_err();
-        assert_eq!(refused.to_string(), expected);
-        let explained = explain_databases(anyhow::anyhow!("open failed"), data.path(), "default");
-        assert_eq!(format!("{explained:#}"), format!("{expected}: open failed"));
+        assert!(refused.to_string().starts_with(&expected), "{refused}");
+        let failed = FailedDatabase(default.join("index.db"));
+        let err = anyhow::anyhow!("open failed").context(failed);
+        let explained = format!("{:#}", explain_migration(err, data.path()));
+        assert!(
+            explained.starts_with(&format!("{expected}: ")),
+            "{explained}"
+        );
     }
 }

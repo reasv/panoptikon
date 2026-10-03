@@ -143,8 +143,8 @@ fn root_dir(flag: Option<PathBuf>, env: Option<std::ffi::OsString>) -> Option<Pa
 }
 
 /// Runs the startup migrations `migrate`. Refused up front when another user
-/// owns a database the server could not write; a failure is explained by
-/// such a database or by a read-only filesystem.
+/// owns a database the server could not write; a failed migration is
+/// explained by its database's owner or read-only filesystem.
 async fn migrate_at_startup(
     data_folder: &std::path::Path,
     index_db: &str,
@@ -153,7 +153,7 @@ async fn migrate_at_startup(
     ownership::check_databases(data_folder, index_db)?;
     migrate
         .await
-        .map_err(|err| ownership::explain_databases(err, data_folder, index_db))
+        .map_err(|err| ownership::explain_migration(err, data_folder))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1022,11 +1022,13 @@ mod route_tests {
     }
 
     /// The refusal comes before any migration: the default database's folder
-    /// is a symlink to a folder another user owns. A migration that fails
-    /// (here, after that folder appears) is explained by it.
+    /// is a symlink to a folder another user owns. A migration of that
+    /// database that fails (here, after that folder appears) is explained by
+    /// it.
     #[cfg(unix)]
     #[tokio::test]
     async fn startup_refuses_or_explains_a_database_folder_another_user_owns() {
+        use crate::db::migrations::FailedDatabase;
         use crate::ownership::tests::{foreign_folder, owned_by_another_user};
         let Some((folder, owner)) = foreign_folder(false) else {
             return;
@@ -1039,21 +1041,26 @@ mod route_tests {
 
         let migrate = async {
             std::os::unix::fs::symlink(folder, &default)?;
-            Err::<(), anyhow::Error>(anyhow::anyhow!("migration failed"))
+            let failed = FailedDatabase(default.join("index.db"));
+            Err::<(), anyhow::Error>(anyhow::anyhow!("migration failed").context(failed))
         };
         let error = migrate_at_startup(data.path(), "default", migrate)
             .await
             .unwrap_err();
-        assert_eq!(
-            format!("{error:#}"),
-            format!("{expected}: migration failed")
-        );
+        let error = format!("{error:#}");
+        assert!(error.starts_with(&format!("{expected}: ")), "{error}");
+        assert!(error.ends_with(": migration failed"), "{error}");
 
         let migrate = async { Err(anyhow::anyhow!("migrated")) };
         let error = migrate_at_startup(data.path(), "default", migrate)
             .await
             .unwrap_err();
-        assert_eq!(format!("{error:#}"), expected, "refused before migrating");
+        let error = format!("{error:#}");
+        assert!(error.starts_with(&expected), "{error}");
+        assert!(
+            !error.contains("migrated"),
+            "refused before migrating: {error}"
+        );
     }
 
     /// What `axum::serve` gave us for free, asserted rather than assumed now
