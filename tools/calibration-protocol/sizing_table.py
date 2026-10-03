@@ -81,7 +81,7 @@ DESKTOP = {
     "the same, the free reading stale when it happens":
         (CARD16, "wdvit", "roomsched=60:2500,200:14500 roomlate=1"),
     "16 GB card, Florence, room halves at window 40": (CARD16, "flor", "roomsched=40:7000"),
-    "host RAM free falls from 51 to 12 GB at window 30 (docTR, 70 MiB a unit)":
+    "host RAM free falls from 51 to 12 GB at window 30 (docTR)":
         (GPU_BIG, "doctr", "hostsched=30:12000"),
     "worker dies at window 30, host RAM booked": (GPU_BIG, "flor", "die=30"),
     "8 GB Mac, pressure warning at 40, paging at 80, normal at 160":
@@ -330,7 +330,11 @@ def acceptance_lines(a):
 
 def run(lines, a):
     """Every line on the simulator, in `a.jobs` shards; one dict per process start. A scenario
-    that panics fails the run."""
+    that panics fails the run. With `--rows`, the simulator's lines are kept in that file, and
+    read from it instead when it exists."""
+    if a.rows and os.path.isfile(a.rows):
+        return [dict(r, key=tuple(r["name"].replace("_", " ").split("|")))
+                for r in (dict(t.split("=", 1) for t in line.split()) for line in open(a.rows))]
     work, procs, rows, panics = tempfile.mkdtemp(prefix="sizing-"), [], [], []
     test = "inferio::ledger::tests::sizing_sim::sizing_sim"
     for i in range(a.jobs):
@@ -339,9 +343,12 @@ def run(lines, a):
         env = dict(os.environ, SIZING_SPEC=spec, SIZING_OUT=out, SIZING_TRACES=a.traces)
         cmd = ["nice", "-n", "8", a.bin, "--ignored", "--exact", "-q", test]
         procs.append((subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL), out))
+    kept = open(a.rows, "w") if a.rows else None
     for proc, out in procs:
         proc.wait()
         for line in open(out):
+            if kept and not line.startswith("panic"):
+                kept.write(line)
             if line.startswith("panic"):
                 panics.append(line[:300])
                 continue
@@ -431,7 +438,9 @@ def tables(rows, a):
             tokens = specs[cls][model]
             fx, upi = fixed[("fixed", cls, model)], per_item(tokens)
             pool_w, rss_w = (float(value(tokens, k, "1")) for k in ("pu", "rsspu"))
-            pool_w *= float(value(tokens, "ratio", "1"))
+            ratio = value(tokens, "ratio", "1")
+            ratio_at = lambda u: (curve_rate("lad:" + ratio.replace(":", "/"), 0, u)
+                                  if ":" in ratio else float(ratio))
             b, v, vs = best("fixed", cls, model), [ips(r) for r in rs], [versus(r) for r in rs]
             seed = int(value(tokens, "seed")) // upi
             w_end = max(max(int(r["W"]), 0) for r in rs)
@@ -442,8 +451,9 @@ def tables(rows, a):
                 f"{mean(rs, num('trials')):.1f}",
                 gb(mean(rs, num("poolmean"))), gb(mean(rs, num("poollast"))),
                 gb(max(map(num("poolpeak"), rs))), gb(max(map(num("trialpeak"), rs))),
-                gb(pool_w * w_end), gb(rss_w * w_end), gb(max(map(num("rssbook"), rs))),
-                gb(max(map(num("rsspeak"), rs))), gb(max(map(num("trialrssbook"), rs))),
+                gb(pool_w * ratio_at(w_end) * w_end), gb(rss_w * w_end),
+                gb(max(map(num("rssbook"), rs))), gb(max(map(num("rsspeak"), rs))),
+                gb(max(map(num("trialrssbook"), rs))),
                 gb(max(map(num("trialrss"), rs))))
     daily_tables(g, versus, a)
     curve_tables(g, scen, top, gain, a)
@@ -733,6 +743,7 @@ def main():
                     help="the CUDA trace days")
     ap.add_argument("--modes", default="balanced,throughput", type=lambda v: v.split(","))
     ap.add_argument("--seeds", type=int, default=8)
+    ap.add_argument("--rows", help="keep the simulator's output here; reuse it if it exists")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--gpu", type=float, default=0.05, help="balanced gain per doubling, GPU")
     ap.add_argument("--strict", type=float, default=0.15, help="balanced gain, CPU and unified")
