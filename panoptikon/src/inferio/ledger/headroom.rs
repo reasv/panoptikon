@@ -223,8 +223,9 @@ impl VramLedger {
     /// On a Metal allocator with a [`RamBasis`] the sum is taken in the RAM
     /// domain (`hw.memsize − available`) and not clipped to the device total.
     /// On a GPU that spills to system RAM, while its free reading is below
-    /// [`DEFAULT_RESERVE_CAP_MB`] it is at least its value at the last
-    /// reading that was not, since our pool may then be partly off the card.
+    /// [`DEFAULT_RESERVE_CAP_MB`] or credited for a departure it is at least
+    /// its value at the last reading that was neither, since our pool may
+    /// then be partly off the card.
     pub(super) fn external_locked(&self, state: &LedgerState, gpu: &str) -> Option<u64> {
         let measured = Self::measured_external_locked(state, gpu)?;
         let gpu_ledger = state.gpus.get(gpu)?;
@@ -232,7 +233,7 @@ impl VramLedger {
             .free
             .as_ref()
             .is_some_and(|sample| sample.free_mb < DEFAULT_RESERVE_CAP_MB);
-        if full && self.budgets.spills_to_ram(gpu) {
+        if (full || gpu_ledger.free_adjusted_at.is_some()) && self.budgets.spills_to_ram(gpu) {
             return Some(measured.max(gpu_ledger.external_before_full_mb.unwrap_or(0)));
         }
         Some(measured)

@@ -285,9 +285,11 @@ impl VramLedger {
             .gpus
             .iter()
             .filter(|(_, gpu)| {
-                gpu.free
-                    .as_ref()
-                    .is_some_and(|sample| sample.free_mb >= DEFAULT_RESERVE_CAP_MB)
+                gpu.free_adjusted_at.is_none()
+                    && gpu
+                        .free
+                        .as_ref()
+                        .is_some_and(|sample| sample.free_mb >= DEFAULT_RESERVE_CAP_MB)
             })
             .map(|(uuid, _)| (uuid.clone(), Self::measured_external_locked(state, uuid)))
             .collect();

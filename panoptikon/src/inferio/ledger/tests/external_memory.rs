@@ -389,8 +389,8 @@ fn external_clamps_at_zero() {
 
 /// A full GPU that spills to system RAM puts part of our pool off the card:
 /// it is in our footprint but not in the GPU's used memory, so `external`
-/// reads too low. While the GPU reads full, `external` is at least its value
-/// at the last reading that was not.
+/// reads too low. While the GPU reads full or is credited for a departure,
+/// `external` is at least its value at the last reading that was neither.
 #[test]
 fn a_spilling_gpu_holds_external_while_it_reads_full() {
     const TOTAL: u64 = 24_000;
@@ -398,37 +398,51 @@ fn a_spilling_gpu_holds_external_while_it_reads_full() {
         let ledger = VramLedger::for_test(&[(GPU, "TEST 9000", TOTAL)], budgets);
         let a = loaded(Some(1_000), Some(0));
         let b = loaded(Some(1_000), Some(0));
-        let _a = ledger.register_worker("g/a", item_cost(4), &a, None);
+        let a_admission = ledger.register_worker("g/a", item_cost(4), &a, None);
         let _b = ledger.register_worker("g/b", item_cost(4), &b, None);
         push_memory_with_total(&b, 17_000, 1_000, Some(TOTAL), "nvml");
-        // A's pool and the card's free reading; B's pool stays 1 000.
-        [
+        // A worker's pool and the card's free reading.
+        let read = |handle: &TelemetryHandle, free_mb, pool_mb| {
+            push_memory_with_total(handle, free_mb, pool_mb, Some(TOTAL), "nvml");
+            ledger.ingest_all_for_test();
+            ledger.health()[0].external_mb
+        };
+        let mut externals = [
+            (12_000, 1_000),
             (17_000, 1_000),
             (0, 19_000),
             (0, 21_000),
             (0, 24_000),
-            (15_000, 1_000),
         ]
-        .map(|(free_mb, pool_mb)| {
-            push_memory_with_total(&a, free_mb, pool_mb, Some(TOTAL), "nvml");
-            ledger.ingest_all_for_test();
-            ledger.health()[0].external_mb
-        })
+        .map(|(free_mb, pool_mb)| read(&a, free_mb, pool_mb))
+        .to_vec();
+        // A leaves while the card reads full: its spilled pool is credited too.
+        drop(a_admission);
+        externals.push(ledger.health()[0].external_mb);
+        externals.extend(
+            [(0, 22_000), (500, 15_000), (15_000, 1_000)]
+                .map(|(free_mb, pool_mb)| read(&b, free_mb, pool_mb)),
+        );
+        externals
     };
-    // Other processes use 3 000 and our contexts 2 000, so a full card holds
-    // 19 000 of our pools: S of them off the card reads as 3 000 − S.
+    // Other processes use 8 000, then 3 000, and our contexts 2 000, so a
+    // full card holds 19 000 of our pools: S of them off the card reads as
+    // 3 000 − S. Then other processes grow to 7 500.
     let spilling = VramBudgets {
         spilling: HashSet::from([GPU.to_owned()]),
         ..no_margin().into()
     };
     assert_eq!(
         externals(spilling),
-        [3_000, 3_000, 3_000, 3_000, 5_000],
-        "held at S = 1 000, 3 000 and 6 000; read afresh once free again"
+        [
+            8_000, 3_000, 3_000, 3_000, 3_000, 3_000, 3_000, 7_500, 7_000
+        ],
+        "the last value read with room held through the spill and A's departure; \
+         a larger reading counts; read afresh once free again"
     );
     assert_eq!(
         externals(no_margin().into()),
-        [3_000, 2_000, 0, 0, 5_000],
+        [8_000, 3_000, 2_000, 0, 0, 0, 1_000, 7_500, 7_000],
         "a GPU that fails the allocation reads what it measures"
     );
 }

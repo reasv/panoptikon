@@ -1391,8 +1391,8 @@ struct GpuLedger {
     /// readings captured before it are refused.
     free_adjusted_at: Option<Instant>,
     /// `external` at the last pool refresh that read at least
-    /// [`DEFAULT_RESERVE_CAP_MB`] free; held on a spilling GPU while it reads
-    /// full.
+    /// [`DEFAULT_RESERVE_CAP_MB`] free and was not credited for a departure;
+    /// held on a spilling GPU while it reads full.
     external_before_full_mb: Option<u64>,
 }
 
