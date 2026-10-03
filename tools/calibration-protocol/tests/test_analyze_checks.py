@@ -768,3 +768,49 @@ def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
     # A step larger than the span fell outside it: busy time, no step.
     assert analyze._items_per_s([record(10, 20)], 30.0) == pytest.approx(
         100 / 4.5)
+
+
+# --- deflation_recovery ------------------------------------------------------
+
+
+def _deflation(deflation, outcome="clean"):
+    return {"ts": "2026-10-03T00:00:00.000000Z", "t_wall": 100.0,
+            "level": "WARN" if outcome == "negative" else "DEBUG",
+            "target": "panoptikon::inferio::ledger",
+            "message": "settled a granted window",
+            "fields": {"model": MODEL, "gpu": GPU, "outcome": outcome,
+                       "deflation": deflation}, "line": ""}
+
+
+def _deflated_health(deflation):
+    sample = _worker_health(8)
+    sample["health"]["workers"][0].update(gpu_uuid=GPU, deflation=deflation)
+    return sample
+
+
+def test_deflation_recovery_reads_the_settle_lines_before_health():
+    """One level, repaid after three clean windows. A 0.3 s job no health
+    sample saw gets a verdict, and a lone deflated sample is not the end."""
+    recovered = [_deflation(1, "negative"), _deflation(1), _deflation(1),
+                 _deflation(0)]
+    for healthrec in ([], [_deflated_health(1)]):
+        ctx = _utilization_context(healthrec, log=recovered)
+        verdict = analyze.check_deflation_recovery(ctx)
+        assert (verdict.verdict, verdict.numbers["source"]) == ("PASS", "log")
+    stuck = _utilization_context(
+        [], log=[_deflation(1, "negative")] + [_deflation(1)] * 3)
+    verdict = analyze.check_deflation_recovery(stuck)
+    assert verdict.verdict == "FAIL"
+    assert verdict.numbers["clean_windows_after_last_negative"] == {
+        f"{MODEL}@{GPU}": 3}
+
+
+def test_deflation_that_never_recovers_passes_only_when_declared():
+    """`calibfixture/oom_cuda` runs no clean window, so its log holds only
+    WARN settles and health is read instead."""
+    ctx = _utilization_context([_deflated_health(0), _deflated_health(3)],
+                               log=[_deflation(3, "negative")])
+    verdict = analyze.check_deflation_recovery(ctx)
+    assert (verdict.verdict, verdict.numbers["source"]) == ("FAIL", "healthrec")
+    ctx.args.expect_deflated = True
+    assert analyze.check_deflation_recovery(ctx).verdict == "PASS"

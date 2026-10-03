@@ -423,6 +423,8 @@ DEPARTED_REPLICA = "credited a departed replica's footprint"
 # One INFO per window settled as an OOM negative, carrying `source`, `trust`,
 # `exception`, `free_mb_at_failure`, `grant_mb`, `oom_samples`; prefix match.
 OOM_TIER_LINE = "classified this window as an out-of-memory negative"
+# DEBUG, carrying `deflation` after a repayment for elapsed time; prefix match.
+DEFLATION_REPAID_LINE = "repaid deflation by elapsed time"
 
 # A pid absent this long and then back is read as a different process.
 PID_REUSE_GAP_S = 60.0
@@ -1419,35 +1421,55 @@ def check_failures(ctx: Context) -> Verdict:
 
 
 def check_deflation_recovery(ctx: Context) -> Verdict:
-    """Deflation must return to 0 within 3 clean windows per level."""
-    if not ctx.health_samples:
-        return Verdict("deflation_recovery", "SKIP", "no healthrec.jsonl")
-    peak: Dict[str, int] = {}
-    last: Dict[str, int] = {}
-    series: Dict[str, List[Tuple[float, int]]] = {}
-    for sample in ctx.health_samples:
+    """Deflation must return to 0 by the end of the recording.
+
+    Read from the log: every settle line carries the worker's `deflation`, and
+    so does the line that repays it by elapsed time. A log without DEBUG lines
+    lacks the clean settles, so `/health` samples stand in for it. A worker
+    still deflated at the end FAILs unless the leg declared that its model
+    never runs a clean window (`--expect-deflated`)."""
+    # Per worker: (deflation, settle outcome or None) in time order.
+    series: Dict[str, List[Tuple[int, Optional[str]]]] = {}
+    if any(event["level"] == "DEBUG" for event in ctx.log):
+        for event in ctx.log:
+            fields = event["fields"]
+            if "deflation" in fields and (
+                    event["message"] == "settled a granted window"
+                    or event["message"].startswith(DEFLATION_REPAID_LINE)):
+                series.setdefault(f"{fields.get('model')}@{fields.get('gpu')}",
+                                  []).append((int(fields["deflation"]),
+                                              fields.get("outcome")))
+    source = "log" if series else "healthrec"
+    for sample in ctx.health_samples if not series else []:
         for worker in (sample.get("health") or {}).get("workers") or []:
-            key = f"{worker['inference_id']}@{worker.get('gpu_uuid')}"
-            value = int(worker.get("deflation") or 0)
-            peak[key] = max(peak.get(key, 0), value)
-            last[key] = value
-            series.setdefault(key, []).append((sample["t_wall"], value))
-    if not peak:
-        return Verdict("deflation_recovery", "SKIP", "no workers in any health sample")
-    cutoff = ctx.idle_cutoff()
-    stuck = {key: value for key, value in last.items() if value > 0}
-    max_peak = max(peak.values())
-    if max_peak == 0:
-        return Verdict("deflation_recovery", "PASS",
-                       "deflation never left 0 on any worker",
-                       {"peak": peak})
-    verdict = "PASS" if not stuck else "FAIL"
+            series.setdefault(f"{worker['inference_id']}@{worker.get('gpu_uuid')}",
+                              []).append((int(worker.get("deflation") or 0), None))
+    if not series:
+        return Verdict("deflation_recovery", "SKIP",
+                       "no settle line with DEBUG logging and no worker in "
+                       "any health sample")
+    peak = {key: max(value for value, _ in rows) for key, rows in series.items()}
+    final = {key: rows[-1][0] for key, rows in series.items()}
+    # Clean windows since each worker's last negative one.
+    clean = {}
+    for key, rows in series.items():
+        outcomes = [outcome for _, outcome in rows if outcome is not None]
+        last = max((index for index, outcome in enumerate(outcomes)
+                    if outcome == "negative"), default=-1)
+        clean[key] = outcomes[last + 1:].count("clean")
+    stuck = {key: value for key, value in final.items() if value > 0}
+    declared = bool(getattr(ctx.args, "expect_deflated", False))
+    verdict = "FAIL" if stuck and not declared else "PASS"
     return Verdict(
         "deflation_recovery", verdict,
-        f"peak deflation {max_peak} ({', '.join(f'{k}={v}' for k, v in peak.items())}); "
-        f"at the end of the recording {len(stuck)} worker(s) were still deflated"
-        + (f" ({stuck})" if stuck else ""),
-        {"peak": peak, "final": last, "idle_cutoff": cutoff},
+        f"from the {source}: peak deflation {max(peak.values())} "
+        f"({', '.join(f'{k}={v}' for k, v in peak.items())}); at the end "
+        f"{len(stuck)} worker(s) still deflated"
+        + "".join(f"; {key} at {value} after {clean[key]} clean window(s)"
+                  for key, value in stuck.items())
+        + (" (declared: --expect-deflated)" if stuck and declared else ""),
+        {"source": source, "peak": peak, "final": final,
+         "clean_windows_after_last_negative": clean, "declared": declared},
     )
 
 
@@ -2518,6 +2540,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="whole jobs whose outcome is meant to be a "
                              "failure (a model that cannot load, and the "
                              "load-failure fixtures)")
+    parser.add_argument("--expect-deflated", action="store_true",
+                        help="this leg's model OOMs on every batch "
+                             "(`calibfixture/oom_cuda`), so no clean window "
+                             "ever repays its deflation")
     parser.add_argument("--expect-empty-setters", action="store_true",
                         help="this leg's setters are meant to run on no "
                              "items (`calibfixture/dies_on_load_cuda` never "
