@@ -142,6 +142,8 @@ impl MemoryPressure {
 }
 
 /// The memory pressure now; `Normal` off macOS or when unreadable.
+/// Unused by macOS test builds, where the ledger reads its stub.
+#[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
 pub(super) fn memory_pressure() -> MemoryPressure {
     #[cfg(target_os = "macos")]
     {

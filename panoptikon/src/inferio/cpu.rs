@@ -173,7 +173,7 @@ fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        return super::mps::physical_ram_mb();
+        super::mps::physical_ram_mb()
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
@@ -201,7 +201,7 @@ fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        return super::mps::ram_available_mb();
+        super::mps::ram_available_mb()
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
