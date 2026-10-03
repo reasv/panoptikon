@@ -143,3 +143,38 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AskEveryEvent {
         false
     }
 }
+
+/// The `reason` field of every WARN event this thread logs while the guard
+/// lives.
+pub(crate) fn warned_reasons() -> (
+    tracing::subscriber::DefaultGuard,
+    std::sync::Arc<Mutex<Vec<String>>>,
+) {
+    use tracing_subscriber::layer::SubscriberExt;
+    install_ask_every_event();
+    let reasons = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(WarnedReasons(reasons.clone()));
+    (tracing::subscriber::set_default(subscriber), reasons)
+}
+
+struct WarnedReasons(std::sync::Arc<Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnedReasons {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            event.record(&mut Reason(&self.0));
+        }
+    }
+}
+
+struct Reason<'a>(&'a Mutex<Vec<String>>);
+
+impl tracing::field::Visit for Reason<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "reason" {
+            self.0.lock().unwrap().push(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
