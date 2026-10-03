@@ -10,10 +10,35 @@ use std::path::{Path, PathBuf};
 /// left behind; it cannot write either way.
 pub(crate) fn check_databases(data_folder: &Path, index_db: &str) -> anyhow::Result<()> {
     let data_folder = absolute(data_folder);
-    match reason(&data_folder, &database_paths(&data_folder, index_db), false) {
-        Some(reason) => Err(anyhow::anyhow!(reason)),
+    let paths = database_paths(&data_folder, index_db);
+    match refusal(&data_folder, &paths, |path| {
+        reason(&data_folder, std::slice::from_ref(path), false)
+    }) {
+        Some(refusal) => Err(anyhow::anyhow!(refusal)),
         None => Ok(()),
     }
+}
+
+/// The first of `paths` with a `problem`, as a message. A database, or its
+/// folder, can instead be left as it is: moved out of the data folder, or
+/// served read-only.
+fn refusal(
+    data_folder: &Path,
+    paths: &[PathBuf],
+    problem: impl Fn(&PathBuf) -> Option<String>,
+) -> Option<String> {
+    let (path, reason) = paths
+        .iter()
+        .find_map(|path| problem(path).map(|reason| (path, reason)))?;
+    let created_in = [data_folder.join("index"), data_folder.join("user_data")];
+    if *path == data_folder || created_in.contains(path) {
+        return Some(reason);
+    }
+    Some(format!(
+        "{reason}; to keep that database as it is, move it out of '{}' or set readonly = true in \
+         the server config",
+        data_folder.display()
+    ))
 }
 
 /// [`explain`] for a failed migration, over the database it failed on.
@@ -291,7 +316,10 @@ pub(crate) mod tests {
                 Access::Writable
             }
         };
-        unix::reason(data, &database_paths(data, "default"), false, 1000, access)
+        let paths = database_paths(data, "default");
+        super::refusal(data, &paths, |path| {
+            unix::reason(data, std::slice::from_ref(path), false, 1000, access)
+        })
     }
 
     /// How [`refusal`] names `path` and the folder to hand over.
@@ -358,27 +386,28 @@ pub(crate) mod tests {
         assert_eq!(refusal(data.path(), data.path()), None, "the data folder");
     }
 
+    /// A database can instead be moved out or served read-only; a folder the
+    /// server creates databases in cannot.
     #[test]
     fn a_database_its_wal_files_or_its_folder_owned_by_root_refuses() {
         let data = data_folder();
-        for owned in [
-            "index/default",
-            "index/default/index.db",
-            "index/default/storage.db-shm",
-            "index/second",
-            "index/second/index.db",
-            "user_data",
-            "user_data/default.db",
-            "user_data/other.DB-wal",
+        for (owned, database) in [
+            ("index/default", true),
+            ("index/default/index.db", true),
+            ("index/default/storage.db-shm", true),
+            ("index/second", true),
+            ("index/second/index.db", true),
+            ("user_data", false),
+            ("user_data/default.db", true),
+            ("user_data/other.DB-wal", true),
         ] {
             let owned = data.path().join(owned);
-            let expected = format!(
-                "'{}' is owned by uid 0 and is not writable by the current user (uid 1000); \
-                 run as uid 0, or change the owner of '{}' and everything in it to uid 1000",
-                owned.display(),
-                data.path().display()
+            let refusal = refusal(data.path(), &owned).unwrap();
+            assert!(
+                refusal.starts_with(&owned_by_root(&owned, data.path())),
+                "{refusal}"
             );
-            assert_eq!(refusal(data.path(), &owned), Some(expected));
+            assert_eq!(refusal.contains("readonly = true"), database, "{refusal}");
         }
     }
 
