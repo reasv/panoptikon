@@ -2472,37 +2472,54 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
 
     # A ceiling the impl raises without cutting the batch itself (an MPS array
     # over 2^32 bytes before macOS 15): the harness halves the batch and the
-    # window's other items run. One item alone still fails the window.
+    # window's other items run. The clamp is carried by the first batch that
+    # ran at half the size, so a window that halves down to one failing item
+    # reports none.
     class Raising:
-        def __init__(self, limit):
-            self.limit = limit
+        def __init__(self, fails):
+            self.fails = fails
             self.batches = []
 
         def predict(self, inputs):
             self.batches.append(len(inputs))
-            if len(inputs) > self.limit:
+            if self.fails(inputs):
                 raise RuntimeError(
                     "[MPSNDArray initWithDevice:descriptor:] Error: total "
                     "bytes of NDArray > 2**32"
                 )
             return [item.data for item in inputs]
 
-    impl = Raising(2)
+    def clamps(measurements):
+        return [
+            (index, (m["clamped"]["from_units"], m["clamped"]["to_units"]))
+            for index, m in enumerate(measurements)
+            if "clamped" in m
+        ]
+
+    impl = Raising(lambda inputs: len(inputs) > 2)
     payload = packing.run_window(impl, items(5), grant(unit_budget=5))
     assert payload["outputs"] == [0, 1, 2, 3, 4]
     assert impl.batches == [5, 2, 2, 1]
-    split = payload["measurements"][0]
-    assert split["clamped"] == {
+    failed, halved = payload["measurements"][:2]
+    assert not {"units", "oom", "clamped"} & failed.keys()
+    assert halved["clamped"] == {
         "from_units": 5,
         "to_units": 2,
         "reason": "index_limit",
         "free_mb": 8000,
     }
-    assert "units" not in split and "oom" not in split
-    alone = Raising(0)
-    with pytest.raises(packing.WindowFailure):
-        packing.run_window(alone, items(3), grant(unit_budget=3))
-    assert alone.batches == [3, 1]
+    assert clamps(payload["measurements"]) == [(1, (5, 2))]
+
+    impl = Raising(lambda inputs: len(inputs) > 1)
+    payload = packing.run_window(impl, items(5), grant(unit_budget=5))
+    assert impl.batches == [5, 2, 1, 1, 1, 1, 1]
+    assert clamps(payload["measurements"]) == [(2, (2, 1))]
+
+    impl = Raising(lambda inputs: any(item.data == 0 for item in inputs))
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(impl, items(8), grant(unit_budget=8))
+    assert impl.batches == [8, 4, 2, 1]
+    assert clamps(caught.value.measurements) == [], "no batch ran halved"
 
 
 def test_an_impl_that_executed_nothing_in_one_call_reports_zero_not_the_batch(

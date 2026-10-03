@@ -1330,6 +1330,9 @@ def run_window(
     outputs: list[Any] = [None] * len(inputs)
     measurements: list[dict[str, Any]] = []
     pending = list(range(len(inputs)))
+    # The priced units of a batch a shape ceiling split, until a batch runs
+    # at the size it was halved to.
+    split_from: int | None = None
 
     def record(measurement: dict[str, Any]) -> dict[str, Any]:
         """Append a measurement; the first is stamped `trimmed` if the pool was
@@ -1415,16 +1418,14 @@ def run_window(
                     and len(batch) > 1
                     and _index_limit(exc)
                 )
-                if split:
-                    executed = len(batch) // 2
-                elif not oom:
+                if not (oom or split):
                     logger.debug(
                         "a batch of %d inputs failed with %s, which is not an "
                         "out-of-memory condition; reporting it without the oom flag",
                         len(batch),
                         type(exc).__name__,
                     )
-                if impl_cut or split:
+                if impl_cut:
                     clamped = executed_clamp(
                         clamped, batch, executed, units, aggregation, priced,
                         live.free_mb,
@@ -1442,14 +1443,14 @@ def run_window(
                     )
                 )
                 if split:
-                    cap_items = executed
+                    split_from, cap_items = priced, len(batch) // 2
                     logger.warning(
                         "a batch of %d inputs exceeded a kernel's size limit "
                         "(%s); running the rest of this window at %d. This is "
                         "a shape ceiling, not an out-of-memory condition",
                         len(batch),
                         exc,
-                        executed,
+                        cap_items,
                     )
                     continue
                 message = str(exc)
@@ -1488,12 +1489,19 @@ def run_window(
                     executed,
                     len(batch),
                 )
-            if _utils_total("total_index_limit_events") > index_limits_before:
-                # The impl hit its own shape ceiling; not a memory event.
+            split_ran = split_from is not None and len(batch) == cap_items
+            if split_ran or (
+                _utils_total("total_index_limit_events") > index_limits_before
+            ):
+                # A shape ceiling, not a memory event: the impl cut this batch
+                # itself, or it is the first to run at the size a split halved
+                # the window to, from the size that failed.
                 clamped = executed_clamp(
                     clamped, batch, executed, units, aggregation, priced,
                     live.free_mb,
                 )
+                if split_ran:
+                    clamped["from_units"], split_from = split_from, None
             measurement = memory.measure_batch(
                 state,
                 items=len(batch),
