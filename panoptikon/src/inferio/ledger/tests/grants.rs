@@ -513,11 +513,23 @@ fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
             expected
         );
     }
+    host.lock().metal_allocator = true;
     for device in [super::cpu::DEVICE_KEY, GPU] {
         assert_eq!(
             host.reserve_locked(&host.lock(), device, 165, 0.0),
             (6_553, RESERVE_RULE_RAM_FLOOR),
             "{device} on a Mac with a margin of 0"
+        );
+    }
+    // A margin the user wrote raises a 36 GiB Mac's reserve above the floor.
+    let mac = ledger(27_648, user_margin(0.25));
+    {
+        let mut state = mac.lock();
+        state.metal_allocator = true;
+        state.gpus.get_mut(GPU).unwrap().unified_ram_mb = Some(36_864);
+        assert_eq!(
+            mac.reserve_locked(&state, GPU, 27_672, 0.25),
+            (6_918, RESERVE_RULE_USER_MARGIN)
         );
     }
 
