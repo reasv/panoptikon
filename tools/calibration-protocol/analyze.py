@@ -229,6 +229,8 @@ class Context:
     fds: List[Dict[str, Any]] = field(default_factory=list)
     # When `legs.py` asked the hog to stop: the gateway is idle from then on.
     teardown_t: Optional[float] = None
+    # The jobs.json job's duration on `legs.py`'s monotonic clock.
+    job_seconds: Optional[float] = None
 
     def __post_init__(self) -> None:
         self.vram_samples = [row for row in self.vramrec if row.get("kind") == "sample"]
@@ -1663,23 +1665,28 @@ def check_throughput(ctx: Context) -> Verdict:
     if not records:
         return Verdict("throughput", "SKIP",
                        "jobs.json has no LogRecord history entries")
-    ours = _items_per_s(records)
+    ours = _items_per_s(records, ctx.job_seconds)
     baseline = ctx.args.baseline_items_per_s
     if baseline is None and ctx.args.baseline_jobs:
-        baseline_records = _log_records(read_json(Path(ctx.args.baseline_jobs)))
-        baseline = _items_per_s(baseline_records)
+        path = Path(ctx.args.baseline_jobs)
+        baseline = _items_per_s(
+            _log_records(read_json(path)),
+            _job_seconds(read_json(path.with_name("legs.json")))
+            if path.name == "jobs.json" else None)
     if not baseline:
         return Verdict("throughput", "INFO",
                        f"{ours:.3f} items/s over {len(records)} job(s); "
                        "no baseline given (--baseline-jobs/--baseline-items-per-s)",
-                       {"items_per_s": ours, "jobs": len(records)})
+                       {"items_per_s": ours, "jobs": len(records),
+                        "monotonic_seconds": ctx.job_seconds})
     ratio = ours / baseline if baseline else float("inf")
     verdict = "PASS" if ratio >= ctx.args.throughput_floor else "FAIL"
     return Verdict("throughput", verdict,
                    f"{ours:.3f} items/s vs baseline {baseline:.3f} = "
                    f"{ratio:.2f}x  [floor {ctx.args.throughput_floor:.2f}x]",
                    {"items_per_s": ours, "baseline_items_per_s": baseline,
-                    "ratio": ratio, "jobs": len(records)})
+                    "ratio": ratio, "jobs": len(records),
+                    "monotonic_seconds": ctx.job_seconds})
 
 
 def _log_records(payload: Any) -> List[Dict[str, Any]]:
@@ -1698,11 +1705,27 @@ def _log_records(payload: Any) -> List[Dict[str, Any]]:
             if isinstance(row, dict) and "total_segments" in row]
 
 
-def _items_per_s(records: List[Dict[str, Any]]) -> float:
-    items = 0.0
+def _job_seconds(legs: Optional[Dict[str, Any]]) -> Optional[float]:
+    """The first job's `job_posted` to `job_end` on `legs.py`'s monotonic
+    clock, or None when its marks carry no `t_mono`."""
+    events = (legs or {}).get("events") or []
+    posted, end = (next((event.get("t_mono") for event in events
+                         if event.get("event") == name), None)
+                   for name in ("job_posted", "job_end"))
+    if posted is None or end is None or end <= posted:
+        return None
+    return end - posted
+
+
+def _items_per_s(records: List[Dict[str, Any]],
+                 monotonic_seconds: Optional[float] = None) -> float:
+    """Items over the jobs' duration: the monotonic one when given, else
+    the server's wall-clock start and end times."""
+    items = sum(float(record.get("total_segments") or 0) for record in records)
+    if monotonic_seconds:
+        return items / monotonic_seconds
     seconds = 0.0
     for record in records:
-        items += float(record.get("total_segments") or 0)
         start = _iso_epoch(str(record.get("start_time", "")).replace(" ", "T"))
         end = _iso_epoch(str(record.get("end_time", "")).replace(" ", "T"))
         if start and end and end > start:
@@ -2559,6 +2582,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         probes=probes,
         fds=read_fds(pick(None, "fds.jsonl")) or read_fds(pick(None, "fdrec.txt")),
         teardown_t=_iso_epoch(hog_stop) if hog_stop else None,
+        job_seconds=None if args.jobs else _job_seconds(legs),
     )
 
     selected = (

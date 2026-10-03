@@ -901,7 +901,9 @@ class Leg:
     # -- recording ----------------------------------------------------------
 
     def mark(self, name: str, **detail: Any) -> None:
-        record = {"iso": iso_now(), "event": name, **detail}
+        # `t_mono` times durations: the wall clock can step (WSL2 steps it).
+        record = {"iso": iso_now(), "t_mono": round(time.monotonic(), 3),
+                  "event": name, **detail}
         self.events.append(record)
         print(f"[{record['iso']}] {name}"
               + (f" {json.dumps(detail)}" if detail else ""), flush=True)
@@ -934,7 +936,9 @@ class Leg:
             if time.monotonic() - started > cap:
                 self.mark("job_cap_exceeded", cap_s=cap)
                 return "cap_exceeded"
-            time.sleep(2.0)
+            # `job_end` ends the job's measured duration: polled often enough
+            # that a short job's rate is not off by the poll.
+            time.sleep(0.25)
 
     def prepare_database(self, corpus: Path, db: Optional[str] = None,
                          tag: str = "") -> int:
