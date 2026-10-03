@@ -317,6 +317,15 @@ fn with_cpu_device(mut host: HostGpus) -> HostGpus {
 /// KFD topology + amdgpu sysfs (`rocm.rs`). Capabilities are always unknown;
 /// off Linux there are no GPUs. The backend is `RocmSysfs` on every path.
 fn probe_rocm() -> HostGpus {
+    if DriverPlatform::current() == DriverPlatform::Wsl {
+        tracing::warn!(
+            "ROCm under WSL2 runs through the Windows display driver, which \
+             exposes none of the amdgpu memory counters this host reads: models \
+             on the GPU run without a memory ledger or batch-size calibration, \
+             and a GPU that runs out of memory may move it to system RAM and \
+             slow down instead of failing"
+        );
+    }
     let roots = rocm::SysfsRoots::default();
     let blank = if cfg!(target_os = "linux") {
         let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
