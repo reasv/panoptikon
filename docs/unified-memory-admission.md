@@ -575,13 +575,12 @@ carrying a footnote forever, and the footnote is the whole complaint.
   indirectly by `platform` + `torch` in the key already). Backend key
   stays `"cpu"`.
 - **Total**: physical RAM. **DP-8 (decided) — no default ceiling.** A RAM
-  OOM is a process kill, not a catchable exception, so the CPU device
-  keeps a reserve of a
-  tenth of RAM (at most 16 GiB; at least 2 GiB, or a quarter of RAM under
-  8 GiB) that no setting lowers. `cap_fraction` is off by default, as on
-  every device; the reserve, live sizing and the shrink under pressure
-  already bound what we take. The worker's clamp
-  keeps the same reserve, and on Linux workers are the kernel's first
+  OOM is a process kill, not a catchable exception, so the CPU device keeps
+  a reserve of a tenth of RAM (at most 16 GiB; at least 2 GiB, or a quarter
+  of RAM under 8 GiB) that no setting lowers. `cap_fraction` is off by
+  default, as on every device; the reserve, the live free reading and the
+  worker's per-batch clamp already bound what a batch takes. The worker's
+  clamp keeps the same reserve, and on Linux workers are the kernel's first
   out-of-memory victim (docs/batch-calibration-design.md, "Host RAM on the
   CPU device").
 - **Worker readings**: `free_source: "ram"` (`psutil.virtual_memory()`);
@@ -709,12 +708,11 @@ carrying a footnote forever, and the footnote is the whole complaint.
   `MALLOC_TRIM_THRESHOLD_=131072` in the CPU arm of `accelerator_env.rs`,
   each unless the operator set it, pin the threshold so large blocks stay on
   `mmap`, where freeing returns the pages — with them the floor held at
-  678 MiB and every size reproduced to
-  within 4 MiB. It is Linux/glibc only; other platforms ignore both. Where the
-  pinning does not reach (musl, Windows, macOS, an allocator the impl brings
-  itself) the residue is an over-read — the safe direction — and the fit's
-  free intercept and `residual_mb` absorb it: un-mitigated, it cost the slope
-  7 % at worst.
+  678 MiB and every size reproduced to within 4 MiB. It is Linux/glibc only;
+  other platforms ignore both. Where the pinning does not reach (musl,
+  Windows, macOS, an allocator the impl brings itself) the residue is an
+  over-read — the safe direction — and the fit's free intercept and
+  `residual_mb` absorb it: un-mitigated, it cost the slope 7 % at worst.
 - **DP-4 adoption is scoped by the backend, not only by the absent address.**
   A CPU device matches every structural condition the adoption path had — one
   GPU, unified, no PCI address, and a worker reporting neither UUID nor
