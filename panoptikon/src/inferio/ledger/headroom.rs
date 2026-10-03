@@ -222,22 +222,20 @@ impl VramLedger {
     /// sampling skew from inventing headroom. `None` with no free reading.
     /// On a Metal allocator with a [`RamBasis`] the sum is taken in the RAM
     /// domain (`hw.memsize − available`) and not clipped to the device total.
-    /// While a resident's pool is partly in system RAM the footprints count
-    /// memory the device does not, so the last value from before is held.
-    pub(super) fn external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
-        let held = state.gpus.get(gpu)?.unspilled_external_mb;
-        if let Some(held) = held.filter(|_| Self::pool_off_device_locked(state, gpu)) {
-            return Some(held);
+    /// On a GPU that spills to system RAM, while its free reading is below
+    /// [`DEFAULT_RESERVE_CAP_MB`] it is at least its value at the last
+    /// reading that was not, since our pool may then be partly off the card.
+    pub(super) fn external_locked(&self, state: &LedgerState, gpu: &str) -> Option<u64> {
+        let measured = Self::measured_external_locked(state, gpu)?;
+        let gpu_ledger = state.gpus.get(gpu)?;
+        let full = gpu_ledger
+            .free
+            .as_ref()
+            .is_some_and(|sample| sample.free_mb < DEFAULT_RESERVE_CAP_MB);
+        if full && self.budgets.spills_to_ram(gpu) {
+            return Some(measured.max(gpu_ledger.external_before_full_mb.unwrap_or(0)));
         }
-        Self::measured_external_locked(state, gpu)
-    }
-
-    /// Whether any resident's last sample put part of its pool off `gpu`.
-    pub(super) fn pool_off_device_locked(state: &LedgerState, gpu: &str) -> bool {
-        state
-            .workers
-            .values()
-            .any(|entry| entry.gpu == gpu && entry.pool_off_device)
+        Some(measured)
     }
 
     /// [`Self::external_locked`] from the current reading alone.
@@ -346,7 +344,7 @@ impl VramLedger {
     /// `limit` under a given margin: the GPU's own, or a model's widened one
     /// ([`Self::effective_margin_locked`]).
     fn limit_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
-        let external = Self::external_locked(state, gpu).unwrap_or(0);
+        let external = self.external_locked(state, gpu).unwrap_or(0);
         // Only external usage is margin-inflated; our residents are measured.
         let (reserve, _) = self.reserve_locked(state, gpu, external, margin);
         self.limit_over_locked(state, gpu, external, reserve)
@@ -394,7 +392,7 @@ impl VramLedger {
         let external = if unified {
             0
         } else {
-            Self::external_locked(state, gpu).unwrap_or(0)
+            self.external_locked(state, gpu).unwrap_or(0)
         };
         self.limit_over_locked(state, gpu, external, 0)
     }

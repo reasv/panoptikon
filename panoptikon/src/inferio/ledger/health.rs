@@ -19,7 +19,7 @@ impl VramLedger {
             .gpus
             .iter()
             .map(|(uuid, gpu)| {
-                let external = Self::external_locked(state, uuid);
+                let external = self.external_locked(state, uuid);
                 let (reserve, reserve_rule) = self.reserve_locked(
                     state,
                     uuid,

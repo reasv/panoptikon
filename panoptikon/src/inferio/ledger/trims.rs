@@ -262,7 +262,6 @@ impl VramLedger {
                     RamBasis::of(&stamped.value),
                 );
             }
-            Self::note_pool_placement_locked(&mut state, worker, &stamped.value);
         }
         // Latched from the ledger's own before/after pool, so a reply that
         // measured nothing latches too; `settle_locked` clears it.

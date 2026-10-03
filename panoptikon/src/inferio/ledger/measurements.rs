@@ -705,7 +705,6 @@ impl VramLedger {
                     RamBasis::of(&stamped.value),
                 );
             }
-            Self::note_pool_placement_locked(state, worker, &stamped.value);
         }
         if let Some((free_mb, grant_mb)) = contradicted_ooms.first().copied() {
             tracing::warn!(

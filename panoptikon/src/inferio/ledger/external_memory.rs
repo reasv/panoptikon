@@ -224,35 +224,6 @@ impl VramLedger {
         });
     }
 
-    /// Note whether a replica's memory sample has its pool partly in system
-    /// RAM (the pool above the GPU's used memory by NVML, one sample), and
-    /// while no resident's is, keep the GPU's `external` for
-    /// [`Self::external_locked`] to hold.
-    pub(super) fn note_pool_placement_locked(
-        state: &mut LedgerState,
-        worker: WorkerId,
-        sample: &MemorySample,
-    ) {
-        let Some(entry) = state.workers.get_mut(&worker) else {
-            return;
-        };
-        let gpu = entry.gpu.clone();
-        let total_mb = sample
-            .total_mb
-            .or_else(|| state.gpus.get(&gpu).map(|gpu| gpu.total_mb));
-        entry.pool_off_device = sample.free_source.as_deref() == Some("nvml")
-            && matches!(
-                (sample.reserved_mb, sample.free_mb, total_mb),
-                (Some(pool), Some(free), Some(total)) if pool > total.saturating_sub(free)
-            );
-        if !Self::pool_off_device_locked(state, &gpu) {
-            let external = Self::measured_external_locked(state, &gpu);
-            if let Some(gpu_ledger) = state.gpus.get_mut(&gpu) {
-                gpu_ledger.unspilled_external_mb = external;
-            }
-        }
-    }
-
     /// Fold every resident's freshest memory sample (the per-batch memory
     /// frames) into its pool figure and the GPU's free reading, so `external`
     /// never nets a current free reading against stale pool figures. An older
@@ -307,7 +278,23 @@ impl VramLedger {
                     RamBasis::of(&stamped.value),
                 );
             }
-            Self::note_pool_placement_locked(state, worker, &stamped.value);
+        }
+        // With every pool figure in: the value `external_locked` holds while
+        // a spilling GPU reads full.
+        let before_full: Vec<(String, Option<u64>)> = state
+            .gpus
+            .iter()
+            .filter(|(_, gpu)| {
+                gpu.free
+                    .as_ref()
+                    .is_some_and(|sample| sample.free_mb >= DEFAULT_RESERVE_CAP_MB)
+            })
+            .map(|(uuid, _)| (uuid.clone(), Self::measured_external_locked(state, uuid)))
+            .collect();
+        for (uuid, external) in before_full {
+            if let Some(gpu) = state.gpus.get_mut(&uuid) {
+                gpu.external_before_full_mb = external;
+            }
         }
     }
 
@@ -568,7 +555,7 @@ impl VramLedger {
                     }),
                 );
                 let total_mb = state.gpus.get(&uuid).map_or(0, |gpu| gpu.total_mb);
-                let external_mb = Self::external_locked(&state, &uuid).unwrap_or(0);
+                let external_mb = self.external_locked(&state, &uuid).unwrap_or(0);
                 // The record may drop this reading; log whether it took.
                 let recorded = state
                     .gpus

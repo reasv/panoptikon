@@ -1349,9 +1349,10 @@ impl's own kernels have said they cannot execute at this corpus's shapes.
   sampling skew must never manufacture phantom headroom. Where a full GPU
   spills to system RAM, the part of our pool off the card is in Σ footprint
   but not in `total − free`, so `external` reads too low (0 once the spill
-  exceeds other processes' use). While a replica's last sample has its pool
-  above NVML's used memory (one sample), `external` is held at its value
-  from the last sample with no pool off the card. When a replica
+  exceeds other processes' use). The driver spills only when the card is
+  full, so on a spilling GPU, while free reads below `DEFAULT_RESERVE_CAP_MB`
+  (1 GiB), `external` is at least its value at the last reading that did
+  not. When a replica
   leaves the GPU its footprint is credited back to the freshest free
   reading as it drops out of the sum — nothing samples a GPU *because*
   a worker left, so without the credit the departed replica's whole
