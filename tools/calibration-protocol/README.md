@@ -630,6 +630,7 @@ analyze.py --scenario results/<run>/<scenario>
            [--checks all|a,b,c] [--list-checks] [--learning]
            [--expect-ooms N] [--expect-deaths N] [--expect-failures N]
            [--expect-failed-jobs N] [--expect-empty-setters]
+           [--expect-deflated]
            [--baseline-jobs FILE | --baseline-items-per-s F]
            [--throughput-floor 0.9] [--utilization-floor 0.25]
            [--idle-window 60] [--join-tolerance 1.5] [--base-window 10]
@@ -686,7 +687,9 @@ last one closes a hole in `base_accuracy` itself):
   1 GB free), needs the second knob or it reports `job_outcome FAIL` for
   succeeding at its own point. `--expect-empty-setters` is the same escape
   for the zero-item clause: `calibfixture/dies_on_load_cuda` never becomes
-  resident, so its setter records 0 items by construction.
+  resident, so its setter records 0 items by construction, and
+  `--expect-deflated` for `deflation_recovery`: `calibfixture/oom_cuda` never
+  runs a clean window, so its deflation never returns to 0.
 - **`ledger_invariant` has two forms and reports both.** The strict form —
   Σ charges + load reservations ≤ `limit_mb` — cannot hold on a nearly-full
   GPU, because `limit = total − external × (1 + margin)` reaches **0** while
@@ -727,8 +730,8 @@ last one closes a hole in `base_accuracy` itself):
   nothing). Under that declaration `calibration_learned` FAILs on any of:
   `fit samples == 0`, no `[[profile]]` in `calibration.after.toml`, or a peak
   `unit_budget` that never rose above the first value recorded **and no
-  plateau knee was learned** (a budget held at its knee is learning, not a
-  stall). A budget the job itself never filled (every window formed short of
+  batch size trial ended** (a budget held where a trial left it is learning,
+  not a stall). A budget the job itself never filled (every window formed short of
   it for want of queued work, `queue_bound_windows == total_batches`, and the
   settle lines' largest `max_units_measured` below the seed) cannot rise, and
   reads INFO, not FAIL, unless the budget was held at a rung the ring never
@@ -791,12 +794,12 @@ that move them are in `analyze.py --help`.
 | `slope_accuracy` | the persisted slope against `ceiling_probe.py`'s **allocated** slope (`fit` where `fit.basis` names it, else the probe's whole-batch `peak_allocated_mb` rows refitted here) | −30 % .. +100 % | PASS/FAIL; WARN (FAIL under `--learning`) when no store was written; SKIP when no probe was passed, or when no probe names a model the store holds |
 | `grant_safety` | every grant against the headroom it was priced against **and** against the oracle's live free memory | no grant over either | PASS/FAIL; WARN without `vramrec.jsonl`, or when a grant has no sample before it or is over free with a covering release |
 | `failures` | OOM negatives, worker deaths and merged-window fallbacks in the log | `--expect-ooms` / `--expect-deaths` | PASS/FAIL |
-| `deflation_recovery` | how long deflation takes to return to 0 | 3 clean windows per level | PASS/FAIL |
+| `deflation_recovery` | each worker's deflation at the end of the recording, from the settle and time-repay lines (`/health` samples when the log has no DEBUG lines); the detail names the clean windows since the last negative | 0, unless `--expect-deflated` | PASS/FAIL |
 | `idle_liveness` | `grants_outstanding` in the trailing `--idle-window` | must reach 0 | PASS/FAIL |
-| `utilization` | the largest `unit_budget` a grant actually carried against the probe's OOM boundary (or knee) | `--utilization-floor` (0.25) | PASS/FAIL; the same result-versus-omission split as `slope_accuracy` |
+| `utilization` | the largest `unit_budget` a grant actually carried against the probe's OOM boundary (or knee), the boundary less the least a hog on that GPU held while the model ran, over the probe's slope | `--utilization-floor` (0.25) | PASS/FAIL; the same result-versus-omission split as `slope_accuracy` |
 | `throughput` | items/s from the job `LogRecord`s against a C0 baseline, their start-to-end spans less the wall-clock step `legs.json`'s marks measured (`iso` against `t_mono`, the first job's `job_posted` to `job_end`; not with an explicit `--jobs`); both sides corrected, or neither when one recording has no `t_mono` | `--throughput-floor` (0.9) | PASS/FAIL; INFO without a baseline |
 | `persistence` | the store write against the anchor advance that queued it | within 30 s | PASS/FAIL; same split again |
-| `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) unless the leg declared it | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs), `--expect-empty-setters` | PASS/FAIL |
+| `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) unless the leg declared it, and so does a job `legs.json` shows did not drain (`job_end` outcome other than `drained`, e.g. cut at `--job-cap`, or no `job_end`) | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs), `--expect-empty-setters` | PASS/FAIL |
 | `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | FAIL on an `over_grant` breach, WARN on a `limit_fell` one |
 | `peak_fds` | peak open descriptors and sockets against the process's own limit | — | INFO; SKIP when nothing recorded them |
 | `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form |
@@ -847,11 +850,11 @@ healthrec's default 500 ms that is within a sample of admission, and a leg
 that ramps at all leaves it far behind (an S2 leg: 8 → 1024).
 
 **A working size a trial left in place is not a stall.** The seed is a
-starting guess, not a floor: the batch size is the smallest whose rate is
-within 5 % of the best a trial measured, so a model that gains nothing from
-larger batches ends *under* its seed on purpose and stays there, trying the
-sizes next to it every so often. A model whose `knee_units` `/health` marks
-`knee_is_local` is therefore never counted as "never left the seed"; the
+starting guess, not a floor: a batch grows only on a measured gain, so a model
+that gains nothing from larger batches stays at or *under* its seed on purpose,
+trying the sizes next to it every so often. A model with an `a batch size
+trial is over` line, or whose `knee_units` `/health` marks `knee_is_local`
+during the leg, is therefore never counted as "never left the seed"; the
 detail instead names the seed, the size a trial first left in place, how many
 times it moved and how low the budget actually ran, and `ramp_progress`
 withholds its `REQUEST_UNIT_BUDGET` note for the same models.
@@ -860,7 +863,9 @@ withholds its `REQUEST_UNIT_BUDGET` note for the same models.
 evidence: it is set the moment a replica opens, and it may come from a shipped
 profile. `knee_is_local` is false for both; a leg that ends that way at its
 seed has measured nothing and is
-named as "never left the seed". `utilization` reads the same flag: only a size
+named as "never left the seed". So is a size `knee_is_local` from the worker's
+first sample, never moved and with no trial line: this machine's store resumed
+it, and this leg measured nothing. `utilization` reads the same flag: only a size
 a trial left in place lowers its denominator from the probe boundary to the
 largest batch that ran.
 
