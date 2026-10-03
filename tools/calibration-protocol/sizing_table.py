@@ -71,7 +71,8 @@ NOISE = {"scatter 35 %, rising": "curve=knee:1.3:256:8 noise=0.35 ndist=g win=30
 FLAT_JOBS = [("s12", "win=12 starts=40"), ("s60", "win=60 starts=40"),
              ("six", "win=20000 items=12000 starts=6")]
 DAILY_ITEMS = [1, 10, 30, 50, 100, 200, 500, 1000]
-IDEAL_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256]  # a daily job's ideal: the best of these, from a load
+# A daily job's ideal: the best of these fixed sizes, run from a load.
+IDEAL_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 MAC8 = "dev=mac room=4000 total=6144 queue=first1"
 MAC_REAL = "dev=mac room=105956 total=110100 queue=first1"
 # Desktop memory cases: device, model and what happens to memory.
@@ -400,8 +401,11 @@ def tables(rows, a):
     specs = {cls: class_models(a, cls) for cls in a.classes}
     fixed, by_seed = collections.defaultdict(dict), collections.defaultdict(dict)
     for (sc, cls, model, _, var), rs in g.items():
-        # A fixed size that does not fit runs out of memory: no reference.
-        if sc in ("fixed", "fixed2000") and not any(int(r["oom"]) for r in rs):
+        # A fixed size that does not fit runs out of memory, or its worker is killed before a
+        # batch completes: no reference.
+        fits = not any(int(r["oom"]) for r in rs) and sum(map(num("items"), rs)) >= sum(
+            map(num("windows"), rs))
+        if sc in ("fixed", "fixed2000") and fits:
             fixed[(sc, cls, model)][int(var)] = mean(rs, ips)
             for r in rs:
                 by_seed[(sc, cls, model, r["key"][5])][int(var)] = ips(r)
