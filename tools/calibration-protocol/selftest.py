@@ -256,6 +256,12 @@ def probe_free_tiers(memory: Any) -> List[Dict[str, Any]]:
     return rows
 
 
+def rocm_reason(on_rocm: str) -> str:
+    """`on_rocm` where KFD lists a GPU this process can open, else "not a
+    ROCm host"."""
+    return on_rocm if rocm_sysfs.inventory() else "not a ROCm host"
+
+
 def _free_tier_reason(memory: Any, tier: str) -> str:
     """Why one free tier returned nothing, in the tier's own terms."""
     try:
@@ -268,9 +274,10 @@ def _free_tier_reason(memory: Any, tier: str) -> str:
             return ("NVML unavailable" if memory._nvml() is None
                     else "NVML gave no memory info for this process's device")
         if tier == "amdgpu-sysfs":
-            return ("no amdgpu sysfs (not a ROCm host, or no device resolved)"
-                    if memory.device_bdf() is None
-                    else "amdgpu sysfs present but mem_info_vram_* unreadable")
+            if memory.device_bdf() is not None:
+                return "amdgpu sysfs present but mem_info_vram_* unreadable"
+            return "no amdgpu sysfs: " + rocm_reason(
+                "no GPU resolved for this device")
         if tier == "mps":
             return ("torch.backends.mps unavailable"
                     if memory._torch_mps() is None
@@ -322,7 +329,8 @@ def probe_base_tiers(
         row("nvml", None, f"raised {type(exc).__name__}: {exc}"[:200])
     try:
         row("fdinfo", memory._fdinfo_base_mb(reserved_mb, reserved_delta),
-            "no DRM fdinfo VRAM figure for this process (not a ROCm host)")
+            "no DRM fdinfo VRAM figure for this process: " + rocm_reason(
+                "no amdgpu fdinfo record of this device parsed"))
     except Exception as exc:  # pragma: no cover - defensive
         row("fdinfo", None, f"raised {type(exc).__name__}: {exc}"[:200])
     try:

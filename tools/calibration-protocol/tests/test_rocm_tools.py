@@ -541,6 +541,32 @@ def test_selftest_pins_like_the_spawner(tmp_path):
     assert selftest.rocm_pin(5, {}, host.roots) == {}
 
 
+def test_selftest_says_not_a_rocm_host_only_without_a_kfd_gpu(tmp_path,
+                                                             monkeypatch):
+    host = Host(tmp_path)
+    inventory = selftest.rocm_sysfs.inventory
+    monkeypatch.setattr(selftest.rocm_sysfs, "inventory",
+                        lambda *roots: inventory(host.roots))
+    memory = types.SimpleNamespace(
+        device_bdf=lambda: None, _ram_currency=lambda: False,
+        _nvml_own_process_mb=lambda holding_mb: None,
+        _fdinfo_base_mb=lambda reserved, delta: None,
+        _mps_call=lambda name: None, _mb=lambda value: None,
+        _free_mb=lambda source=None: (None, None),
+        _free_delta=lambda before, after: None,
+        context_allowance_mb=lambda: (0, "default"), IMPLAUSIBLE_SLACK_MB=0)
+
+    def reasons():
+        base = {row["tier"]: row["reason"] for row in
+                selftest.probe_base_tiers(memory, {}, None, None, None)}
+        return [selftest._free_tier_reason(memory, "amdgpu-sysfs"),
+                base["fdinfo"]]
+
+    assert all("not a ROCm host" in reason for reason in reasons())
+    host.gpu(1, 0x0300)
+    assert not any("not a ROCm host" in reason for reason in reasons())
+
+
 def test_newrun_records_the_gpu_nodes(tmp_path):
     host = Host(tmp_path).gpu(1, 0x0300).gpu(2, 0x0C00, openable=False)
     facts = newrun.rocm_facts(host.roots, module=str(tmp_path / "absent"))
