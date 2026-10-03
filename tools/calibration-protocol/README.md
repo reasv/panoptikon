@@ -116,8 +116,9 @@ of job control, and no shell anywhere.
 In order: `newrun.py` for the results directory and `host.json`; `vramrec.py`;
 `hog.py` filled to its target before the gateway sees the board; `healthrec.py`;
 a wait of up to 30 s for a sample in both recordings (a
-`recorder_sample_timeout` event if one never comes); the binary with `--config <toml> --root <dir>/root --disable-update-check`;
-`fds.jsonl` sampled from a thread; wait for `/api/client-config`; create the
+`recorder_sample_timeout` event if one never comes); the binary with
+`--config <toml> --root <dir>/root --disable-update-check`; `fds.jsonl` sampled
+from a thread; wait for `/api/client-config`; create the
 `cal` databases and point the job config at the corpus; rescan; post the
 extraction job — one per `--models` id, in order, in the same database — and
 fire the scenario's timed hog events; wait for the queue;
@@ -239,8 +240,9 @@ Per sample: every GPU's `total/used/free`, every NVML compute/graphics
 process on it (`pid`, `used_mb`, cmdline, `comm`, RSS, VmHWM and the
 `CUDA_VISIBLE_DEVICES` / `PANOPTIKON_DEVICE_PIN` / `INFERIO_*` /
 `PANOPTIKON_*` variables from `/proc/<pid>/environ`), `/proc/meminfo`
-(`MemAvailable`, `MemFree`, `Cached`, swap, `SReclaimable`, `Shmem`), and the RSS/VmHWM of every process
-whose cmdline matches `--filter`. Runs until SIGINT/SIGTERM or `--duration`.
+(`MemAvailable`, `MemFree`, `Cached`, swap, `SReclaimable`, `Shmem`), and the
+RSS/VmHWM of every process whose cmdline matches `--filter`. Runs until
+SIGINT/SIGTERM or `--duration`.
 A per-process `used_mb` of `null` means NVML answered N/A (WDDM, or a container
 without `--pid=host`) — it is never silently turned into 0.
 
