@@ -11,19 +11,24 @@ mod config;
 mod db;
 mod desktop;
 mod env_template;
+mod heap;
 mod host_paths;
+mod inference_errors;
 mod inferio;
 mod inferio_client;
 mod jobs;
+mod log_throttle;
 mod logging;
 mod media_tools;
 mod openapi;
+mod ownership;
 mod policy;
 mod policy_token;
 mod pql;
 mod process_tree;
 mod proxy;
 mod resources;
+mod rlimit;
 mod setup;
 mod shutdown;
 #[cfg(test)]
@@ -42,7 +47,7 @@ use axum::{
     routing::{any, delete, get, post, put},
 };
 use clap::Parser;
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf, sync::Arc};
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_redoc::Redoc;
@@ -61,9 +66,10 @@ struct Args {
     config: Option<PathBuf>,
     /// Root directory for all relative path resolution: data_folder,
     /// config, python sources, runtime/ (global: also valid after the
-    /// subcommand). Default: the current working directory. Implemented as
-    /// a chdir at startup before anything else runs, so every CWD-relative
-    /// default resolves under it — .env auto-loading included.
+    /// subcommand). Default: the PANOPTIKON_ROOT environment variable, else
+    /// the current working directory. Implemented as a chdir at startup
+    /// before anything else runs, so every CWD-relative default resolves
+    /// under it — .env auto-loading included.
     #[arg(long, value_name = "DIR", global = true)]
     root: Option<PathBuf>,
     /// Skip the best-effort startup check for a newer Panoptikon release.
@@ -130,7 +136,32 @@ enum Command {
 /// route keeps the 2 MiB default.
 const PINBOARD_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
+/// The root to chdir into, if any: `--root` beats the environment variable.
+/// An empty variable counts as unset.
+fn root_dir(flag: Option<PathBuf>, env: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    flag.or_else(|| env.filter(|root| !root.is_empty()).map(PathBuf::from))
+}
+
+/// Runs the startup migrations `migrate`. Refused up front when another user
+/// owns a database the server could not write; a failure is explained by
+/// such a database or by a read-only filesystem.
+async fn migrate_at_startup(
+    data_folder: &std::path::Path,
+    index_db: &str,
+    migrate: impl Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    ownership::check_databases(data_folder, index_db)?;
+    migrate
+        .await
+        .map_err(|err| ownership::explain_databases(err, data_folder, index_db))
+}
+
 fn main() -> anyhow::Result<()> {
+    // Before the runtime exists, so every thread and child inherits it.
+    rlimit::raise_soft_limit_at_startup();
+    // Before the runtime's threads exist.
+    heap::limit_arenas();
+
     // Build a custom tokio runtime with a larger worker thread stack size.
     // The default 2MB stack can be insufficient for deeply nested async code,
     // especially in debug builds where stack frames are larger due to unoptimized
@@ -140,7 +171,10 @@ fn main() -> anyhow::Result<()> {
         .thread_stack_size(8 * 1024 * 1024) // 8MB stack for worker threads
         .build()?;
 
-    runtime.block_on(async_main())
+    runtime.block_on(async {
+        heap::spawn_idle_trim();
+        async_main().await
+    })
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -149,9 +183,9 @@ async fn async_main() -> anyhow::Result<()> {
     // config, python, runtime). It is implemented as exactly that: a chdir
     // before anything else touches the filesystem, so every CWD-relative
     // default below — including the .env auto-load — resolves under it.
-    if let Some(root) = &args.root {
-        env::set_current_dir(root)
-            .with_context(|| format!("failed to change to --root '{}'", root.display()))?;
+    if let Some(root) = root_dir(args.root, env::var_os(config::ROOT_ENV)) {
+        env::set_current_dir(&root)
+            .with_context(|| format!("failed to change to the root '{}'", root.display()))?;
     }
     desktop::set_managed(args.desktop_managed);
     env_template::capture_inherited_environment();
@@ -197,6 +231,7 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!("{message}");
     }
     env_template::warn_dotenv_diagnostics(&dotenv_diagnostics);
+    rlimit::log_startup_raise();
     settings.log_warnings();
 
     // Policy-token HMAC key: random per boot unless [server]
@@ -296,7 +331,7 @@ async fn async_main() -> anyhow::Result<()> {
         Arc::clone(&settings),
         Arc::clone(&token_key),
         shutdown_rx.clone(),
-    ));
+    )?);
 
     let local_api = settings.upstreams.api.local;
 
@@ -307,8 +342,11 @@ async fn async_main() -> anyhow::Result<()> {
     // Python-created DBs are baselined, not re-migrated — see
     // db::migrations::ensure_baseline_if_needed.
     if local_api && !db::readonly_mode() {
-        db::migrations::migrate_databases_on_disk(None, None).await?;
-        db::migrations::migrate_all_databases_on_disk().await?;
+        migrate_at_startup(&settings.data_folder, &settings.index_db, async {
+            db::migrations::migrate_databases_on_disk(None, None).await?;
+            db::migrations::migrate_all_databases_on_disk().await
+        })
+        .await?;
         // Vector-quant discrepancy check (crash/power-loss recovery and
         // first-post-upgrade convergence): metadata-only diffs are applied
         // synchronously, real data work enqueues a reconcile job. Runs in
@@ -472,6 +510,14 @@ async fn async_main() -> anyhow::Result<()> {
                 .route(
                     "/api/desktop/update-ribbon/dismiss",
                     post(api::desktop::dismiss_update_ribbon),
+                )
+                .route(
+                    "/api/desktop/sysmem-fallback-notice/dismiss",
+                    post(api::desktop::dismiss_sysmem_fallback_notice),
+                )
+                .route(
+                    "/api/desktop/gpu-memory-setting/open",
+                    post(api::desktop::open_gpu_memory_setting),
                 )
                 .layer(axum::Extension(api::desktop::DesktopInferenceState(
                     inferio_state.clone(),
@@ -678,13 +724,10 @@ async fn async_main() -> anyhow::Result<()> {
             );
     }
 
-    let app = app
-        .with_state(state)
-        .layer(TraceLayer::new_for_http())
-        .layer(policy::PolicyLayer::new(
-            Arc::clone(&settings),
-            Arc::clone(&token_key),
-        ));
+    let app = observed(app.with_state(state)).layer(policy::PolicyLayer::new(
+        Arc::clone(&settings),
+        Arc::clone(&token_key),
+    ));
 
     // Bind every configured listener (primary + [[server.endpoints]]) before
     // serving any of them: a config that cannot fully bind fails startup as
@@ -710,6 +753,11 @@ async fn async_main() -> anyhow::Result<()> {
     });
     // One server task per listener, all serving the same router; the only
     // difference is the ListenerEndpoint extension the policy layer reads.
+    // Each serves HTTP/1.1 and h2c on the same port (hyper-util's auto builder).
+    tracing::info!(
+        max_concurrent_streams = MAX_CONCURRENT_STREAMS,
+        "serving HTTP/1.1 and HTTP/2 cleartext"
+    );
     let mut servers = Vec::new();
     for (name, listener) in listeners {
         let app = app
@@ -719,11 +767,7 @@ async fn async_main() -> anyhow::Result<()> {
             ))));
         let mut shutdown_rx = shutdown_rx.clone();
         servers.push(tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
+            serve_with_stream_limit(listener, app, async move {
                 let _ = shutdown_rx.changed().await;
             })
             .await
@@ -735,6 +779,173 @@ async fn async_main() -> anyhow::Result<()> {
     }
     let _ = cleanup.await;
     tracing::info!("gateway stopped");
+    Ok(())
+}
+
+/// Concurrent HTTP/2 streams admitted per connection (hyper's default of 200
+/// capped concurrent predicts). 8 x `inferio_client::H2_STREAMS_PER_CONNECTION`,
+/// because a reverse proxy fans several clients onto one connection. Memory is
+/// bounded by [`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`], not by this.
+pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 512;
+
+/// HTTP/2 flow-control windows advertised by both ends of the inference
+/// transport (this server and [`inferio_client::h2_client_builder`]). hyper's
+/// 1 MiB default caps a remote upload at about 1 MiB per round trip; fixed
+/// rather than `adaptive_window`, which starts at 64 KiB and was slower on
+/// loopback (`docs/inferio-transport.md`). The connection window bounds what a
+/// peer can leave unread on one connection, however many streams it opens.
+pub(crate) const H2_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
+pub(crate) const H2_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// `TraceLayer`'s failure line through a [`log_throttle::LogThrottle`]: a
+/// client retrying into a 5xx would otherwise log one ERROR per request.
+#[derive(Clone)]
+struct ThrottledOnFailure(log_throttle::LogThrottle);
+
+impl tower_http::trace::OnFailure<tower_http::classify::ServerErrorsFailureClass>
+    for ThrottledOnFailure
+{
+    fn on_failure(
+        &mut self,
+        failure: tower_http::classify::ServerErrorsFailureClass,
+        latency: std::time::Duration,
+        _span: &tracing::Span,
+    ) {
+        if self.0.admit_for(&failure.to_string()) {
+            tracing::error!(
+                classification = %failure,
+                latency_ms = latency.as_millis(),
+                "response failed"
+            );
+        }
+    }
+}
+
+/// Request tracing, and each request counted as work for the idle trim.
+fn observed(app: Router) -> Router {
+    app.layer(axum::middleware::from_fn(heap::track_request))
+        .layer(trace_layer())
+}
+
+fn trace_layer() -> TraceLayer<
+    tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
+    tower_http::trace::DefaultMakeSpan,
+    tower_http::trace::DefaultOnRequest,
+    tower_http::trace::DefaultOnResponse,
+    tower_http::trace::DefaultOnBodyChunk,
+    tower_http::trace::DefaultOnEos,
+    ThrottledOnFailure,
+> {
+    TraceLayer::new_for_http().on_failure(ThrottledOnFailure(log_throttle::LogThrottle::new(
+        "failed responses",
+        tracing::Level::ERROR,
+    )))
+}
+
+/// Serve `app` on `listener` until `shutdown` resolves, then drain.
+///
+/// axum 0.8's graceful-shutdown loop on hyper-util's auto builder, because
+/// axum offers no hook to set [`MAX_CONCURRENT_STREAMS`].
+pub(crate) async fn serve_with_stream_limit<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    serve_with_streams(listener, app, shutdown, MAX_CONCURRENT_STREAMS).await
+}
+
+/// [`serve_with_stream_limit`] with the limit as a parameter, for tests.
+pub(crate) async fn serve_with_streams<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: F,
+    max_concurrent_streams: u32,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use tower::ServiceExt as _;
+
+    // Dropping the only receiver is the signal, as in axum's own loop.
+    let (signal_tx, signal_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        shutdown.await;
+        drop(signal_rx);
+    });
+    // Held by every live connection task; the sender's `closed()` is the drain.
+    let (close_tx, close_rx) = tokio::sync::watch::channel(());
+
+    loop {
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                // A per-connection error must not take the listener down; the
+                // sleep keeps a persistent one from spinning the CPU.
+                Err(err) => {
+                    tracing::debug!(error = %err, "failed to accept a connection");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
+            _ = signal_tx.closed() => break,
+        };
+
+        let io = TokioIo::new(stream);
+        let app = app.clone();
+        let signal_tx = signal_tx.clone();
+        let close_rx = close_rx.clone();
+        tokio::spawn(async move {
+            let service = hyper::service::service_fn(
+                move |request: hyper::Request<hyper::body::Incoming>| {
+                    let mut request = request.map(axum::body::Body::new);
+                    request
+                        .extensions_mut()
+                        .insert(axum::extract::ConnectInfo(peer));
+                    app.clone().oneshot(request)
+                },
+            );
+            let mut builder = Builder::new(TokioExecutor::new());
+            builder
+                .http2()
+                .max_concurrent_streams(max_concurrent_streams)
+                .initial_stream_window_size(H2_STREAM_WINDOW)
+                .initial_connection_window_size(H2_CONNECTION_WINDOW)
+                // CONNECT protocol: HTTP/2 websockets, as axum sets it too.
+                .enable_connect_protocol();
+            let mut conn = std::pin::pin!(builder.serve_connection_with_upgrades(io, service));
+            let mut draining = false;
+            loop {
+                if draining {
+                    if let Err(err) = conn.as_mut().await {
+                        tracing::trace!("failed to serve connection: {err:#}");
+                    }
+                    break;
+                }
+                tokio::select! {
+                    result = conn.as_mut() => {
+                        if let Err(err) = result {
+                            tracing::trace!("failed to serve connection: {err:#}");
+                        }
+                        break;
+                    }
+                    _ = signal_tx.closed() => {
+                        conn.as_mut().graceful_shutdown();
+                        draining = true;
+                    }
+                }
+            }
+            drop(close_rx);
+        });
+    }
+
+    drop(close_rx);
+    drop(listener);
+    close_tx.closed().await;
     Ok(())
 }
 
@@ -762,8 +973,7 @@ async fn inferio_main(
     let state = inferio::http::InferioState::from_settings(&settings)?;
     // Single listener: extra [[server.endpoints]] do not apply to the
     // standalone inference service. Its one listener is the primary.
-    let app = inferio::http::standalone_router(Arc::clone(&state))
-        .layer(TraceLayer::new_for_http())
+    let app = observed(inferio::http::standalone_router(Arc::clone(&state)))
         .layer(policy::PolicyLayer::new(Arc::clone(&settings), token_key))
         .layer(axum::Extension(policy::ListenerEndpoint(Arc::from(
             config::PRIMARY_ENDPOINT,
@@ -785,11 +995,11 @@ async fn inferio_main(
         let _ = shutdown_tx.send(());
         shutdown::run_inferio_cleanup(manager).await;
     });
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
+    tracing::info!(
+        max_concurrent_streams = MAX_CONCURRENT_STREAMS,
+        "serving HTTP/1.1 and HTTP/2 cleartext"
+    );
+    serve_with_stream_limit(listener, app, async move {
         let _ = shutdown_rx.await;
     })
     .await?;
@@ -801,6 +1011,98 @@ async fn inferio_main(
 #[cfg(test)]
 mod route_tests {
     use super::*;
+
+    #[test]
+    fn the_root_flag_beats_the_environment_variable() {
+        let (flag, env) = (PathBuf::from("/flag"), std::ffi::OsString::from("/env"));
+        assert_eq!(root_dir(Some(flag.clone()), Some(env.clone())), Some(flag));
+        assert_eq!(root_dir(None, Some(env)), Some(PathBuf::from("/env")));
+        assert_eq!(root_dir(None, None), None);
+        assert_eq!(root_dir(None, Some(std::ffi::OsString::new())), None);
+    }
+
+    /// The refusal comes before any migration: the default database's folder
+    /// is a symlink to a folder another user owns. A migration that fails
+    /// (here, after that folder appears) is explained by it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_refuses_or_explains_a_database_folder_another_user_owns() {
+        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        let Some((folder, owner)) = foreign_folder(false) else {
+            return;
+        };
+        let data = tempfile::tempdir().unwrap();
+        let default = data.path().join("index/default");
+        std::fs::create_dir_all(data.path().join("user_data")).unwrap();
+        std::fs::create_dir(default.parent().unwrap()).unwrap();
+        let expected = owned_by_another_user(&default, owner, data.path());
+
+        let migrate = async {
+            std::os::unix::fs::symlink(folder, &default)?;
+            Err::<(), anyhow::Error>(anyhow::anyhow!("migration failed"))
+        };
+        let error = migrate_at_startup(data.path(), "default", migrate)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!("{expected}: migration failed")
+        );
+
+        let migrate = async { Err(anyhow::anyhow!("migrated")) };
+        let error = migrate_at_startup(data.path(), "default", migrate)
+            .await
+            .unwrap_err();
+        assert_eq!(format!("{error:#}"), expected, "refused before migrating");
+    }
+
+    /// What `axum::serve` gave us for free, asserted rather than assumed now
+    /// that `serve_with_stream_limit` replaces it: it answers, `ConnectInfo` is
+    /// populated, and graceful shutdown stops accepting and returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_serve_loop_answers_with_connect_info_and_then_drains() {
+        use axum::extract::ConnectInfo;
+        use std::net::SocketAddr;
+
+        let app = Router::new().route(
+            "/peer",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_stream_limit(listener, app, async move {
+            let _ = stop_rx.await;
+        }));
+
+        // Over h2c with prior knowledge: what the inference client speaks.
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap();
+        let body = client
+            .get(format!("http://{addr}/peer"))
+            .send()
+            .await
+            .expect("the serve loop answers")
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.starts_with("127.0.0.1:"),
+            "ConnectInfo must carry the peer address, not a default: {body}"
+        );
+
+        let _ = stop_tx.send(());
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("the serve future returns once the signal fires and connections drain");
+        drained.expect("no panic").expect("clean shutdown");
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "the listener must be closed once the serve future returns"
+        );
+    }
 
     #[test]
     fn relay_pairing_route_shapes_do_not_conflict() {
@@ -827,6 +1129,29 @@ mod route_tests {
     /// in the video surface where a path parameter is followed by a literal
     /// segment. Both shapes must reach their own handler, and the job id must
     /// not swallow `events`.
+    /// Every request through the served router counts as work while its
+    /// handler runs, so the idle trim never runs under one.
+    #[tokio::test]
+    async fn a_request_counts_as_work_for_the_idle_trim() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = observed(Router::new().route(
+            "/probe",
+            get(|| async { heap::ACTIVITY.busy().to_string() }),
+        ));
+        let response = app
+            .oneshot(Request::get("/probe").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .unwrap();
+        let in_flight: usize = std::str::from_utf8(&body).unwrap().parse().unwrap();
+        assert!(in_flight >= 1, "the request itself is in flight");
+    }
+
     #[tokio::test]
     async fn video_job_routes_do_not_shadow_the_events_route() {
         use axum::body::Body;

@@ -1,3 +1,4 @@
+pub(crate) mod batch_auto;
 pub(crate) mod bookmarks;
 mod connection;
 pub(crate) mod epochs;
@@ -12,10 +13,12 @@ pub(crate) mod index_writer;
 pub(crate) mod info;
 pub(crate) mod instance_id;
 pub(crate) mod items;
+pub(crate) mod job_failures;
 pub(crate) mod ledger;
 pub(crate) mod local_dbs;
 pub(crate) mod maintenance_state;
 pub(crate) mod migrations;
+pub(crate) mod output_batch;
 pub(crate) mod pinboard_dbs;
 pub(crate) mod pinboards;
 pub(crate) mod pql;

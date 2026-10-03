@@ -110,7 +110,9 @@ impl Modify for JsonValueSchema {
         crate::api::desktop::update_status,
         crate::api::desktop::open_update_window,
         crate::api::desktop::snooze_update_ribbon,
-        crate::api::desktop::dismiss_update_ribbon
+        crate::api::desktop::dismiss_update_ribbon,
+        crate::api::desktop::dismiss_sysmem_fallback_notice,
+        crate::api::desktop::open_gpu_memory_setting
     ),
     components(
         schemas(
@@ -171,6 +173,8 @@ impl Modify for JsonValueSchema {
             crate::api::jobs::ContinuousScanStatusResponse,
             crate::api::jobs::ExtractionFailure,
             crate::api::jobs::ExtractionFailuresResponse,
+            crate::api::jobs::JobItemFailure,
+            crate::db::job_failures::FailedJobRecord,
             crate::api::jobs::ScanFailure,
             crate::api::jobs::ScanFailuresResponse,
             crate::jobs::queue::JobModel,

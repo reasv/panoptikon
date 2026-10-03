@@ -6,6 +6,7 @@
 #
 # Build (from a checkout with submodules):  docker build -t panoptikon .
 # CUDA variant:  docker build --build-arg ACCELERATOR=cuda -t panoptikon:cuda .
+# ROCm variant:  docker build --build-arg ACCELERATOR=rocm -t panoptikon:rocm .
 #
 # linux/amd64 only: the Python inference lockfile excludes linux/aarch64
 # (torch's pinned triton publishes no aarch64 wheels).
@@ -95,8 +96,14 @@ COPY config/inference/example.toml config/inference/example.toml
 # uid-1000 `ubuntu` user): a named volume mounted there inherits this
 # ownership (Docker creates missing mountpoints as root).
 RUN mkdir -p data && chown -R ubuntu:ubuntu /app
-USER ubuntu
+# The root of every relative path (runtime/, data/, config/) and the config in
+# it, so a process started in another working directory still finds the
+# environment set up below. Login sessions (SSH on a rented GPU host) do not
+# inherit ENV; they read /etc/environment.
+ENV PANOPTIKON_ROOT=/app
 ENV PANOPTIKON_CONFIG_PATH=/app/config/server/docker.toml
+RUN env | grep '^PANOPTIKON_' >> /etc/environment
+USER ubuntu
 # The NVIDIA container runtime injects driver libraries per this list; its
 # default when unset is compute,utility, which OMITS libnvidia-encode — video
 # transcoding's nvenc would silently fall back to software. Inert without the
@@ -105,11 +112,18 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
 # Provision the Python inference environment at build time so first boot is
 # fast: extracts the embedded Python source set to /app/runtime and creates
-# the venv with the PATH-installed uv. ACCELERATOR: cpu (default) or cuda
-# (CUDA 12.8 wheels — run the container with --gpus all). Dropped in the
+# the venv with the PATH-installed uv. ACCELERATOR: cpu (default), cuda
+# (CUDA 12.8 wheels — run the container with --gpus all) or rocm (ROCm 7.2
+# wheels, which bundle the ROCm libraries — see deploy/docker-compose.rocm.yml).
+# Dropped in the
 # same layer: the uv wheel cache (the venv keeps its own copies) and the
 # ffmpeg/ffprobe binaries setup's static-ffmpeg prefetch downloads — the
 # image wires the apt ffmpeg via [jobs] in docker.toml instead.
+#
+# uv hardlinks from its cache by default, which fails on some storage drivers
+# (overlay2 on ZFS); copying always works. An ENV so a `panoptikon setup`
+# re-run inside the container inherits it.
+ENV UV_LINK_MODE=copy
 ARG ACCELERATOR=cpu
 RUN panoptikon setup --accelerator ${ACCELERATOR} \
     && cp /app/runtime/venv/lib/python*/site-packages/pypdfium2_raw/libpdfium.so \

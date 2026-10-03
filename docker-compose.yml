@@ -25,8 +25,9 @@ services:
     build:
       context: .
       args:
-        # cpu or cuda. CUDA pulls multi-GB torch/nvidia wheels — the first
-        # build is slow.
+        # cpu, cuda or rocm. The GPU builds pull multi-GB torch wheels — the
+        # first build is slow. For rocm, replace the deploy: block below with
+        # the devices:/group_add: of deploy/docker-compose.rocm.yml.
         ACCELERATOR: ${ACCELERATOR:-cuda}
     image: panoptikon:dev
     container_name: panoptikon-dev

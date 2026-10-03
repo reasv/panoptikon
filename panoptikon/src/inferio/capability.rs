@@ -3,14 +3,17 @@
 //! `nvidia-smi --query-gpu=compute_cap` (available since driver R470) is
 //! the source: no torch import (~100 ms vs seconds), independent of venv
 //! state, and any failure degrades to "unknown", which never filters
-//! anything. ROCm/MPS/CPU hosts have no nvidia-smi and are likewise
-//! unknown by design — the only capability floors shipped today are
+//! anything. ROCm/MPS/CPU hosts are not queried and are unknown by
+//! design — the only capability floors shipped today are
 //! CUDA-specific (bf16 + FlashAttention 2 want sm_80+), and the Python
 //! impls carry their own load-time backstop guard.
+//! The query itself runs in `gpu.rs`, together with the GPU identity probe.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde_json::Value as JsonValue;
 
@@ -19,45 +22,19 @@ use serde_json::Value as JsonValue;
 pub struct HostComputeCaps(Option<Vec<(u32, u32)>>);
 
 impl HostComputeCaps {
-    /// Only tests construct states without probing; production goes
-    /// through [`Self::probe`].
-    #[cfg(test)]
+    /// Unknown capabilities, which never filter anything.
     pub fn unknown() -> Self {
         Self(None)
     }
 
-    #[cfg(test)]
-    pub fn known(caps: Vec<(u32, u32)>) -> Self {
+    /// Build from probed capabilities; empty means unknown.
+    pub fn from_caps(caps: Vec<(u32, u32)>) -> Self {
         if caps.is_empty() {
             Self(None)
         } else {
+            tracing::info!(compute_caps = %join_caps(&caps), "detected GPU compute capabilities");
             Self(Some(caps))
         }
-    }
-
-    /// Probe once at startup. Never fails: no nvidia-smi, a timeout, or
-    /// unparseable output all yield "unknown".
-    pub fn probe() -> Self {
-        let Some(smi) = find_nvidia_smi() else {
-            return Self(None);
-        };
-        let mut cmd = Command::new(smi);
-        cmd.args(["--query-gpu=compute_cap", "--format=csv,noheader"]);
-        let Some(output) = output_with_timeout(cmd, Duration::from_secs(5)) else {
-            tracing::warn!(
-                "nvidia-smi compute_cap probe failed or timed out; \
-                 model availability will not be capability-filtered"
-            );
-            return Self(None);
-        };
-        if !output.status.success() {
-            return Self(None);
-        }
-        let caps = parse_compute_caps(&String::from_utf8_lossy(&output.stdout));
-        if let Some(caps) = &caps {
-            tracing::info!(compute_caps = %join_caps(caps), "detected GPU compute capabilities");
-        }
-        Self(caps)
     }
 
     /// Whether ANY visible device meets `floor` (e.g. `8.0`); `None` when
@@ -123,23 +100,13 @@ pub fn overlay_metadata(root: &mut JsonValue, caps: &HostComputeCaps) {
     }
 }
 
-/// One capability per line, `major.minor` (`--format=csv,noheader`). Any
-/// unparseable non-empty line (e.g. `N/A`, driver error text) makes the
-/// whole probe unknown — a partial picture must not filter models.
-fn parse_compute_caps(stdout: &str) -> Option<Vec<(u32, u32)>> {
-    let mut caps = Vec::new();
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (major, minor) = line.split_once('.')?;
-        caps.push((
-            major.trim().parse::<u32>().ok()?,
-            minor.trim().parse::<u32>().ok()?,
-        ));
-    }
-    if caps.is_empty() { None } else { Some(caps) }
+/// One `major.minor` capability field as nvidia-smi prints it, else `None`.
+pub(super) fn parse_compute_cap(field: &str) -> Option<(u32, u32)> {
+    let (major, minor) = field.trim().split_once('.')?;
+    Some((
+        major.trim().parse::<u32>().ok()?,
+        minor.trim().parse::<u32>().ok()?,
+    ))
 }
 
 fn join_caps(caps: &[(u32, u32)]) -> String {
@@ -151,7 +118,7 @@ fn join_caps(caps: &[(u32, u32)]) -> String {
 
 /// Same locations the setup accelerator probes use: PATH, plus the
 /// Windows driver install location that never touches PATH.
-fn find_nvidia_smi() -> Option<PathBuf> {
+pub(super) fn find_nvidia_smi() -> Option<PathBuf> {
     let path = std::env::var_os("PATH");
     if let Some(path) = path {
         for dir in std::env::split_paths(&path) {
@@ -180,15 +147,68 @@ fn find_nvidia_smi() -> Option<PathBuf> {
     None
 }
 
-/// Run to completion or give up after `timeout`. On timeout the child is
-/// left to finish on its own (nvidia-smi is short-lived); only the boot
-/// path must not stall behind a wedged driver.
-fn output_with_timeout(mut cmd: Command, timeout: Duration) -> Option<std::process::Output> {
-    let (tx, rx) = std::sync::mpsc::channel();
+/// Poll interval while waiting for the probe child.
+const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Run to completion or give up after `timeout`, killing the child's whole
+/// process group (a wrapper script's children hold the pipes too). Output is
+/// drained on two threads so a full pipe cannot deadlock the wait; on
+/// timeout they are not joined, so an escaped descendant cannot block us.
+pub(super) fn output_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Own process group (console-signal group on Windows), for the kill below.
+    crate::process_tree::detach_from_console(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            // Unwaitable is as good as gone; fall through to the kill.
+            Err(_) => break None,
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(PROBE_POLL_INTERVAL);
+    };
+    let Some(status) = status else {
+        // Group, then the child, then reap it.
+        crate::process_tree::kill_process_group_pid(Some(child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+        drop((stdout, stderr));
+        return None;
+    };
+    Some(std::process::Output {
+        status,
+        stdout: drained(stdout),
+        stderr: drained(stderr),
+    })
+}
+
+/// Read one of the child's pipes to EOF on its own thread. A missing pipe or
+/// a failed read yields empty output.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
-        let _ = tx.send(cmd.output());
-    });
-    rx.recv_timeout(timeout).ok()?.ok()
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+/// What a finished [`drain`] read; empty if the thread panicked.
+fn drained(pipe: JoinHandle<Vec<u8>>) -> Vec<u8> {
+    pipe.join().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -196,37 +216,100 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A child that answers in time yields what a plain `output()` would:
+    /// status, stdout and stderr.
+    #[cfg(unix)]
     #[test]
-    fn parses_single_and_multi_gpu_output() {
-        assert_eq!(parse_compute_caps("8.6\n"), Some(vec![(8, 6)]));
-        assert_eq!(
-            parse_compute_caps("12.0\n6.1\n"),
-            Some(vec![(12, 0), (6, 1)])
+    fn a_probe_that_answers_returns_its_output() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf out; printf err >&2");
+        let output = output_with_timeout(cmd, Duration::from_secs(5)).expect("the probe answered");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+    }
+
+    /// A drain thread that panicked costs only the stream it was reading:
+    /// the child answered, so the probe stands with that stream empty.
+    #[test]
+    fn a_panicking_drain_thread_costs_only_its_own_stream() {
+        struct PanicsOnRead;
+        impl Read for PanicsOnRead {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("the drain thread died");
+            }
+        }
+        // The panic is the point; keep it off the test log.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let handle = drain(Some(PanicsOnRead));
+        let read = drained(handle);
+        std::panic::set_hook(hook);
+        assert!(read.is_empty(), "the stream is empty, and the probe stands");
+    }
+
+    /// Giving up on a probe must end the probe: an abandoned child keeps
+    /// running, so a binary slower than the caller's retry backoff would pile
+    /// up processes. The child here would create a marker one second in; the
+    /// timeout is 200 ms, and the marker must never appear.
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_probe_child_is_killed_rather_than_abandoned() {
+        let marker = std::env::temp_dir().join(format!("panoptikon-f13-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 1; : > '{}'", marker.display()));
+
+        let started = Instant::now();
+        assert!(
+            output_with_timeout(cmd, Duration::from_millis(200)).is_none(),
+            "the probe did not answer within its timeout"
         );
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "and it gave up at the timeout rather than at the child's pace: {:?}",
+            started.elapsed()
+        );
+
+        // Well past the point the child would have written it.
+        std::thread::sleep(Duration::from_millis(1_500));
+        assert!(
+            !marker.exists(),
+            "the timed-out child kept running: {}",
+            marker.display()
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[test]
-    fn garbage_or_na_output_is_unknown() {
-        assert_eq!(parse_compute_caps(""), None);
-        assert_eq!(parse_compute_caps("N/A\n"), None);
-        assert_eq!(parse_compute_caps("8.6\nN/A\n"), None);
+    fn parses_a_capability_field() {
+        assert_eq!(parse_compute_cap("8.6"), Some((8, 6)));
+        assert_eq!(parse_compute_cap(" 12.0 "), Some((12, 0)));
+    }
+
+    #[test]
+    fn garbage_or_na_field_is_unknown() {
+        assert_eq!(parse_compute_cap(""), None);
+        assert_eq!(parse_compute_cap("N/A"), None);
+        assert_eq!(parse_compute_cap("8"), None);
         assert_eq!(
-            parse_compute_caps("Failed to initialize NVML: Driver error\n"),
+            parse_compute_cap("Failed to initialize NVML: Driver error"),
             None
         );
     }
 
     #[test]
     fn meets_floor_boundaries() {
-        let caps = HostComputeCaps::known(vec![(7, 5)]);
+        let caps = HostComputeCaps::from_caps(vec![(7, 5)]);
         assert_eq!(caps.meets_floor(7.5), Some(true));
         assert_eq!(caps.meets_floor(8.0), Some(false));
         // ANY device qualifying is enough.
-        let mixed = HostComputeCaps::known(vec![(6, 1), (8, 6)]);
+        let mixed = HostComputeCaps::from_caps(vec![(6, 1), (8, 6)]);
         assert_eq!(mixed.meets_floor(8.0), Some(true));
         assert_eq!(HostComputeCaps::unknown().meets_floor(8.0), None);
         // 10.x majors compare above 9.x, not lexicographically.
-        let blackwell = HostComputeCaps::known(vec![(12, 0)]);
+        let blackwell = HostComputeCaps::from_caps(vec![(12, 0)]);
         assert_eq!(blackwell.meets_floor(8.0), Some(true));
     }
 
@@ -244,7 +327,7 @@ mod tests {
                 }
             }
         });
-        let caps = HostComputeCaps::known(vec![(6, 1)]);
+        let caps = HostComputeCaps::from_caps(vec![(6, 1)]);
         overlay_metadata(&mut body, &caps);
         let gated = &body["doctr"]["inference_ids"]["dots_ocr"];
         assert_eq!(gated["unavailable"], json!(true));
@@ -266,7 +349,7 @@ mod tests {
             }
         });
         let mut satisfied = template.clone();
-        overlay_metadata(&mut satisfied, &HostComputeCaps::known(vec![(8, 9)]));
+        overlay_metadata(&mut satisfied, &HostComputeCaps::from_caps(vec![(8, 9)]));
         assert_eq!(satisfied, template);
 
         let mut unknown = template.clone();
@@ -285,7 +368,7 @@ mod tests {
             }
         });
         let mut body = template.clone();
-        overlay_metadata(&mut body, &HostComputeCaps::known(vec![(6, 1)]));
+        overlay_metadata(&mut body, &HostComputeCaps::from_caps(vec![(6, 1)]));
         assert_eq!(body, template);
     }
 }

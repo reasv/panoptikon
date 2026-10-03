@@ -35,9 +35,13 @@ class SentenceTransformersModel(InferenceModel):
             return
 
         self.devices = get_device()
+        # Use the resolved device rather than SentenceTransformer's own probe;
+        # an explicit `init_args.device` still wins.
+        init_args = dict(self.init_args)
+        init_args.setdefault("device", str(self.devices[0]))
         self.model = SentenceTransformer(
             model_name_or_path=self.model_name,
-            **self.init_args,
+            **init_args,
         )
         self.pool = None
         # if len(self.devices) > 1:

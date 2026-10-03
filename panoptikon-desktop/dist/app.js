@@ -280,6 +280,45 @@ function renderSource(id, field) {
   element.textContent = sourceDescription(field);
   element.hidden = !element.textContent;
 }
+function renderGpuMemory(memory) {
+  byId('gpu-memory').hidden = !memory.local_inference;
+  byId('gpu-memory-mode').value = memory.margin ? 'margin' : 'default';
+  const percent = String(memory.margin ? Number((memory.margin.value * 100).toFixed(4)) : 10);
+  byId('gpu-memory-margin').value = percent;
+  byId('gpu-memory-margin').dataset.rendered = percent;
+  renderSource('gpu-memory-source', memory.margin ?? { source: { type: 'toml' } });
+  updateGpuMemory();
+}
+function updateGpuMemory() {
+  const memory = serverConfiguration.performance.gpu_memory;
+  const custom = byId('gpu-memory-mode').value === 'margin';
+  byId('gpu-memory-margin-field').hidden = !custom;
+  const help = custom
+    ? 'Keeps free this percentage of the GPU memory other programs use, with no upper limit. 0 keeps nothing free.'
+    : memory.flat_default
+      ? 'Keeps 1 GiB free on each NVIDIA GPU. When a GPU is full, the NVIDIA driver moves memory to system RAM, and inference becomes several times slower.'
+      : 'Keeps free 10 % of the GPU memory other programs use: at most 1 GiB and, except on a Mac, at least 3 % of the GPU.';
+  const gpus = memory.custom_gpus === 0 ? ''
+    : memory.custom_gpus === 1 ? ' One GPU has its own margin in the config file, which applies to it instead.'
+      : ` ${memory.custom_gpus} GPUs have their own margin in the config file, which applies to them instead.`;
+  byId('gpu-memory-help').textContent = help + gpus;
+}
+function readGpuMargin() {
+  if (byId('gpu-memory-mode').value === 'default') return null;
+  const input = byId('gpu-memory-margin');
+  const loaded = serverConfiguration.performance.gpu_memory.margin;
+  // An unedited field sends the value as loaded, not its rounded display.
+  if (loaded && input.value === input.dataset.rendered) return loaded.value;
+  const percent = input.value.trim() === '' ? Number.NaN : Number(input.value);
+  if (!(percent >= 0 && percent <= 100)) throw new Error('GPU memory margin must be between 0 and 100 %.');
+  return Number((percent / 100).toFixed(6));
+}
+function showSetting(id) {
+  if (id !== 'gpu-memory') return;
+  selectTab('server');
+  byId('gpu-memory').scrollIntoView({ block: 'center' });
+  byId('gpu-memory-mode').focus();
+}
 let lastEditedPort = 'lan-port';
 function validatePortConflict(changedPort = lastEditedPort) {
   lastEditedPort = changedPort || lastEditedPort;
@@ -343,6 +382,7 @@ function renderServerConfiguration(configuration) {
   renderSource('intermediate-budget-source', configuration.performance.intermediate_data_budget_mb);
   byId('embedding-cache-size').value = configuration.performance.embedding_cache_size.value;
   renderSource('embedding-cache-source', configuration.performance.embedding_cache_size);
+  renderGpuMemory(configuration.performance.gpu_memory);
   byId('search-cache-size').value = configuration.search_cache.size_mb.value;
   renderSource('search-cache-size-source', configuration.search_cache.size_mb);
   byId('search-cache-enabled').checked = configuration.search_cache.policy_enabled;
@@ -405,6 +445,7 @@ function readServerConfiguration() {
       loader_concurrency: positiveInteger('loader-concurrency', 'Concurrent file loaders', 1, 256),
       intermediate_data_budget_mb: positiveInteger('intermediate-budget', 'Intermediate-data memory', 64, 1048576),
       embedding_cache_size: positiveInteger('embedding-cache-size', 'Embedding cache size', 0, 65536),
+      gpu_margin: readGpuMargin(),
     },
     search_cache_enabled: byId('search-cache-enabled').checked,
   };
@@ -532,6 +573,7 @@ byId('relay-enabled').addEventListener('change', async (event) => {
 });
 for (const section of [byId('network-settings'), byId('performance-settings')]) section.addEventListener('input', () => { serverConfigurationDirty = true; byId('server-configuration-status').textContent = ''; });
 byId('lan-enabled').addEventListener('change', updateLanVisibility);
+byId('gpu-memory-mode').addEventListener('change', updateGpuMemory);
 byId('lan-all-databases').addEventListener('change', updateLanDefaultOptions);
 byId('local-port').addEventListener('input', () => validatePortConflict('local-port'));
 byId('lan-port').addEventListener('input', () => validatePortConflict('lan-port'));
@@ -608,5 +650,6 @@ byId('clear-share-cache').addEventListener('click', async () => {
 byId('save-file-commands').addEventListener('click', async () => { try { await invoke('set_file_action_commands', { commands: readCommands(byId('file-commands')) }); byId('file-command-status').textContent = 'File-opening settings saved.'; } catch (error) { fail(error); } });
 window.__TAURI__?.event?.listen('desktop-state', refresh);
 window.__TAURI__?.event?.listen('desktop-update-state', (event) => showUpdate(event.payload));
-refresh();
+window.__TAURI__?.event?.listen('desktop-show-setting', (event) => showSetting(event.payload));
+refresh().then(() => showSetting(location.hash.slice(1)));
 setInterval(refresh, 3000);

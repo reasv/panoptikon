@@ -25,6 +25,8 @@ State machine (protocol v2):
   survives.
 - A failed handshake is the one error the worker does not survive (exit
   non-zero).
+- With the handshake's `batch_memory_frames` flag, a granted `predict` writes
+  a `memory` frame (with the request id) after each batch but the last.
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ import logging
 import os
 import sys
 import traceback
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 EXIT_OK = 0
 EXIT_HANDSHAKE_FAILED = 1
@@ -75,18 +77,48 @@ def _send_ok(proto_out: BinaryIO, req_id: int, **payload: Any) -> None:
 
 
 def _send_error(
-    proto_out: BinaryIO, req_id: int, message: str, tb: str = ""
+    proto_out: BinaryIO, req_id: int, message: str, tb: str = "", **extra: Any
 ) -> None:
+    """Send an `error` frame; `extra` carries the optional memory-sensing
+    fields a failed `predict` can still report."""
     from inferio_worker import protocol
 
     protocol.write_frame(
         proto_out,
-        {"type": "error", "id": req_id, "message": message, "traceback": tb},
+        {
+            "type": "error",
+            "id": req_id,
+            "message": message,
+            "traceback": tb,
+            **extra,
+        },
     )
 
 
-def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> type | None:
-    """Process the handshake frame; returns the impl *class* or None.
+def _memory_frame_emitter(
+    proto_out: BinaryIO, req_id: int, wanted: bool
+) -> Callable[[dict[str, Any]], None] | None:
+    """The per-batch `memory` frame writer for one in-flight `predict`, or None
+    when not wanted. Only valid until that request's reply is sent.
+    """
+    if not wanted:
+        return None
+
+    from inferio_worker import protocol
+
+    def emit(sample: dict[str, Any]) -> None:
+        protocol.write_frame(
+            proto_out, {"type": "memory", "id": req_id, "memory": sample}
+        )
+
+    return emit
+
+
+def _handshake(
+    proto_in: BinaryIO, proto_out: BinaryIO
+) -> tuple[type | None, bool]:
+    """Process the handshake frame; returns `(impl class, per-batch memory
+    frames wanted)`, the class being None on any failure.
 
     v2: the handshake carries identity only (impl_class + impl_dirs). The
     class is located but not instantiated — `configure` does that later.
@@ -98,7 +130,7 @@ def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> type | None:
     msg = protocol.read_frame(proto_in)
     if msg is None:
         logger.error("EOF before handshake; exiting.")
-        return None
+        return None, False
     req_id = msg.get("id", 0)
     if msg.get("type") != "handshake":
         _send_error(
@@ -106,7 +138,7 @@ def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> type | None:
             req_id,
             f"Expected handshake as first frame, got {msg.get('type')!r}",
         )
-        return None
+        return None, False
     version = msg.get("protocol_version")
     if version != protocol.PROTOCOL_VERSION:
         _send_error(
@@ -115,7 +147,8 @@ def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> type | None:
             f"Unsupported protocol version {version!r}; this worker speaks "
             f"{protocol.PROTOCOL_VERSION}",
         )
-        return None
+        return None, False
+    batch_memory_frames = msg.get("batch_memory_frames") is True
 
     # cuDNN path setup before any impl module import; failure is only a
     # warning.
@@ -135,18 +168,18 @@ def _handshake(proto_in: BinaryIO, proto_out: BinaryIO) -> type | None:
     except Exception as e:
         logger.error("handshake failed: %s", e, exc_info=True)
         _send_error(proto_out, req_id, str(e), traceback.format_exc())
-        return None
+        return None, False
 
     logger.info("Handshake ok for impl class %s", impl_class_name)
     _send_ok(proto_out, req_id, protocol_version=protocol.PROTOCOL_VERSION)
-    return impl_cls
+    return impl_cls, batch_memory_frames
 
 
 def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
-    from inferio_worker import protocol
+    from inferio_worker import memory, packing, protocol, sdpa
     from inferio_worker.inputs import prediction_input_from_frame
 
-    impl_cls = _handshake(proto_in, proto_out)
+    impl_cls, batch_memory_frames = _handshake(proto_in, proto_out)
     if impl_cls is None:
         return EXIT_HANDSHAKE_FAILED
 
@@ -154,6 +187,7 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
     inference_id = "<unconfigured>"
     prewarmed = False
     loaded = False
+    batching_off_logged = False
     while True:
         msg = protocol.read_frame(proto_in)
         if msg is None:
@@ -225,13 +259,33 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     "load before configure",
                 )
                 continue
+            before: dict = {}
             try:
+                # Bracket the load for the footprint the orchestrator charges.
+                before = memory.begin_load()
                 # Idempotency lives in the impl's own load() guard
                 # (InferenceModel implementations early-return when loaded).
                 instance.load()
+                # A pin that named nothing is a silent CPU fallback.
+                pin_problem = memory.pinned_device_missing()
+                if pin_problem is not None:
+                    raise RuntimeError(pin_problem)
                 loaded = True
-                _send_ok(proto_out, req_id)
+                report = memory.finish_load(before, instance)
+                # After the load is priced: the GQA check only runs where the
+                # load put memory on a GPU.
+                sdpa.expand_kv_heads_without_fused_gqa()
+                # Canvas and token window from the downloaded model config.
+                canvas_pixels = packing.impl_canvas_pixels(instance)
+                if canvas_pixels is not None:
+                    report["canvas_pixels"] = canvas_pixels
+                max_tokens = packing.impl_max_tokens(instance)
+                if max_tokens is not None:
+                    report["max_tokens"] = max_tokens
+                _send_ok(proto_out, req_id, **report)
             except Exception as e:
+                # Stops the context probe `begin_load` started.
+                memory.abort_load(before)
                 logger.error(
                     "%s - load failed: %s", inference_id, e, exc_info=True
                 )
@@ -252,13 +306,46 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     "predict before a successful load",
                 )
                 continue
+            grant = msg.get("grant")
+            if not isinstance(grant, dict):
+                grant = None
+            if grant is not None:
+                # An impl that batches internally takes the grantless path.
+                if packing.batching_disabled(instance):
+                    if not batching_off_logged:
+                        batching_off_logged = True
+                        logger.info(
+                            "%s - this impl has its own batching disabled; "
+                            "ignoring memory grants and running each window in "
+                            "one predict call (no calibration units reported)",
+                            inference_id,
+                        )
+                    grant = None
             try:
                 inputs = [
                     prediction_input_from_frame(entry)
                     for entry in msg.get("inputs") or []
                 ]
-                outputs = list(instance.predict(inputs))
-                _send_ok(proto_out, req_id, outputs=outputs)
+                if grant is None:
+                    # The whole window in one GPU batch.
+                    _send_ok(
+                        proto_out,
+                        req_id,
+                        **packing.run_grantless_window(instance, inputs),
+                    )
+                else:
+                    _send_ok(
+                        proto_out,
+                        req_id,
+                        **packing.run_window(
+                            instance,
+                            inputs,
+                            grant,
+                            _memory_frame_emitter(
+                                proto_out, req_id, batch_memory_frames
+                            ),
+                        ),
+                    )
             except Exception as e:
                 # Includes serialization failures from write_frame (bad
                 # output type, oversized response): packing happens before
@@ -267,7 +354,21 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 logger.error(
                     "%s - predict failed: %s", inference_id, e, exc_info=True
                 )
-                _send_error(proto_out, req_id, str(e), traceback.format_exc())
+                extra: dict[str, Any] = {}
+                measurements = getattr(e, "measurements", None)
+                if measurements:
+                    # A partial window still measured what ran.
+                    extra["measurements"] = measurements
+                    sample = memory.device_memory_sample()
+                    if sample is not None:
+                        extra["memory"] = sample
+                _send_error(
+                    proto_out, req_id, str(e), traceback.format_exc(), **extra
+                )
+            # The window's inputs are not held while waiting for the next
+            # request, and what they occupied goes back to the OS.
+            msg = inputs = None
+            memory.return_freed_memory()
 
         elif mtype == "unload":
             # Valid in every state: a parked prewarmed worker with no
@@ -287,6 +388,29 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
             proto_out.flush()
             logger.info("Unloaded; exiting.")
             return EXIT_OK
+
+        elif mtype == "trim":
+            # Release the allocator's unused pool; never an error.
+            released = memory.empty_cache(memory.TRIM_RELEASE)
+            trim_payload: dict[str, Any] = {}
+            if released:
+                packing.note_trimmed()
+                released_mb, release_ms = memory.last_release()
+                if released_mb is not None:
+                    trim_payload["released_mb"] = released_mb
+                if release_ms is not None:
+                    trim_payload["release_ms"] = release_ms
+                logger.info(
+                    "%s - released the allocator pool on request: handed back "
+                    "%s MiB",
+                    inference_id,
+                    "?" if released_mb is None else released_mb,
+                )
+            sample = memory.device_memory_sample()
+            if sample is not None:
+                # After the release, so `reserved_mb` is what to charge now.
+                trim_payload["memory"] = sample
+            _send_ok(proto_out, req_id, **trim_payload)
 
         elif mtype == "ping":
             _send_ok(proto_out, req_id)

@@ -60,7 +60,7 @@ Reusable external-input declarations can also pass current values directly to
 workers for libraries which read their environment. `.env` is the backing
 source; numeric/boolean server keys are templated as quoted
 whole-value templates (`port = "${PORT:-6342}"`), coerced at load.
-Bootstrap/diagnostic env vars (`PANOPTIKON_CONFIG_PATH`, `RUST_LOG`) are
+Bootstrap/diagnostic env vars (`PANOPTIKON_ROOT`, `PANOPTIKON_CONFIG_PATH`, `RUST_LOG`) are
 the documented exceptions.
 
 Desktop manages external inputs in its Server root `.env`; remote Inferio owns
@@ -109,7 +109,7 @@ on a `runtime/setup.lock` file lock):
 1. Locates `uv` on PATH, else downloads a pinned, checksum-verified
    standalone `uv` into the managed root.
 2. Detects the accelerator (`[inference_local.python_env] accelerator =
-   "auto" | "cuda" | "rocm" | "cpu"`; auto = our detection, ported from the old
+   "auto" | "cuda" | "rocm" | "mps" | "cpu"`; auto = our detection, ported from the old
    install scripts — uv's `--torch-backend=auto` exists only in its pip
    interface, so we detect and pass the extra ourselves).
 3. Creates `python/.venv` and runs a locked `uv sync --extra <accelerator>`.
@@ -163,7 +163,7 @@ embedding and read the source tree as usual) and materialized at first run:
 
 Resource resolution order everywhere: explicit config > dev source tree (when
 present) > extracted embedded set. The root for all of this is `--root`
-(default: CWD, portable-app style; implemented as a chdir at startup, before
+(default: `PANOPTIKON_ROOT`, else CWD, portable-app style; implemented as a chdir at startup, before
 `.env` loading and config resolution). Panoptikon Desktop uses platform
 application-data directories through this same root abstraction.
 

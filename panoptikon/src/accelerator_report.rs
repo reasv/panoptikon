@@ -14,8 +14,8 @@
 //!    Intel XPU); add an [`Accelerator`] variant when the managed venv gains
 //!    a matching extra.
 //!
-//! **Warnings:** only when a *GPU* backend is selected but no device name is
-//! found. **CPU is never a warning** — it is reported as using CPU.
+//! **Warnings:** only when a backend with a driver stack to probe is selected
+//! and no device name is found. **CPU and MPS are never a warning.**
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -105,13 +105,16 @@ impl AcceleratorReport {
 
         if is_gpu_backend(self.backend) {
             let devices = self.selected_devices();
-            if devices.is_empty() {
-                lines.push("GPU devices: (none detected)".into());
-            } else {
+            if !devices.is_empty() {
                 lines.push("GPU devices:".into());
                 for d in devices {
                     lines.push(format!("  - [{}] {}", d.stack, d.label()));
                 }
+            } else if stack_id_for_backend(self.backend).is_none() {
+                // Metal is part of macOS; no vendor tool names the device.
+                lines.push("GPU device: the one this OS provides".into());
+            } else {
+                lines.push("GPU devices: (none detected)".into());
             }
         } else {
             // CPU is a normal outcome — never a warning.
@@ -133,9 +136,10 @@ impl AcceleratorReport {
     }
 }
 
-/// Whether this backend is a GPU stack (may warn if devices are missing).
+/// Whether this backend runs the model on a GPU (MPS included, though it has
+/// no driver stack to probe: [`stack_id_for_backend`]).
 pub fn is_gpu_backend(a: Accelerator) -> bool {
-    matches!(a, Accelerator::Cuda | Accelerator::Rocm)
+    matches!(a, Accelerator::Cuda | Accelerator::Rocm | Accelerator::Mps)
     // | Accelerator::Xpu
 }
 
@@ -145,7 +149,8 @@ pub fn stack_id_for_backend(a: Accelerator) -> Option<&'static str> {
         Accelerator::Cuda => Some("nvidia"),
         Accelerator::Rocm => Some("amd-rocm"),
         // Accelerator::Xpu => Some("intel-xpu"),
-        Accelerator::Cpu | Accelerator::Auto => None,
+        // MPS has no driver stack to probe: Metal is part of the OS.
+        Accelerator::Cpu | Accelerator::Mps | Accelerator::Auto => None,
     }
 }
 
@@ -156,6 +161,7 @@ pub fn accelerator_slug(a: Accelerator) -> &'static str {
         Accelerator::Cuda => "cuda",
         Accelerator::Rocm => "rocm",
         Accelerator::Cpu => "cpu",
+        Accelerator::Mps => "mps",
         // Accelerator::Xpu => "xpu",
     }
 }
@@ -315,6 +321,7 @@ fn probe_amd_rocm_stack() -> Option<GpuStackPresence> {
     if !cfg!(target_os = "linux") {
         return None;
     }
+    let kfd_gpus = crate::inferio::gpu::rocm_topology_gfx_names();
     let mut evidence = Vec::new();
     if std::path::Path::new("/opt/rocm").is_dir() {
         evidence.push("/opt/rocm exists");
@@ -325,13 +332,22 @@ fn probe_amd_rocm_stack() -> Option<GpuStackPresence> {
     if which("rocminfo").is_some() {
         evidence.push("rocminfo on PATH");
     }
+    if !kfd_gpus.is_empty() {
+        evidence.push("KFD topology lists a GPU");
+    }
     if evidence.is_empty() {
         return None;
+    }
+    // The ROCm tools are optional (the Docker image and a driver-only host
+    // have neither); the kernel's topology still names each GPU's ISA.
+    let mut names = amd_device_names();
+    if names.is_empty() {
+        names = kfd_gpus.iter().map(|gfx| format!("AMD {gfx}")).collect();
     }
     Some(GpuStackPresence {
         stack: "amd-rocm",
         backend: Accelerator::Rocm,
-        devices: amd_device_names()
+        devices: names
             .into_iter()
             .map(|name| GpuDevice {
                 stack: "amd-rocm",
@@ -523,6 +539,7 @@ mod tests {
         assert_eq!(accelerator_slug(Accelerator::Cpu), "cpu");
         assert_eq!(accelerator_slug(Accelerator::Cuda), "cuda");
         assert_eq!(accelerator_slug(Accelerator::Rocm), "rocm");
+        assert_eq!(accelerator_slug(Accelerator::Mps), "mps");
         assert_eq!(accelerator_slug(Accelerator::Auto), "auto");
     }
 
@@ -677,8 +694,33 @@ mod tests {
         assert_eq!(stack_id_for_backend(Accelerator::Cuda), Some("nvidia"));
         assert_eq!(stack_id_for_backend(Accelerator::Rocm), Some("amd-rocm"));
         assert_eq!(stack_id_for_backend(Accelerator::Cpu), None);
+        assert_eq!(stack_id_for_backend(Accelerator::Mps), None);
         assert!(!is_gpu_backend(Accelerator::Cpu));
         assert!(is_gpu_backend(Accelerator::Cuda));
+        assert!(
+            is_gpu_backend(Accelerator::Mps),
+            "a GPU with no stack to probe"
+        );
+    }
+
+    /// An Apple Silicon host is not a CPU host, and the absence of a vendor
+    /// tool that could name its device is not a missing driver.
+    #[test]
+    fn format_text_mps_is_not_reported_as_cpu() {
+        let report = assemble_report(
+            Accelerator::Mps,
+            BackendSource::InstalledVenv,
+            empty_stacks(),
+        );
+        let text = report.format_text();
+        assert!(text.contains("accelerator backend: mps"), "{text}");
+        assert!(
+            text.contains("GPU device: the one this OS provides"),
+            "{text}"
+        );
+        assert!(!text.contains("using CPU"), "{text}");
+        assert!(!text.contains("none detected"), "{text}");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
     /// Minimal rocminfo-shaped output: CPU agent first, then GPU (real tools

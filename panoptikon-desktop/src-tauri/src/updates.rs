@@ -325,6 +325,7 @@ struct BridgeUpdateStatus {
     available: bool,
     target_version: Option<String>,
     ribbon_visible: bool,
+    sysmem_fallback_notice: crate::sysmem_notice::SysmemFallbackNotice,
 }
 
 pub fn initialize_bridge(app: &mut tauri::App) -> tauri::Result<()> {
@@ -356,6 +357,14 @@ pub fn initialize_bridge(app: &mut tauri::App) -> tauri::Result<()> {
             .route("/open", post(bridge_open))
             .route("/snooze", post(bridge_snooze))
             .route("/dismiss", post(bridge_dismiss))
+            .route(
+                "/sysmem-fallback-notice/dismiss",
+                post(bridge_dismiss_sysmem_fallback_notice),
+            )
+            .route(
+                "/gpu-memory-setting/open",
+                post(bridge_open_gpu_memory_setting),
+            )
             .with_state(state);
         if let Err(error) = axum::serve(listener, router).await {
             tracing::error!(%error, "Desktop update bridge stopped");
@@ -390,6 +399,7 @@ async fn bridge_status(
         available: view.available,
         target_version: view.target_version,
         ribbon_visible: view.ribbon_visible,
+        sysmem_fallback_notice: crate::sysmem_notice::status(&state.app).await,
     }))
 }
 
@@ -429,6 +439,34 @@ async fn bridge_dismiss(
     set_ribbon_dismissal(&state.app, request.version)
         .await
         .map_err(|error| error.status_code())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn bridge_dismiss_sysmem_fallback_notice(
+    State(state): State<BridgeServerState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    if !bridge_authorized(&headers, &state) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    crate::sysmem_notice::dismiss(&state.app)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to save the sysmem fallback notice dismissal");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn bridge_open_gpu_memory_setting(
+    State(state): State<BridgeServerState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    if !bridge_authorized(&headers, &state) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    crate::show_control_setting(&state.app, crate::GPU_MEMORY_SETTING)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -940,6 +978,8 @@ impl UpdateCoordinator {
         }
         #[cfg(not(windows))]
         {
+            // Also stops the Relay so the relaunched instance can bind.
+            crate::supervised_shutdown(app, "the updater").await;
             app.restart()
         }
     }

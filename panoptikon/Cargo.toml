@@ -19,7 +19,13 @@ bundled = []
 bundled-ui = []
 
 [dependencies]
-axum = { version = "0.8", features = ["multipart"] }
+# Named directly so `inferio_client::is_refused_stream` can downcast to
+# `h2::Error`; must stay the h2 version hyper resolves to (both 0.4.x).
+h2 = "0.4"
+
+# `http2`: `axum::serve` needs it for the h2c inference surface, so the
+# inference client uses a bounded connection pool, not a socket per predict.
+axum = { version = "0.8", features = ["multipart", "http2"] }
 tokio = { version = "1.39", features = [
     "rt-multi-thread",
     "macros",
@@ -31,12 +37,20 @@ tokio = { version = "1.39", features = [
 ] }
 fs2 = "0.4"
 hyper = { version = "1", features = ["http1", "http2", "client"] }
+# `server-auto` + `service`: `main.rs::serve_with_stream_limit` drives the auto
+# connection builder directly to set HTTP/2 `max_concurrent_streams` (hyper's
+# default of 200 streams would cap the in-flight window).
 hyper-util = { version = "0.1", features = [
     "client-legacy",
     "http1",
     "http2",
+    "server-auto",
+    "service",
     "tokio",
 ] }
+# The `/api/inference/*` proxy's client for `https://` upstreams; the same
+# native-tls stack reqwest already links.
+hyper-tls = "0.6"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -117,7 +131,16 @@ utoipa = "5.4"
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 utoipa-redoc = { version = "6", features = ["axum"] }
 # `stream`: setup.rs streams the pinned uv download to disk with progress.
-reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+# `http2` (a default, named so it cannot silently disappear) and
+# `native-tls-alpn` (ALPN, so an `https://` upstream can negotiate HTTP/2) are
+# what the inference client's HTTP/2 path needs.
+reqwest = { version = "0.12", features = [
+    "json",
+    "multipart",
+    "stream",
+    "http2",
+    "native-tls-alpn",
+] }
 reqwest-middleware = { version = "0.3", features = ["multipart"] }
 reqwest-retry = "0.5"
 futures-util = "0.3"
@@ -159,18 +182,32 @@ libc = "0.2"
 # console signal path (CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW).
 # Win32_Storage_FileSystem + Win32_System_IO: LockFileEx for the advisory
 # lock serializing concurrent setup runs (setup.rs).
+# Win32_System_SystemInformation: GlobalMemoryStatusEx, the host's RAM total
+# and availability for the CPU admission board (inferio/cpu.rs).
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 # Extraction of the pinned uv standalone build (setup.rs): zip on Windows.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+# atexit: removes the shared test data root at exit (test_utils.rs).
+libc = "0.2"
+# `test-util`: paused clocks for tests of timers.
+tokio = { version = "1.39", features = ["test-util"] }
+
+# The inference client's TLS tests: openssl mints a throwaway certificate and
+# tokio-rustls serves it with the ALPN list under test (native-tls has no
+# server-side ALPN). Both were already in the dependency tree.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+openssl = "0.10"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 [build-dependencies]
 # build.rs packages the embedded resource archives (`bundled`/`bundled-ui`);
