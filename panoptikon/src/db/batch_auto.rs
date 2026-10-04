@@ -312,6 +312,10 @@ threshold = 0.2
         let (path, config_path) = pre_upgrade_db(&tmp).await;
         let store = SystemConfigStore::new(tmp.path().to_path_buf());
         fs::write(&config_path, CONFIG_WITH_CAPS).unwrap();
+        // The read creates the WAL files and the open connection keeps them
+        // through the read-only window: SQLite deletes them on the last close.
+        let mut held = open(&path).await;
+        assert!(!is_stamped(&mut held).await.unwrap());
         let refusing = Unwritable::around(&config_path);
 
         assert!(clear_config_batch_sizes(&store, "default").is_err());
@@ -321,6 +325,7 @@ threshold = 0.2
         assert_eq!(fs::read_to_string(&config_path).unwrap(), CONFIG_WITH_CAPS);
         assert!(stamped(&path).await);
         drop(refusing);
+        held.close().await.unwrap();
     }
 
     /// Makes the config unwritable for as long as it lives, and restores the
@@ -329,8 +334,7 @@ threshold = 0.2
     /// The atomic write puts a temp file *beside* the config and renames it
     /// over it, so on POSIX a read-only file is replaced happily and only a
     /// read-only **directory** refuses. Windows refuses on the file's own
-    /// read-only flag instead. The index database shares that directory, but
-    /// its WAL files are already there, so the stamp still lands.
+    /// read-only flag instead. The index database shares that directory.
     struct Unwritable(PathBuf, fs::Permissions);
 
     impl Unwritable {
