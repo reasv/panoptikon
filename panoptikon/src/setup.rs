@@ -663,7 +663,7 @@ impl DetectionProbes {
             rocm_dir: cfg!(target_os = "linux") && Path::new("/opt/rocm").is_dir(),
             rocm_smi_on_path: on_path("rocm-smi").is_some(),
             kfd_gpus: if cfg!(target_os = "linux") {
-                crate::inferio::gpu::rocm_topology_gpus()
+                crate::inferio::gpu::rocm_topology_gpus(false)
                     .into_iter()
                     .map(|(gfx, _)| gfx)
                     .collect()

@@ -224,9 +224,10 @@ pub fn gfx_override() -> bool {
 }
 
 /// The GPUs in the KFD topology: ISA name (`gfx1100`) and whether this
-/// process can open it; empty without amdgpu.
-pub fn rocm_topology_gpus() -> Vec<(String, bool)> {
-    rocm::topology_gpus(&rocm::SysfsRoots::default())
+/// process can open it; empty without amdgpu. Without `check_access` nothing
+/// is opened and every GPU reports `false`.
+pub fn rocm_topology_gpus(check_access: bool) -> Vec<(String, bool)> {
+    rocm::topology_gpus(&rocm::SysfsRoots::default(), check_access)
 }
 
 /// Probe once at startup; never fails. `accelerator` must be the resolved

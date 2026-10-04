@@ -487,10 +487,11 @@ fn node_dirs(root: &Path) -> Vec<(u32, PathBuf)> {
 /// Every GPU node in the KFD topology that this process can see, in node
 /// order: its ISA name (`gfx1100`) and whether `/dev/kfd` and its render node
 /// open read-write, which is what [`build`] admits it by. Quiet and best-effort.
-pub(super) fn topology_gpus(roots: &SysfsRoots) -> Vec<(String, bool)> {
+/// Without `check_access` nothing is opened and every GPU reports `false`.
+pub(super) fn topology_gpus(roots: &SysfsRoots, check_access: bool) -> Vec<(String, bool)> {
     let mut nodes = node_dirs(&roots.kfd_nodes);
     nodes.sort_by_key(|(node, _)| *node);
-    let kfd_openable = opens_read_write(&roots.kfd);
+    let kfd_openable = check_access && opens_read_write(&roots.kfd);
     nodes
         .into_iter()
         .filter_map(|(_, dir)| {
@@ -1349,7 +1350,7 @@ mod tests {
         assert_eq!(indexed(rows), vec![at(0, BDF_0C)], "one openable GPU");
     }
 
-    /// GPU nodes this process cannot open (no render node, or no
+    /// GPU nodes this process cannot open (no render node, or no read-write
     /// `/dev/kfd`), no GPU nodes, no topology, and every GPU node hidden by a
     /// device cgroup: ROCr enumerates nothing, so the inventory is known empty.
     #[test]
@@ -1365,9 +1366,28 @@ mod tests {
         fs::remove_file(&no_kfd.roots.kfd).unwrap();
         assert_eq!(no_kfd.build(), Some(Vec::new()));
         assert_eq!(
-            topology_gpus(&no_kfd.roots),
+            topology_gpus(&no_kfd.roots, true),
             [("gfx1100".to_owned(), false)]
         );
+        let read_only_kfd = Fixture::new();
+        read_only_kfd.dgpu(1, LOC_03_00, 128, GB24);
+        let kfd = &read_only_kfd.roots.kfd;
+        let set_readonly = |value| {
+            let mut perms = fs::metadata(kfd).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(value);
+            fs::set_permissions(kfd, perms).unwrap();
+        };
+        set_readonly(true);
+        // Skipped where privileges ignore the mode bits (root).
+        if OpenOptions::new().read(true).write(true).open(kfd).is_err() {
+            let rows = read_only_kfd.build();
+            let topology = topology_gpus(&read_only_kfd.roots, true);
+            set_readonly(false);
+            assert_eq!(rows, Some(Vec::new()));
+            assert_eq!(topology, [("gfx1100".to_owned(), false)]);
+        }
+        set_readonly(false);
         let empty = Fixture::new();
         assert_eq!(empty.build(), Some(Vec::new()));
         let rootless = SysfsRoots {
@@ -1441,14 +1461,18 @@ mod tests {
             .node(2, &gpu_props(LOC_03_00, 128, 0, 110000))
             .render(129);
         assert_eq!(
-            topology_gpus(&fixture.roots),
+            topology_gpus(&fixture.roots, true),
             [("gfx1100".to_owned(), false), ("gfx1201".to_owned(), true)]
+        );
+        assert_eq!(
+            topology_gpus(&fixture.roots, false),
+            [("gfx1100".to_owned(), false), ("gfx1201".to_owned(), false)]
         );
         let rootless = SysfsRoots {
             kfd_nodes: fixture.roots.kfd_nodes.join("absent"),
             ..fixture.roots.clone()
         };
-        assert!(topology_gpus(&rootless).is_empty());
+        assert!(topology_gpus(&rootless, true).is_empty());
     }
 
     /// major*10000 + minor*100 + stepping, rendered major-decimal then

@@ -201,7 +201,7 @@ pub fn resolve_backend_from(
 pub fn build_report(settings: &Settings) -> AcceleratorReport {
     let (backend, backend_source) =
         resolve_backend(settings.inference_local.python_env.accelerator);
-    assemble_report(backend, backend_source, probe_gpu_stacks())
+    assemble_report(backend, backend_source, probe_gpu_stacks(backend))
 }
 
 /// Pure assembly of warnings + device list (unit-tested).
@@ -279,15 +279,16 @@ pub fn print_report(settings: &Settings) {
 
 // --- GPU stack probes (append new stacks to the list) -------------------------
 
-type StackProbeFn = fn() -> Option<GpuStackPresence>;
+/// Takes the resolved backend.
+type StackProbeFn = fn(Accelerator) -> Option<GpuStackPresence>;
 
 const GPU_STACK_PROBES: &[StackProbeFn] = &[probe_nvidia_stack, probe_amd_rocm_stack];
 
-fn probe_gpu_stacks() -> Vec<GpuStackPresence> {
-    GPU_STACK_PROBES.iter().filter_map(|p| p()).collect()
+fn probe_gpu_stacks(backend: Accelerator) -> Vec<GpuStackPresence> {
+    GPU_STACK_PROBES.iter().filter_map(|p| p(backend)).collect()
 }
 
-fn probe_nvidia_stack() -> Option<GpuStackPresence> {
+fn probe_nvidia_stack(_backend: Accelerator) -> Option<GpuStackPresence> {
     let mut evidence = Vec::new();
     if which("nvidia-smi").is_some() {
         evidence.push("nvidia-smi on PATH");
@@ -317,11 +318,13 @@ fn probe_nvidia_stack() -> Option<GpuStackPresence> {
     })
 }
 
-fn probe_amd_rocm_stack() -> Option<GpuStackPresence> {
+fn probe_amd_rocm_stack(backend: Accelerator) -> Option<GpuStackPresence> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    let kfd_gpus = crate::inferio::gpu::rocm_topology_gpus();
+    // Opening the devices can resume a suspended GPU: only on a ROCm backend.
+    let check_access = backend == Accelerator::Rocm;
+    let kfd_gpus = crate::inferio::gpu::rocm_topology_gpus(check_access);
     let mut evidence = Vec::new();
     if std::path::Path::new("/opt/rocm").is_dir() {
         evidence.push("/opt/rocm exists");
@@ -341,19 +344,20 @@ fn probe_amd_rocm_stack() -> Option<GpuStackPresence> {
     Some(GpuStackPresence {
         stack: "amd-rocm",
         backend: Accelerator::Rocm,
-        devices: amd_devices(&kfd_gpus),
+        devices: amd_devices(&kfd_gpus, check_access),
         evidence: evidence.join("; "),
     })
 }
 
 /// One device per KFD GPU node, named by ISA as the GPU inventory names it;
-/// a GPU this process cannot open, which the inventory leaves out, says so.
-fn amd_devices(kfd_gpus: &[(String, bool)]) -> Vec<GpuDevice> {
+/// a GPU this process cannot open, which the inventory leaves out, says so
+/// when `check_access` is set.
+fn amd_devices(kfd_gpus: &[(String, bool)], check_access: bool) -> Vec<GpuDevice> {
     kfd_gpus
         .iter()
         .map(|(gfx, openable)| GpuDevice {
             stack: "amd-rocm",
-            name: if *openable {
+            name: if *openable || !check_access {
                 format!("AMD {gfx}")
             } else {
                 format!("AMD {gfx} (not openable by this process)")
@@ -497,7 +501,7 @@ mod tests {
             GpuStackPresence {
                 stack: "amd-rocm",
                 backend: Accelerator::Rocm,
-                devices: amd_devices(&[("gfx1100".into(), true), ("gfx1030".into(), false)]),
+                devices: amd_devices(&[("gfx1100".into(), true), ("gfx1030".into(), false)], true),
                 evidence: "test".into(),
             },
             // Unrelated stack should not appear under selected ROCm devices.
