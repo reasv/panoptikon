@@ -2824,7 +2824,7 @@ def nvml_card(cuda, monkeypatch, total_mb=8192, others_mb=1000):
     monkeypatch.setattr(memory, "_nvml_memory", reading)
     monkeypatch.setitem(memory._release_state, "armed", False)
     monkeypatch.setitem(memory._release_state, "largest_units", None)
-    monkeypatch.setitem(memory._release_state, "largest_input", None)
+    monkeypatch.setitem(memory._release_state, "grantless_size", None)
 
 
 @pytest.fixture
@@ -2918,14 +2918,15 @@ def test_the_backstop_needs_nvml(fake_torch, monkeypatch):
 def test_a_grantless_window_releases_the_pool_before_a_larger_input_only(
     spill_host, caplog
 ):
-    """The grantless path runs a window in one call: the pool is released
-    before a window whose largest input has more pixels than any since the
-    last release. The third window's largest input is in the middle and has
-    less width than the first, the fourth has more pixels only in sum, and a
-    trim restarts the record; the three-item pools are 208 MiB above NVML's
-    used memory, within the tolerance."""
+    """An impl that runs one input at a time: the pool is released before a
+    window whose largest input has more pixels than any since the last
+    release. The third window's largest input is in the middle and has less
+    width than the first, the second and fourth have more pixels only in sum,
+    and a trim restarts the record; the three-item pools are 208 MiB above
+    NVML's used memory, within the tolerance."""
     assert len(png_bytes(30, 45)) == len(png_bytes(40, 30)), "same PNG bytes"
     impl = caching_impl(spill_host, [2800])
+    impl.enable_batching = False
 
     def run(window):
         inputs = [PredictionInput(data=0, file=png_bytes(w, h)) for w, h in window]
@@ -2936,7 +2937,7 @@ def test_a_grantless_window_releases_the_pool_before_a_larger_input_only(
             run(window)
             for window in (
                 [(40, 30)],
-                [(30, 40)],
+                [(30, 40), (20, 20)],
                 [(40, 30), (30, 45), (20, 20)],
                 [(40, 30), (40, 30), (40, 30)],
             )
@@ -2949,6 +2950,15 @@ def test_a_grantless_window_releases_the_pool_before_a_larger_input_only(
     ]
     assert not any(p["measurements"][0].get("spilled") for p in payloads)
     assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_a_batching_grantless_window_is_sized_by_its_input_count(spill_host):
+    """One batch pads to its largest input, so three images outgrow one."""
+    impl = caching_impl(spill_host, [100])
+    image = PredictionInput(data=0, file=png_bytes(40, 30))
+    packing.run_grantless_window(impl, [image])
+    payload = packing.run_grantless_window(impl, [image] * 3)
+    assert payload["measurements"][0]["regrow_after"] == memory.GROWTH_RELEASE
 
 
 def test_a_grantless_window_that_spills_is_flagged_and_releases_the_pool(

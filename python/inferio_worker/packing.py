@@ -966,14 +966,20 @@ def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]
     stops the batch's peak sampler if `predict` raises.
 
     Where a full GPU spills to system RAM, the pool is released before a
-    window whose largest input is larger than any since the last release (as
-    `run_window` does before a growing batch), and a window whose pool ends
-    above NVML's used memory is flagged `spilled` and the pool released.
+    window whose size (its largest input, times its input count when the impl
+    batches) is larger than any since the last release (as `run_window` does
+    before a growing batch), and a window whose pool ends above NVML's used
+    memory is flagged `spilled` and the pool released.
     """
     spill_host = memory.spill_capable()
-    largest = max(map(_input_size, inputs), default=0) if spill_host else 0
-    if spill_host and memory.outgrows_pool(largest, "largest_input"):
-        memory.empty_cache(memory.GROWTH_RELEASE)
+    size = 0
+    if spill_host:
+        # A batch pads to its largest input.
+        size = max(map(_input_size, inputs), default=0)
+        if not batching_disabled(instance):
+            size *= len(inputs)
+        if memory.outgrows_pool(size, "grantless_size"):
+            memory.empty_cache(memory.GROWTH_RELEASE)
     state = memory.begin_batch()
     try:
         outputs = list(instance.predict(inputs))
@@ -981,7 +987,7 @@ def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]
     finally:
         memory.abandon_batch(state)
     if spill_host:
-        memory.note_batch_units(largest, "largest_input")
+        memory.note_batch_units(size, "grantless_size")
         off_device_mb = pool_off_device_mb(payload.get("memory"))
         if off_device_mb is not None and off_device_mb > SPILL_TOLERANCE_MB:
             payload["measurements"][0]["spilled"] = True

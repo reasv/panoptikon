@@ -1695,15 +1695,15 @@ GROWTH_RELEASE = "growth"
 SPILL_RELEASE = "spill"
 
 # The last release, whether the next batch's pool growth is its re-grow, and
-# what ran since it: the largest batch in units and the largest input of a
-# grantless window; None until one runs.
+# what ran since it: the largest batch in units and the largest grantless
+# window (`run_grantless_window`'s size); None until one runs.
 _release_state: dict[str, Any] = {
     "armed": False,
     "released_mb": None,
     "release_ms": None,
     "trigger": None,
     "largest_units": None,
-    "largest_input": None,
+    "grantless_size": None,
 }
 
 # The WSL2 GPU device: CUDA through the Windows display driver.
@@ -1747,7 +1747,7 @@ def _note_release(
     _release_state["released_mb"] = released_mb
     _release_state["release_ms"] = round(elapsed_ms, 3)
     _release_state["trigger"] = trigger
-    _release_state["largest_units"] = _release_state["largest_input"] = None
+    _release_state["largest_units"] = _release_state["grantless_size"] = None
     logger.debug(
         "released the allocator pool (%s): handed back %s MiB in %.1f ms%s",
         trigger,
