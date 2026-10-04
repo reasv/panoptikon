@@ -156,6 +156,9 @@ def test_the_fill_stops_once_free_reaches_the_level():
         made.target_mb = made.resolve_target(0.5)
         made.apply(made.target_mb)
         assert (made.held_mb, made.target_mb) == (3072, 3072)
+        backend.free = 6000
+        made.apply(4096)
+        assert made.held_mb == 3072
 
     # A hold is not stopped by the last leave-free level.
     backend.free = 6000

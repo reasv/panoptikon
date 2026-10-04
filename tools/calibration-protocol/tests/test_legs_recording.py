@@ -165,6 +165,7 @@ def test_healthrec_keeps_the_clients_of_a_gateway_that_answered_504(
     assert (health["ok"], health["status_code"]) == (False, 504)
     assert health["inference_clients"] == clients
     assert health["detail"] == "frozen"
+    assert healthrec.flatten_health(result, full=True)["raw"] == json.loads(body)
     assert "running" not in healthrec.flatten_queue(result)
 
 
@@ -172,7 +173,7 @@ def test_healthrec_keeps_the_clients_of_a_gateway_that_answered_504(
 # driver is gone, or after 60 s. The teardown's stop_all starts 1 s late, so a
 # signal can land inside it.
 DRIVER = """
-import json, os, subprocess, sys, time
+import json, os, signal, subprocess, sys, time
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import legs
@@ -193,6 +194,12 @@ def late_stop_all(self):
     time.sleep(1.0)
     return stop_all(self)
 legs.Supervisor.start, legs.Supervisor.stop_all = logged_start, late_stop_all
+mark = legs.Leg.mark
+def mark_then_sigint(self, name, **detail):
+    mark(self, name, **detail)
+    if name == "interrupted":
+        signal.raise_signal(signal.SIGINT)
+legs.Leg.mark = mark_then_sigint
 legs.unsampled = lambda paths, timeout: []
 legs.board_total_mb = lambda device: None
 legs.rocm_sysfs.inventory = lambda *roots: []
@@ -227,10 +234,11 @@ def test_a_stop_signal_tears_the_leg_down_and_records_it(tmp_path, first,
     if split:
         argv += ["--inference-url", REMOTE]
     with (tmp_path / "err.log").open("wb") as err:
-        # A shell's background job inherits SIGINT ignored.
+        # A background job or nohup inherits these ignored.
         leg = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=err,
-            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+            preexec_fn=lambda: [signal.signal(s, signal.SIG_DFL)
+                                for s in (signal.SIGINT, signal.SIGHUP)])
     try:
         for line in leg.stdout:
             if b"gateway_started" in line:
