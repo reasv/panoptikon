@@ -1945,8 +1945,8 @@ mod tests {
 
     /// `settle_refills` waits only in the situation that produces the
     /// 2-cycle, and returns immediately in every other. Asserted on the
-    /// function, so the timings are the function's own.
-    #[tokio::test]
+    /// function under a paused clock, so the timings are exact.
+    #[tokio::test(start_paused = true)]
     async fn the_settle_waits_only_for_a_window_that_is_short_of_its_budget() {
         let cost = item_cost(8);
         let ctx = dispatcher_ctx(cost, Arc::new(ModelStats::default()));
@@ -1973,7 +1973,7 @@ mod tests {
             let (_tx, mut rx) = mpsc::unbounded_channel();
             let mut free = Vec::new();
             let mut in_flight = JoinSet::new();
-            let started = std::time::Instant::now();
+            let started = tokio::time::Instant::now();
             let outcome = settle_refills(
                 &ctx,
                 &mut queue,
@@ -1990,25 +1990,19 @@ mod tests {
 
         let now = tokio::time::Instant::now;
         let full = run(queued(16), now() + WINDOW_SETTLE_MAX).await;
-        assert!(
-            full < WINDOW_SETTLE_QUIET,
-            "a queue that already fills the window must not wait: {full:?}"
+        assert_eq!(
+            full,
+            Duration::ZERO,
+            "a queue that already fills the window must not wait"
         );
         // A deadline in the past is a model nothing has answered recently:
         // a lone request arriving at a quiet model pays nothing at all.
         let idle = run(queued(1), now()).await;
-        assert!(
-            idle < WINDOW_SETTLE_QUIET,
-            "an idle model must not wait: {idle:?}"
-        );
+        assert_eq!(idle, Duration::ZERO, "an idle model must not wait");
         let short = run(queued(1), now() + WINDOW_SETTLE_MAX).await;
-        assert!(
-            short >= WINDOW_SETTLE_QUIET,
-            "a short window right after a reply must let refills land: {short:?}"
-        );
-        assert!(
-            short < WINDOW_SETTLE_MAX,
-            "and must end on the quiet gap, not on the deadline: {short:?}"
+        assert_eq!(
+            short, WINDOW_SETTLE_QUIET,
+            "a short window right after a reply waits for one quiet gap, not for the deadline"
         );
     }
 
