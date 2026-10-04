@@ -2290,17 +2290,23 @@ def test_after_a_release_that_returned_nothing_the_slack_must_grow_first():
 
     with mps_host(available_mb=40 * 1024, mps=mps):
         mps.allocate(3000, driver_mb=5000)
-        mps.kept = 1999 * MIB
-        assert windows(6) == 1, "the release returned 1 MiB of 2000"
+        mps.kept = 1000 * MIB
+        assert windows(6) == 1, "the release left 1000 MiB of 2000"
         assert windows(6, grow_mb=1) == 1, "the slack grew 6 MiB"
         mps.driver += 256 * MIB
-        assert windows(2) == 2, "the slack grew 256 MiB"
+        assert windows(2) == 2, "the slack grew 256 MiB past what was left"
         assert windows(4, grant_mb=0) == 2, "memory-blind windows wait as well"
+        assert windows(1, grow_mb=300) == 2
+        assert windows(1, grow_mb=-100) == 3, "growing past it once is enough"
         packing.note_trimmed()
         mps.kept = 0
-        assert windows(2) == 3, "a trim forgets what a release left"
+        assert windows(2) == 4, "a trim forgets what a release left"
         mps.driver += 200 * MIB
-        assert windows(2) == 4, "a release that returned all its slack left none"
+        assert windows(2) == 5, "a release that returned all its slack left none"
+        mps.kept = 255 * MIB
+        mps.driver += 1000 * MIB
+        assert windows(2) == 6
+        assert windows(2) == 7, "a release that left 255 MiB is not waited on"
 
 
 def test_the_clamp_credits_a_split_pool_the_release_decision_refuses(fake_torch):
