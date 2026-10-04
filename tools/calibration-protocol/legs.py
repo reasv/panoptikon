@@ -71,7 +71,7 @@ applying the floor's pressure, not the fraction's, and two legs written to
 different fractions can land on the same level.
 
 S4c's spike is not a fraction. Its "~2 GB free" is the defensive clamp's own
-threshold, so it is 2 048 MiB on every board, not scaled, and raised only by a
+threshold, so it is 2 048 MiB on every GPU, not scaled, and raised only by a
 `--min-free-mb` above it. A `--hog-event` figure is in MiB too: not scaled,
 but bounded like every figure.
 Both the fraction and the resolved MiB are recorded in `legs.json`, and the
@@ -1198,7 +1198,7 @@ class Leg:
 
     def note_floor(self, kind: str, at: str, fraction: Optional[float],
                    scaled_mb: int, resolved_mb: int) -> None:
-        """Record a figure `--min-free-mb` moved off its own fraction.
+        """Record a figure `--min-free-mb` moved off its stated value.
 
         A bound floor makes two legs written to different fractions apply the
         same pressure, so the leg says so instead of letting a reader compare
@@ -2166,8 +2166,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"PRECONDITION: the --min-free-mb {note['min_free_mb']} floor "
               f"binds on this {note['gpu_total_mb']} MiB board - {note['at']} "
               f"{note['kind']} {note['scaled_mb']} -> {note['resolved_mb']} "
-              f"MiB, so this leg applies the floor's pressure, not the "
-              f"fraction's", flush=True)
+              f"MiB, so this leg applies the floor's pressure"
+              + ("" if note["fraction"] is None else ", not the fraction's"),
+              flush=True)
         leg.mark("floor_bound", **note)
     leg.mark("inference_python", python=inference_python,
              source=python_source, config=str(gateway_config))
