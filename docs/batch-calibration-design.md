@@ -870,8 +870,8 @@ booked centrally on the CPU device. It is never a throughput signal.
   - from two sizes, the fit: the Theil–Sen intercept (the growth that does
     not scale with units) plus per unit the largest cost above it among the
     batches within `RATCHET_FACTOR` of the largest, or the slope if higher.
-    Past twice the largest it stays at its value there, so the booking never
-    falls as the batch grows.
+    Past twice the largest it stays at its value there, and further units
+    are priced by the extensions.
   - past the largest batch measured, extensions of the batches within
     `RATCHET_FACTOR` of it, each from its own growth at a rate per further
     unit. Up to twice the largest, only a batch whose growth lies above the
@@ -901,12 +901,12 @@ booked centrally on the CPU device. It is never a throughput signal.
   windows after the first uncapped one, whether the worker keeps memory or
   not).
 
-  The first window past twice the largest over-books: each further unit
-  books at most the costliest growth per unit beyond the first batch's
-  units among the batches near the largest. Priced from two items after
-  one, that is about `2 + fixed / per unit` times its growth for a worker
-  that hands back what its batches used, and about its growth for one that
-  keeps it. The next window is priced from the batch it ran.
+  The first window past twice the largest over-books: each further unit books
+  at most the costliest growth per unit beyond the first batch's units among
+  the batches near the largest, or the slope, if higher. Priced from two items
+  after one, that is about `2 + fixed / per unit` times its growth for a
+  worker that hands back what its batches used, and about its growth for one
+  that keeps it. The next window is priced from the batch it ran.
 
   A one-size cost books the growth it measured at every size up to that
   one, and prices only item-capped windows (below) and at most twice its
@@ -941,17 +941,17 @@ booked centrally on the CPU device. It is never a throughput signal.
   after a window), that reading is carried forward by the change, once per
   window, as it is credited when a replica departs; otherwise the kept
   memory would read as free until the next probe and be booked twice.
-- **Grant.** The GPU side is sized as before, then capped at the largest
-  batch whose booking fits the room, at least one unit, where room is the
-  CPU device's headroom plus the replica's own resident growth no booking
-  claims. With RAM to spare the batch size is unchanged, and under tight RAM
-  it can still double each window. The grant also tells the worker the CPU device's reserve and the
-  RAM the booking needs beyond what the replica holds (`ram_reserve_mb`,
-  `ram_mb`); before each batch the worker shrinks it in proportion if free
-  RAM above the reserve is less. It is recomputed at every grant from the host's free
-  RAM read at that moment (a cheap read, unlike a GPU driver query; skipped
-  while a probe is in flight or backing off after a failure), so RAM another
-  process takes shrinks the very next grant.
+- **Grant.** The GPU side is sized as before, then capped at the largest batch
+  whose booking fits the room, at least one unit, where room is the CPU
+  device's headroom plus the replica's own resident growth no booking claims.
+  With RAM to spare the batch size is unchanged, and under tight RAM it can
+  still double each window. The grant also tells the worker the CPU device's
+  reserve and the RAM the booking needs beyond what the replica holds
+  (`ram_reserve_mb`, `ram_mb`); before each batch the worker shrinks it in
+  proportion if free RAM above the reserve is less. It is recomputed at every
+  grant from the host's free RAM read at that moment (a cheap read, unlike a
+  GPU driver query; skipped while a probe is in flight or backing off after a
+  failure), so RAM another process takes shrinks the very next grant.
 - **Cold start.** While the cost is unknown for this (model, GPU), a
   replica's first window after load is a single item, measured before any
   larger batch runs: the dispatcher puts one request in the window, the grant
