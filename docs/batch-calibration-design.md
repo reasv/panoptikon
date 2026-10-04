@@ -2082,12 +2082,13 @@ than the margin within one window. The backstop covers the exceptions.
 
 Applies only to CUDA GPUs under the Windows display driver model (WDDM): on
 native Windows per GPU, as nvidia-smi's `driver_model.current` reports it
-(TCC and MCDM cards fail the allocation and are excluded), and every GPU on
-WSL2 or Docker Desktop, where the GPU is `/dev/dxg`. The host decides per GPU
-and tells each worker (`PANOPTIKON_SPILLS_TO_RAM`, read by
-`memory.spill_capable()`). Linux, MPS and the CPU device are unchanged. ROCm
-under WSL2 is not covered: WSL exposes no amdgpu sysfs, so such a GPU runs
-unpriced and without spill handling, and the host warns at startup.
+(TCC cards fail the allocation and are excluded; MCDM, unmeasured, counts as
+WDDM), and every GPU on WSL2 or Docker Desktop, where the GPU is `/dev/dxg`.
+The host decides per GPU and tells each worker (`PANOPTIKON_SPILLS_TO_RAM`,
+read by `memory.spill_capable()`). Linux, MPS and the CPU device are
+unchanged. ROCm under WSL2 is not covered: WSL exposes no amdgpu sysfs, so
+such a GPU runs unpriced and without spill handling, and the host warns at
+startup.
 
 - **Mechanism.** There `cudaMalloc` never fails. The driver moves memory to
   system RAM instead. On Linux, a full card makes the caching allocator free

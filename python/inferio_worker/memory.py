@@ -1716,9 +1716,9 @@ SPILL_VERDICT_ENV = "PANOPTIKON_SPILLS_TO_RAM"
 def spill_capable() -> bool:
     """Whether a full GPU moves this worker's memory to system RAM instead of
     failing the allocation: CUDA under the Windows display driver. The
-    orchestrator's per-GPU verdict decides (a TCC or MCDM card on native
-    Windows fails the allocation); without one, native Windows, and WSL2 and
-    Docker Desktop through `/dev/dxg`, spill."""
+    orchestrator's per-GPU verdict decides (a TCC card on native Windows
+    fails the allocation); without one, native Windows, and WSL2 and Docker
+    Desktop through `/dev/dxg`, spill."""
     if device_kind() != "cuda":
         return False
     verdict = os.environ.get(SPILL_VERDICT_ENV)
