@@ -58,9 +58,15 @@ impl TomlDocument {
         let after = after
             .as_table()
             .context("new TOML document value is not a table")?;
-        let mut orphans = Vec::new();
-        patch_table(self.document.as_table_mut(), before, after, &mut orphans)?;
-        for (owner, block) in orphans {
+        // Blocks of removed keys that were last in a table body, by table position.
+        let mut blocks_after_table = Vec::new();
+        patch_table(
+            self.document.as_table_mut(),
+            before,
+            after,
+            &mut blocks_after_table,
+        )?;
+        for (owner, block) in blocks_after_table {
             self.prepend_after_table_body(owner, &block);
         }
         Ok(())
@@ -102,17 +108,13 @@ impl std::fmt::Display for TomlDocument {
     }
 }
 
-/// Comment blocks of removed keys that were last in their table body, with
-/// the position of that table; placed once the whole document is patched.
-type Orphans = Vec<(usize, String)>;
-
 /// Returns, for a dotted-key table, the comment blocks of removed keys that
 /// were last in it: they belong before what follows it in its parent's body.
 fn patch_table(
     concrete: &mut Table,
     before: &toml::Table,
     after: &toml::Table,
-    orphans: &mut Orphans,
+    blocks_after_table: &mut Vec<(usize, String)>,
 ) -> Result<String> {
     // A block that finds no key-value after it is above the ones collected
     // here before it, so it goes in front.
@@ -149,14 +151,16 @@ fn patch_table(
                 Some(toml::Value::Table(old_value)),
                 toml::Value::Table(new_value),
             ) if table.is_dotted() => {
-                let block = patch_table(table, old_value, new_value, orphans)?;
+                let block = patch_table(table, old_value, new_value, blocks_after_table)?;
                 let index = concrete.iter().position(|(name, _)| name == key);
                 let index = index.expect("the patched key is in the table");
                 if let Some(block) = prepend_to_next_key(concrete, index + 1, block) {
                     last.insert_str(0, &block);
                 }
             }
-            (Some(item), Some(old_value), _) => patch_item(item, old_value, new_value, orphans)?,
+            (Some(item), Some(old_value), _) => {
+                patch_item(item, old_value, new_value, blocks_after_table)?
+            }
             _ => {
                 concrete.insert(key, item_from_toml(new_value)?);
             }
@@ -167,14 +171,15 @@ fn patch_table(
     }
     if !last.is_empty() {
         // Only the parsed root has no position; it renders first.
-        orphans.push((concrete.position().unwrap_or(0), last));
+        blocks_after_table.push((concrete.position().unwrap_or(0), last));
     }
     Ok(String::new())
 }
 
 fn leading_lines(key: &Key) -> &str {
     let prefix = key.leaf_decor().prefix();
-    prefix.and_then(RawString::as_str).unwrap_or("")
+    let prefix = prefix.and_then(RawString::as_str).unwrap_or("");
+    &prefix[..prefix.rfind('\n').map_or(0, |end| end + 1)]
 }
 
 /// Prepends `block` to the first key-value rendered from item `index` on,
@@ -242,11 +247,11 @@ fn patch_item(
     concrete: &mut Item,
     before: &toml::Value,
     after: &toml::Value,
-    orphans: &mut Orphans,
+    blocks_after_table: &mut Vec<(usize, String)>,
 ) -> Result<()> {
     match (concrete, before, after) {
         (Item::Table(table), toml::Value::Table(before), toml::Value::Table(after)) => {
-            patch_table(table, before, after, orphans)?;
+            patch_table(table, before, after, blocks_after_table)?;
         }
         (
             Item::Value(Value::InlineTable(table)),
@@ -262,7 +267,7 @@ fn patch_item(
             if before.iter().all(toml::Value::is_table)
                 && after.iter().all(toml::Value::is_table) =>
         {
-            patch_array_of_tables(tables, before, after, orphans)?
+            patch_array_of_tables(tables, before, after, blocks_after_table)?
         }
         (slot, _, after) => replace_item_preserving_decor(slot, item_from_toml(after)?),
     }
@@ -333,7 +338,7 @@ fn patch_array_of_tables(
     concrete: &mut ArrayOfTables,
     before: &[toml::Value],
     after: &[toml::Value],
-    orphans: &mut Orphans,
+    blocks_after_table: &mut Vec<(usize, String)>,
 ) -> Result<()> {
     let shared = before.len().min(after.len()).min(concrete.len());
     for index in 0..shared {
@@ -342,7 +347,7 @@ fn patch_array_of_tables(
                 concrete.get_mut(index).expect("shared table index exists"),
                 before[index].as_table().expect("guarded above"),
                 after[index].as_table().expect("guarded above"),
-                orphans,
+                blocks_after_table,
             )?;
         }
     }
@@ -937,7 +942,7 @@ mod tests {
     #[test]
     fn removing_a_key_keeps_the_comment_block_above_it() {
         let dotted = "[vram]\ngpu.a = 1\n# b note\ngpu.b = 2\n# k\nkeep = 1\n# n\n[next]\n";
-        let cases: [(&str, &[&str]); 9] = [
+        let cases: [(&str, &[&str]); 10] = [
             // Next key in the same table.
             (
                 "[vram]\n# margin note\nmargin = 0.10\n# cap note\ncap_fraction = 0.90\n",
@@ -962,8 +967,8 @@ mod tests {
             ),
             // Two adjacent keys, the second one last in its table.
             (
-                "[vram]\n# m\nmargin = 0.10\n# c\ncap_fraction = 0.90\n# k\n[next]\n",
-                &["margin = 0.10\n", "cap_fraction = 0.90\n"],
+                "[vram]\n  # m\n  margin = 0.10\n  # c\n  cap_fraction = 0.90\n  # k\n[next]\n[after]\n",
+                &["  margin = 0.10\n", "  cap_fraction = 0.90\n"],
             ),
             // Last key of a dotted-key table, which renders in its parent's
             // body: before the parent's next key, else the next table header.
@@ -971,6 +976,8 @@ mod tests {
             (dotted, &["gpu.b = 2\n", "keep = 1\n"]),
             // The whole dotted-key table.
             (dotted, &["gpu.a = 1\n", "gpu.b = 2\n"]),
+            // Last key of an array-of-tables element.
+            ("[[p]]\nn = 1\n# x\nx = 1\n[[p]]\nn = 2\n", &["x = 1\n"]),
             // The next line is a dotted key.
             (
                 "[vram]\n# a note\na = 1\n# g note\ngpu.x = 1\n",
