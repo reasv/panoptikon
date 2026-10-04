@@ -297,7 +297,7 @@ Single synthetic device:
     With 0 available, `external` is everything but our own residents and
     `limit` is what they hold less the reserve: a grant is cut to the
     replica's own free pool less the reserve (the squeeze path; before the
-    fit, to the batch that pool covers at the pre-fit price), and the
+    fit, to the batch its whole pool covers at the pre-fit price), and the
     worker's live clamp, which reads the same 0, cuts each batch to the pool
     it holds (`releasable_pool_mb`); a replica with no pool runs one unit. A
     squeezed grant asks idle residents for their pools (the trim path).
