@@ -121,18 +121,17 @@ impl VramLedger {
             .sum()
     }
 
-    /// The other device sharing this one's physical RAM: on a Metal host the
-    /// MPS and CPU devices, which would otherwise grant the same bytes twice.
-    /// `None` everywhere else.
-    fn ram_domain_peer(state: &LedgerState, gpu: &str) -> Option<&'static str> {
-        if !state.metal_allocator {
-            return None;
-        }
-        match gpu {
-            cpu::DEVICE_KEY => Some(mps::DEVICE_KEY),
-            mps::DEVICE_KEY => Some(cpu::DEVICE_KEY),
-            _ => None,
-        }
+    /// The other devices sharing this one's host RAM, which would otherwise
+    /// grant the same bytes twice: the CPU device, the MPS device and every
+    /// APU are peers of each other. None for a GPU with its own memory.
+    fn ram_domain_peers<'a>(state: &'a LedgerState, gpu: &'a str) -> impl Iterator<Item = &'a str> {
+        let shares_ram = |device: &GpuLedger| device.unified_ram_mb.is_some();
+        let own = state.gpus.get(gpu).is_some_and(shares_ram);
+        state
+            .gpus
+            .iter()
+            .filter(move |(key, device)| own && key.as_str() != gpu && shares_ram(device))
+            .map(|(key, _)| key.as_str())
     }
 
     /// Everything *we* hold against a device: its residents' charges plus the
@@ -243,12 +242,12 @@ impl VramLedger {
     pub(super) fn measured_external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let gpu_ledger = state.gpus.get(gpu)?;
         let sample = gpu_ledger.free.as_ref()?;
-        // "Ours" includes the RAM-domain peer's residents: they are in this
-        // reading, and must not be margin-inflated as external.
-        let ours = Self::footprints_locked(state, gpu).saturating_add(
-            Self::ram_domain_peer(state, gpu)
-                .map_or(0, |peer| Self::footprints_locked(state, peer)),
-        );
+        // "Ours" includes the RAM-domain peers' residents: they are in a
+        // reading of the RAM they share, and must not be margin-inflated as
+        // external.
+        let ours = Self::ram_domain_peers(state, gpu)
+            .map(|peer| Self::footprints_locked(state, peer))
+            .fold(Self::footprints_locked(state, gpu), u64::saturating_add);
         if state.metal_allocator
             && let Some(ram) = sample.ram
         {
@@ -407,17 +406,17 @@ impl VramLedger {
     }
 
     /// Headroom before its floor at zero (`limit − Σ claims`, may be
-    /// negative). The claims include the RAM-domain peer's, which is where the
-    /// shared room on a Mac is enforced.
+    /// negative). The claims include the RAM-domain peers', which is where
+    /// the shared room of a Mac or an APU host is enforced.
     pub(super) fn overdraft_with_margin_locked(
         &self,
         state: &LedgerState,
         gpu: &str,
         margin: f64,
     ) -> i128 {
-        let ours = Self::claims_locked(state, gpu).saturating_add(
-            Self::ram_domain_peer(state, gpu).map_or(0, |peer| Self::claims_locked(state, peer)),
-        );
+        let ours = Self::ram_domain_peers(state, gpu)
+            .map(|peer| Self::claims_locked(state, peer))
+            .fold(Self::claims_locked(state, gpu), u64::saturating_add);
         i128::from(self.limit_with_margin_locked(state, gpu, margin)) - i128::from(ours)
     }
 
@@ -546,7 +545,7 @@ impl VramLedger {
 
     /// Replicas whose memory counts against `gpu`'s room: its residents and
     /// the loads in flight on it, on the CPU device also GPU replicas that
-    /// book host RAM there, and the same for its RAM-domain peer.
+    /// book host RAM there, and the same for its RAM-domain peers.
     fn replicas_locked(state: &LedgerState, gpu: &str) -> u64 {
         let on = |device: &str| {
             let residents = state
@@ -562,7 +561,7 @@ impl VramLedger {
                 .map_or(0, |gpu| gpu.load_reservations.len());
             (residents + loads) as u64
         };
-        on(gpu) + Self::ram_domain_peer(state, gpu).map_or(0, on)
+        on(gpu) + Self::ram_domain_peers(state, gpu).map(on).sum::<u64>()
     }
 
     /// [`PreFitPrice`] for this replica's (model, device). A batch that
@@ -619,16 +618,16 @@ impl VramLedger {
     }
 
     /// Whether another replica holds a reservation on `worker`'s device or
-    /// its RAM-domain peer.
+    /// its RAM-domain peers.
     pub(super) fn neighbour_reserved_locked(state: &LedgerState, worker: WorkerId) -> bool {
         let Some(requesting) = state.workers.get(&worker) else {
             return false;
         };
-        let peer = Self::ram_domain_peer(state, &requesting.gpu);
+        let peers: Vec<&str> = Self::ram_domain_peers(state, &requesting.gpu).collect();
         state.workers.iter().any(|(id, entry)| {
             *id != worker
                 && (entry.grants_on(&requesting.gpu) > 0
-                    || peer.is_some_and(|peer| entry.grants_on(peer) > 0))
+                    || peers.iter().any(|peer| entry.grants_on(peer) > 0))
         })
     }
 

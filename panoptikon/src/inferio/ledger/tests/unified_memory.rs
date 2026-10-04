@@ -1383,6 +1383,46 @@ fn the_unified_pair_charges_each_others_residents() {
     grant.finish(WindowOutcome::Responded { oom: None });
 }
 
+/// An APU and the CPU device draw on the same RAM: a grant on either is room
+/// the other no longer has, before any new reading.
+#[test]
+fn an_apu_and_the_cpu_device_charge_each_others_grants() {
+    const RAM: u64 = 128 * 1024 - APU_CARVEOUT_MB;
+    let inventory = GpuInventory::known_rocm(vec![apu_device(0)])
+        .with_cpu(RAM, crate::inferio::cpu::MemRoots::default());
+    let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+    ledger.install_probe_stub(None);
+    let apu_handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
+    let on_apu = ledger
+        .register_worker("g/apu", item_cost(4), &apu_handle, None)
+        .expect("admitted on the APU");
+    let cpu_handle = loaded_on_cpu(Some(RAM));
+    let on_cpu = ledger
+        .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+        .expect("admitted on RAM");
+    push_memory_with_total(
+        &apu_handle,
+        32 * 1024,
+        0,
+        Some(APU_TOTAL_MB),
+        "amdgpu-sysfs",
+    );
+    push_memory_with_total(&cpu_handle, 32 * 1024, 0, Some(RAM), "ram");
+    ledger.ingest_all_for_test();
+
+    for (admission, other) in [(&on_cpu, AMD_A), (&on_apu, cpu::DEVICE_KEY)] {
+        let before = ledger.headroom_mb(other);
+        let grant = admission.request_grant(64, None, 1, 0).expect("granted");
+        assert!(grant.grant().mb > 0);
+        assert_eq!(
+            before - ledger.headroom_mb(other),
+            grant.grant().mb,
+            "{other} lost the grant"
+        );
+        grant.finish(WindowOutcome::Responded { oom: None });
+    }
+}
+
 /// The MPS and CPU devices of a Mac share its RAM, so a CPU replica counts
 /// as a replica on the MPS device: a pre-fit MPS grant reserves half the
 /// headroom and the CPU replica's window is still priced.
