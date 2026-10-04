@@ -1806,11 +1806,13 @@ def free_total_reading() -> FreeReading:
 
 # --- Accelerator context: measured once per process ---
 
-# The context this process measured for itself (MiB) and the running probe.
+# The context this process measured for itself (MiB), the running probe, and
+# why the context is not measured yet.
 _context_state: dict[str, Any] = {
     "measured_mb": None,
     "logged": False,
     "probe": None,
+    "unmeasured": None,
 }
 
 
@@ -1910,12 +1912,9 @@ class _ContextProbe:
             return None
         measured = self._free_before - self._free_at_init - self._reserved_at_init
         if measured < CONTEXT_MIN_MB or measured > CONTEXT_MAX_MB:
-            logger.debug(
-                "discarding a %d MiB context measurement: outside the "
-                "%d-%d MiB band a context can plausibly occupy",
-                measured,
-                CONTEXT_MIN_MB,
-                CONTEXT_MAX_MB,
+            _context_state["unmeasured"] = (
+                f"a {measured} MiB reading is outside the {CONTEXT_MIN_MB}-"
+                f"{CONTEXT_MAX_MB} MiB a context can occupy"
             )
             return None
         return measured
@@ -1935,21 +1934,26 @@ def _reserved_mb_unguarded() -> int | None:
 def _start_context_probe(
     free_mb: int | None, free_source: str | None
 ) -> "_ContextProbe | None":
-    """Start the context probe, or None when no measurement is possible: no
-    driver-level reading, a RAM-priced process, CUDA already initialised, or a
-    context already measured. A leftover probe is collected first."""
+    """Start the context probe, or None when no measurement is possible: a
+    RAM-priced process, a context already measured, no driver-level reading,
+    or CUDA already initialised. A leftover probe is collected first."""
     _collect_context_probe(announce=False)
-    if free_mb is None or free_source not in ("nvml", "amdgpu-sysfs"):
-        return None
     if _ram_currency() or _context_state["measured_mb"] is not None:
+        return None
+    if free_mb is None or free_source not in ("nvml", "amdgpu-sysfs"):
+        _context_state["unmeasured"] = "no driver free reading before the load"
         return None
     torch = _torch()
     if torch is not None:
         try:
             if torch.cuda.is_initialized():
+                _context_state["unmeasured"] = (
+                    "GPU initialised before the load"
+                )
                 return None
         except Exception:
             return None
+    _context_state["unmeasured"] = "no reading across the GPU's initialisation"
     probe = _ContextProbe(free_mb, free_source)
     probe.start()
     _context_state["probe"] = probe
@@ -1959,7 +1963,8 @@ def _start_context_probe(
 def _collect_context_probe(
     probe: "_ContextProbe | None" = None, announce: bool = True
 ) -> None:
-    """Stop any running context probe and keep its result."""
+    """Stop any running context probe and keep its result; with `announce`,
+    log which context figure a process with a live GPU context uses."""
     running = _context_state.get("probe")
     _context_state["probe"] = None
     seen: list[Any] = []
@@ -1972,8 +1977,10 @@ def _collect_context_probe(
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("could not collect the context probe: %s", exc)
             continue
-        if measured is not None or announce:
+        if measured is not None:
             _remember_context_mb(measured)
+    if announce and not _ram_currency() and _torch_cuda() is not None:
+        _remember_context_mb(None)
 
 
 def abort_load(before: dict[str, Any]) -> None:
@@ -2015,8 +2022,9 @@ def _remember_context_mb(measured: int | None) -> None:
         )
     else:
         logger.info(
-            "could not measure this process's accelerator context; using the "
-            "%d MiB estimate",
+            "could not measure this process's accelerator context (%s); using "
+            "the %d MiB estimate",
+            _context_state["unmeasured"] or "no reading",
             allowance,
         )
 

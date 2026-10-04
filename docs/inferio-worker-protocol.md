@@ -1002,9 +1002,9 @@ matters most, because too small is the direction the ledger cannot absorb.
 #### The accelerator context probe
 
 `base_method: "alloc_delta_measured"` reports a context this process measured
-for itself rather than the fixed 500 MiB allowance `"alloc_delta"` assumes. How
-it is measured matters, because the sensing module may not create a CUDA
-context of its own:
+for itself rather than the fixed per-backend estimate `"alloc_delta"` assumes
+(700 MiB on CUDA, 300 MiB on HIP). How it is measured matters, because the
+sensing module may not create a CUDA context of its own:
 
 - **A watcher, not a call.** The context is created lazily by whatever the impl
   does first inside `load()`. A daemon thread started by `begin_load` polls
@@ -1038,6 +1038,9 @@ context of its own:
   cannot meaningfully outlive the load it belongs to. It is collected from the
   load-failure path as well as on success, and whatever it measured is kept: a
   context is a fact about the process, not about the load that created it.
+- A worker with a live GPU context logs one INFO line naming the figure it
+  uses and, for the estimate, why the context went unmeasured: no driver
+  reading before the load, the GPU already initialised, or no usable reading.
 
 Two plausibility bounds elsewhere in the base measurement are built from the
 same allowance, one pointing each way:

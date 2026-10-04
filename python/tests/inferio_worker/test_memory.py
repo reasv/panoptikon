@@ -217,7 +217,12 @@ def isolated(torch_module=None):
             mock.patch.dict(memory._bdf_state, {"bdf": None}, clear=False),
             mock.patch.dict(
                 memory._context_state,
-                {"measured_mb": None, "logged": False, "probe": None},
+                {
+                    "measured_mb": None,
+                    "logged": False,
+                    "probe": None,
+                    "unmeasured": None,
+                },
                 clear=False,
             ),
             mock.patch.dict(memory._logged, {}, clear=False),
@@ -585,6 +590,37 @@ def test_the_fixed_estimate_is_the_last_resort_and_names_itself(fake_torch) -> N
             memory.HIP_CONTEXT_ESTIMATE_MB, "estimate"
         )
         assert memory.HIP_CONTEXT_ESTIMATE_MB >= 286
+
+
+def test_an_unmeasured_context_is_logged_once_with_its_reason(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    # Two loads into one worker log one line, naming the figure and why it
+    # was not measured. A load that never brings up the GPU logs nothing.
+    monkeypatch.setattr(memory, "PCI_DEVICES_ROOT", empty_dir(tmp_path, "pci"))
+    for initialized, nvml in ((True, (8700, 24_576)), (False, (None, None))):
+        cuda = FakeCuda(initialized=initialized)
+        with (
+            isolated(fake_torch_module(cuda)),
+            mock.patch.object(memory, "_nvml_memory", return_value=nvml),
+            caplog.at_level(logging.INFO, logger="inferio_worker.memory"),
+        ):
+            caplog.clear()
+            cuda.initialized = False
+            idle = memory.begin_load()
+            memory.finish_load(idle, object())
+            assert caplog.records == [], "no GPU context, nothing to size"
+            cuda.initialized = initialized
+            for _ in range(2):
+                before = memory.begin_load()
+                cuda.initialized = True
+                cuda.allocate(100)
+                memory.finish_load(before, object())
+            reason = memory._context_state["unmeasured"]
+        assert reason is not None, initialized
+        assert [r.args for r in caplog.records] == [
+            (reason, memory.CONTEXT_ESTIMATE_MB)
+        ], initialized
 
 
 def test_a_measured_context_sharpens_the_plausibility_ceiling() -> None:
