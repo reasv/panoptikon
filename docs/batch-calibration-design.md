@@ -775,8 +775,8 @@ therefore differs from a GPU in six ways.
   leaves out. Shared memory is in neither figure. Windows reads
   `min(ullAvailPhys, ullAvailPageFile)`: free physical memory bounded by the
   commit left at the pagefile's current size, beyond which Windows refuses
-  the allocation or grows the pagefile. macOS reads RAM less wired,
-  compressed and anonymous pages, as before.
+  the allocation or grows the pagefile. macOS reads
+  `mps.rs::available_bytes`.
 - **A replica's footprint is the memory it holds now.** A CPU worker reports
   its lifetime peak resident set as `reserved` (the knee's warm/high-water
   split needs it), and its heap is trimmed after every batch, so the peak is

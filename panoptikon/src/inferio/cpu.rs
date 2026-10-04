@@ -2,10 +2,10 @@
 //!
 //! Total is physical RAM (`MemTotal`, `ullTotalPhys`, `hw.memsize`) and free
 //! is what the OS could deliver now (`MemAvailable − SReclaimable`,
-//! `min(ullAvailPhys, ullAvailPageFile)`, macOS RAM less wired, compressed
-//! and anonymous pages), matching the worker's `"ram"` reading. On Linux
-//! both are bounded by the cgroup memory limit, since `/proc/meminfo` is not
-//! namespaced. See docs/unified-memory-admission.md "Backend C: CPU".
+//! `min(ullAvailPhys, ullAvailPageFile)`, macOS `mps::available_bytes`),
+//! matching the worker's `"ram"` reading. On Linux both are bounded by the
+//! cgroup memory limit, since `/proc/meminfo` is not namespaced. See
+//! docs/unified-memory-admission.md "Backend C: CPU".
 
 use std::path::PathBuf;
 
@@ -221,10 +221,10 @@ mod sys {
     const MIB: u64 = 1024 * 1024;
 
     fn status() -> Option<MEMORYSTATUSEX> {
-        // SAFETY: zeroed is a valid `MEMORYSTATUSEX` (plain integers);
-        // `dwLength` is the only field the API reads rather than writes.
-        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        status.dwLength = u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?;
+        let mut status = MEMORYSTATUSEX {
+            dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?,
+            ..Default::default()
+        };
         // SAFETY: the out-buffer is a whole `MEMORYSTATUSEX` and its
         // `dwLength` says so, as `GlobalMemoryStatusEx` documents.
         let ok = unsafe { GlobalMemoryStatusEx(ptr::from_mut(&mut status)) };
