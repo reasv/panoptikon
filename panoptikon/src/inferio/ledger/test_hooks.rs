@@ -151,6 +151,7 @@ impl VramLedger {
             None,
             None,
             None,
+            None,
         );
     }
 

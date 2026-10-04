@@ -703,6 +703,7 @@ impl VramLedger {
                 sample.total_mb,
                 Some(inference_id),
                 RamBasis::of(sample),
+                GttBasis::pair(sample.gtt_free_mb, sample.ram_available_mb),
             );
         }
         let seeded_from_store = seed.is_some();

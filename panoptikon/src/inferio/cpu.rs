@@ -151,6 +151,7 @@ pub(super) fn query_memory(key: &str, ram_mb: u64, roots: &MemRoots) -> Option<V
         uuid: key.to_owned(),
         total_mb: ram_mb,
         free_mb: free_mb(ram_mb, available),
+        gtt: None,
     }])
 }
 

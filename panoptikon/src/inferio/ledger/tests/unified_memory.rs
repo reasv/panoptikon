@@ -278,6 +278,7 @@ async fn a_mac_that_has_not_adopted_its_total_yet_prices_the_ram_it_has() {
         uuid: MPS_GPU.to_owned(),
         total_mb: MAC_RAM_MB,
         free_mb: MAC_RAM_MB - HOG,
+        gtt: None,
     }]));
     let (_reservation, exceeds_headroom) = ledger
         .reserve_load_signalling_for_test("g/a", item_cost(4), MPS_GPU, None)
@@ -303,6 +304,7 @@ async fn a_mac_that_has_not_adopted_its_total_yet_prices_the_ram_it_has() {
         uuid: MPS_GPU.to_owned(),
         total_mb: MAC_RAM_MB,
         free_mb: 0,
+        gtt: None,
     }]));
     let (_reservation, exceeds_headroom) = full
         .reserve_load_signalling_for_test("g/a", item_cost(4), MPS_GPU, None)
@@ -425,6 +427,27 @@ pub(super) fn apu_device(index: u32) -> crate::inferio::gpu::GpuInfo {
         unified_ram_mb: Some(128 * 1024),
         vram_carveout_mb: Some(APU_CARVEOUT_MB),
     }
+}
+
+/// An APU's memory frame: free VRAM plus the smaller of unclaimed GTT and
+/// deliverable RAM, with both terms beside it.
+pub(super) fn push_apu(
+    handle: &TelemetryHandle,
+    vram_free_mb: u64,
+    gtt_free_mb: u64,
+    ram_available_mb: u64,
+    reserved_mb: u64,
+) {
+    let mut telemetry = handle.lock().unwrap();
+    telemetry.memory = Some(Timestamped::now(MemorySample {
+        free_mb: Some(vram_free_mb + gtt_free_mb.min(ram_available_mb)),
+        free_source: Some("amdgpu-sysfs".to_owned()),
+        reserved_mb: Some(reserved_mb),
+        allocated_mb: Some(reserved_mb),
+        ram_available_mb: Some(ram_available_mb),
+        gtt_free_mb: Some(gtt_free_mb),
+        ..MemorySample::default()
+    }));
 }
 
 pub(super) fn apu_ledger(gpus: Vec<crate::inferio::gpu::GpuInfo>) -> Arc<VramLedger> {
@@ -1178,6 +1201,7 @@ pub(super) fn push_basis(
         allocated_mb: Some(allocated_mb),
         ram_total_mb: Some(ram_total_mb),
         ram_available_mb: Some(ram_available_mb),
+        gtt_free_mb: None,
     }));
 }
 
@@ -1383,83 +1407,197 @@ fn the_unified_pair_charges_each_others_residents() {
     grant.finish(WindowOutcome::Responded { oom: None });
 }
 
-/// An APU and the CPU device draw on the same RAM: a grant on either is room
-/// the other no longer has, before any new reading. Each grant carries its
-/// own device's reserve, which on the APU is the RAM floor, to the worker.
+/// Two APUs and the CPU device draw on the same RAM, each APU beyond its
+/// carve-out. While RAM, not the GTT window, binds the APUs, every device
+/// reads the same external usage, and what a grant adds to its device's
+/// charges is room the others no longer have, before any new reading. Each
+/// grant carries its own device's reserve, which on an APU is the RAM floor,
+/// to the worker.
 #[test]
-fn an_apu_and_the_cpu_device_charge_each_others_grants() {
+fn apus_and_the_cpu_device_charge_each_others_grants() {
     const RAM: u64 = 128 * 1024 - APU_CARVEOUT_MB;
-    let inventory = GpuInventory::known_rocm(vec![apu_device(0)])
+    const OTHERS: u64 = 100 * 1024;
+    const POOL: u64 = 2048;
+    let apu_b = crate::inferio::gpu::GpuInfo {
+        index: 1,
+        uuid: AMD_B.to_owned(),
+        bdf: Some("0000:0c:00.0".to_owned()),
+        ..apu_device(1)
+    };
+    let inventory = GpuInventory::known_rocm(vec![apu_device(0), apu_b])
         .with_cpu(RAM, crate::inferio::cpu::MemRoots::default());
     let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
     ledger.install_probe_stub(None);
-    let apu_handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
-    let on_apu = ledger
-        .register_worker("g/apu", item_cost(4), &apu_handle, None)
-        .expect("admitted on the APU");
-    let cpu_handle = loaded_on_cpu(Some(RAM));
-    let on_cpu = ledger
-        .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
-        .expect("admitted on RAM");
-    push_memory_with_total(
-        &apu_handle,
-        32 * 1024,
-        0,
-        Some(APU_TOTAL_MB),
-        "amdgpu-sysfs",
-    );
-    push_memory_with_total(&cpu_handle, 32 * 1024, 0, Some(RAM), "ram");
+    let mut replicas = Vec::new();
+    for (model, handle, device) in [
+        (
+            "g/a",
+            loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB)),
+            AMD_A,
+        ),
+        (
+            "g/b",
+            loaded_rocm(Some("0000:0c:00.0"), Some(APU_TOTAL_MB)),
+            AMD_B,
+        ),
+        ("g/cpu", loaded_on_cpu(Some(RAM)), cpu::DEVICE_KEY),
+    ] {
+        let admission = ledger
+            .register_worker(model, item_cost(4), &handle, Some(device))
+            .expect("admitted");
+        replicas.push((admission, handle, device));
+    }
+    // Each APU's carve-out is full; the rest of its footprint is in RAM.
+    let footprint = 1_000 + POOL;
+    let available = RAM - OTHERS - footprint - 2 * (footprint - APU_CARVEOUT_MB);
+    for (_, handle, device) in &replicas {
+        if *device == cpu::DEVICE_KEY {
+            push_memory_with_total(handle, available, POOL, Some(RAM), "ram");
+        } else {
+            push_apu(handle, 0, 60 * 1024, available, POOL);
+        }
+    }
     ledger.ingest_all_for_test();
 
+    let health = ledger.health();
+    for (_, _, device) in &replicas {
+        assert_eq!(device_of(&health, device).external_mb, OTHERS, "{device}");
+    }
     let reserve = |key: &str| device_of(&ledger.health(), key).reserve_mb;
+    let charges = |key: &str| device_of(&ledger.health(), key).charges_mb;
     assert_eq!(reserve(AMD_A), cpu::ram_reserve_mb(RAM));
-    for (admission, own, other) in [
-        (&on_cpu, cpu::DEVICE_KEY, AMD_A),
-        (&on_apu, AMD_A, cpu::DEVICE_KEY),
-    ] {
-        let before = ledger.headroom_mb(other);
+    for (admission, _, own) in &replicas {
+        let others: Vec<(&str, u64)> = replicas
+            .iter()
+            .filter(|(_, _, device)| device != own)
+            .map(|(_, _, device)| (*device, ledger.headroom_mb(device)))
+            .collect();
+        let charged = charges(own);
         let grant = admission.request_grant(64, None, 1, 0).expect("granted");
-        assert!(grant.grant().mb > 0);
-        assert_eq!(
-            before - ledger.headroom_mb(other),
-            grant.grant().mb,
-            "{other} lost the grant"
-        );
+        let charged = charges(own) - charged;
+        assert!(charged > 0, "{own}");
+        for (other, before) in others {
+            assert_eq!(
+                before - ledger.headroom_mb(other),
+                charged,
+                "{other} lost the grant on {own}"
+            );
+        }
         assert_eq!(grant.grant().ram_reserve_mb, reserve(own));
         grant.finish(WindowOutcome::Responded { oom: None });
     }
 }
 
-/// The MPS and CPU devices of a Mac share its RAM, so a CPU replica counts
-/// as a replica on the MPS device: a pre-fit MPS grant reserves half the
-/// headroom and the CPU replica's window is still priced.
+/// An APU whose GTT window binds holds only its own memory in it: a CPU
+/// replica that fills RAM the window does not need leaves its headroom as
+/// it was.
 #[test]
-fn a_pre_fit_mps_grant_leaves_ram_for_the_cpu_replica() {
-    const RECMAX: u64 = MAC_RAM_MB / 4 * 3;
-    let ledger = VramLedger::new(
-        &GpuInventory::known_mps(MAC_RAM_MB),
-        no_margin().into(),
-        None,
-    );
+fn a_cpu_replica_leaves_an_apus_gtt_window_alone() {
+    const RAM: u64 = 128 * 1024 - APU_CARVEOUT_MB;
+    const CPU_POOL: u64 = 30 * 1024;
+    let inventory = GpuInventory::known_rocm(vec![apu_device(0)])
+        .with_cpu(RAM, crate::inferio::cpu::MemRoots::default());
+    let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
     ledger.install_probe_stub(None);
-    let mps_handle = loaded_mps(Some(RECMAX));
-    let on_mps = ledger
-        .register_worker("g/mps", item_cost(4), &mps_handle, Some(MPS_GPU))
-        .expect("admitted on Metal");
-    let cpu_handle = loaded_on_cpu(Some(MAC_RAM_MB));
-    let on_cpu = ledger
+    let apu_handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
+    let _on_apu = ledger
+        .register_worker("g/apu", item_cost(4), &apu_handle, None)
+        .expect("admitted on the APU");
+    // 1 GiB of other usage; the APU's 1 000 MiB base fills its carve-out.
+    let gtt_free = 64 * 1024 - (1_000 - APU_CARVEOUT_MB);
+    let available = RAM - 1024 - (1_000 - APU_CARVEOUT_MB);
+    push_apu(&apu_handle, 0, gtt_free, available, 0);
+    ledger.ingest_all_for_test();
+    let alone = ledger.headroom_mb(AMD_A);
+
+    let cpu_handle = loaded_on_cpu(Some(RAM));
+    let _on_cpu = ledger
         .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
         .expect("admitted on RAM");
-    // Nothing else holds RAM: both bases are ours.
-    push_basis(&mps_handle, RECMAX, MAC_RAM_MB, MAC_RAM_MB - 2_000, 0, 0);
+    let available = available - 1_000 - CPU_POOL;
+    push_memory_with_total(&cpu_handle, available, CPU_POOL, Some(RAM), "ram");
+    push_apu(&apu_handle, 0, gtt_free, available, 0);
     ledger.ingest_all_for_test();
-    let headroom = ledger.headroom_mb(MPS_GPU);
+    assert!(
+        available > gtt_free,
+        "RAM still has more room than the window"
+    );
+    assert_eq!(ledger.headroom_mb(AMD_A), alone);
+}
 
-    let held = on_mps.request_grant(u64::MAX, None, 1, 0).expect("granted");
-    assert_eq!(held.grant().mb, headroom / 2);
-    let other = on_cpu.request_grant(u64::MAX, None, 1, 0).expect("granted");
-    assert!(other.grant().mb > 0);
-    assert_eq!(other.grant().unit_budget, 4);
+/// An APU's memory in its carve-out is not in host RAM: a pool that fits in
+/// a 96 GiB carve-out leaves the CPU device's headroom as it was.
+#[test]
+fn an_apu_pool_in_its_carve_out_leaves_the_cpu_device_alone() {
+    const CARVEOUT: u64 = 96 * 1024;
+    const MEM_TOTAL: u64 = 32 * 1024;
+    let apu = crate::inferio::gpu::GpuInfo {
+        total_mb: CARVEOUT + 16 * 1024,
+        unified_ram_mb: Some(CARVEOUT + MEM_TOTAL),
+        vram_carveout_mb: Some(CARVEOUT),
+        ..apu_device(0)
+    };
+    let inventory = GpuInventory::known_rocm(vec![apu.clone()])
+        .with_cpu(MEM_TOTAL, crate::inferio::cpu::MemRoots::default());
+    let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
+    ledger.install_probe_stub(None);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, MEM_TOTAL - 6 * 1024);
+    let before = ledger.headroom_mb(cpu::DEVICE_KEY);
+    assert!(before > 0);
+
+    let handle = loaded_rocm(Some("0000:03:00.0"), Some(apu.total_mb));
+    let _on_apu = ledger
+        .register_worker("g/apu", item_cost(4), &handle, None)
+        .expect("admitted on the APU");
+    let pool = 40 * 1024;
+    push_apu(&handle, CARVEOUT - 1_000 - pool, 16 * 1024, 26 * 1024, pool);
+    ledger.ingest_all_for_test();
+    assert_eq!(ledger.headroom_mb(cpu::DEVICE_KEY), before);
+}
+
+/// The GPU and CPU devices of a Mac or an APU host share its RAM, so a CPU
+/// replica counts as a replica on the GPU: a pre-fit GPU grant reserves half
+/// the headroom and the CPU replica's window is still priced.
+#[test]
+fn a_pre_fit_unified_gpu_grant_leaves_ram_for_the_cpu_replica() {
+    const RECMAX: u64 = MAC_RAM_MB / 4 * 3;
+    const APU_RAM: u64 = MAC_RAM_MB - APU_CARVEOUT_MB;
+    for apu in [false, true] {
+        let (inventory, gpu, gpu_handle, ram) = if apu {
+            let inventory = GpuInventory::known_rocm(vec![apu_device(0)])
+                .with_cpu(APU_RAM, crate::inferio::cpu::MemRoots::default());
+            let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
+            (inventory, AMD_A, handle, APU_RAM)
+        } else {
+            let inventory = GpuInventory::known_mps(MAC_RAM_MB);
+            (inventory, MPS_GPU, loaded_mps(Some(RECMAX)), MAC_RAM_MB)
+        };
+        let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let on_gpu = ledger
+            .register_worker("g/gpu", item_cost(4), &gpu_handle, Some(gpu))
+            .expect("admitted on the GPU");
+        let cpu_handle = loaded_on_cpu(Some(ram));
+        let on_cpu = ledger
+            .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+            .expect("admitted on RAM");
+        // Nothing else holds RAM: both bases are ours, the APU's beyond its
+        // carve-out.
+        if apu {
+            let in_ram = 1_000 - APU_CARVEOUT_MB;
+            push_apu(&gpu_handle, 0, 64 * 1024 - in_ram, ram - 1_000 - in_ram, 0);
+        } else {
+            push_basis(&gpu_handle, RECMAX, MAC_RAM_MB, MAC_RAM_MB - 2_000, 0, 0);
+        }
+        ledger.ingest_all_for_test();
+        let headroom = ledger.headroom_mb(gpu);
+
+        let held = on_gpu.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert_eq!(held.grant().mb, headroom / 2, "{gpu}");
+        let other = on_cpu.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert!(other.grant().mb > 0, "{gpu}");
+        assert_eq!(other.grant().unit_budget, 4, "{gpu}");
+    }
 }
 
 /// A load in flight on the CPU device of a Mac counts as a replica on the
@@ -1723,6 +1861,7 @@ fn paging_windows(
         uuid: MPS_GPU.to_owned(),
         total_mb: MAC_RAM_MB,
         free_mb: 0,
+        gtt: None,
     }]));
     for window in 0..windows {
         let token = admission
@@ -1820,6 +1959,7 @@ fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
             uuid: MPS_GPU.to_owned(),
             total_mb: MAC_RAM_MB,
             free_mb: 0,
+            gtt: None,
         }]));
         push_ram(&handle, MAC_TOTAL_MB, 90_000, 1_400, 0);
         assert_eq!(ramp_window(&handle, &admission, &MINILM_M3_MAX), 64);
@@ -1876,6 +2016,7 @@ async fn while_the_mac_pages_a_load_is_priced_from_a_fresh_reading() {
             uuid: MPS_GPU.to_owned(),
             total_mb: MAC_RAM_MB,
             free_mb: 0,
+            gtt: None,
         }]));
         let (_reservation, exceeds) = ledger
             .reserve_load_signalling("g/a", item_cost(4), MPS_GPU, None)
@@ -1927,6 +2068,7 @@ fn a_load_under_memory_pressure_warns_once_per_model_and_episode() {
             uuid: MPS_GPU.to_owned(),
             total_mb: MAC_RAM_MB,
             free_mb,
+            gtt: None,
         }]));
         ledger.lock().gpus.get_mut(MPS_GPU).expect("the Mac").free = None;
         ledger.set_memory_pressure_for_test(pressure);
@@ -2301,6 +2443,7 @@ fn paging_pre_fit_mac_replica() -> (Arc<VramLedger>, TelemetryHandle, Admission)
         uuid: MPS_GPU.to_owned(),
         total_mb: MAC_RAM_MB,
         free_mb: 0,
+        gtt: None,
     }]));
     push_ram(&handle, MAC_TOTAL_MB, 90_000, 120, 0);
     ledger.health();

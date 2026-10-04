@@ -188,8 +188,8 @@ impl VramLedger {
     /// [`free_source_is_authoritative`] and never going back in time.
     /// `reported_total_mb` is the same sample's total: an authoritative
     /// reading whose total does not match the GPU's is discarded as describing
-    /// another device. `model` is for the log only. `ram` is the same
-    /// instant's [`RamBasis`] and is stored with the reading.
+    /// another device. `model` is for the log only. `ram` and `gtt` are the
+    /// same instant's [`RamBasis`] and [`GttBasis`], stored with the reading.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_free_locked(
         state: &mut LedgerState,
@@ -200,6 +200,7 @@ impl VramLedger {
         reported_total_mb: Option<u64>,
         model: Option<&str>,
         ram: Option<RamBasis>,
+        gtt: Option<GttBasis>,
     ) {
         // Every device of a Mac is its RAM, and while macOS pages none is
         // available, whatever a formula reading counts as file cache.
@@ -274,6 +275,7 @@ impl VramLedger {
             source,
             at,
             ram,
+            gtt,
         });
     }
 
@@ -329,6 +331,7 @@ impl VramLedger {
                     stamped.value.total_mb,
                     Some(&model),
                     RamBasis::of(&stamped.value),
+                    GttBasis::pair(stamped.value.gtt_free_mb, stamped.value.ram_available_mb),
                 );
             }
         }
@@ -576,8 +579,8 @@ impl VramLedger {
             let found = gpus
                 .as_ref()
                 .and_then(|gpus| gpus.iter().find(|entry| entry.uuid == uuid))
-                .map(|entry| (entry.free_mb, entry.total_mb));
-            if let Some((free_mb, probe_total_mb)) = found {
+                .map(|entry| (entry.free_mb, entry.total_mb, entry.gtt));
+            if let Some((free_mb, probe_total_mb, gtt)) = found {
                 if uuid == gpu {
                     answered = true;
                 }
@@ -601,6 +604,7 @@ impl VramLedger {
                         total_mb: probe_total_mb,
                         available_mb: free_mb,
                     }),
+                    gtt,
                 );
                 let total_mb = state.gpus.get(&uuid).map_or(0, |gpu| gpu.total_mb);
                 let external_mb = self.external_locked(&state, &uuid).unwrap_or(0);

@@ -466,6 +466,7 @@ fn push_ram(
         allocated_mb: Some(allocated_mb),
         ram_total_mb: Some(MAC_RAM_MB),
         ram_available_mb: Some(available_mb),
+        gtt_free_mb: None,
     }));
 }
 

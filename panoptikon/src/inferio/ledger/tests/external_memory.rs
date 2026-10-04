@@ -253,6 +253,7 @@ async fn a_frame_fresh_gpu_is_not_re_probed_before_a_load() {
         uuid: GPU.to_owned(),
         total_mb: 32_000,
         free_mb: 1_000,
+        gtt: None,
     }]));
     let handle = loaded(Some(1_000), Some(0));
     let _admission = ledger
@@ -264,6 +265,7 @@ async fn a_frame_fresh_gpu_is_not_re_probed_before_a_load() {
         source: "nvml".to_owned(),
         at: Instant::now() - EXTERNAL_SAMPLE_MAX_AGE - Duration::from_secs(1),
         ram: None,
+        gtt: None,
     });
     push_memory_with_total(&handle, 25_000, 0, Some(32_000), "nvml");
 
@@ -483,6 +485,7 @@ fn a_frame_that_arrived_mid_window_prices_the_next_grant() {
         source: "nvml".to_owned(),
         at: Instant::now(),
         ram: None,
+        gtt: None,
     });
     push_memory_with_total(&handle, 25_000, 0, Some(TOTAL), "nvml");
 
@@ -834,6 +837,7 @@ fn a_failed_external_refresh_backs_off() {
             source: "nvml".to_owned(),
             at: Instant::now() - EXTERNAL_SAMPLE_MAX_AGE - Duration::from_secs(1),
             ram: None,
+            gtt: None,
         })
     };
     assert!(
@@ -848,6 +852,7 @@ fn a_failed_external_refresh_backs_off() {
                 source: "nvml".to_owned(),
                 at: Instant::now(),
                 ram: None,
+                gtt: None,
             }),
             None,
             false
@@ -879,6 +884,7 @@ fn a_failed_external_refresh_backs_off() {
                 source: "nvml".to_owned(),
                 at: Instant::now(),
                 ram: None,
+                gtt: None,
             }),
             failed,
             refreshing,
@@ -909,6 +915,7 @@ async fn a_load_reservation_probes_a_gpu_with_no_reading() {
         uuid: GPU.to_owned(),
         total_mb: 97_887,
         free_mb: 2_271,
+        gtt: None,
     }]));
     assert!(
         !ledger.health()[0].external_known,
@@ -961,6 +968,7 @@ async fn a_placeholder_reservation_is_clamped_to_the_headroom() {
         uuid: GPU.to_owned(),
         total_mb: 32_606,
         free_mb: 196,
+        gtt: None,
     }]));
     let (reservation, exceeds_headroom) = ledger
         .reserve_load_signalling_for_test("g/a", item_cost(4), GPU, None)
@@ -996,12 +1004,14 @@ async fn a_fresh_reading_suppresses_the_load_probe() {
         uuid: GPU.to_owned(),
         total_mb: 32_000,
         free_mb: 1_000,
+        gtt: None,
     }]));
     ledger.lock().gpus.get_mut(GPU).expect("the GPU").free = Some(FreeSample {
         free_mb: 20_000,
         source: "nvml".to_owned(),
         at: Instant::now(),
         ram: None,
+        gtt: None,
     });
 
     let (_reservation, exceeds_headroom) = ledger
@@ -1060,6 +1070,7 @@ async fn a_probe_that_misses_the_pinned_gpu_backs_off_like_a_failure() {
         uuid: OTHER.to_owned(),
         total_mb: 32_000,
         free_mb: 1_000,
+        gtt: None,
     }]));
 
     let _first = ledger
@@ -1107,11 +1118,13 @@ async fn one_probe_serves_every_gpu_a_load_is_pinned_to() {
             uuid: GPU.to_owned(),
             total_mb: 32_000,
             free_mb: 2_000,
+            gtt: None,
         },
         GpuMemory {
             uuid: OTHER.to_owned(),
             total_mb: 24_000,
             free_mb: 3_000,
+            gtt: None,
         },
     ]));
 
@@ -1378,6 +1391,7 @@ async fn a_cuda_probe_before_the_first_worker_prices_as_before() {
         uuid: GPU.to_owned(),
         total_mb: TOTAL,
         free_mb: TOTAL - HOG,
+        gtt: None,
     }]));
     let (_reservation, exceeds) = ledger
         .reserve_load_signalling_for_test("g/a", item_cost(4), GPU, None)

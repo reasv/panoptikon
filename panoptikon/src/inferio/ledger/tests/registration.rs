@@ -875,6 +875,7 @@ fn an_adopted_row_reaches_the_ledger_and_the_inventory() {
         uuid: "GPU-3c4d".to_owned(),
         total_mb: 100_000,
         free_mb: 40_000,
+        gtt: None,
     }]));
     let handle = loaded_on("GPU-3c4d", Some(1000), Some(0));
     let admission = ledger

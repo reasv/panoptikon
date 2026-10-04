@@ -553,6 +553,26 @@ pub struct GpuMemory {
     pub uuid: String,
     pub total_mb: u64,
     pub free_mb: u64,
+    /// The terms of an APU's free reading; `None` on any other device.
+    pub gtt: Option<GttBasis>,
+}
+
+/// The two terms an APU's free reading takes the smaller of, on top of its
+/// free VRAM: unclaimed GTT, and the host RAM the OS could deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GttBasis {
+    pub gtt_free_mb: u64,
+    pub ram_available_mb: u64,
+}
+
+impl GttBasis {
+    /// Both terms, or `None`.
+    pub fn pair(gtt_free_mb: Option<u64>, ram_available_mb: Option<u64>) -> Option<Self> {
+        Some(Self {
+            gtt_free_mb: gtt_free_mb?,
+            ram_available_mb: ram_available_mb?,
+        })
+    }
 }
 
 /// How this host's live free/total memory is read. Cheap to clone.
@@ -650,6 +670,7 @@ fn parse_memory(stdout: &str) -> Option<Vec<GpuMemory>> {
             uuid,
             total_mb,
             free_mb,
+            gtt: None,
         });
     }
     if gpus.is_empty() { None } else { Some(gpus) }

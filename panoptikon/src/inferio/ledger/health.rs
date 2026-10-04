@@ -20,13 +20,8 @@ impl VramLedger {
             .gpus
             .iter()
             .map(|(uuid, gpu)| {
-                let external = self.external_locked(state, uuid);
-                let (reserve, reserve_rule) = self.reserve_locked(
-                    state,
-                    uuid,
-                    external.unwrap_or(0),
-                    self.budgets.for_gpu(uuid).margin_in_force(),
-                );
+                let side =
+                    self.side_locked(state, uuid, self.budgets.for_gpu(uuid).margin_in_force());
                 let mut workers: Vec<LedgerWorkerHealth> = state
                     .workers
                     .values()
@@ -93,17 +88,17 @@ impl VramLedger {
                     device_kind: state.inventory.device_kind(uuid).to_owned(),
                     gpu_arch: gpu.arch.clone(),
                     total_mb: gpu.total_mb,
-                    external_mb: external.unwrap_or(0),
-                    external_known: external.is_some(),
+                    external_mb: side.external.unwrap_or(0),
+                    external_known: side.external.is_some(),
                     external_source: gpu.free.as_ref().map(|sample| sample.source.clone()),
                     external_sample_age_ms: gpu
                         .free
                         .as_ref()
                         .map(|sample| sample.at.elapsed().as_millis() as u64),
-                    limit_mb: self.limit_locked(state, uuid),
-                    reserve_mb: reserve,
-                    reserve_rule: reserve_rule.to_owned(),
-                    headroom_mb: self.headroom_locked(state, uuid),
+                    limit_mb: side.limit,
+                    reserve_mb: side.reserve,
+                    reserve_rule: side.rule.to_owned(),
+                    headroom_mb: side.overdraft().max(0) as u64,
                     charges_mb: Self::charges_locked(state, uuid),
                     footprints_mb: Self::footprints_locked(state, uuid),
                     load_reservations_mb: gpu.load_reservations.values().copied().sum(),
@@ -135,7 +130,10 @@ pub struct GpuBudgetHealth {
     pub gpu_arch: Option<String>,
     pub total_mb: u64,
     /// `max(0, total − free − Σ our footprints)`: what other processes hold.
-    /// On unified memory the footprints of both devices sharing the RAM count.
+    /// On unified memory the footprints of every device sharing the RAM
+    /// count, an APU's only beyond its carve-out. An APU reports this, the
+    /// reserve, the limit and the headroom from the side that binds: its GTT
+    /// window (VRAM and GTT, its own memory only) or the RAM behind it.
     pub external_mb: u64,
     /// False when no free reading exists yet and `external_mb` is assumed 0.
     pub external_known: bool,
@@ -144,7 +142,9 @@ pub struct GpuBudgetHealth {
     pub external_source: Option<String>,
     pub external_sample_age_ms: Option<u64>,
     /// The admission budget: `min(total × cap_fraction,
-    /// total − external − reserve_mb)`.
+    /// total − external − reserve_mb)`. On an APU's RAM side
+    /// `carve-out + host RAM − external − reserve_mb`: the total and the cap
+    /// bound its GTT window instead.
     pub limit_mb: u64,
     /// The reserve applied to this GPU on top of `external_mb`.
     pub reserve_mb: u64,
@@ -156,7 +156,8 @@ pub struct GpuBudgetHealth {
     /// tenth of RAM, at most 16 GiB, at least 2 GiB or a quarter of RAM).
     pub reserve_rule: String,
     /// `limit − Σ charges − Σ load reservations`; on unified memory the
-    /// charges of every device sharing the RAM.
+    /// charges of every device sharing the RAM, an APU's only beyond its
+    /// carve-out, except on an APU's GTT window.
     pub headroom_mb: u64,
     /// `Σ` per-worker `footprint + max(0, grants − pool growth)`; what
     /// `headroom_mb` subtracts. On the CPU device it includes GPU replicas'

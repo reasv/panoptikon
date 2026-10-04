@@ -239,8 +239,12 @@ pub struct MemorySample {
     /// Host RAM a unified device's free reading comes out of (`hw.memsize`);
     /// differs from [`Self::total_mb`] on MPS.
     pub ram_total_mb: Option<u64>,
-    /// RAM `available` before [`Self::free_mb`] clips it to the device total.
+    /// RAM `available` before [`Self::free_mb`] clips it to the device total
+    /// on MPS, or to [`Self::gtt_free_mb`] on an APU.
     pub ram_available_mb: Option<u64>,
+    /// An APU's unclaimed GTT: its `free_mb` is free VRAM plus the smaller of
+    /// this and [`Self::ram_available_mb`].
+    pub gtt_free_mb: Option<u64>,
 }
 
 /// The `load` response's footprint report (protocol doc, `load` `ok` table);
@@ -347,6 +351,8 @@ pub struct BatchMeasurement {
     /// On a unified device, the RAM total [`Self::free_mb`] was clipped from.
     pub ram_total_mb: Option<u64>,
     pub ram_available_mb: Option<u64>,
+    /// As [`MemorySample::gtt_free_mb`].
+    pub gtt_free_mb: Option<u64>,
     /// `num_alloc_retries` delta for this batch; `None` off CUDA.
     pub alloc_retries: Option<u64>,
     /// Pool MiB re-grown after a release, on the first batch after it only;
@@ -1792,6 +1798,7 @@ impl MemorySample {
             allocated_mb: field_u64(map, "allocated_mb"),
             ram_total_mb: field_u64(map, "ram_total_mb"),
             ram_available_mb: field_u64(map, "ram_available_mb"),
+            gtt_free_mb: field_u64(map, "gtt_free_mb"),
         };
         (sample != Self::default()).then_some(sample)
     }
@@ -1861,6 +1868,7 @@ impl BatchMeasurement {
                     free_source: field_string(map, "free_source"),
                     ram_total_mb: field_u64(map, "ram_total_mb"),
                     ram_available_mb: field_u64(map, "ram_available_mb"),
+                    gtt_free_mb: field_u64(map, "gtt_free_mb"),
                     alloc_retries: field_u64(map, "alloc_retries"),
                     regrow_mb: field_u64(map, "regrow_mb"),
                     regrow_after: field_string(map, "regrow_after"),
@@ -3663,6 +3671,20 @@ mod tests {
         assert_eq!(frame.reserved_after_mb, Some(1050));
         assert_eq!(frame.ram_total_mb, Some(131072));
         assert_eq!(frame.ram_available_mb, Some(15891));
+
+        // An APU's frame: both terms of its GTT clamp.
+        #[rustfmt::skip]
+        let apu = Value::Array(vec![Value::Map(vec![
+            (Value::from("free_mb"), Value::from(8448u64)),
+            (Value::from("free_source"), Value::from("amdgpu-sysfs")),
+            (Value::from("ram_available_mb"), Value::from(8192u64)),
+            (Value::from("gtt_free_mb"), Value::from(61440u64)),
+        ])]);
+        let frame = &BatchMeasurement::parse_list(Some(&apu))[0];
+        assert_eq!(
+            (frame.gtt_free_mb, frame.ram_available_mb),
+            (Some(61440), Some(8192))
+        );
     }
 
     /// The two clamps, including a shape ceiling that arrives without a free

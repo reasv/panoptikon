@@ -58,7 +58,7 @@ use super::calibration::{
     CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate, TrialCadence,
 };
 use super::cost::{CostAggregation, CostDimension, CostUnit, SEED_BUDGET_MB};
-use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
+use super::gpu::{GpuInventory, GpuMemory, GttBasis, MemoryQuery as GpuMemoryQuery};
 use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle, TrimReply};
 use super::{cpu, gpu, mps, worker};
 
@@ -1361,6 +1361,25 @@ struct FreeSample {
     at: Instant,
     /// The reading's [`RamBasis`], on unified devices.
     ram: Option<RamBasis>,
+    /// The reading's [`GttBasis`], on an APU.
+    gtt: Option<GttBasis>,
+}
+
+impl FreeSample {
+    /// An APU's free memory in its GTT window and in the RAM behind it:
+    /// `(VRAM + GTT free, VRAM free + deliverable RAM)`. Free VRAM is what
+    /// `free_mb` holds beyond the smaller GTT term, so a shift of `free_mb`
+    /// moves both. `None` without a [`GttBasis`].
+    fn apu_free_mb(&self) -> Option<(u64, u64)> {
+        let gtt = self.gtt?;
+        let vram_free = self
+            .free_mb
+            .saturating_sub(gtt.gtt_free_mb.min(gtt.ram_available_mb));
+        Some((
+            vram_free.saturating_add(gtt.gtt_free_mb),
+            vram_free.saturating_add(gtt.ram_available_mb),
+        ))
+    }
 }
 
 /// The architecture every synthetic GPU is seeded with, as [`VramLedger::new`]

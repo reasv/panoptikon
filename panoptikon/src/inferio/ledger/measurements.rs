@@ -455,6 +455,7 @@ impl VramLedger {
                     model.as_deref(),
                     // The RAM domain the reading was clipped from, if stated.
                     RamBasis::of_batch(measurement),
+                    GttBasis::pair(measurement.gtt_free_mb, measurement.ram_available_mb),
                 );
             }
             // This replica's pool as the batch left it, never its peak: a peak
@@ -705,6 +706,7 @@ impl VramLedger {
                     stamped.value.total_mb,
                     model.as_deref(),
                     RamBasis::of(&stamped.value),
+                    GttBasis::pair(stamped.value.gtt_free_mb, stamped.value.ram_available_mb),
                 );
             }
         }

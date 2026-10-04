@@ -130,6 +130,7 @@ async fn the_reserve_does_not_refuse_a_model_the_card_has_room_for() {
         uuid: GPU.to_owned(),
         total_mb: 24_576,
         free_mb: 981,
+        gtt: None,
     }]));
     let reservation = ledger
         .reserve_load("tags/wd-vit-tagger-v3", item_cost(4), GPU, None)
@@ -157,6 +158,7 @@ async fn a_base_over_what_the_card_has_free_is_refused() {
         uuid: GPU.to_owned(),
         total_mb: 24_576,
         free_mb: 500,
+        gtt: None,
     }]));
     let Err(refusal) = ledger
         .reserve_load("tags/wd-vit-tagger-v3", item_cost(4), GPU, None)
@@ -185,6 +187,7 @@ async fn a_model_too_big_for_the_card_is_refused_without_the_reserve_too() {
         uuid: GPU.to_owned(),
         total_mb: 32_607,
         free_mb: 32_607 - 1_316,
+        gtt: None,
     }]));
     let Err(refusal) = ledger
         .reserve_load("clip/qwen3-vl-embedding-8b", item_cost(4), GPU, None)
@@ -302,6 +305,7 @@ async fn a_mac_under_ram_pressure_still_attempts_a_model_it_ran_before() {
             uuid: MPS_GPU.to_owned(),
             total_mb: MAC_RAM_MB,
             free_mb: 30_000,
+            gtt: None,
         }]));
         ledger
             .reserve_load("clip/big", item_cost(4), MPS_GPU, None)
@@ -412,6 +416,7 @@ async fn a_memory_blind_condemnation_refuses_the_reload_on_an_unchanged_card() {
         uuid: GPU.to_owned(),
         total_mb: 24_576,
         free_mb: 981,
+        gtt: None,
     }]));
     let Err(refusal) = ledger
         .reserve_load("tags/wd-vit-tagger-v3", item_cost(4), GPU, None)
@@ -466,6 +471,7 @@ async fn the_remembered_working_set_climbs_until_it_refuses() {
         uuid: GPU.to_owned(),
         total_mb: 32_607,
         free_mb: 32_607,
+        gtt: None,
     }]));
     // Cycle two: the card has more room than the figure that condemned it,
     // so the reload is admitted. An unchanged card would refuse it.

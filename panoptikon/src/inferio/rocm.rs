@@ -20,7 +20,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::cpu;
-use super::gpu::{GpuInfo, GpuMemory};
+use super::gpu::{GpuInfo, GpuMemory, GttBasis};
 
 /// Every env var that can restrict which GPUs a HIP process sees.
 /// `ROCR_VISIBLE_DEVICES` filters at the ROCr/KFD layer; the other three at
@@ -235,6 +235,7 @@ pub(super) fn query_memory(
                 uuid: gpu.key.clone(),
                 total_mb: vram_total_mb,
                 free_mb: vram_free_mb,
+                gtt: None,
             });
             continue;
         }
@@ -248,6 +249,10 @@ pub(super) fn query_memory(
             uuid: gpu.key.clone(),
             total_mb: vram_total_mb + gtt_total_mb,
             free_mb: vram_free_mb + gtt_free_mb.min(available_mb),
+            gtt: Some(GttBasis {
+                gtt_free_mb,
+                ram_available_mb: available_mb,
+            }),
         });
     }
     Some(out)
@@ -1569,6 +1574,15 @@ mod tests {
         let tight = host(8 * 1024 * 1024);
         let budget = 512 + 64 * 1024;
         assert_eq!(read_from(&tight, apu(true)), Some((budget, 256 + 8 * 1024)));
+        let terms = query_memory(&tight.roots.pci_devices, &tight.roots.ram, &[apu(true)]);
+        assert_eq!(
+            terms.map(|rows| rows[0].gtt),
+            Some(Some(GttBasis {
+                gtt_free_mb: 60 * 1024,
+                ram_available_mb: 8 * 1024,
+            })),
+            "and carries both terms"
+        );
         assert_eq!(
             read_from(&tight, apu(false)),
             Some((512, 256)),

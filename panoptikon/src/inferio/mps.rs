@@ -85,6 +85,7 @@ pub(super) fn query_memory(key: &str, ram_mb: u64) -> Option<Vec<GpuMemory>> {
         // Physical RAM, not the device total; the refresh reads only `free_mb`.
         total_mb: ram_mb,
         free_mb: free_mb(ram_mb, available),
+        gtt: None,
     }])
 }
 

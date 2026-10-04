@@ -703,9 +703,16 @@ on Metal and `cap_fraction × RAM` on the CPU device — and the shared room is
 enforced in `headroom_mb`, so on either device `headroom + Σ charges` stays
 inside `memsize − external`. The ledger lock serialises grant issuance, which
 is what makes "the other device's headroom drops immediately" true rather than
-eventually. An AMD APU and the CPU device cross-charge the same way, since
-the APU's GTT is backed by the same RAM (and on a host with several APUs, all
-of them); a discrete GPU's VRAM is its own.
+eventually. An AMD APU shares only RAM with the CPU device and with other
+APUs: its carve-out is not RAM the OS manages, and its GTT window is a bound
+of its own. Its memory counts on the others only beyond its carve-out, which
+fills first. The APU itself is priced on two sides and the smaller headroom
+binds: its GTT window (VRAM and GTT free, its own memory only, under the
+GPU's reserve, the device total and `cap_fraction`), and the RAM behind it
+(carve-out plus host RAM, over VRAM free plus deliverable RAM, with the
+others' memory netted and charged as above, under the RAM floor). Its free
+reading carries the GTT and RAM terms for this (`gtt_free_mb`,
+`ram_available_mb`). A discrete GPU's VRAM is its own.
 
 **What still relies on frames: other processes' memory.** `external_mb` is only
 as fresh as the last free reading *that device* received, and the two devices
