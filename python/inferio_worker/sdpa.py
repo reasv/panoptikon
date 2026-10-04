@@ -22,7 +22,13 @@ logger = logging.getLogger(__name__)
 # the name up in this module's globals on every call.
 SDPA_MODULE = "transformers.integrations.sdpa_attention"
 
-_checked = False
+# What `expand_kv_heads_without_fused_gqa` decided.
+PATCHED = "patched"  # no fused kernel takes GQA; transformers expands the KV heads
+FUSED = "fused"  # a fused kernel takes GQA; transformers left untouched
+NOT_APPLICABLE = "not applicable"  # no transformers, or the model is not on a GPU
+CHECK_FAILED = "check failed"  # the check raised; transformers left untouched
+
+_decision: str | None = None
 
 
 def _never_gqa(attention_mask: Any, key: Any) -> bool:
@@ -66,33 +72,37 @@ def _model_device_index(torch: Any) -> int | None:
     return None
 
 
-def expand_kv_heads_without_fused_gqa() -> None:
+def expand_kv_heads_without_fused_gqa() -> str:
     """Once per process, after a model load: if transformers is imported, the
     load put memory on a CUDA/HIP device, and no fused kernel accepts GQA on
-    that device, patch `use_gqa_in_sdpa` to return False. Never creates a
-    context; never raises.
+    that device, patch `use_gqa_in_sdpa` to return False. Returns the decision
+    (the first call's, on every later call). Never creates a context; never
+    raises.
     """
-    global _checked
-    if _checked:
-        return
-    _checked = True
+    global _decision
+    if _decision is None:
+        _decision = _check()
+    return _decision
+
+
+def _check() -> str:
     try:
         torch = sys.modules.get("torch")
         sdpa = sys.modules.get(SDPA_MODULE)
         if torch is None or sdpa is None:
-            return
+            return NOT_APPLICABLE
         if not torch.cuda.is_initialized():
-            return
+            return NOT_APPLICABLE
         # Initialised alone does not mean the model is on a GPU: loading a
         # model onto the CPU may still have queried the devices.
         index = _model_device_index(torch)
         if index is None:
-            return
+            return NOT_APPLICABLE
         device = torch.device("cuda", index)
         # Kernel selection reads the current device's properties.
         with torch.cuda.device(index):
             if fused_kernel_accepts_gqa(torch, device):
-                return
+                return FUSED
         sdpa.use_gqa_in_sdpa = _never_gqa
         logger.info(
             "PyTorch %s has no fused attention kernel for grouped-query "
@@ -101,5 +111,7 @@ def expand_kv_heads_without_fused_gqa() -> None:
             torch.__version__,
             device,
         )
+        return PATCHED
     except Exception as e:
         logger.warning("GQA attention check failed: %s", e, exc_info=True)
+        return CHECK_FAILED
