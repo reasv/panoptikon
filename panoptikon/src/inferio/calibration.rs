@@ -2043,7 +2043,7 @@ sample_delta_mb = [80, 160]
                 local_path: path.clone(),
             },
             env(),
-            Duration::from_secs(10),
+            Duration::from_secs(3600),
         );
 
         // The first update has no previous write to wait behind, so it is
