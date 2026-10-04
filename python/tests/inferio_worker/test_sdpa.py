@@ -106,7 +106,8 @@ def test_a_fused_gqa_kernel_in_every_dtype_leaves_transformers_untouched(
     fake_worker,
 ) -> None:
     sdpa.expand_kv_heads_without_fused_gqa()
-    assert [dtype for _, _, dtype in fake_worker.calls] == list(sdpa.TEST_DTYPES)
+    dtypes = [dtype for _, _, dtype in fake_worker.calls]
+    assert dtypes == ["float16", "bfloat16", "float32"]
     assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
 
 
