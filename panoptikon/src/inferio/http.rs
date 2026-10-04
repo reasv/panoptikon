@@ -243,17 +243,11 @@ impl InferioState {
             ),
             super::calibration::StoreEnv {
                 platform: super::calibration::StoreEnv::platform_name(),
-                backend: accelerator_backend(accelerator).to_owned(),
+                backend: super::gpu::accelerator_backend(accelerator).to_owned(),
                 generator: format!("panoptikon {}", crate::resources::VERSION),
             },
         );
-        // The CPU on a host whose models are placed on the CPU device.
-        let worker_backend =
-            if host.inventory.resolve_device_key(None).as_deref() == Some(super::cpu::DEVICE_KEY) {
-                "cpu"
-            } else {
-                accelerator_backend(accelerator)
-            };
+        let worker_backend = super::gpu::worker_backend(&host.inventory, accelerator);
         let default_gpu_name = host.inventory.default_gpu_name();
         let default_gpu_arch = host.inventory.default_gpu_arch();
         let spilling = host.inventory.spilling_gpus().to_vec();
@@ -320,17 +314,6 @@ fn vram_budgets(
         );
     }
     budgets
-}
-
-/// The `backend` component of a calibration profile key. `Auto` (resolution
-/// failed) keys as `cpu`; Apple Silicon keys as `mps`.
-fn accelerator_backend(accelerator: crate::config::Accelerator) -> &'static str {
-    match accelerator {
-        crate::config::Accelerator::Cuda => "cuda",
-        crate::config::Accelerator::Rocm => "rocm",
-        crate::config::Accelerator::Mps => "mps",
-        crate::config::Accelerator::Cpu | crate::config::Accelerator::Auto => "cpu",
-    }
 }
 
 /// Bytes one predict body may carry (one worker frame); over it is a `413`.

@@ -61,6 +61,27 @@ pub fn pin_env_var(accelerator: Accelerator) -> &'static str {
     }
 }
 
+/// The `backend` component of a calibration profile key. `Auto` (resolution
+/// failed) keys as `cpu`; Apple Silicon keys as `mps`.
+pub fn accelerator_backend(accelerator: Accelerator) -> &'static str {
+    match accelerator {
+        Accelerator::Cuda => "cuda",
+        Accelerator::Rocm => "rocm",
+        Accelerator::Mps => "mps",
+        Accelerator::Cpu | Accelerator::Auto => "cpu",
+    }
+}
+
+/// The backend workers run on: the CPU on a host whose models are placed on
+/// the CPU device, the accelerator's otherwise.
+pub fn worker_backend(inventory: &GpuInventory, accelerator: Accelerator) -> &'static str {
+    if inventory.resolve_device_key(None).as_deref() == Some(cpu::DEVICE_KEY) {
+        "cpu"
+    } else {
+        accelerator_backend(accelerator)
+    }
+}
+
 /// One visible GPU, from nvidia-smi (CUDA) or KFD topology (ROCm).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GpuInfo {
@@ -2255,6 +2276,25 @@ mod tests {
         let host = probe_rocm_at(&roots, [None; rocm::VISIBILITY_VARS.len()], true).inventory;
         assert!(!host.no_visible_gpu);
         assert_eq!(host.gpus(), None);
+    }
+
+    /// Workers run on the CPU where models are placed on the CPU device, and
+    /// on the accelerator where a GPU is visible.
+    #[test]
+    fn the_worker_backend_follows_where_models_are_placed() {
+        let ram_mb = 64 * 1024;
+        let with_cpu = |host: GpuInventory| host.with_cpu(ram_mb, cpu::MemRoots::default());
+        let hidden_cuda = with_cpu(build(Some(TWO_GPUS), Some("")).inventory);
+        let roots = rocm::SysfsRoots::default();
+        let hidden_rocm =
+            with_cpu(rocm_host(&roots, Some(Vec::new().into()), false, true).inventory);
+        assert_eq!(worker_backend(&hidden_cuda, Accelerator::Cuda), "cpu");
+        assert_eq!(worker_backend(&hidden_rocm, Accelerator::Rocm), "cpu");
+        let cuda = with_cpu(GpuInventory::known(vec![gpu(0, "GPU-a", "8.6")]));
+        let amd = amd_gpu(0, "0000:03:00.0", 24_576);
+        let rocm = with_cpu(GpuInventory::known_rocm(vec![amd]));
+        assert_eq!(worker_backend(&cuda, Accelerator::Cuda), "cuda");
+        assert_eq!(worker_backend(&rocm, Accelerator::Rocm), "rocm");
     }
 
     /// The dispatch itself: each accelerator gets its own backend, whatever
