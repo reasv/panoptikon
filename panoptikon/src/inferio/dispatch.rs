@@ -1026,7 +1026,11 @@ async fn run_batch_inner(
                     Err(individual_err) => {
                         let fatal = individual_err.downcast_ref::<WorkerError>().is_none();
                         let settle = fatal_settlement(worker);
-                        oom = oom.or(error_reports_oom(&individual_err));
+                        // A device's out-of-memory outranks host RAM's.
+                        oom = match (oom, error_reports_oom(&individual_err)) {
+                            (None | Some(ErrorFrameOom::HostRam), Some(later)) => Some(later),
+                            (kept, _) => kept,
+                        };
                         let message = format!("{individual_err:#}");
                         let _ = request.reply.send(Err(individual_err));
                         if fatal {
@@ -1814,6 +1818,11 @@ mod tests {
             "",
         );
         let mps = worker_error("RuntimeError", "MPS backend out of memory", "");
+        let host_ram = worker_error(
+            "RuntimeError",
+            "[enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator: can't allocate memory",
+            "",
+        );
         let marker = worker_error("INFERENCE_OOM_WINDOW: batch of 32 failed", "", "");
         let driver = worker_error("RuntimeError: CUDA driver error: out of memory", "", "");
         let supervision = anyhow!("predict failed: CUDA out of memory");
@@ -1823,6 +1832,11 @@ mod tests {
             (cache, None, "names no device, nor a batch size"),
             (marker, Some(ErrorFrameOom::Marker), "our own sentinel"),
             (mps, Some(ErrorFrameOom::Prose), "the traceback"),
+            (
+                host_ram,
+                Some(ErrorFrameOom::HostRam),
+                "host RAM, in the traceback",
+            ),
             (driver, Some(ErrorFrameOom::Prose), "driver-shaped"),
             (supervision, Some(ErrorFrameOom::Prose), "no envelope"),
             (unrelated, None, "and a supervision error with no OOM"),
