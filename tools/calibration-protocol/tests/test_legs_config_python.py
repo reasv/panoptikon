@@ -176,3 +176,8 @@ def test_the_cudnn_path_follows_the_worker_venv(monkeypatch, tmp_path):
         written = (out / "env.C1").read_text(encoding="utf-8")
         assert (expected in written) if expected else (
             "LD_LIBRARY_PATH" not in written)
+        other = cpu if given == python else python
+        _, _, env, _ = legs.resolve_config(
+            argparse.Namespace(config=str(out / "server-C1.toml")), {}, other)
+        assert env.get("LD_LIBRARY_PATH") == (
+            str(cudnn) if other == python else None)

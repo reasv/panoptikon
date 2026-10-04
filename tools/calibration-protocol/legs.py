@@ -1638,8 +1638,13 @@ def resolve_config(args: argparse.Namespace, base: Dict[str, str],
         candidate = candidate.resolve()
         env_file = (candidate.parent
                     / f"env.{candidate.stem.replace('server-', '')}")
-        return (candidate.read_text(encoding="utf-8"), str(candidate),
-                read_env_file(env_file, base),
+        env = read_env_file(env_file, base)
+        if python:
+            env.pop("LD_LIBRARY_PATH", None)
+            cudnn = cudnn_library_dir(Path(shutil.which(python) or python))
+            if cudnn is not None:
+                env["LD_LIBRARY_PATH"] = str(cudnn)
+        return (candidate.read_text(encoding="utf-8"), str(candidate), env,
                 str(env_file) if env_file.is_file() else "")
     if given not in CONFIGS:
         raise SystemExit(f"legs.py: no config {given!r} - pass a path, or one "
