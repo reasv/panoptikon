@@ -1463,6 +1463,12 @@ def run_window(
                         f"{OOM_WINDOW_PREFIX} out of GPU memory on a packed batch "
                         f"of {len(batch)} inputs ({priced} {unit} units): {exc}"
                     )
+                if _index_limit(exc):
+                    # Only a window that completes shows a batch-size ceiling.
+                    for done in measurements:
+                        reason = done.get("clamped", {}).get("reason")
+                        if reason == INDEX_LIMIT_REASON:
+                            del done["clamped"]
                 raise WindowFailure(message, measurements, exc) from exc
             elapsed = time.perf_counter() - started
             if len(produced) != len(batch):

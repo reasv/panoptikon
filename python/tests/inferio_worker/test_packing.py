@@ -2465,14 +2465,14 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
     assert halved["oom_class"]["exception"] == packing.OOM_HALVING_WITNESS
     assert "clamped" not in halved
 
-    # A window that dies after the impl hit the ceiling still reports it: the
-    # failure path is where the orchestrator most needs to know the size was
-    # not its choice.
+    # A window that dies of another error after the impl hit the ceiling
+    # still reports it: the failure path is where the orchestrator most needs
+    # to know the size was not its choice.
     class Failing:
         def predict(self, inputs):
             fake_oom_retry.record(1)
             fake_oom_retry.note_index_limit()
-            raise RuntimeError("integer out of range")
+            raise RuntimeError("unsupported input")
 
     with pytest.raises(packing.WindowFailure) as caught:
         packing.run_window(Failing(), items(4), grant(unit_budget=4))
@@ -2484,8 +2484,7 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
     # A ceiling the impl raises without cutting the batch itself (an MPS array
     # over 2^32 bytes before macOS 15): the harness halves the batch and the
     # window's other items run. The clamp is carried by the first batch that
-    # ran at half the size, so a window that halves down to one failing item
-    # reports none.
+    # ran at half the size; a window that fails on the error reports none.
     class Raising:
         def __init__(self, fails):
             self.fails = fails
@@ -2526,11 +2525,42 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
     assert impl.batches == [5, 2, 1, 1, 1, 1, 1]
     assert clamps(payload["measurements"]) == [(2, (2, 1))]
 
-    impl = Raising(lambda inputs: any(item.data == 0 for item in inputs))
+    # A batch the live memory clamp cut below the halved size is not the
+    # first to run at it.
+    def fails_and_frees(inputs):
+        fake_torch.free = (250 if len(inputs) > 4 else 8000) * MIB
+        return len(inputs) > 4
+
+    impl = Raising(fails_and_frees)
+    payload = packing.run_window(impl, items(8), grant(unit_budget=8))
+    assert impl.batches == [8, 2, 4, 2]
+    assert clamps(payload["measurements"]) == [(1, (8, 2)), (2, (8, 4))]
+    assert "reason" not in payload["measurements"][1]["clamped"]
+
+    def fails_on_item_5(inputs):
+        return any(item.data == 5 for item in inputs)
+
+    impl = Raising(fails_on_item_5)
     with pytest.raises(packing.WindowFailure) as caught:
         packing.run_window(impl, items(8), grant(unit_budget=8))
-    assert impl.batches == [8, 4, 2, 1]
-    assert clamps(caught.value.measurements) == [], "no batch ran halved"
+    assert impl.batches == [8, 4, 4, 2, 1, 1]
+    assert clamps(caught.value.measurements) == []
+
+    # The same item through an impl that halves on its own: the harness does
+    # not split again.
+    class Retrying(Raising):
+        def predict(self, inputs):
+            return impl_utils.run_with_oom_retry(
+                super().predict, inputs, oom_exceptions=MemoryError
+            )
+
+    impl = Retrying(fails_on_item_5)
+    with mock.patch.dict(sys.modules, {"inferio.impl.utils": impl_utils}):
+        with pytest.raises(packing.WindowFailure) as caught:
+            packing.run_window(impl, items(8), grant(unit_budget=8))
+    assert impl.batches == [8, 4, 4, 2, 1, 1]
+    assert len(caught.value.measurements) == 1
+    assert clamps(caught.value.measurements) == []
 
 
 def test_an_impl_that_executed_nothing_in_one_call_reports_zero_not_the_batch(

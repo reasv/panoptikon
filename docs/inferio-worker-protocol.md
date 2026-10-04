@@ -395,9 +395,8 @@ impl having cut it (`looks_like_index_limit`, which also matches an MPS array
 over 2^32 bytes before macOS 15) does not fail the window: the harness
 reports it unpriced and without `oom`, and runs the rest of the window at
 half its items. The first batch that ran at half the size carries the
-`clamped` map, from the failed batch's units to its own. A single item that
-raises it still fails the window, and a window that never ran a halved batch
-reports no clamp.
+`clamped` map, from the failed batch's units to its own. A window that
+fails on such an error reports no clamp.
 
 **The easyOCR ceiling in full**, since it is the worked example a second impl
 would copy. The canvas comes first: `easyocr.imgproc.resize_aspect_ratio`
