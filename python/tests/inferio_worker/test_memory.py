@@ -2475,18 +2475,17 @@ def test_the_swap_out_counter_is_followed_at_every_pressure_level() -> None:
 
 def test_the_vm_statistics_fields_are_read_at_their_positions() -> None:
     # wire_count, compressor_page_count, internal_page_count, swapouts and
-    # external_page_count:
-    # each value is its own 1-based position in `vm_statistics64_data_t`
-    # (<mach/vm_statistics.h>).
+    # external_page_count: each value is its own 1-based position in
+    # `vm_statistics64_data_t` (<mach/vm_statistics.h>).
     raw = struct.pack("@4I9Q2I4Q4IQ", *range(1, 25))
     assert memory._vm_statistics(raw) == (4, 20, 23, 19, 22)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="vm_stat is macOS's")
 def test_the_mac_counters_match_vm_stat() -> None:
-    def vm_stat() -> tuple[int, int, int]:
-        """Swap-outs since boot, and the wired memory and file cache in
-        bytes."""
+    def vm_stat() -> tuple[int, int, int, int, int]:
+        """Swap-outs since boot, then the wired, compressed and anonymous
+        memory and the file cache in bytes."""
         out = subprocess.run(
             ["vm_stat"], capture_output=True, text=True, check=True
         ).stdout
@@ -2498,15 +2497,21 @@ def test_the_mac_counters_match_vm_stat() -> None:
         return (
             count("Swapouts:"),
             count("Pages wired down:") * page,
+            count("Pages occupied by compressor:") * page,
+            count("Anonymous pages:") * page,
             count("File-backed pages:") * page,
         )
 
-    before, wired, file_cache = vm_stat()
+    before, wired, compressed, anonymous, file_cache = vm_stat()
     counters = memory._mac_memory_counters()
-    after, _, _ = vm_stat()
+    after, *_ = vm_stat()
     assert counters is not None
-    # Wired memory and the file cache move between the two reads.
+    # Each figure moves between the two reads; the compressor may hold
+    # little or nothing.
     assert wired / 2 <= counters[1] <= wired * 2
+    assert compressed / 2 - 64 * MIB <= counters[2]
+    assert counters[2] <= compressed * 2 + 64 * MIB
+    assert anonymous / 2 <= counters[3] <= anonymous * 2
     assert file_cache / 2 <= counters[6] <= file_cache * 2
     if before == 0:
         pytest.skip("no swap-outs since boot to compare")

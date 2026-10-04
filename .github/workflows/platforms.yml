@@ -64,7 +64,7 @@ jobs:
 
       - name: Platform tests
         if: ${{ !cancelled() && steps.check.outcome == 'success' }}
-        run: cargo test -p panoptikon --bin panoptikon -- ownership inferio::mps inferio::cpu
+        run: cargo test -p panoptikon --bin panoptikon -- ownership inferio::mps inferio::cpu host_paths probe_dispatches_on case_drifted walkers_casing non_utf8_database
 
       - name: Worker tests
         if: ${{ !cancelled() }}
