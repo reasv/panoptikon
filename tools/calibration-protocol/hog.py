@@ -729,6 +729,8 @@ class Hog:
         self.target_mb = 0
         self._last_free_eval = -1e9
         self._leave_free_target: Optional[int] = None
+        #: the free level a leave-free target was solved for, else None
+        self.leave_mb: Optional[int] = None
         # Re-touch bookkeeping (see `touch`).
         self.touch_period = float(getattr(args, "touch_period", 0.0) or 0.0)
         self._touch_cursor = 0
@@ -788,6 +790,15 @@ class Hog:
             while len(self.chunks) < want_chunks:
                 if _stop.is_set():
                     return
+                if self.leave_mb is not None:
+                    # Where allocating past physical memory succeeds (WSL,
+                    # WDDM's system-memory fallback) no failure ends the
+                    # fill; free reaching the level does, and what is held
+                    # then is the target.
+                    free_mb, _ = self.backend.free_total_mb()
+                    if free_mb is not None and free_mb <= self.leave_mb:
+                        self._leave_free_target = self.target_mb = self.held_mb
+                        return
                 try:
                     self.chunks.append(self.backend.alloc())
                 except Exception as exc:  # OOM or any allocator failure
@@ -849,15 +860,18 @@ class Hog:
 
     # -- schedule ---------------------------------------------------------
     def resolve_target(self, elapsed: float) -> int:
+        self.leave_mb = None
         if self.override == "mb":
             self.phase = "override:mb"
             return self.override_mb
         if self.override == "leave_free":
             self.phase = "override:leave-free"
+            self.leave_mb = self.override_mb
             return self._leave_free(self.override_mb)
         absolute, leave_free, phase = self.schedule.target(elapsed)
         self.phase = phase
         if leave_free is not None:
+            self.leave_mb = leave_free
             return self._leave_free(leave_free)
         return int(absolute or 0)
 

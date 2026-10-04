@@ -8,6 +8,9 @@ one captured set of counters, and they differ by 9 109 MiB -- so a
 `leave-free 20480` leg held 9 109 MiB too little and left ~11 371 MiB free
 under the reading everything else now uses.
 
+The fill itself stops on the free reading, not on an allocation failure:
+where allocating past physical memory succeeds there is no failure to stop it.
+
 Run with the managed interpreter:
 
     python/.venv/bin/python -m pytest tools/calibration-protocol/tests -q
@@ -113,3 +116,37 @@ def _target(free_mb: int, held_mb: int, leave: int) -> int:
     made.chunks = [None] * (held_mb * MIB // backend.chunk_bytes())
     assert made.held_mb == held_mb
     return made._leave_free(leave)
+
+
+def test_the_fill_stops_once_free_reaches_the_level():
+    """Where allocation past physical memory succeeds, no failure stops the
+    fill. Here every chunk the hog takes, the job's pool takes another, so
+    the one solve at the start (10 240 - 2 048 = 8 192 MiB) would overshoot
+    by twice what the level allows; the fill stops at 4 096 MiB held."""
+
+    class _Backend(hog.Backend):
+        name = "overcommits"
+        free = 10240
+
+        def chunk_bytes(self) -> int:
+            return 128 * MIB
+
+        def alloc(self):
+            self.free -= 2 * 128
+            return object()
+
+        def free_total_mb(self):
+            return self.free, 24576
+
+    backend = _Backend()
+    args = argparse.Namespace(touch_period=0.0, progress_every=2.0,
+                              reeval=999999.0)
+    made = hog.Hog(backend, hog.LeaveFree(2048), args)
+    made.target_mb = made.resolve_target(0.0)
+    assert made.target_mb == 8192
+    made.apply(made.target_mb)
+    assert (made.held_mb, made.target_mb, backend.free) == (4096, 4096, 2048)
+    # The next tick holds there: the level is reached and the solve pinned.
+    made.target_mb = made.resolve_target(0.5)
+    made.apply(made.target_mb)
+    assert made.held_mb == 4096
