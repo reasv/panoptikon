@@ -918,15 +918,16 @@ booked centrally on the CPU device. It is never a throughput signal.
   figure is runtime-only: no profile row, no calibration change.
 
   Known limits: a window of inputs costlier on average than any measured
-  near its size still exceeds the booking. With pages costing 45–130 MiB
-  each in random order, kept by the worker or not, the most a batch exceeded
-  it in simulation was 501 MiB on an 8 GB host (2 GiB reserve) and 2.7 GB on
-  a 64 GB host (6.4 GB reserve), outside the case below; the excess grows
-  with the square root of the batch, the reserve with RAM. A worker that
-  keeps what it decoded and is opened by a stored working size hundreds of
-  pages past its two- and four-page batches books those pages' cost per
-  page; when they ran cheap, that window can exceed the reserve (5 of 40
-  such runs on the 64 GB host ran it out of RAM).
+  near its size still exceeds the booking, by its units times the
+  difference in average cost. That difference shrinks as the batch grows,
+  so the excess grows with the square root of the batch, and the reserve
+  with RAM: with pages costing 45–130 MiB each in random order, kept by the
+  worker or not, the tests hold every batch within 2 GiB of its booking on
+  an 8 GB host (2 GiB reserve) and within 3 GiB on a 64 GB host (6.4 GB
+  reserve), outside the case below. A worker that keeps what it decoded and
+  is opened by a stored working size hundreds of pages past its two- and
+  four-page batches books those pages' cost per page; when they ran cheap,
+  that window can exceed the reserve and run the host out of RAM.
 - **Booking.** Each grant books that figure for its units on the CPU
   device, held until the grant settles. There the replica's resident set
   counts as our footprint, not as external usage, and its charge is

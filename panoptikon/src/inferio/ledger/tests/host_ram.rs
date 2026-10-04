@@ -2117,57 +2117,15 @@ fn an_out_of_memory_window_host_ram_sized_leaves_the_pool_margin() {
     }
 }
 
-/// A first uncapped window priced from two- and three-page batches whose
-/// pages cost less (414 MiB a page) than the job's (457): it books what its
-/// pages need and leaves the host its RAM.
-#[test]
-fn a_first_large_window_priced_from_cheap_small_batches_covers_its_pages() {
-    const STARTUP: u64 = 700;
-    const OTHERS: u64 = 10_161;
-    let profiles = Arc::new(FakeProfiles {
-        seed: Some(seeded_anchor(1_024, true)),
-        ..FakeProfiles::default()
-    });
-    let ledger = host(&[GPU], Some(profiles));
-    let (handle, admission) = cold_gpu_replica(&ledger, "g/pages", GPU, item_cost(32));
-    let level = RSS_AT_LOAD_MB + STARTUP;
-    for (window, (pages, growth)) in [(1, 427), (2, 828), (2, 688), (3, 1_226)]
-        .into_iter()
-        .enumerate()
-    {
-        let before = if window == 0 { RSS_AT_LOAD_MB } else { level };
-        ledger.record_free_for_test(cpu::DEVICE_KEY, CPU_RAM_MB - OTHERS - before);
-        let token = admission.request_grant(pages, None, 1, 0).expect("granted");
-        assert!(token.grant().user_cap_items.is_some());
-        handle
-            .lock()
-            .unwrap()
-            .record_measurements(vec![ram_batch(pages, level + growth, level)]);
-        token.finish(WindowOutcome::Responded { oom: None });
-    }
-    ledger.record_free_for_test(cpu::DEVICE_KEY, CPU_RAM_MB - OTHERS - level);
-    let token = admission
-        .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
-    let pages = token.grant().unit_budget;
-    assert_eq!(token.grant().user_cap_items, None);
-    let need = 457 * pages;
-    assert!(
-        row(&ledger, "g/pages").ram_booked_mb >= need,
-        "{pages} pages"
-    );
-    assert!(OTHERS + level + need <= CPU_RAM_MB, "{pages} pages");
-}
-
-/// A worker that pins its first batch's memory, half of it for good or all
-/// of it until its fourth window's batch frees it before or after its peak,
-/// under pages costing 650 MiB, then 300 and 360, then 460 each, plus 200
-/// per batch, with a stored working size that opens the first uncapped
-/// window far past the item-capped ones and short queues between full
-/// windows: no window runs the host out of RAM, none past the item-capped
-/// sizes books less than its pages add, and a batch that frees the memory
-/// after its peak leaves the later windows the sizes they run when it frees
-/// it before.
+/// A worker that pins its first batch's memory, half of it for good, all of
+/// it until its fourth window's batch frees it before or after its peak, or
+/// none of it, under pages costing 650 MiB, then 300 and 360, then 460
+/// each, plus 200 per batch, with a stored working size that opens the first
+/// uncapped window far past the item-capped ones and short queues between
+/// full windows: no window runs the host out of RAM, none past the
+/// item-capped sizes books less than its pages add, and a batch that frees
+/// the memory after its peak leaves the later windows the sizes they run
+/// when it frees it before.
 #[test]
 fn a_first_batch_pinned_then_freed_leaves_no_large_window_under_booked() {
     const STARTUP: u64 = 700;
@@ -2179,7 +2137,7 @@ fn a_first_batch_pinned_then_freed_leaves_no_large_window_under_booked() {
         _ => 460,
     };
     // The window whose batch frees the pinned memory, and whether after its
-    // peak.
+    // peak: freed after the first batch's peak, none of it stays pinned.
     let mut freed_before = HashMap::new();
     for (freed, others) in [
         (None, 8_000),
@@ -2188,6 +2146,7 @@ fn a_first_batch_pinned_then_freed_leaves_no_large_window_under_booked() {
         (Some((3, false)), 20_000),
         (Some((3, true)), 8_000),
         (Some((3, true)), 20_000),
+        (Some((0, true)), 10_161),
     ] {
         let profiles = Arc::new(FakeProfiles {
             seed: Some(seeded_anchor(1_024, true)),
@@ -2319,10 +2278,10 @@ fn varying_pages(ram_mb: u64, anchored: bool, retain: bool, seed: u64) -> (u64, 
 /// Pages whose cost varies with the input, with the worker keeping what it
 /// decoded or not: no batch exceeds its booking by the RAM an 8 GB host keeps
 /// free (2 GiB), or by 3 GiB on a 64 GB host (the excess grows with the
-/// batch; 2.7 GB is the most seen), and none runs the host out of RAM. Not
-/// covered: on the 64 GB host a stored working size opens a worker that
-/// keeps what it decoded hundreds of pages past the two- and four-page
-/// batches, priced at their pages' cost alone.
+/// batch), and none runs the host out of RAM. Not covered: on the 64 GB host
+/// a stored working size opens a worker that keeps what it decoded hundreds
+/// of pages past the two- and four-page batches, priced at their pages' cost
+/// alone.
 #[test]
 fn pages_of_varying_cost_stay_inside_the_reserve() {
     for (ram_mb, most) in [(8 * 1024, 2 * 1024), (64 * 1024, 3 * 1024)] {
