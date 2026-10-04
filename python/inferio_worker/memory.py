@@ -2721,7 +2721,8 @@ def measure_batch(
     # the reset copied, which is not this batch's peak.
     before = state.get("reserved_before_mb")
     if (
-        peak_reserved is not None
+        sampled_pool is None
+        and peak_reserved is not None
         and before is not None
         and reserved_after is not None
         and reserved_after < before

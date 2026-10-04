@@ -1015,6 +1015,7 @@ def test_batch_measurement_is_per_call(fake_torch) -> None:
     measurement = memory.finish_batch(state, items=1)["measurements"][0]
     assert measurement["allocated_before_mb"] == 500
     assert measurement["peak_allocated_mb"] == 550
+    assert measurement["peak_reserved_mb"] == 800
 
     # A pool emptied inside the batch and regrown smaller has no peak of its
     # own: torch's is still the pool before the batch.
@@ -1026,6 +1027,34 @@ def test_batch_measurement_is_per_call(fake_torch) -> None:
         800, 650
     )
     assert emptied["peak_reserved_mb"] is None
+
+    # Emptied and regrown past the pool before the batch: that peak is its own.
+    fake_torch.reserved = 800 * MIB
+    state = memory.begin_batch()
+    fake_torch.reserved = fake_torch.allocated
+    fake_torch.allocate(250)
+    fake_torch.allocated -= 250 * MIB
+    fake_torch.reserved = fake_torch.allocated
+    regrown = memory.finish_batch(state, items=1)["measurements"][0]
+    assert (
+        regrown["reserved_before_mb"],
+        regrown["peak_reserved_mb"],
+        regrown["reserved_after_mb"],
+    ) == (800, 900, 650)
+
+    # A sampled MPS peak is this batch's own, even where the pool fell.
+    with mps_host(available_mb=110 * 1024) as mps:
+        mps.allocate(800)
+        state = memory.begin_batch()
+        state["mps_sampler"].observe()
+        mps.free(500)
+        mps.empty_cache()
+        sampled = memory.measure_batch(state, items=1)
+    assert (
+        sampled["reserved_before_mb"],
+        sampled["peak_reserved_mb"],
+        sampled["reserved_after_mb"],
+    ) == (800, 800, 300)
 
 
 def test_alloc_retries_is_a_per_batch_delta(fake_torch) -> None:
