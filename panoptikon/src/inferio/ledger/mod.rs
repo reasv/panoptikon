@@ -89,7 +89,7 @@ use oom::{
     pool_grew_past_free,
 };
 pub use oom::{ErrorFrameOom, UnrunnableReplica, message_oom_tier};
-use ramp::{deflation_cap, median};
+use ramp::{admitted_units, deflation_cap, median};
 pub use registration::Admission;
 use registration::GpuLog;
 pub use trims::TrimRequest;
@@ -585,6 +585,9 @@ struct GrantCharge {
     /// The batch size the gain rule asked for this window
     /// ([`VramLedger::size_locked`]), before anything cut it.
     size_asked: u64,
+    /// `size_asked` in units under the ratchet, batch ceiling and deflation
+    /// at grant ([`admitted_units`]), before the [`PressureCap`].
+    units_asked: u64,
     /// When the grant began, before its pressure reading: a throughput
     /// sample is charged its share of the time from here to the settle, and
     /// settle counts paging from here on.
@@ -1132,11 +1135,13 @@ struct PressureCap {
     /// by each clean full window since.
     units: u64,
     /// How far `units` may grow back while the level is warning: the batch
-    /// size admitted when the first episode began, halved by each episode
-    /// that our batch, running at it, began. Kept until the cap lifts.
+    /// size the grant asked when the first episode began, halved by each
+    /// episode that our batch, running at it, began. Kept until the cap lifts.
     regrow_to: u64,
     /// The last window was a paging one: the episode is still on.
     paging: bool,
+    /// A window of this episode halved `regrow_to`.
+    halved: bool,
 }
 
 /// What the local store holds of a (model, GPU), as far as the write policy

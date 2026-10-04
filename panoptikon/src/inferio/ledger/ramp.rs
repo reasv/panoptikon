@@ -322,12 +322,13 @@ impl VramLedger {
     ///
     /// A paging window that memory or the batch size set (not the queue) sets the
     /// cap to its unit budget. The first one of an episode also sets how far
-    /// the cap may grow back at warning: the batch size admitted, or the
-    /// previous bound, halved (at least 1) when this window was granted
-    /// before the paging began and ran at that size or at the size its grant
-    /// asked, if smaller. So a batch size that made the Mac page is not
-    /// returned to while the level stays at warning, and paging that began
-    /// under a smaller batch, or before the grant, does not lower the bound.
+    /// the cap may grow back at warning: the batch size its grant asked, or
+    /// the previous bound. A window granted before the paging began that ran
+    /// at that bound, or at the size its grant asked if smaller, halves it
+    /// (at least 1), once per episode. So a batch size that made the Mac page
+    /// is not returned to while the level stays at warning, and paging that
+    /// began under a smaller batch, or before the grant, does not lower the
+    /// bound.
     ///
     /// Otherwise a clean window that `filled` its budget doubles the cap: at
     /// warning up to that bound, at normal until it reaches the batch size
@@ -347,7 +348,7 @@ impl VramLedger {
         let ceiling = Self::batch_ceiling_locked(state, entry);
         let size = Self::size_locked(state, entry, mps::MemoryPressure::Normal);
         let admitted = admitted_units(entry, size, anchor, ceiling);
-        let asked = admitted_units(entry, charge.size_asked, anchor, ceiling);
+        let asked = charge.units_asked;
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let Some(cal) = state.calibration.get_mut(&key) else {
             return;
@@ -357,22 +358,17 @@ impl VramLedger {
             if charge.queue_bound && !charge.memory_cut {
                 return;
             }
-            let regrow_to = match cap {
-                Some(cap) if cap.paging => cap.regrow_to,
-                _ => {
-                    let bound = cap.map_or(admitted, |cap| cap.regrow_to);
-                    let in_force = bound.min(asked);
-                    if !paged_at_grant && charge.unit_budget >= in_force {
-                        (in_force / 2).max(1)
-                    } else {
-                        bound
-                    }
-                }
+            let (bound, halved) = match cap {
+                Some(cap) if cap.paging => (cap.regrow_to, cap.halved),
+                _ => (cap.map_or(asked, |cap| cap.regrow_to), false),
             };
+            let in_force = bound.min(asked);
+            let halves = !halved && !paged_at_grant && charge.unit_budget >= in_force;
             Some(PressureCap {
                 units: charge.unit_budget,
-                regrow_to,
+                regrow_to: if halves { (in_force / 2).max(1) } else { bound },
                 paging: true,
+                halved: halved || halves,
             })
         } else if let Some(cap) = cap {
             let grown = if filled {
@@ -384,12 +380,14 @@ impl VramLedger {
                 Some(PressureCap {
                     units: grown.min(cap.regrow_to),
                     paging: false,
+                    halved: false,
                     ..cap
                 })
             } else {
                 (grown < admitted).then_some(PressureCap {
                     units: grown,
                     paging: false,
+                    halved: false,
                     ..cap
                 })
             }

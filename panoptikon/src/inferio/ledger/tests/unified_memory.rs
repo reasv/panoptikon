@@ -1984,29 +1984,98 @@ fn only_an_episode_our_batch_began_at_the_bound_halves_it() {
     assert_eq!(pressure_cap(&ledger), None, "back at what the ramp admits");
 }
 
-/// At warning a replica that normal pressure would let double its working
-/// size, memory having granted nothing above it, runs the working size. Paging
-/// that a window began at that size halves the bound.
+/// A window granted before the paging began that ran at what its grant asked
+/// halves the bound, whatever its settle changed, whichever window of the
+/// episode settles first, and only once an episode. Rows: at warning, a
+/// replica that normal pressure would let double its working size, memory
+/// having granted nothing above it; a deflation the window's settle repaid;
+/// an out-of-memory failure; a second replica granted after the paging began.
 #[test]
-fn at_warning_paging_our_batch_began_at_the_working_size_halves_the_bound() {
+fn paging_our_batch_began_at_what_its_grant_asked_halves_the_bound() {
     use mps::MemoryPressure::{Paging, Warning};
-    let (ledger, handle, admission) = ramped_mac_replica();
-    {
-        let mut state = ledger.lock();
-        let cal = state
-            .calibration
-            .get_mut(&("g/a".to_owned(), MPS_GPU.to_owned()))
-            .expect("calibrated");
-        cal.trial = None;
-        cal.room_cut = true;
+    type Setup = fn(&Arc<VramLedger>, &TelemetryHandle, &Admission);
+    let room_cut: Setup = |ledger, handle, admission| {
+        {
+            let mut state = ledger.lock();
+            let cal = state
+                .calibration
+                .get_mut(&("g/a".to_owned(), MPS_GPU.to_owned()))
+                .expect("calibrated");
+            cal.trial = None;
+            cal.room_cut = true;
+        }
+        assert_eq!(ramp_figures(ledger).3, 128, "twice the working size");
+        ledger.set_memory_pressure_for_test(Warning);
+        assert_eq!(ramp_window(handle, admission, &MINILM_M3_MAX), 64);
+        assert_eq!(window_that_began_paging(ledger, handle, admission), 64);
+    };
+    let deflated: Setup = |ledger, handle, admission| {
+        for entry in ledger.lock().workers.values_mut() {
+            entry.deflation = 1;
+            entry.clean_windows = 2;
+        }
+        assert_eq!(window_that_began_paging(ledger, handle, admission), 64);
+    };
+    let out_of_memory: Setup = |ledger, handle, admission| {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        ledger.set_paging_rise_for_test(ledger.pressure_read_at_for_test());
+        assert_eq!(token.grant().unit_budget, 128);
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement(128, 0, 1_380)]);
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Marker),
+        });
+    };
+    let two_replicas: Setup = |ledger, handle, admission| {
+        let late = loaded_mps(Some(MAC_TOTAL_MB));
+        let late_admission = ledger
+            .register_worker("g/a", item_cost(4), &late, None)
+            .expect("registers");
+        ledger.set_memory_pressure_for_test(Warning);
+        let early = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        ledger.set_paging_rise_for_test(ledger.pressure_read_at_for_test());
+        assert_eq!(early.grant().unit_budget, 64);
+        ledger.set_memory_pressure_for_test(Paging);
+        push_ram(&late, MAC_TOTAL_MB, 0, 180, 0);
+        let token = late_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        late.lock()
+            .unwrap()
+            .record_measurements(vec![measurement(8, 0, 180)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement(64, 0, 740)]);
+        early.finish(WindowOutcome::Responded { oom: None });
+        // Another window of the same episode, at the bound it had.
+        ledger.set_memory_pressure_for_test(Warning);
+        push_ram(handle, MAC_TOTAL_MB, 90_000, 740, 0);
+        assert_eq!(window_that_began_paging(ledger, handle, admission), 64);
+    };
+    for (setup, regrow_to, regrowth) in [
+        (room_cut, 32, [8, 16, 32, 32, 32]),
+        (deflated, 32, [8, 16, 32, 32, 32]),
+        (out_of_memory, 64, [8, 16, 32, 64, 64]),
+        (two_replicas, 32, [8, 16, 32, 32, 32]),
+    ] {
+        let (ledger, handle, admission) = ramped_mac_replica();
+        setup(&ledger, &handle, &admission);
+        paging_windows(&ledger, &handle, &admission, Paging, 1);
+        assert_eq!(
+            pressure_cap(&ledger).map(|cap| cap.regrow_to),
+            Some(regrow_to)
+        );
+        ledger.set_memory_pressure_for_test(Warning);
+        assert_eq!(ramp_windows(&handle, &admission, 5), regrowth);
     }
-    assert_eq!(ramp_figures(&ledger).3, 128, "twice the working size");
-    ledger.set_memory_pressure_for_test(Warning);
-    assert_eq!(ramp_window(&handle, &admission, &MINILM_M3_MAX), 64);
-    assert_eq!(window_that_began_paging(&ledger, &handle, &admission), 64);
-    paging_windows(&ledger, &handle, &admission, Paging, 1);
-    ledger.set_memory_pressure_for_test(Warning);
-    assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 32]);
 }
 
 /// The bound is at least one unit, or a batch already at one unit would be
@@ -2035,6 +2104,7 @@ fn the_bound_of_a_one_unit_batch_is_one_unit() {
             units: 1,
             regrow_to: 1,
             paging: true,
+            halved: false,
         })
     );
 }

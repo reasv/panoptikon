@@ -494,6 +494,7 @@ fn a_capped_replica_is_priced_at_the_capped_batch() {
                     units: 2,
                     regrow_to: 2,
                     paging: false,
+                    halved: false,
                 });
             }
         }
