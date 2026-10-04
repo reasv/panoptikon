@@ -1286,10 +1286,11 @@ impl GpuInventory {
     ///
     /// No request gives the default GPU; a full key or an index gives that
     /// row; on CUDA an unambiguous UUID prefix also resolves. Anything else is
-    /// `None` without a warning (`resolve_pin` already warned).
+    /// `None` without a warning (`resolve_pin` already warned). With no
+    /// visible GPU every request gives the default device, as in `resolve_pin`.
     pub fn resolve_device_key(&self, requested: Option<&str>) -> Option<String> {
         let gpus = &self.priced_gpus()?;
-        let Some(requested) = requested else {
+        let Some(requested) = requested.filter(|_| !self.no_visible_gpu) else {
             return Some(default_gpu(self.rankable(gpus))?.uuid.clone());
         };
         let trimmed = requested.trim();
@@ -1991,7 +1992,7 @@ mod tests {
             // also the calibration keyspace `/metadata` reports.
             let host = host.inventory.with_cpu(64 * 1024, cpu::MemRoots::default());
             assert_eq!(host.resolve_device_key(None).as_deref(), Some("CPU"));
-            assert_eq!(host.resolve_device_key(Some("0")), None);
+            assert_eq!(host.resolve_device_key(Some("0")).as_deref(), Some("CPU"));
             assert_eq!(host.default_gpu_name().as_deref(), Some("CPU (64 GB)"));
         }
 
@@ -2261,6 +2262,7 @@ mod tests {
             assert_eq!(host.resolve_pin(Some("0")), None, "{ambient:?}");
             let host = host.with_cpu(64 * 1024, cpu::MemRoots::default());
             assert_eq!(host.resolve_device_key(None).as_deref(), Some("CPU"));
+            assert_eq!(host.resolve_device_key(Some("0")).as_deref(), Some("CPU"));
         }
     }
 
@@ -2273,9 +2275,20 @@ mod tests {
             kfd_nodes: dir.path().join("absent"),
             ..rocm::SysfsRoots::default()
         };
-        let host = probe_rocm_at(&roots, [None; rocm::VISIBILITY_VARS.len()], true).inventory;
-        assert!(!host.no_visible_gpu);
-        assert_eq!(host.gpus(), None);
+        // (ambient, no visible GPU, the pin written for a `1` request)
+        let cases = [
+            ([None; rocm::VISIBILITY_VARS.len()], false, Some("1")),
+            ([None, Some(""), None, None], true, None),
+            ([None, Some("0"), None, None], false, None),
+        ];
+        for (ambient, no_visible_gpu, pin) in cases {
+            let host = probe_rocm_at(&roots, ambient, true).inventory;
+            assert_eq!(host.no_visible_gpu, no_visible_gpu, "{ambient:?}");
+            if !no_visible_gpu {
+                assert_eq!(host.gpus(), None, "{ambient:?}");
+            }
+            assert_eq!(host.resolve_pin(Some("1")).as_deref(), pin, "{ambient:?}");
+        }
     }
 
     /// Workers run on the CPU where models are placed on the CPU device, and
