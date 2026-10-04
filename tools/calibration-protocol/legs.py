@@ -696,7 +696,10 @@ class FdRecorder(threading.Thread):
     def stop(self) -> None:
         self._stopped.set()
         # Joined, so no sample lands in the file after the gateway is gone.
-        self.join(timeout=2)
+        try:
+            self.join(timeout=2)
+        except RuntimeError:
+            pass  # never started: nothing to join
 
 
 # --- small helpers ---------------------------------------------------------
@@ -2368,14 +2371,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         stopped = leg.supervisor.stop_all()
         leg.mark("processes_stopped", **stopped)
         leg.copy_log()
-
-    plan["outcome"] = outcome
-    plan["events"] = leg.events
-    plan["processes"] = {child.name: {"pid": child.pid,
-                                      "returncode": child.popen.returncode}
-                         for child in leg.supervisor.children}
-    leg.path("legs.json").write_text(json.dumps(plan, indent=1),
-                                     encoding="utf-8")
+        plan["outcome"] = outcome
+        plan["events"] = leg.events
+        plan["processes"] = {child.name: {"pid": child.pid,
+                                          "returncode": child.popen.returncode}
+                             for child in leg.supervisor.children}
+        leg.path("legs.json").write_text(json.dumps(plan, indent=1),
+                                         encoding="utf-8")
     print(f"\nDONE {directory}  outcome={outcome}")
     print("analyze with:\n  " + " ".join(leg.analyze_command()))
     return 0 if outcome == "drained" else 1

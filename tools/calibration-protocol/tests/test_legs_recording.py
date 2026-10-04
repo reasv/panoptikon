@@ -205,7 +205,8 @@ sys.exit(legs.main(sys.argv[3:]))
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX signal")
 @pytest.mark.parametrize("first, split", [("SIGTERM", False),
-                                          ("SIGHUP", True)])
+                                          ("SIGHUP", True),
+                                          ("SIGINT", False)])
 def test_a_stop_signal_tears_the_leg_down_and_records_it(tmp_path, first,
                                                          split):
     """With stdout gone (a hung-up terminal), and a second signal during the
@@ -225,7 +226,10 @@ def test_a_stop_signal_tears_the_leg_down_and_records_it(tmp_path, first,
     if split:
         argv += ["--inference-url", REMOTE]
     with (tmp_path / "err.log").open("wb") as err:
-        leg = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=err)
+        # A shell's background job inherits SIGINT ignored.
+        leg = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=err,
+            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
     try:
         for line in leg.stdout:
             if b"gateway_started" in line:
@@ -236,10 +240,11 @@ def test_a_stop_signal_tears_the_leg_down_and_records_it(tmp_path, first,
         leg.send_signal(getattr(signal, first))
         assert legs.wait_for((tmp_path / "teardown").exists, 30.0,
                              interval=0.1)
-        leg.send_signal(signal.SIGTERM)
+        leg.send_signal(signal.SIGINT)
         leg.wait(timeout=30)
     finally:
         leg.kill()
+        leg.wait(timeout=5)
     recorded = json.loads((tmp_path / "run" / "S14" / "legs.json").read_text())
     assert recorded["outcome"] == "interrupted"
     assert {"event": "interrupted", "signal": first}.items() <= next(

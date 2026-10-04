@@ -66,6 +66,8 @@ def test_start_stop_joins_without_raising(tmp_path):
     deadline.wait(0.2)
     recorder.stop()
     assert not recorder.is_alive()
+    # A signal can land between construction and start().
+    _recorder(tmp_path).stop()
 
 
 def test_stop_after_run_finished_still_joins(tmp_path):
