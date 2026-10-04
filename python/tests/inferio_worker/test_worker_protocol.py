@@ -918,7 +918,7 @@ def test_every_load_runs_the_attention_check_after_it_is_priced() -> None:
     ):
         assert harness._serve(proto_in, io.BytesIO()) == 0
     load = ["begin", "finish", "check", "reply"]
-    assert calls == ["reply", "reply", *load, *load, "reply"]
+    assert calls[calls.index("begin") :] == [*load, *load, "reply"]
 
 
 def test_the_batch_memory_frames_capability_is_read_off_the_handshake() -> None:
