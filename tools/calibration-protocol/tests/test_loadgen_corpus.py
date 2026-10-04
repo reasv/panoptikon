@@ -13,6 +13,8 @@ Run with the managed interpreter:
 from __future__ import annotations
 
 import argparse
+import email
+import email.policy
 import importlib.util
 import json
 import shutil
@@ -61,8 +63,9 @@ def test_a_copied_corpus_is_read_from_the_copy(tmp_path):
     spec = loadgen.ModelSpec(f"id=g/m,mode=file,corpus={copy}", DEFAULTS)
     body, _, _ = loadgen.build_request(spec, spec.pool[:1])
     assert b"\xff\xd8 page" in body and b"the original" not in body
-    items, _ = probe.load_items(str(copy), None, "image")
-    assert items[0]["abspath"] == str(copy / "img" / "a.jpg")
+    items, root = probe.load_items(str(copy), None, "image")
+    assert (items[0]["abspath"], root) == (str(copy / "img" / "a.jpg"),
+                                           str(copy))
 
     # A manifest written apart from its files still finds them by its root.
     apart = tmp_path / "elsewhere" / "manifest.json"
@@ -76,8 +79,14 @@ def test_mode_text_sends_only_the_text_items(tmp_path):
     manifest = _corpus(tmp_path)
     spec = loadgen.ModelSpec(f"id=g/m,mode=text,corpus={manifest}", DEFAULTS)
     assert [item["id"] for item in spec.pool] == ["note"]
-    body, _, meta = loadgen.build_request(spec, spec.pool)
-    assert b'{"text": "words"}' in body and meta["item_ids"] == ["note"]
-    with pytest.raises(SystemExit, match="mode=text and kind=image"):
+    body, content_type, meta = loadgen.build_request(spec, spec.pool)
+    message = email.message_from_bytes(
+        f"Content-Type: {content_type}\r\n\r\n".encode() + body,
+        policy=email.policy.HTTP)
+    (data,) = message.iter_parts()
+    assert data.get_param("name", header="content-disposition") == "data"
+    assert json.loads(data.get_content())["inputs"] == [{"text": "words"}]
+    assert meta["item_ids"] == ["note"]
+    with pytest.raises(SystemExit):
         loadgen.ModelSpec(f"id=g/m,mode=text,kind=image,corpus={manifest}",
                           DEFAULTS)

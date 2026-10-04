@@ -642,6 +642,7 @@ def read_manifest(path: Path) -> Dict[str, Any]:
         root = Path(manifest.get("root") or root)
     for item in items:
         item["abspath"] = str(root / item["path"])
+    manifest["root"] = str(root)
     return manifest
 
 
