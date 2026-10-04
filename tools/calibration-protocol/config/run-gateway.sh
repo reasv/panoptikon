@@ -14,9 +14,12 @@
 #               The server config and env file are generated into it first
 #               (`legs.py --write-config`; the table is legs.py's CONFIGS).
 #               Their paths follow this checkout; CALIB_REPO=<checkout>
-#               points them at another one (legs.py --repo), and
+#               points them at another one (legs.py --repo),
 #               CALIB_WORKER_PYTHON=<python> names the worker's interpreter
-#               (legs.py --python).
+#               (legs.py --python), CALIB_PORT=<port> moves every listener
+#               so the gateway binds <port> (legs.py --port), and
+#               CALIB_INFERENCE_URL=<url> forwards inference to a server on
+#               another host (legs.py --inference-url).
 #
 # Runs in the FOREGROUND on purpose: the caller decides whether to background
 # it, and the console copy of the log is what gets tailed. Stop it with
@@ -32,7 +35,7 @@
 # R1 6402/6403/6399, R2 6412/6413/6409, R3 6422/6423/6419, R7 6432/6433/6429.
 set -euo pipefail
 
-usage() { sed -n '2,32p' "$0"; exit "${1:-2}"; }
+usage() { sed -n '2,35p' "$0"; exit "${1:-2}"; }
 
 ID="${1:-}"; ROOT="${2:-}"
 [ -n "$ID" ] && [ -n "$ROOT" ] || usage
@@ -45,7 +48,10 @@ ROOT="$(cd "$ROOT" && pwd)"
 CONFIG="$("${CALIB_PYTHON:-python3}" "$HERE/../legs.py" --config "$ID" \
   ${CALIB_REPO:+--repo "$CALIB_REPO"} \
   $([ "${CALIB_LOAD_DOTENV:-1}" = "1" ] || echo --no-dotenv) \
-  ${CALIB_WORKER_PYTHON:+--python "$CALIB_WORKER_PYTHON"} --write-config "$ROOT")"
+  ${CALIB_WORKER_PYTHON:+--python "$CALIB_WORKER_PYTHON"} \
+  ${CALIB_PORT:+--port "$CALIB_PORT"} \
+  ${CALIB_INFERENCE_URL:+--inference-url "$CALIB_INFERENCE_URL"} \
+  --write-config "$ROOT")"
 ENVFILE="$ROOT/env.$ID"
 
 # env.<ID> carries RUST_LOG, INFERIO_WORKER_LOG_LEVEL, any

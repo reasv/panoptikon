@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import threading
+import tomllib
 import types
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -100,3 +103,72 @@ def test_a_hog_event_that_asks_for_nothing_is_marked_and_skips_hog_tracking(
                       "--json", str(tmp_path / "v.json"), "--quiet"])
         (result,) = json.loads((tmp_path / "v.json").read_text())["verdicts"]
         assert result["verdict"] == verdict
+
+
+REMOTE = "http://10.0.0.5:7777"
+
+
+def test_a_split_gateway_forwards_inference_and_both_sides_are_polled(
+        tmp_path):
+    """`--inference-url` replaces the config's inference servers and turns
+    local inference off, in the leg's copy and in `--write-config`'s; the
+    server's own /health is polled beside the gateway's."""
+    config = tmp_path / "server-X.toml"
+    config.write_text('[server]\nport = 16342\n\n[inference_local]\n'
+                      'enabled = true\n\n[[upstreams.inference]]\n'
+                      'base_url = "http://old:1"\nweight = 2.0\n\n'
+                      '[search]\ncache_size_mb = 1\n', encoding="utf-8")
+    document = tomllib.loads(legs.leg_config(config.read_text(), None, None,
+                                             REMOTE))
+    assert document["inference_local"]["enabled"] is False
+    assert document["upstreams"]["inference"] == [{"base_url": REMOTE}]
+    assert document["search"] == {"cache_size_mb": 1}
+
+    out = tmp_path / "out"
+    assert legs.main(["--config", "C1", "--repo", str(HERE.parents[1]),
+                      "--no-dotenv", "--python", "/opt/venv/bin/python",
+                      "--inference-url", REMOTE, "--write-config",
+                      str(out)]) == 0
+    written = tomllib.loads((out / "server-C1.toml").read_text())
+    assert written["upstreams"]["inference"] == [{"base_url": REMOTE}]
+    assert written["inference_local"]["enabled"] is False
+
+    plan = json.loads(subprocess.run(
+        [sys.executable, str(HERE / "legs.py"), "--scenario", "S14",
+         "--config", str(config), "--inference-url", REMOTE + "/",
+         "--no-dotenv", "--dry-run"],
+        capture_output=True, text=True, check=True).stdout)
+    assert plan["health_urls"] == {"healthrec": "http://127.0.0.1:16342",
+                                   "healthrec-remote": REMOTE}
+
+
+def test_healthrec_keeps_the_clients_of_a_gateway_that_answered_504():
+    """The gateway's 504 for a frozen inference server names its clients and
+    when it declared the server frozen; the sample keeps both."""
+    healthrec = _load("healthrec")
+    clients = [{"base_url": REMOTE, "transport": "h2c",
+                "frozen_since": "2026-10-04T10:00:00Z"}]
+    body = json.dumps({"detail": "frozen", "inference_clients": clients})
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(504)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/api/inference/health"
+        result = healthrec.fetch(url, 5.0)
+    finally:
+        server.shutdown()
+    health = healthrec.flatten_health(result, full=False)
+    assert (health["ok"], health["status_code"]) == (False, 504)
+    assert health["inference_clients"] == clients
+    assert health["detail"] == "frozen"
+    assert "running" not in healthrec.flatten_queue(result)

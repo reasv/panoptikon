@@ -99,7 +99,7 @@ per-platform checks.
 legs.py --scenario S2 --bin PATH --config C1 --results DIR
         [--run-id ID] [--gpu-total-mb 24564] [--python PATH]
         [--model ID] [--models a,b,c] [--scan-audio] [--corpus DIR]
-        [--note "..."] [--port N]
+        [--note "..."] [--port N] [--inference-url URL]
         [--legacy-port 6339] [--seed-calibration FILE] [--job-cap S]
         [--settle S] [--hog-device N] [--hog-port N] [--min-free-mb 1024]
         [--health-full] [--repo DIR] [--no-dotenv] [--list] [--dry-run]
@@ -138,6 +138,14 @@ endpoint with `restricted_demo`). A listener that answers anything else, or
 does not answer at all, writes an `endpoint_assertion_failed` event and the
 per-endpoint rows land in `smoke.json` under `endpoints`. `--legacy-port`
 still adds a port the config does not declare.
+
+**A split gateway.** `--inference-url URL` turns `[inference_local]` off in
+the leg's copy of the config and makes `URL` its one `[[upstreams.inference]]`
+server. `healthrec.jsonl` then holds the server's report as the gateway
+forwards it, with the gateway's own `inference_clients`; a second healthrec
+polls the server directly into `healthrec-remote.jsonl`. A 504 from the
+gateway (a server it declared frozen) keeps its `inference_clients` and
+`detail`. Recorders on the server's host are started there by hand.
 
 **S3's second job runs on its own database** (`cal2`). Re-creating `cal`
 does not empty it, so the first job's extractions are still there and the

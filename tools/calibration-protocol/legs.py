@@ -15,7 +15,7 @@ Usage
     legs.py --scenario S2 --bin PATH --config C1 --results DIR \\
             [--run-id ID] [--gpu-total-mb 24564] [--python PATH] \\
             [--model ID] [--models a,b,c] [--scan-audio] [--corpus DIR] \\
-            [--note "..."] [--port N] \\
+            [--note "..."] [--port N] [--inference-url URL] \\
             [--seed-calibration FILE] [--job-cap S] [--settle S] \\
             [--hog-device N] [--hog-target gpu|mps|ram] [--min-free-mb 1024] \\
             [--list] [--dry-run]
@@ -1674,6 +1674,37 @@ def repin_ports(text: str, offset: int) -> str:
     return "\n".join(out) + "\n"
 
 
+def remote_inference(text: str, url: str) -> str:
+    """`url` as the config's one `[[upstreams.inference]]` server, with
+    `[inference_local]` off: the gateway forwards every inference request
+    there."""
+    out: List[str] = []
+    section = ""
+    for line in text.splitlines():
+        header = _TOML_SECTION.match(line)
+        if header:
+            section = header.group(1).strip().strip("[]")
+        if section != "upstreams.inference":
+            out.append(line)
+    text = set_toml_key("\n".join(out) + "\n", "inference_local", "enabled",
+                        "false")
+    return text + f"\n[[upstreams.inference]]\nbase_url = {json.dumps(url)}\n"
+
+
+def leg_config(text: str, python: Optional[str], port: Optional[int],
+               inference_url: Optional[str]) -> str:
+    """The config the gateway runs: `python` as the worker's interpreter,
+    every listener moved so the gateway binds `port`, and `inference_url` as
+    its inference server. `--write-config` writes the same text."""
+    if python:
+        text = repin_inference_python(text, python)
+    if port:
+        text = repin_ports(text, port - (config_port(text) or 6342))
+    if inference_url:
+        text = remote_inference(text, inference_url)
+    return text
+
+
 def config_inference_python(text: str) -> Optional[str]:
     """`[inference_local] python`, or None when the config leaves it to the
     gateway's own managed venv."""
@@ -1799,6 +1830,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="gateway port: every listener the config "
                              "declares moves with it, in the per-leg copy "
                              "(default: read from the config)")
+    parser.add_argument("--inference-url", default=None,
+                        help="an inference server on another host: the "
+                             "gateway forwards inference to it instead of "
+                             "running its own, and a second healthrec polls "
+                             "its /health into healthrec-remote.jsonl")
     parser.add_argument("--legacy-port", type=int, default=None,
                         help="an extra listener to probe on top of the ones "
                              "the config declares (S14 probes every "
@@ -1867,8 +1903,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         text, name, variables, _ = resolve_config(args, dict(os.environ),
                                                   explicit_python)
         refuse_inherited_visibility(text, variables, env)
-        if explicit_python:
-            text = repin_inference_python(text, explicit_python)
+        text = leg_config(text, explicit_python, args.port, args.inference_url)
         out = Path(args.write_config)
         out.mkdir(parents=True, exist_ok=True)
         stem = Path(name).stem.replace("server-", "")
@@ -1897,11 +1932,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     env.update(config_vars)
     env.setdefault("RUST_LOG", "info,panoptikon::inferio=trace")
     env.setdefault("INFERIO_WORKER_LOG_LEVEL", "DEBUG")
-    declared_port = config_port(original) or 6342
-    port = args.port or declared_port
-    # `--port` has to reach the gateway's own listeners, not only the probe.
-    port_offset = port - declared_port
+    port = args.port or config_port(original) or 6342
     base = f"http://127.0.0.1:{port}"
+    health_urls = {"healthrec": base}
+    if args.inference_url:
+        # The server's own report: the gateway answers 504 for a server it
+        # declared frozen.
+        health_urls["healthrec-remote"] = args.inference_url.rstrip("/")
     # `--models` beats the scenario's own chain, which beats a single model.
     models = ([m.strip() for m in args.models.split(",") if m.strip()]
               if args.models else
@@ -1957,14 +1994,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # config's own `[inference_local] python`.
     inference_python = config_inference_python(original)
     python_source = "config" if inference_python else "the gateway's managed venv"
-    text = original
     if explicit_python:
         inference_python, python_source = explicit_python, "--python"
-        text = repin_inference_python(text, explicit_python)
-    if port_offset:
-        text = repin_ports(text, port_offset)
+    text = leg_config(original, explicit_python, args.port, args.inference_url)
     # A generated config is always written; a config given by path is used in
-    # place unless `--python` or `--port` changed it.
+    # place unless `--python`, `--port` or `--inference-url` changed it.
     gateway_config = Path(config_name)
     if text != original or not gateway_config.is_absolute():
         gateway_config = directory / gateway_config.name
@@ -1996,6 +2030,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "dotenv": (None if args.no_dotenv
                    else str(dotenv) if dotenv.is_file() else None),
         "base_url": base,
+        "inference_url": args.inference_url,
+        "health_urls": health_urls,
         "bound_ports": {"gateway": port,
                         **{row["name"]: row["port"] for row in leg.endpoints}},
         "legacy_port": args.legacy_port,
@@ -2124,15 +2160,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 leg.mark("hog_state_unreadable", error=str(exc))
 
         # 3. the gateway's own view, then the gateway
-        health_argv = [args.python, str(HERE / "healthrec.py"), "--base", base,
-                       "--out", str(leg.path("healthrec.jsonl")), "--interval",
-                       str(leg.scenario.health_interval
-                           if args.health_interval is None
-                           else args.health_interval), "--quiet"]
-        if args.health_full:
-            health_argv.append("--full")
-        leg.supervisor.start("healthrec", health_argv)
-        leg.mark("healthrec_started")
+        for name, url in health_urls.items():
+            health_argv = [
+                args.python, str(HERE / "healthrec.py"), "--base", url,
+                "--out", str(leg.path(f"{name}.jsonl")), "--interval",
+                str(leg.scenario.health_interval if args.health_interval is None
+                    else args.health_interval), "--quiet"]
+            if url != base:
+                health_argv.append("--no-queue")
+            if args.health_full:
+                health_argv.append("--full")
+            leg.supervisor.start(name, health_argv)
+            leg.mark(f"{name}_started")
         leg.wait_for_recorders()
 
         gateway = leg.start_gateway()
