@@ -644,10 +644,10 @@ def test_a_sample_older_than_twice_the_recorder_interval_is_not_joined():
     judged, one 0.6 s after it is not, unless `--join-tolerance` says
     otherwise. A single sample: twice the header's interval. A health sample
     is joined to an oracle sample the same way."""
-    def judge(vramrec, grants, tolerance=None):
+    def judge(vramrec, grants, tolerance=None, log=()):
         result = analyze.check_grant_safety(analyze.Context(
             args=_args(join_tolerance=tolerance), vramrec=vramrec, healthrec=[],
-            hog=[], log=[_room_grant(t, 15000, 15000) for t in grants],
+            hog=[], log=[*log, *(_room_grant(t, 15000, 15000) for t in grants)],
             before=None, after=None, jobs=None, probes=[]))
         return result.verdict, result.numbers["undecided"]
     samples = [_timed(t, 10000) for t in (97.0, 98.0, 98.25, 98.5, 98.6)]
@@ -655,6 +655,11 @@ def test_a_sample_older_than_twice_the_recorder_interval_is_not_joined():
     assert judge(samples, (98.9, 99.2), 1.5) == ("FAIL", 0)
     lone = [{"kind": "header", "interval_s": 0.25}, _timed(99.0, 10000)]
     assert judge(lone, (99.45, 99.55)) == ("FAIL", 1)
+    # 901's release 1.2 s after the grant is too late to have covered it.
+    workers = [_worker_sample(t, {900: 10000, 901: 6000}, 10000)
+               for t in (99.0, 99.25, 99.5, 99.75)]
+    assert judge(workers + [_worker_sample(101.0, {900: 10000, 901: 500}, 15500)],
+                 (99.8,), log=[_spawn(900, MODEL)]) == ("FAIL", 0)
     rows = [_row(t, 20, {}) for t in (100.0, 100.25, 100.5)]
     for t_wall, joined in ((100.9, 1), (101.1, 0)):
         verdict = _agreement(rows, [_ledger(t_wall, 20)], join_tolerance=None)
@@ -709,6 +714,7 @@ def test_grant_safety_without_a_spawn_line_tries_each_possible_requester():
                                  in verdict.numbers["covered_without_spawn_line"]]
     assert judge([], {900: 10000, 901: 500}) == ("WARN", [MODEL])
     assert judge([], {900: 10000, 901: 4000}) == ("FAIL", [])
+    assert judge([], {900: 12000, 901: 500}) == ("WARN", [MODEL])
     assert judge([_spawn(950, MODEL)], {900: 10000, 901: 500}) == ("WARN", [MODEL])
     # 901 grows 4000 MiB while another process frees 6000.
     assert judge([], {900: 10000, 901: 10000}, 2000) == ("WARN", [MODEL])
@@ -746,10 +752,12 @@ def test_oracle_agreement_skips_the_samples_while_no_job_ran():
         {"event": "job_end", "iso": "1970-01-01T00:01:40.5Z", "outcome": "drained"},
         {"event": "job_start", "iso": "1970-01-01T00:01:42Z"},
         {"event": "job_end", "iso": "1970-01-01T00:01:43Z", "outcome": "cap_exceeded"},
+        {"event": "hog_stop_requested", "iso": "1970-01-01T00:01:43.25Z"},
         {"event": "job_start", "iso": "1970-01-01T00:01:43.5Z"},
         {"event": "job_end", "iso": "1970-01-01T00:01:44Z", "outcome": "drained"},
         {"event": "hog_stop_requested", "iso": "1970-01-01T00:01:45Z"}]}
-    assert analyze._idle_spans(legs) == [(100.5, 102.0), (104.0, math.inf)]
+    assert analyze._idle_spans(legs) == [(100.5, 102.0), (103.25, 103.5),
+                                         (104.0, math.inf)]
     procs = [_proc(900, 1000, "inferio-worker")]
     stale = {**_health_sample(14000), "t_wall": 101.0}
     ctx = _context(vramrec=[_vram_sample(procs, used_mb=1000)],
@@ -802,10 +810,11 @@ def _died(t_wall, model):
 
 def test_oracle_agreement_release_window_lasts_the_lag_or_the_drain():
     """A release window opens at the oracle sample before a process's figure
-    falls, or at the logged death of one of our workers. It lasts 40 ms per
-    GiB freed, or longer until `used` is back within the allowance of its
-    level before, but at most 2 s past that bound. A ledger figure read, or
-    an oracle sample taken, in it is skipped; one past it is judged."""
+    falls, or at a death logged for one of our workers' model at most 10 s
+    before its PID leaves. It lasts 40 ms per GiB freed, or longer until
+    `used` is back within the allowance of its level before, but at most 2 s
+    past that bound. A ledger figure read, or an oracle sample taken, in it
+    is skipped; one past it is judged."""
     vramrec = _recording([
         (100.0, 12020, {900: 12000}),
         (100.25, 1020, {900: 1000}),  # 11000 MiB freed, `used` at once
@@ -830,11 +839,35 @@ def test_oracle_agreement_release_window_lasts_the_lag_or_the_drain():
     for extra in (_ledger(112.75, 3520), _ledger(113.0, 2920), _ledger(123.0, 1420)):
         assert _agreement(vramrec, healthrec + [extra]).verdict == "FAIL"
 
-    # The worker's PID and `used` leave together, after its death line.
-    dying = _recording([(101.0, 6020, {900: 6000}), (102.0, 20, {})], 102.0)
-    for log, expected in (([_spawn(900, MODEL), _died(100.5, MODEL)], "SKIP"),
-                          ([_spawn(900, MODEL)], "FAIL")):
-        assert _agreement(dying, [_ledger(100.75, 6020)], log=log).verdict == expected
+    # 900's PID and `used` leave together, after its death line. 901, spawned
+    # before the death and configured after it, leaves 30 s later; 950 is a
+    # respawn. On amdgpu the PID leaves first and the death line comes later.
+    dying = _recording([(101.0, 12020, {900: 6000, 901: 6000}),
+                        (131.0, 6020, {901: 6000}), (132.0, 20, {})], 132.0)
+    died = [_spawn(900, MODEL), _died(100.5, MODEL)]
+    spare = [{**_spawn(901, None), "t_wall": 95.0, "fields": {"pid": 901, "worker": "v"}},
+             {**_spawn(901, None), "t_wall": 101.0, "message": f"Configured as {MODEL}",
+              "fields": {"worker": "v"}}]
+    respawn = [{**_spawn(950, MODEL), "t_wall": 101.5}]
+    amdgpu = _recording([(100.0, 6020, {900: 6000}), (100.25, 6020, {}),
+                         (101.0, 20, {})], 101.0)
+    # `used` lags 900's fall by a row; 901's release never leaves `used`.
+    lagging = _recording([(99.75, 12020, {900: 12000}), (100.0, 12020, {900: 1000}),
+                          (100.25, 1020, {900: 1000})], 100.25, start=99.75)
+    stuck = _recording([(100.0, 7020, {900: 1000, 901: 6000}),
+                        (103.0, 7020, {900: 1000})], 103.0)
+    for vramrec, log, ledger, expected in (
+            (dying, died, _ledger(100.75, 6020), "SKIP"),
+            (dying, died[:1], _ledger(100.75, 6020), "FAIL"),
+            (dying, died + spare, _ledger(100.75, 6020), "SKIP"),
+            (dying, died + spare, _ledger(130.0, 6020), "FAIL"),
+            (dying, died + respawn, _ledger(100.75, 6020), "SKIP"),
+            (amdgpu, [_spawn(900, MODEL), _died(100.6, MODEL)], _ledger(100.25, 20),
+             "SKIP"),
+            (lagging, [], _ledger(100.0, 20, age_ms=500), "SKIP"),
+            (stuck, [], _ledger(101.5, 20), "SKIP"),
+            (stuck, [], _ledger(102.75, 20), "FAIL")):
+        assert _agreement(vramrec, [ledger], log=log).verdict == expected
 
 
 def test_oracle_agreement_counts_another_process_window_when_it_meets_the_span():
@@ -900,6 +933,10 @@ def test_oracle_agreement_skips_samples_while_the_hog_moved():
                  (99.0, 99.5, 100.0, 101.5)) == ("SKIP", 1, 0, 0)
     assert judge(_ledger(101.5, 20, age_ms=15000), lambda t: 8192 if t >= 89.5 else 0,
                  (86.0, 89.5, 95.0, 100.0, 101.0, 102.0))[0] == "FAIL"
+    # Up and back between the two readings, in no oracle sample.
+    flat = [_row(t, 20, {}) for t in (100.0, 102.0)]
+    assert judge(_ledger(102.0, 1544, age_ms=2000), lambda t: 2048 if t == 101.0 else 0,
+                 vramrec=flat)[0] == "FAIL"
 
     step = lambda t: 512 if t >= 100.5 else 0
     missed = _ledger(101.0, 1832, age_ms=1000)  # 1300 MiB over the oracle

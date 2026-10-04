@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import importlib.util
+import itertools
 import json
 import math
 import re
@@ -249,14 +250,16 @@ class Context:
         self.worker_spawns = _worker_spawns(self.log)
         self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
         self._pid_first_seen: Optional[Dict[int, float]] = None
-        self._release_windows: Dict[str, List[Tuple[float, float, int, int]]] = {}
-        # Each worker PID whose death the log names, to the time of that line.
-        self.death_t: Dict[int, float] = {}
+        self._release_windows: Dict[str, Tuple[List[Tuple[float, float, int, int]],
+                                               List[float], List[float]]] = {}
+        # Each worker PID spawned before a death line for its model, to the
+        # times of those lines.
+        self.death_t: Dict[int, List[float]] = {}
         for event in self.log_matching("worker died fatally"):
-            spawn = event["t_wall"] is not None and self.replica_spawn(
-                str(event["fields"].get("model")), event["t_wall"])
-            if spawn:
-                self.death_t[spawn["pid"]] = event["t_wall"]
+            for spawn in self.worker_spawns:
+                if (event["t_wall"] is not None and spawn["t_wall"] <= event["t_wall"]
+                        and spawn["model"] == str(event["fields"].get("model"))):
+                    self.death_t.setdefault(spawn["pid"], []).append(event["t_wall"])
         self.vram_tolerance = self._join_tolerance(self._vram_times, self.vramrec)
         self.hog_tolerance = self._join_tolerance(self._hog_times, self.hog)
 
@@ -299,8 +302,7 @@ class Context:
         process's release window meeting `[start, end]`, or one of our workers'
         holding one of `readings`. The README's oracle_agreement row says how
         long a window lasts."""
-        windows = self._release_windows.get(uuid)
-        if windows is None:
+        if uuid not in self._release_windows:
             rows = [(sample["t_wall"], gpu) for sample in self.vram_samples
                     for gpu in [self.oracle_gpu(sample, uuid)]
                     if gpu is not None and gpu.get("used_mb") is not None
@@ -320,34 +322,43 @@ class Context:
                     if self.is_ours(proc):
                         ours += int(held) - int(later)
                         if proc["pid"] not in now:
-                            opened = min(opened, self.death_t.get(proc["pid"], opened))
+                            opened = min([opened] + [
+                                died for died in self.death_t.get(proc["pid"], [])
+                                if died >= t_shown - WORKER_TEARDOWN_MAX_S])
                     else:
                         others += int(held) - int(later)
                 if ours + others <= 0:
                     continue
                 end_t = t_shown + (ours + others) / 1024 * RELEASE_LAG_S_PER_GIB
                 level = unattributed[index - 1] + allowance_mb(shown.get("total_mb"))
-                drained = next((rows[later][0] for later in range(index, len(rows))
-                                if unattributed[later] <= level), None)
-                closed = end_t if drained is None else max(
-                    end_t, min(drained, end_t + RELEASE_DRAIN_MAX_S))
-                windows.append((opened, closed, ours, others))
-            self._release_windows[uuid] = windows
+                cap = end_t + RELEASE_DRAIN_MAX_S
+                drained = next((rows[later][0] for later in itertools.takewhile(
+                    lambda later: rows[later][0] < cap, range(index, len(rows)))
+                    if unattributed[later] <= level), cap)
+                windows.append((opened, max(end_t, drained), ours, others))
+            # Sorted by opening, with the latest close up to each window.
+            windows.sort()
+            self._release_windows[uuid] = (
+                windows, [window[0] for window in windows],
+                list(itertools.accumulate((window[1] for window in windows), max)))
+        windows, opens, reach = self._release_windows[uuid]
+        windows = windows[bisect.bisect_left(reach, min(start, *readings)):
+                          bisect.bisect_left(opens, max(end, *readings))]
         return sum(others for opened, closed, _, others in windows
                    if opened < end and closed >= start) + sum(
             ours for opened, closed, ours, _ in windows
             if any(opened < t <= closed for t in readings))
 
-    def hog_moved_mb(self, uuid: str, start: float, end: float) -> int:
-        """How far what hog.py held on this GPU moved over `[start, end]`,
-        counting the first row after `end`: a fill writes its row when done."""
+    def hog_moved_mb(self, uuid: str, readings: Tuple[float, float]) -> int:
+        """How far what hog.py held on this GPU may have changed between the
+        two reading times, each bounded by the hog rows either side of it."""
         header = next((row for row in self.hog if row.get("kind") == "header"), {})
         if header.get("target", "gpu") != "gpu" or header.get("gpu_uuid") != uuid:
             return 0
-        first = max(0, bisect.bisect_left(self._hog_times, start) - 1)
-        last = bisect.bisect_right(self._hog_times, end) + 1
-        held = [row.get("held_mb") or 0 for row in self.hog_samples[first:last]]
-        return max(held) - min(held) if held else 0
+        first, second = ([row.get("held_mb") or 0 for row in self.hog_samples[
+            max(0, bisect.bisect_left(self._hog_times, t) - 1):
+            bisect.bisect_right(self._hog_times, t) + 1]] for t in readings)
+        return max((abs(a - b) for a in first for b in second), default=0)
 
     def oracle_gpu(self, sample: Dict[str, Any], uuid: str) -> Optional[Dict[str, Any]]:
         for gpu in sample.get("gpus", []):
@@ -638,7 +649,9 @@ def allowance_mb(total_mb: Any) -> float:
 RELEASE_LAG_S_PER_GIB = 0.040
 #: How long past that bound `used` may still be draining.
 RELEASE_DRAIN_MAX_S = 2.0
-#: The ledger refreshes a free reading older than this at its next batch or load.
+#: How long a dead worker's PID may stay listed after its death line.
+WORKER_TEARDOWN_MAX_S = 10.0
+#: The ledger's `EXTERNAL_SAMPLE_MAX_AGE`: it refreshes an older reading at a batch or load.
 LEDGER_READ_MAX_AGE_S = 10.0
 
 # How long a hog must hold, and how much, before `external_mb` not moving at
@@ -856,14 +869,14 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             last = max(sample["t_wall"], vram["t_wall"])
             released = ctx.released_mb(uuid, min(read_t, first), last,
                                        (vram["t_wall"], read_t))
-            moved = ctx.hog_moved_mb(uuid, min(read_t, first), last)
+            moved = ctx.hog_moved_mb(uuid, (read_t, vram["t_wall"]))
             if max(released, moved) > allowance:
                 if released > allowance:
                     releasing += 1
                 else:
                     hog_moving += 1
                 if max(ctx.released_mb(uuid, first, last, (vram["t_wall"], first)),
-                       ctx.hog_moved_mb(uuid, first, last)) <= allowance:
+                       ctx.hog_moved_mb(uuid, (first, last))) <= allowance:
                     read_age += 1
                     read_age_worst = max(read_age_worst, raw)
                 continue
