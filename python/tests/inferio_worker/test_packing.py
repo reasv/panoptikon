@@ -2545,14 +2545,45 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
     assert clamps(payload["measurements"]) == [(1, (8, 2)), (2, (8, 4))]
     assert "reason" not in payload["measurements"][1]["clamped"]
 
+    # Items of different sizes: the one clamp runs from the smallest batch
+    # that failed to the largest that ran at the halved size.
+    impl = Raising(lambda inputs: sum(item.data for item in inputs) > 30000)
+    mixed = [
+        PredictionInput(data=100 * width, file=png_bytes(width, 100))
+        for width in [1] * 4 + [120] * 4
+    ]
+    payload = packing.run_window(
+        impl, mixed, grant(unit_budget=48400, unit="pixel", aggregation="sum")
+    )
+    assert impl.batches == [8, 4, 4, 2, 2]
+    assert clamps(payload["measurements"]) == [(1, (48000, 24000))]
+
+    # A batch the impl's own OOM halving touched did not run at the size.
+    def fails_then_halves(inputs):
+        if len(impl.batches) == 2:
+            fake_oom_retry.record(4, halvings=1)
+        return len(inputs) > 4
+
+    impl = Raising(fails_then_halves)
+    payload = packing.run_window(impl, items(8), grant(unit_budget=8))
+    halved = payload["measurements"][1]
+    assert halved["oom"] is True and "clamped" not in halved
+    assert clamps(payload["measurements"]) == [(2, (8, 4))]
+
     def fails_on_item_5(inputs):
         return any(item.data == 5 for item in inputs)
 
-    impl = Raising(fails_on_item_5)
+    def frees_then_fails_on_item_5(inputs):
+        fake_torch.free = (250 if len(inputs) > 4 else 8000) * MIB
+        return fails_on_item_5(inputs)
+
+    impl = Raising(frees_then_fails_on_item_5)
     with pytest.raises(packing.WindowFailure) as caught:
         packing.run_window(impl, items(8), grant(unit_budget=8))
-    assert impl.batches == [8, 4, 4, 2, 1, 1]
-    assert clamps(caught.value.measurements) == []
+    assert impl.batches == [8, 2, 4, 2, 2, 1, 1]
+    memory_clamp = caught.value.measurements[1]["clamped"]
+    assert clamps(caught.value.measurements) == [(1, (8, 2))]
+    assert "reason" not in memory_clamp
 
     # The same item through an impl that halves on its own: the harness does
     # not split again.

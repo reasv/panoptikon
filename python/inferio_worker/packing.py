@@ -1331,9 +1331,12 @@ def run_window(
     outputs: list[Any] = [None] * len(inputs)
     measurements: list[dict[str, Any]] = []
     pending = list(range(len(inputs)))
-    # The priced units of a batch a shape ceiling split, until a batch runs
-    # at the size it was halved to.
+    # The smallest priced units of a batch that failed on a shape ceiling.
     split_from: int | None = None
+    # The one clamp this window reports for its splits: `to_units` is the
+    # largest batch that ran at the halved size, `from_units` the smallest
+    # that failed.
+    split_clamp: dict[str, Any] | None = None
 
     def record(measurement: dict[str, Any]) -> dict[str, Any]:
         """Append a measurement; the first is stamped `trimmed` if the pool was
@@ -1440,11 +1443,13 @@ def run_window(
                         free_mb=live.free_mb,
                         free_source=live.free_source,
                         ram_mb=live.ram_mb,
-                        clamped=clamped,
+                        clamped=live.clamped if split else clamped,
                     )
                 )
                 if split:
-                    split_from, cap_items = priced, len(batch) // 2
+                    if split_from is None or priced < split_from:
+                        split_from = priced
+                    cap_items = len(batch) // 2
                     logger.warning(
                         "a batch of %d inputs exceeded a kernel's size limit "
                         "(%s); running the rest of this window at %d. This is "
@@ -1496,19 +1501,29 @@ def run_window(
                     executed,
                     len(batch),
                 )
-            split_ran = split_from is not None and len(batch) == cap_items
-            if split_ran or (
+            split_ran = (
+                split_from is not None
+                and len(batch) == cap_items
+                and priceable
+                and not absorbed_ooms
+            )
+            impl_cut = (
                 _utils_total("total_index_limit_events") > index_limits_before
-            ):
+            )
+            if impl_cut or (split_ran and split_clamp is None):
                 # A shape ceiling, not a memory event: the impl cut this batch
                 # itself, or it is the first to run at the size a split halved
-                # the window to, from the size that failed.
+                # the window to.
                 clamped = executed_clamp(
                     clamped, batch, executed, units, aggregation, priced,
                     live.free_mb,
                 )
-                if split_ran:
-                    clamped["from_units"], split_from = split_from, None
+                if not impl_cut:
+                    clamped["from_units"] = split_from
+                    split_clamp = clamped
+            elif split_ran:
+                split_clamp["to_units"] = max(split_clamp["to_units"], priced)
+                split_clamp["from_units"] = split_from
             measurement = memory.measure_batch(
                 state,
                 items=len(batch),
