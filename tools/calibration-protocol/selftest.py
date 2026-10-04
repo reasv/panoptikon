@@ -575,7 +575,7 @@ def induce_oom(
 
     # A unified device's "total" is host RAM: overshooting it swaps the
     # machine instead of exhausting a board.
-    unified = device == "mps" or bool(_safe(memory._unified_gpu))
+    unified = device == "mps" or bool(_safe(memory.unified_gpu))
     cap_mb = total_mb if unified else total_mb + FILLER_OVERSHOOT_MB
     if cap_mb_override:
         cap_mb = min(cap_mb, cap_mb_override)
@@ -1062,7 +1062,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.induce_oom:
             # A unified ROCm GPU's total is carve-out plus GTT, which HIP's
             # `total_memory` may not report; `free_total_mb` does.
-            board_total = ((total_mb if _safe(memory._unified_gpu) else None)
+            board_total = ((total_mb if _safe(memory.unified_gpu) else None)
                            or document["device"].get("gpu_total_mb") or total_mb)
             if board_total is None:
                 print("VERDICT: --induce-oom refused: no board total resolved, "
