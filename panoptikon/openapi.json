@@ -9120,7 +9120,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "A GPU replica's host RAM, booked on the CPU device: its resident set\n(absent when its RAM is not booked), the fitted host RAM per unit\n(absent until a batch measured it), what its outstanding grants hold\nbooked, and whether host RAM capped its last grant.",
+            "description": "A GPU replica's host RAM, booked on the CPU device: its resident set\n(absent when its RAM is not booked), the host RAM per unit of its cost\nestimate (absent until a batch measured it), what its outstanding\ngrants hold booked, and whether host RAM capped its last grant.",
             "minimum": 0
           },
           "reserved_at_load_mb": {

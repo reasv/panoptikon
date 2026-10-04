@@ -130,7 +130,7 @@ impl VramLedger {
             queue_bound,
             ram_mb,
             ram_bound,
-            ram_fitted_mb_per_unit,
+            ram_mb_per_unit,
             fixed_mb,
         ) = {
             let entry = state.workers.get(&worker)?;
@@ -194,7 +194,7 @@ impl VramLedger {
             }
             let ram_cost = ram.and_then(|ram| ram.cost);
             let ram_mb = ram_cost.as_ref().map_or(0, |cost| cost.booking_mb(units));
-            let ram_fitted_mb_per_unit = ram_cost.map(|cost| cost.mb_per_unit);
+            let ram_mb_per_unit = ram_cost.map(|cost| cost.mb_per_unit);
             (
                 units,
                 mb,
@@ -207,7 +207,7 @@ impl VramLedger {
                 wanted < capped,
                 ram_mb,
                 ram_bound,
-                ram_fitted_mb_per_unit,
+                ram_mb_per_unit,
                 price.map_or(0, |price| price.fixed_mb as u64),
             )
         };
@@ -322,7 +322,7 @@ impl VramLedger {
                     gpu = %gpu,
                     unit_budget,
                     ram_mb,
-                    ram_fitted_mb_per_unit = ?ram_fitted_mb_per_unit,
+                    ram_mb_per_unit = ?ram_mb_per_unit,
                     "host RAM capped this window below what the GPU could hold"
                 );
             }
