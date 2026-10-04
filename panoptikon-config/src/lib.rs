@@ -116,8 +116,7 @@ fn patch_table(
     after: &toml::Table,
     blocks_after_table: &mut Vec<(usize, String)>,
 ) -> Result<String> {
-    // A block that finds no key-value after it is above the ones collected
-    // here before it, so it goes in front.
+    // Blocks with no key-value after them arrive bottom-up, so each goes in front.
     let mut last = String::new();
     for key in before.keys().filter(|key| !after.contains_key(*key)) {
         // The lines above a key-value are in the decor of its key's last segment:
@@ -941,7 +940,7 @@ mod tests {
     #[test]
     fn removing_a_key_keeps_the_comment_block_above_it() {
         let dotted = "[vram]\n# a note\ngpu.CPU.a = 1\n# b note\ngpu.CPU.b = 2\n# k\nkeep = 1\n# n\n[next]\n";
-        let cases: [(&str, &[&str]); 10] = [
+        let cases: [(&str, &[&str]); 11] = [
             // Next key in the same table.
             (
                 "[vram]\n# margin note\nmargin = 0.10\n# cap note\ncap_fraction = 0.90\n",
@@ -977,6 +976,11 @@ mod tests {
             (dotted, &["gpu.CPU.a = 1\n", "gpu.CPU.b = 2\n"]),
             // Last key of an array-of-tables element.
             ("[[p]]\nn = 1\n# x\nx = 1\n[[p]]\nn = 2\n", &["x = 1\n"]),
+            // A whole [table]: its keys' comments go with it.
+            (
+                "[a]\nx = 1\n[t]\n# n note\nn = 1\n[z]\nq = 1\n",
+                &["[t]\n# n note\nn = 1\n"],
+            ),
             // The next line is a dotted key.
             (
                 "[vram]\n# a note\na = 1\n# g note\ngpu.x = 1\n",
