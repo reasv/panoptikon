@@ -1908,7 +1908,7 @@ fn a_load_under_memory_pressure_warns_once_per_model_and_episode() {
 
 /// At warning, once the paging has stopped, the batch grows back by doubling
 /// to half the size our batch ran at when the paging began, and no further;
-/// a second episode our batch began at that bound halves it again. The full
+/// each further episode our batch began at the bound halves it again. The full
 /// size returns only at normal.
 #[test]
 fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() {
@@ -1931,6 +1931,10 @@ fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() 
     paging_windows(&ledger, &handle, &admission, Paging, 2);
     ledger.set_memory_pressure_for_test(Warning);
     assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 32]);
+    assert_eq!(window_that_began_paging(&ledger, &handle, &admission), 32);
+    paging_windows(&ledger, &handle, &admission, Paging, 1);
+    ledger.set_memory_pressure_for_test(Warning);
+    assert_eq!(ramp_windows(&handle, &admission, 3), [8, 16, 16]);
     assert_eq!(
         ramp_figures(&ledger).0,
         Some(64),
@@ -1938,8 +1942,9 @@ fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() 
     );
 
     ledger.set_memory_pressure_for_test(Normal);
-    assert_eq!(ramp_windows(&handle, &admission, 4), [32, 64, 64, 64]);
-    assert_eq!(pressure_cap(&ledger), None);
+    assert_eq!(ramp_windows(&handle, &admission, 2), [16, 32]);
+    assert_eq!(pressure_cap(&ledger), None, "doubled to what is admitted");
+    assert_eq!(ramp_windows(&handle, &admission, 2), [64, 64]);
     assert_eq!(shown(&ledger), (None, None));
 }
 
@@ -2258,17 +2263,17 @@ fn at_warning_without_paging_the_batch_size_is_held() {
     let (ledger, handle, admission) = ramped_mac_replica();
     let samples = ramp_figures(&ledger).2;
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
-    let held: Vec<u64> = (0..3)
-        .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
-        .collect();
-    assert_eq!(held, [64, 64, 64], "the trial under way is put off");
-    let (size_during, _, samples_during, budget_during) = ramp_figures(&ledger);
-    assert_eq!(size_during, Some(64), "what the trial had measured");
-    assert_eq!(budget_during, 64);
+    assert_eq!(ramp_figures(&ledger).3, 64);
     assert_eq!(
         ledger.window_target_units(admission.worker_id()),
         64 * WINDOW_DEPTH_MULTIPLIER
     );
+    let held: Vec<u64> = (0..3)
+        .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
+        .collect();
+    assert_eq!(held, [64, 64, 64], "the trial under way is put off");
+    let (size_during, _, samples_during, _) = ramp_figures(&ledger);
+    assert_eq!(size_during, Some(64), "what the trial had measured");
     assert!(samples_during <= samples);
     assert_eq!(
         ledger.trial_for_test("g/a", MPS_GPU),
@@ -2302,7 +2307,7 @@ fn at_warning_without_paging_the_batch_size_is_held() {
 }
 
 /// Pressure at either end of a window marks it: at the grant only, or at the
-/// settle only.
+/// settle only. It earns no step and puts off the trial under way.
 #[test]
 fn a_window_under_pressure_at_either_end_earns_no_step() {
     use mps::MemoryPressure::{Critical, Normal, Warning};
@@ -2313,19 +2318,22 @@ fn a_window_under_pressure_at_either_end_earns_no_step() {
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
         ledger.set_memory_pressure_for_test(at_settle);
-        let rate = ladder_rate(&MINILM_M3_MAX, 128);
+        let granted = token.grant().unit_budget;
+        let rate = ladder_rate(&MINILM_M3_MAX, granted);
         let mut batches = vec![BatchMeasurement {
-            duration_ms: Some(128.0 * 1000.0 / rate),
-            ..measurement(128, 0, 10 * 128 + 100)
+            duration_ms: Some(granted as f64 * 1000.0 / rate),
+            ..measurement(granted, 0, 10 * granted + 100)
         }];
-        batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| warm_batch(128, rate)));
+        batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| warm_batch(granted, rate)));
         handle.lock().unwrap().record_measurements(batches);
         token.finish(WindowOutcome::Responded { oom: None });
+        let ends = format!("{at_grant:?} at the grant, {at_settle:?} at the settle");
         assert_eq!(
             ramp_figures(&ledger).0,
             Some(64),
-            "128 units earned nothing: {at_grant:?} at the grant, {at_settle:?} at the settle"
+            "{granted} units earned nothing: {ends}"
         );
+        assert_eq!(ledger.trial_for_test("g/a", MPS_GPU).0, None, "{ends}");
     }
 }
 
