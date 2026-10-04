@@ -1091,6 +1091,8 @@ def test_hip_suppresses_the_uuid_but_keeps_the_address() -> None:
         report = memory.finish_load(before, object())
         cuda.integrated = 1
         assert memory.gpu_integrated() is True
+        os.environ["INFERIO_DEVICE"] = "cpu"
+        assert memory.gpu_integrated() is None, "a CPU-device worker"
     assert "gpu_uuid" not in report, report
     assert (report["gpu_bdf"], report["gpu_total_mb"]) == ("0000:03:00.0", 8192)
     assert report["torch_version"] == "2.11.0+rocm7.2"

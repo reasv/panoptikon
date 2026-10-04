@@ -960,6 +960,12 @@ mod tests {
         (answer != "unanswered").then_some(answer == "fusion")
     }
 
+    fn set_readonly(path: &Path, value: bool) {
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(value);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
     const GB24: u64 = 24 * 1024 * 1024 * 1024;
     const GB16: u64 = 16 * 1024 * 1024 * 1024;
     /// A common BIOS UMA carve-out: what amdgpu publishes as an APU's whole
@@ -1329,24 +1335,18 @@ mod tests {
             .dgpu(1, LOC_03_00, 128, GB24)
             .dgpu(2, LOC_0C_00, 129, GB24);
         let read_only = fixture.roots.dev_dri.join("renderD128");
-        let set_readonly = |value| {
-            let mut perms = fs::metadata(&read_only).unwrap().permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(value);
-            fs::set_permissions(&read_only, perms).unwrap();
-        };
-        set_readonly(true);
+        set_readonly(&read_only, true);
         // Privileges that ignore the mode bits (root in a container) defeat
         // the fixture: the premise fails, not the behaviour.
         let writable = OpenOptions::new().read(true).write(true).open(&read_only);
         if writable.is_ok() {
-            set_readonly(false);
+            set_readonly(&read_only, false);
             return;
         }
         let rows = fixture.build().expect("the writable sibling survives");
         // Restored before the assertions so a failure still leaves a
         // deletable tree: `TempDir`'s drop leaks a read-only file.
-        set_readonly(false);
+        set_readonly(&read_only, false);
         assert_eq!(indexed(rows), vec![at(0, BDF_0C)], "one openable GPU");
     }
 
@@ -1372,22 +1372,17 @@ mod tests {
         let read_only_kfd = Fixture::new();
         read_only_kfd.dgpu(1, LOC_03_00, 128, GB24);
         let kfd = &read_only_kfd.roots.kfd;
-        let set_readonly = |value| {
-            let mut perms = fs::metadata(kfd).unwrap().permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(value);
-            fs::set_permissions(kfd, perms).unwrap();
-        };
-        set_readonly(true);
+        set_readonly(kfd, true);
         // Skipped where privileges ignore the mode bits (root).
         if OpenOptions::new().read(true).write(true).open(kfd).is_err() {
             let rows = read_only_kfd.build();
             let topology = topology_gpus(&read_only_kfd.roots, true);
-            set_readonly(false);
+            set_readonly(kfd, false);
             assert_eq!(rows, Some(Vec::new()));
             assert_eq!(topology, [("gfx1100".to_owned(), false)]);
+        } else {
+            set_readonly(kfd, false);
         }
-        set_readonly(false);
         let empty = Fixture::new();
         assert_eq!(empty.build(), Some(Vec::new()));
         let rootless = SysfsRoots {

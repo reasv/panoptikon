@@ -2253,11 +2253,13 @@ mod tests {
             pci_devices: dir.path().join("pci"),
             dev_dri: dir.path().join("dri"),
             meminfo: dir.path().join("meminfo"),
+            kfd: dir.path().join("kfd"),
             ..rocm::SysfsRoots::default()
         };
         let node = roots.kfd_nodes.join("1");
         std::fs::create_dir_all(&node).unwrap();
         std::fs::create_dir_all(&roots.dev_dri).unwrap();
+        std::fs::write(&roots.kfd, "").unwrap();
         std::fs::write(
             node.join("properties"),
             "simd_count 96\ndrm_render_minor 128\ngfx_target_version 110000\n",

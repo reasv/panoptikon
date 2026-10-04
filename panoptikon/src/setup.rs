@@ -1378,6 +1378,8 @@ mod tests {
         linux.kfd_gpus = vec!["gfx1031".into()];
         linux.gfx_override = true;
         assert_eq!(decide_accelerator(&linux).0, Accelerator::Rocm);
+        linux.kfd_gpus.clear();
+        assert_eq!(decide_accelerator(&linux).0, Accelerator::Cpu);
         // The ROCm wheels are x86_64 only.
         let mut arm = probes("linux");
         arm.arch = "aarch64";
