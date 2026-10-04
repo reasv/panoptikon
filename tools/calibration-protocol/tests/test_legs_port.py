@@ -149,17 +149,6 @@ def test_a_config_named_by_path_moves_the_same_way(tmp_path):
                                  {"name": "legacy_ui", "port": 17909}]
 
 
-def test_write_config_moves_every_listener_too(tmp_path):
-    """What `run-gateway.sh` starts must not bind C1's ports under `--port`."""
-    assert legs.main(["--config", "C1", "--repo", str(HERE.parents[1]),
-                      "--no-dotenv", "--python", "/opt/venv/bin/python",
-                      "--port", "17912", "--write-config", str(tmp_path)]) == 0
-    text = (tmp_path / "server-C1.toml").read_text(encoding="utf-8")
-    assert tomllib.loads(text)["server"]["port"] == 17912
-    assert {(row["name"], row["port"]) for row in legs.endpoints_in(text)} == {
-        ("test", 17913), ("legacy_ui", 17909)}
-
-
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 def test_run_gateway_passes_the_port_and_the_inference_url(tmp_path):
     env = {**os.environ, "CALIB_PYTHON": sys.executable, "CALIB_PORT": "17912",
@@ -170,7 +159,10 @@ def test_run_gateway_passes_the_port_and_the_inference_url(tmp_path):
         ["bash", str(HERE / "config" / "run-gateway.sh"), "C1", str(tmp_path)],
         env=env, capture_output=True, text=True)
     assert result.returncode == 3, result.stderr  # the missing binary
-    document = tomllib.loads((tmp_path / "server-C1.toml").read_text())
+    text = (tmp_path / "server-C1.toml").read_text()
+    document = tomllib.loads(text)
     assert document["server"]["port"] == 17912
+    assert {(row["name"], row["port"]) for row in legs.endpoints_in(text)} == {
+        ("test", 17913), ("legacy_ui", 17909)}
     assert document["upstreams"]["inference"] == [
         {"base_url": "http://10.0.0.5:7777"}]

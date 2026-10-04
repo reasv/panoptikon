@@ -127,8 +127,9 @@ snapshot jobs / failures / metadata / health and `calibration.after.toml`;
 stop everything in reverse; copy `panoptikon.log`. Then `legs.json`: every
 resolved parameter, every event with its wall clock and monotonic `t_mono`,
 every process and its exit code, and the `analyze.py` command line for this
-scenario. SIGTERM, SIGHUP (an ssh drop) or SIGBREAK ends a leg as Ctrl-C
-does: the same teardown, and the outcome `interrupted`.
+scenario. SIGTERM, SIGHUP (an ssh drop), unless it is ignored (nohup), or
+SIGBREAK ends a leg as Ctrl-C does: the same teardown, and the outcome
+`interrupted`.
 
 **S14 probes every listener the config declares.** A config can name more
 than the gateway port — `[[server.endpoints]]` puts the same routes on
@@ -186,11 +187,13 @@ exactly what changed. The fractions come from this host's legs: S4a `leave-free`
 `leave-free` 8 192 / 97 887 released at t+120 s. **S4c's spike is not a
 fraction**: its "~2 GB free" is the defensive clamp's own threshold, the
 number the scenario is defined against, so it is 2 048 MiB on every board,
-neither scaled nor floored, at t+90 s and released at t+100 s. On a 32 607 MiB
+not scaled, and raised only by a `--min-free-mb` above it, at t+90 s and
+released at t+100 s. On a 32 607 MiB
 board the four resolve to S4a 4 093, S4b 10 233, S4c 2 048 and S4d 2 729 MiB. Every event is timed **from the job's POST**, not from
 the leg's start, because what the scenario describes is a change during the
 job. `--hog-event` adds such an event in MiB to any scenario (`at=60,
-leave_free=4096`, `at=120,release`), with any `--hog-target`; on a scenario
+leave_free=4096`, `at=120,release`), with any `--hog-target`; its figures are
+not scaled, but bounded like every figure. On a scenario
 without a hog of its own, one starts holding 0 with its leave-free level
 pinned, as S4a's, so the job's own pool does not move it after the event.
 

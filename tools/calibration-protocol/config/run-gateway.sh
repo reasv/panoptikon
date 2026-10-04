@@ -78,8 +78,8 @@ set -a
 . "$ENVFILE"
 set +a
 
-# Every env.<ID> puts the venv's nvidia/cudnn/lib on LD_LIBRARY_PATH, so
-# faster-whisper's CTranslate2 can dlopen cuDNN. A
+# env.<ID> puts the worker venv's nvidia/cudnn/lib on LD_LIBRARY_PATH when that
+# venv has one, so faster-whisper's CTranslate2 can dlopen cuDNN. A
 # binary that puts those directories in the worker's own spawn environment
 # does not need it -- and keeping it there hides whether that works, since
 # the worker would inherit the variable either way. CALIB_NO_CUDNN_LDPATH=1

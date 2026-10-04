@@ -9,6 +9,7 @@ Run with the managed interpreter:
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -17,7 +18,7 @@ import sys
 import threading
 import tomllib
 import types
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -40,7 +41,7 @@ HEADER = json.dumps({"kind": "header"}) + "\n"
 SAMPLE = json.dumps({"kind": "sample", "seq": 0, "t_wall": 100.0}) + "\n"
 
 
-def test_the_leg_waits_for_both_recorders_and_marks_a_silent_one(tmp_path):
+def test_the_leg_waits_for_every_recorder_and_marks_a_silent_one(tmp_path):
     sampled, late = tmp_path / "vramrec.jsonl", tmp_path / "healthrec.jsonl"
     sampled.write_text(HEADER + SAMPLE)
     late.write_text(HEADER)
@@ -53,10 +54,12 @@ def test_the_leg_waits_for_both_recorders_and_marks_a_silent_one(tmp_path):
     late.write_text(HEADER + SAMPLE[:20])
     leg = types.SimpleNamespace(path=lambda name: tmp_path / name, events=[])
     leg.mark = lambda name, **detail: legs.Leg.mark(leg, name, **detail)
-    legs.Leg.wait_for_recorders(leg, timeout=0.3)
+    legs.Leg.wait_for_recorders(leg, ["healthrec", "healthrec-remote"],
+                                timeout=0.3)
     (event,) = leg.events
     assert (event["event"], event["files"], event["waited_s"]) == (
-        "recorder_sample_timeout", ["healthrec.jsonl"], 0.3)
+        "recorder_sample_timeout",
+        ["healthrec.jsonl", "healthrec-remote.jsonl"], 0.3)
     assert isinstance(event["t_mono"], float)
 
 
@@ -113,10 +116,10 @@ REMOTE = "http://10.0.0.5:7777"
 
 
 def test_a_split_gateway_forwards_inference_and_both_sides_are_polled(
-        tmp_path):
+        capsys, tmp_path):
     """`--inference-url` replaces the config's inference servers and turns
-    local inference off, in the leg's copy and in `--write-config`'s; the
-    server's own /health is polled beside the gateway's."""
+    local inference off; the server's own /health is polled beside the
+    gateway's. A hog is refused: it would pressure this host."""
     config = tmp_path / "server-X.toml"
     config.write_text('[server]\nport = 16342\n\n[inference_local]\n'
                       'enabled = true\n\n[[upstreams.inference]]\n'
@@ -128,25 +131,22 @@ def test_a_split_gateway_forwards_inference_and_both_sides_are_polled(
     assert document["upstreams"]["inference"] == [{"base_url": REMOTE}]
     assert document["search"] == {"cache_size_mb": 1}
 
-    out = tmp_path / "out"
-    assert legs.main(["--config", "C1", "--repo", str(HERE.parents[1]),
-                      "--no-dotenv", "--python", "/opt/venv/bin/python",
-                      "--inference-url", REMOTE, "--write-config",
-                      str(out)]) == 0
-    written = tomllib.loads((out / "server-C1.toml").read_text())
-    assert written["upstreams"]["inference"] == [{"base_url": REMOTE}]
-    assert written["inference_local"]["enabled"] is False
-
-    plan = json.loads(subprocess.run(
-        [sys.executable, str(HERE / "legs.py"), "--scenario", "S14",
-         "--config", str(config), "--inference-url", REMOTE + "/",
-         "--no-dotenv", "--dry-run"],
-        capture_output=True, text=True, check=True).stdout)
+    argv = ["--config", str(config), "--no-dotenv", "--dry-run",
+            "--gpu-total-mb", "24564"]
+    assert legs.main(["--scenario", "S14", *argv, "--inference-url",
+                      REMOTE + "/api/inference/"]) == 0
+    plan = json.loads(capsys.readouterr().out)
     assert plan["health_urls"] == {"healthrec": "http://127.0.0.1:16342",
                                    "healthrec-remote": REMOTE}
+    for hog in (["--scenario", "S4a"],
+                ["--scenario", "S14", "--hog-event", "at=5,release"]):
+        assert legs.main([*hog, *argv]) == 0
+        with pytest.raises(SystemExit):
+            legs.main([*hog, *argv, "--inference-url", REMOTE])
 
 
-def test_healthrec_keeps_the_clients_of_a_gateway_that_answered_504():
+def test_healthrec_keeps_the_clients_of_a_gateway_that_answered_504(
+        monkeypatch):
     """The gateway's 504 for a frozen inference server names its clients and
     when it declared the server frozen; the sample keeps both."""
     healthrec = _load("healthrec")
@@ -154,23 +154,12 @@ def test_healthrec_keeps_the_clients_of_a_gateway_that_answered_504():
                 "frozen_since": "2026-10-04T10:00:00Z"}]
     body = json.dumps({"detail": "frozen", "inference_clients": clients})
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
-            self.send_response(504)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(body.encode())
+    def answer_504(url, timeout):
+        raise urllib.error.HTTPError(url, 504, "", {},
+                                     io.BytesIO(body.encode()))
 
-        def log_message(self, *_args):
-            pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        url = f"http://127.0.0.1:{server.server_port}/api/inference/health"
-        result = healthrec.fetch(url, 5.0)
-    finally:
-        server.shutdown()
+    monkeypatch.setattr(healthrec.urllib.request, "urlopen", answer_504)
+    result = healthrec.fetch("http://gateway/api/inference/health", 5.0)
     health = healthrec.flatten_health(result, full=False)
     assert (health["ok"], health["status_code"]) == (False, 504)
     assert health["inference_clients"] == clients
@@ -178,21 +167,35 @@ def test_healthrec_keeps_the_clients_of_a_gateway_that_answered_504():
     assert "running" not in healthrec.flatten_queue(result)
 
 
-# Every child legs starts, replaced by one that exits once its parent is gone.
+# Every child legs starts is logged and replaced by one that exits once the
+# driver is gone, or after 60 s. The teardown's stop_all starts 1 s late, so a
+# signal can land inside it.
 DRIVER = """
-import os, subprocess, sys, time
+import json, os, subprocess, sys, time
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import legs
-start = legs.Supervisor.start
-CHILD = ("import os, time\\nparent = os.getppid()\\n"
-         "while os.getppid() == parent: time.sleep(0.1)")
-legs.Supervisor.start = lambda self, name, argv, **kw: start(
-    self, name, [sys.executable, "-c", CHILD], **kw)
+tmp = Path(sys.argv[2])
+CHILD = ("import os, sys, time\\ndeadline = time.monotonic() + 60\\n"
+         "while time.monotonic() < deadline:\\n"
+         "    try: os.kill(int(sys.argv[1]), 0)\\n"
+         "    except OSError: break\\n"
+         "    time.sleep(0.1)")
+start, stop_all = legs.Supervisor.start, legs.Supervisor.stop_all
+def logged_start(self, name, argv, **kw):
+    with (tmp / "started.jsonl").open("a") as out:
+        out.write(json.dumps([name, list(argv)]) + "\\n")
+    return start(self, name, [sys.executable, "-c", CHILD, str(os.getpid())],
+                 **kw)
+def late_stop_all(self):
+    (tmp / "teardown").touch()
+    time.sleep(1.0)
+    return stop_all(self)
+legs.Supervisor.start, legs.Supervisor.stop_all = logged_start, late_stop_all
 legs.unsampled = lambda paths, timeout: []
 legs.board_total_mb = lambda device: None
 legs.rocm_sysfs.inventory = lambda *roots: []
-directory = Path(sys.argv[2]) / "run" / "S14"
+directory = tmp / "run" / "S14"
 directory.mkdir(parents=True)
 legs.subprocess.run = lambda argv, **kw: subprocess.CompletedProcess(
     argv, 0, stdout=f"{directory}\\n", stderr="")
@@ -201,7 +204,12 @@ sys.exit(legs.main(sys.argv[3:]))
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX signal")
-def test_sigterm_tears_the_leg_down_and_records_it(tmp_path):
+@pytest.mark.parametrize("first, split", [("SIGTERM", False),
+                                          ("SIGHUP", True)])
+def test_a_stop_signal_tears_the_leg_down_and_records_it(tmp_path, first,
+                                                         split):
+    """With stdout gone (a hung-up terminal), and a second signal during the
+    teardown, every child is still stopped and legs.json still written."""
     corpus = tmp_path / "corpus"
     corpus.mkdir()
     (corpus / "manifest.json").write_text(json.dumps(
@@ -210,28 +218,61 @@ def test_sigterm_tears_the_leg_down_and_records_it(tmp_path):
     config.write_text("[server]\nport = 1\n")
     driver = tmp_path / "driver.py"
     driver.write_text(DRIVER)
-    log = tmp_path / "out.log"
-    with log.open("wb") as sink:
-        leg = subprocess.Popen(
-            [sys.executable, str(driver), str(HERE), str(tmp_path),
-             "--scenario", "S14", "--config", str(config), "--bin",
-             str(config), "--corpus", str(corpus), "--results",
-             str(tmp_path), "--no-dotenv", "--stop-grace", "5"],
-            stdout=sink, stderr=subprocess.STDOUT)
-        try:
-            assert legs.wait_for(lambda: b"gateway_started" in log.read_bytes(),
-                                 30.0, interval=0.1), log.read_text()
-            leg.send_signal(signal.SIGTERM)
-            assert leg.wait(timeout=30) == 1
-        finally:
-            leg.kill()
+    argv = [sys.executable, str(driver), str(HERE), str(tmp_path),
+            "--scenario", "S14", "--config", str(config), "--bin",
+            str(config), "--corpus", str(corpus), "--results", str(tmp_path),
+            "--no-dotenv", "--stop-grace", "5"]
+    if split:
+        argv += ["--inference-url", REMOTE]
+    with (tmp_path / "err.log").open("wb") as err:
+        leg = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=err)
+    try:
+        for line in leg.stdout:
+            if b"gateway_started" in line:
+                break
+        else:
+            pytest.fail((tmp_path / "err.log").read_text())
+        leg.stdout.close()
+        leg.send_signal(getattr(signal, first))
+        assert legs.wait_for((tmp_path / "teardown").exists, 30.0,
+                             interval=0.1)
+        leg.send_signal(signal.SIGTERM)
+        leg.wait(timeout=30)
+    finally:
+        leg.kill()
     recorded = json.loads((tmp_path / "run" / "S14" / "legs.json").read_text())
     assert recorded["outcome"] == "interrupted"
-    assert {"event": "interrupted", "signal": "SIGTERM"}.items() <= next(
+    assert {"event": "interrupted", "signal": first}.items() <= next(
         event for event in recorded["events"]
         if event["event"] == "interrupted").items()
     # Each child was stopped and reaped by the leg, not left to its parent's
     # death.
-    assert set(recorded["processes"]) == {"vramrec", "healthrec", "gateway"}
+    extra = {"healthrec-remote"} if split else set()
+    assert set(recorded["processes"]) == {"vramrec", "healthrec", "gateway",
+                                          *extra}
     assert all(row["returncode"] == -signal.SIGTERM
                for row in recorded["processes"].values())
+    if split:
+        started = dict(json.loads(line) for line in
+                       (tmp_path / "started.jsonl").read_text().splitlines())
+        remote = started["healthrec-remote"]
+        assert remote[remote.index("--base") + 1] == REMOTE
+        assert "--no-queue" in remote
+        (written,) = (tmp_path / "run" / "S14").glob("server-*.toml")
+        document = tomllib.loads(written.read_text())
+        assert document["inference_local"]["enabled"] is False
+        assert document["upstreams"]["inference"] == [{"base_url": REMOTE}]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signal")
+def test_an_ignored_sighup_stays_ignored():
+    """nohup: a leg started with SIGHUP ignored is not ended by a hang-up."""
+    saved = {sig: signal.getsignal(sig) for sig in legs.STOP_SIGNALS}
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        legs.stop_on_signals()
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+        assert signal.getsignal(signal.SIGTERM) is not saved[signal.SIGTERM]
+    finally:
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)

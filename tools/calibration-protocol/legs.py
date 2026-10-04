@@ -71,7 +71,9 @@ applying the floor's pressure, not the fraction's, and two legs written to
 different fractions can land on the same level.
 
 S4c's spike is not a fraction. Its "~2 GB free" is the defensive clamp's own
-threshold, so it is 2 048 MiB on every board, neither scaled nor floored.
+threshold, so it is 2 048 MiB on every board, not scaled, and raised only by a
+`--min-free-mb` above it. A `--hog-event` figure is in MiB too: not scaled,
+but bounded like every figure.
 Both the fraction and the resolved MiB are recorded in `legs.json`, and the
 reference column in `--list` is the figure this host's runs used, so a
 cross-platform comparison can state what changed.
@@ -107,14 +109,16 @@ The recorders handle `SIGBREAK` for exactly this reason, so a Windows
 teardown flushes its last samples instead of losing them. `hog.py` is asked to
 release over its own HTTP endpoint first, on every platform, because that is
 the only stop that is observably complete before the process exits.
-SIGTERM, SIGHUP or SIGBREAK sent to `legs.py` itself ends the leg as Ctrl-C
-does: the same teardown, and `legs.json` with the outcome `interrupted`.
+SIGTERM, SIGHUP (an ssh drop), unless it is ignored (nohup), or SIGBREAK
+sent to `legs.py` itself ends the leg as Ctrl-C does: the same teardown, and
+`legs.json` with the outcome `interrupted`.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import re
@@ -170,8 +174,9 @@ class HogEvent:
     hold_fraction: Optional[float] = None
     leave_free_fraction: Optional[float] = None
     #: absolute levels, for a figure stated in MiB rather than as a share of
-    #: the board: S4c's 2 GB is the defensive clamp's own threshold, the same
-    #: number on a 24 GB card as on a 96 GB one, and `--hog-event` is in MiB.
+    #: the GPU's total: S4c's 2 GB is the defensive clamp's own threshold, the
+    #: same number on a 24 GB card as on a 96 GB one, and `--hog-event` is in
+    #: MiB.
     leave_free_mb: Optional[int] = None
     hold_mb: Optional[int] = None
     label: str = ""
@@ -179,17 +184,20 @@ class HogEvent:
 
 def parse_hog_event(text: str) -> HogEvent:
     """`at=S,leave_free=MIB`, `at=S,hold=MIB` or `at=S,release`: a hog change
-    S seconds after the job is posted, in MiB, neither scaled nor floored."""
+    S seconds after the job is posted, in MiB, not scaled. S and MIB are
+    finite and not negative."""
     fields = dict(part.partition("=")[::2] for part in text.split(","))
     try:
         at_s = float(fields.pop("at"))
-        if fields.keys() == {"leave_free"}:
-            return HogEvent(at_s, leave_free_mb=int(fields["leave_free"]),
-                            label=text)
-        if fields.keys() == {"hold"}:
-            return HogEvent(at_s, hold_mb=int(fields["hold"]), label=text)
         if fields == {"release": ""}:
-            return HogEvent(at_s, hold_mb=0, label=text)
+            fields = {"hold": "0"}
+        ((key, value),) = fields.items()
+        mib = int(value)
+        if math.isfinite(at_s) and at_s >= 0 and mib >= 0:
+            if key == "leave_free":
+                return HogEvent(at_s, leave_free_mb=mib, label=text)
+            if key == "hold":
+                return HogEvent(at_s, hold_mb=mib, label=text)
     except (KeyError, ValueError):
         pass
     raise argparse.ArgumentTypeError(
@@ -699,21 +707,28 @@ def iso_now() -> str:
     return now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+#: The signals that end a leg as Ctrl-C does, where the OS has them.
+STOP_SIGNALS = [getattr(signal, name) for name in
+                ("SIGTERM", "SIGHUP", "SIGBREAK") if hasattr(signal, name)]
+
+
+def ignore_stop_signals() -> None:
+    for sig in (signal.SIGINT, *STOP_SIGNALS):
+        signal.signal(sig, signal.SIG_IGN)
+
+
 def stop_on_signals() -> None:
     """SIGTERM, SIGHUP and SIGBREAK end the leg as Ctrl-C does, through its
     teardown: the children run in their own sessions, so a driver killed
-    outright leaves them running. Later signals are ignored so the teardown
-    finishes."""
-    names = [name for name in ("SIGTERM", "SIGHUP", "SIGBREAK")
-             if hasattr(signal, name)]
-
+    outright leaves them running. A signal already ignored (nohup) stays
+    ignored. Once the teardown starts, stop signals are ignored."""
     def interrupt(signum: int, _frame: Any) -> None:
-        for name in names:
-            signal.signal(getattr(signal, name), signal.SIG_IGN)
+        ignore_stop_signals()
         raise KeyboardInterrupt(signal.Signals(signum).name)
 
-    for name in names:
-        signal.signal(getattr(signal, name), interrupt)
+    for sig in STOP_SIGNALS:
+        if signal.getsignal(sig) is not signal.SIG_IGN:
+            signal.signal(sig, interrupt)
 
 
 def wait_for(predicate: Callable[[], bool], timeout: float,
@@ -967,17 +982,22 @@ class Leg:
         record = {"iso": iso_now(), "t_mono": round(time.monotonic(), 3),
                   "event": name, **detail}
         self.events.append(record)
-        print(f"[{record['iso']}] {name}"
-              + (f" {json.dumps(detail)}" if detail else ""), flush=True)
+        try:
+            print(f"[{record['iso']}] {name}"
+                  + (f" {json.dumps(detail)}" if detail else ""), flush=True)
+        except OSError:  # a hung-up terminal or a closed pipe: the echo only
+            pass
 
     def path(self, name: str) -> Path:
         return self.directory / name
 
-    def wait_for_recorders(self, timeout: float = RECORDER_START_S) -> None:
-        """Waits up to `timeout` for both recordings to hold a sample; marks
-        `recorder_sample_timeout` with those that still hold none."""
-        missing = unsampled([self.path("vramrec.jsonl"),
-                             self.path("healthrec.jsonl")], timeout)
+    def wait_for_recorders(self, health: Sequence[str],
+                           timeout: float = RECORDER_START_S) -> None:
+        """Waits up to `timeout` for vramrec's and each `health` recorder's
+        recording to hold a sample; marks `recorder_sample_timeout` with those
+        that still hold none."""
+        missing = unsampled([self.path(f"{name}.jsonl")
+                             for name in ("vramrec", *health)], timeout)
         if missing:
             self.mark("recorder_sample_timeout", files=missing,
                       waited_s=timeout)
@@ -1170,8 +1190,8 @@ class Leg:
             return ["hold", str(mib)], detail
         return [], {}
 
-    def note_floor(self, kind: str, at: str, fraction: float, scaled_mb: int,
-                   resolved_mb: int) -> None:
+    def note_floor(self, kind: str, at: str, fraction: Optional[float],
+                   scaled_mb: int, resolved_mb: int) -> None:
         """Record a figure `--min-free-mb` moved off its own fraction.
 
         A bound floor makes two legs written to different fractions apply the
@@ -1188,28 +1208,28 @@ class Leg:
 
     def resolved_events(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
+        # A figure in MiB is not scaled, but bounded as a scaled one is.
         for event in self.scenario.events:
+            at = event.label or f"t+{event.at_s:g}s"
             row: Dict[str, Any] = {"at_s": event.at_s, "label": event.label}
-            if event.leave_free_mb is not None:
-                row["leave_free_mb"] = event.leave_free_mb
-                row["fraction"] = None
-            elif event.hold_mb is not None:
-                row["mb"] = event.hold_mb
-                row["fraction"] = None
-            elif event.leave_free_fraction is not None:
-                scaled = scale_mb(event.leave_free_fraction, self.total_mb)
-                row["leave_free_mb"] = max(self.args.min_free_mb, scaled)
-                row["fraction"] = event.leave_free_fraction
-                self.note_floor("leave-free", event.label or f"t+{event.at_s:g}s",
-                                event.leave_free_fraction, scaled,
+            if (event.leave_free_mb is not None
+                    or event.leave_free_fraction is not None):
+                fraction = event.leave_free_fraction
+                figure = (event.leave_free_mb if fraction is None
+                          else scale_mb(fraction, self.total_mb))
+                row["leave_free_mb"] = max(self.args.min_free_mb, figure)
+                row["fraction"] = fraction
+                self.note_floor("leave-free", at, fraction, figure,
                                 row["leave_free_mb"])
             else:
-                scaled = scale_mb(event.hold_fraction or 0.0, self.total_mb)
-                row["mb"] = min(scaled,
+                fraction = (None if event.hold_mb is not None
+                            else event.hold_fraction or 0.0)
+                figure = (event.hold_mb if fraction is None
+                          else scale_mb(fraction, self.total_mb))
+                row["mb"] = min(figure,
                                 max(0, self.total_mb - self.args.min_free_mb))
-                row["fraction"] = event.hold_fraction
-                self.note_floor("hold", event.label or f"t+{event.at_s:g}s",
-                                event.hold_fraction or 0.0, scaled, row["mb"])
+                row["fraction"] = fraction
+                self.note_floor("hold", at, fraction, figure, row["mb"])
             out.append(row)
         return out
 
@@ -1887,7 +1907,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "(default: NVML's, or amdgpu sysfs', for "
                              "--hog-device)")
     parser.add_argument("--min-free-mb", type=int, default=1024,
-                        help="floor under a scaled leave-free figure")
+                        help="floor under a leave-free figure, and what "
+                             "a hold leaves free")
     parser.add_argument("--hog-device", type=int, default=0)
     parser.add_argument("--hog-target", choices=("gpu", "mps", "ram"),
                         default="gpu",
@@ -1932,8 +1953,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     # Only an explicit `--python` repins the worker; the default is this
-    # interpreter, which is the right recorder but not the right worker.
-    explicit_python = args.python
+    # interpreter, which is the right recorder but not the right worker. A
+    # path is made absolute, since the gateway runs in `--root`; never
+    # resolved, since a venv's interpreter is a symlink out of the venv.
+    explicit_python = (os.path.abspath(args.python)
+                       if args.python and os.path.dirname(args.python)
+                       else args.python)
     args.python = args.python or sys.executable
 
     if args.list:
@@ -1987,8 +2012,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     health_urls = {"healthrec": base}
     if args.inference_url:
         # The server's own report: the gateway answers 504 for a server it
-        # declared frozen.
-        health_urls["healthrec-remote"] = args.inference_url.rstrip("/")
+        # declared frozen. healthrec adds `/api/inference/health`, and the
+        # gateway accepts the URL with or without `/api/inference`.
+        health_urls["healthrec-remote"] = (
+            args.inference_url.rstrip("/").removesuffix("/api/inference"))
     # `--models` beats the scenario's own chain, which beats a single model.
     models = ([m.strip() for m in args.models.split(",") if m.strip()]
               if args.models else
@@ -2018,6 +2045,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     total_mb = args.gpu_total_mb or measured_total_mb or REFERENCE_TOTAL_MB
     wants_hog = (scenario.hog_hold_fraction is not None
                  or scenario.hog_leave_free_fraction is not None)
+    if args.inference_url and (wants_hog or args.hog_event):
+        raise SystemExit(
+            "legs.py: --inference-url with a hog: the hog would pressure this "
+            "host, not the inference server's")
     if wants_hog and not args.gpu_total_mb and measured_total_mb is None:
         # Scaling a fraction against another machine's board is not a
         # degraded measurement, it is a different experiment.
@@ -2033,8 +2064,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if wants_hog:
             scenario = replace(scenario, events=timed)
         else:
-            # Pinned, as S4a's: the job's own pool changing `free` after an
-            # event must not move the hog.
+            # Pinned: the job's own pool changing `free` after an event does
+            # not move the hog.
             scenario = replace(scenario, events=timed, hog_hold_fraction=0.0,
                                hog_reeval=999999)
 
@@ -2234,7 +2265,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 health_argv.append("--full")
             leg.supervisor.start(name, health_argv)
             leg.mark(f"{name}_started")
-        leg.wait_for_recorders()
+        leg.wait_for_recorders(list(health_urls))
 
         gateway = leg.start_gateway()
         fds = FdRecorder(gateway.pid, leg.path("fds.jsonl"))
@@ -2322,6 +2353,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         outcome = f"error: {type(exc).__name__}: {exc}"
         leg.mark("error", error=str(exc))
     finally:
+        ignore_stop_signals()
         if fds is not None:
             fds.stop()
         # The hog is asked to release over HTTP first: that is the only stop
@@ -2331,7 +2363,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 request(leg.hog_url("/stop"), method="POST", timeout=5)
                 leg.mark("hog_stop_requested")
                 time.sleep(3.0)
-            except HttpError:
+            except (HttpError, OSError):
                 pass
         stopped = leg.supervisor.stop_all()
         leg.mark("processes_stopped", **stopped)

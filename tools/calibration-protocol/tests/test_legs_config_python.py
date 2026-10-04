@@ -12,8 +12,10 @@ Run with the managed interpreter:
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -95,7 +97,8 @@ def _plan(capsys, *argv) -> dict:
     return json.loads(capsys.readouterr().out)
 
 
-def test_the_plan_names_the_interpreter_the_gateway_will_use(capsys, tmp_path):
+def test_the_plan_names_the_interpreter_the_gateway_will_use(
+        capsys, monkeypatch, tmp_path):
     config = tmp_path / "server-CT.toml"
     config.write_text(CONFIG, encoding="utf-8")
     plan = _plan(capsys, "--scenario", "S2", "--config", str(config),
@@ -108,8 +111,20 @@ def test_the_plan_names_the_interpreter_the_gateway_will_use(capsys, tmp_path):
     assert plan["inference_python"] == "/cpu/venv/bin/python"
     assert plan["inference_python_source"] == "--python"
 
+    # The gateway runs in `--root`: a relative path is made absolute, without
+    # following the venv's symlink; a command name is left to PATH.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "venv" / "bin").mkdir(parents=True)
+    (tmp_path / "venv" / "bin" / "python").symlink_to(sys.executable)
+    for given, expected in ((str(Path("venv", "bin", "python")),
+                             str(tmp_path / "venv" / "bin" / "python")),
+                            ("python3", "python3")):
+        plan = _plan(capsys, "--scenario", "S2", "--config", str(config),
+                     "--python", given, "--dry-run")
+        assert plan["inference_python"] == expected
 
-def test_the_venv_interpreter_follows_the_os(monkeypatch):
+
+def test_the_venv_interpreter_follows_the_os(monkeypatch, tmp_path):
     import tomllib
 
     monkeypatch.setattr(legs, "IS_WINDOWS", True)
@@ -117,14 +132,28 @@ def test_the_venv_interpreter_follows_the_os(monkeypatch):
     rendered = tomllib.loads(legs.render_config("C1", REPO))
     assert Path(rendered["inference_local"]["python"]) == (
         REPO / "python" / ".venv" / "Scripts" / "python.exe")
+    # A Windows tree's venv is found where it is.
+    (tmp_path / "config" / "server").mkdir(parents=True)
+    shutil.copy(REPO / "config" / "server" / "default.toml",
+                tmp_path / "config" / "server")
+    (tmp_path / "python" / ".venv" / "Scripts").mkdir(parents=True)
+    (tmp_path / "python" / ".venv" / "Scripts" / "python.exe").touch()
+    legs.resolve_config(argparse.Namespace(config="C1", repo=str(tmp_path),
+                                           dry_run=False), {})
     monkeypatch.setattr(legs, "IS_WINDOWS", False)
     assert legs.venv_python(Path("v")) == Path("v", "bin", "python")
 
 
 def test_the_cudnn_path_follows_the_worker_venv(tmp_path):
-    """`LD_LIBRARY_PATH` names the `--python` venv's cuDNN, in the run's
-    environment and in the env file `--write-config` writes, and is left out
-    when that venv has none."""
+    """`LD_LIBRARY_PATH` names the `--python` venv's cuDNN, else the tree's,
+    in the run's environment and in the env file `--write-config` writes, and
+    is left out when that venv has none."""
+    venv = tmp_path / "tree" / "python" / ".venv"
+    tree_cudnn = venv / "lib" / "python3.11" / "site-packages" / "nvidia" / "cudnn" / "lib"
+    tree_cudnn.mkdir(parents=True)
+    assert legs.config_env("C1", tmp_path / "tree", {})["LD_LIBRARY_PATH"] == (
+        str(tree_cudnn))
+
     gpu = tmp_path / "gpu"
     cudnn = gpu / "lib" / "python3.11" / "site-packages" / "nvidia" / "cudnn" / "lib"
     cudnn.mkdir(parents=True)

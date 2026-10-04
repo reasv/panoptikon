@@ -51,22 +51,29 @@ def test_plain_s14_still_runs_one_model_on_the_smoke_tier():
     assert (scenario.corpus, scenario.models) == ("smoke", ())
 
 
-
 def test_a_hog_event_squeezes_during_the_job_on_any_hog_target(capsys):
     """`--hog-event` adds timed changes in MiB to a scenario with no hog of
-    its own, through the same driver, on host RAM as on a GPU."""
+    its own, through the same driver, on host RAM as on a GPU. Its figures
+    are bounded by `--min-free-mb` as scaled ones are."""
     assert legs.main(["--scenario", "S2", "--hog-target", "ram",
                       "--gpu-total-mb", "24564", "--no-dotenv", "--dry-run",
                       "--hog-event", "at=60,leave_free=4096",
                       "--hog-event", "at=30,hold=2048",
-                      "--hog-event", "at=120,release"]) == 0
+                      "--hog-event", "at=120,release",
+                      "--hog-event", "at=130,leave_free=0",
+                      "--hog-event", "at=140,hold=30000"]) == 0
     plan = json.loads(capsys.readouterr().out)
     hog = plan["hog"]
     assert (hog["target"], hog["schedule"], hog["reeval"]) == (
         "ram", ["hold", "0"], 999999)
     assert [(row["at_s"], row.get("leave_free_mb"), row.get("mb"))
             for row in plan["hog_events"]] == [
-        (30.0, None, 2048), (60.0, 4096, None), (120.0, None, 0)]
+        (30.0, None, 2048), (60.0, 4096, None), (120.0, None, 0),
+        (130.0, 1024, None), (140.0, None, 23540)]
+    assert [(row["at"], row["fraction"], row["scaled_mb"], row["resolved_mb"])
+            for row in plan["floor_bound"]] == [
+        ("at=130,leave_free=0", None, 0, 1024),
+        ("at=140,hold=30000", None, 30000, 23540)]
 
     # Beside a scenario's own events, in time order, its hog unchanged.
     assert legs.main(["--scenario", "S4c", "--gpu-total-mb", "24564",
@@ -76,6 +83,8 @@ def test_a_hog_event_squeezes_during_the_job_on_any_hog_target(capsys):
     assert [row["at_s"] for row in plan["hog_events"]] == [90.0, 95.0, 100.0]
     assert plan["hog"]["reeval"] is None
 
-    for bad in ("at=5,leave_free=1,hold=2", "leave_free=1", "at=5,hold=x"):
+    for bad in ("at=5,leave_free=1,hold=2", "leave_free=1", "at=5,hold=x",
+                "at=5,release=x", "at=-1,release", "at=nan,release",
+                "at=inf,release", "at=5,hold=-1"):
         with pytest.raises(SystemExit):
             legs.main(["--scenario", "S2", "--dry-run", "--hog-event", bad])
