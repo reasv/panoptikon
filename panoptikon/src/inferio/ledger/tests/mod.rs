@@ -483,7 +483,8 @@ fn cpu_ledger(budgets: impl Into<VramBudgets>) -> Arc<VramLedger> {
 }
 
 /// A CPU worker's load report: no UUID and no PCI address (there is no GPU),
-/// `psutil`'s RAM total as `gpu_total_mb`, and the RSS-derived base.
+/// `psutil`'s RAM total as `gpu_total_mb`, the RSS-derived base, and the
+/// device it ran on.
 fn loaded_cpu(total_mb: Option<u64>) -> TelemetryHandle {
     let mut telemetry = WorkerTelemetry::default();
     telemetry.load = Some(Timestamped::now(LoadReport {
@@ -493,6 +494,7 @@ fn loaded_cpu(total_mb: Option<u64>) -> TelemetryHandle {
         allocated_at_load_mb: Some(0),
         gpu_name: Some("CPU (64 GB)".to_owned()),
         gpu_total_mb: total_mb,
+        device_kind: Some("cpu".to_owned()),
         torch_version: Some("2.7.1".to_owned()),
         ..LoadReport::default()
     }));

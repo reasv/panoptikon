@@ -920,28 +920,38 @@ fn a_configured_ceiling_overrides_the_cpu_default() {
     );
 }
 
-/// On a CPU host the join is the single-GPU fallback, cross-checked against
-/// physical RAM, which `psutil` reports from the same sources the host reads.
+/// On a CPU host a worker reaches the CPU device by reporting
+/// `device_kind = cpu`. A GPU worker without a UUID is never priced against
+/// RAM, even when its total matches RAM (an APU, or a 64 GB card in a 64 GB
+/// host).
 #[test]
-fn a_cpu_worker_registers_against_the_ram_gpu() {
+fn only_a_cpu_report_registers_against_the_ram_device() {
     let ledger = cpu_ledger(no_margin());
-    let handle = loaded_cpu(Some(CPU_RAM_MB));
     let _admission = ledger
-        .register_worker("g/a", item_cost(4), &handle, None)
-        .expect("admitted under the only GPU there is");
+        .register_worker("g/a", item_cost(4), &loaded_cpu(Some(CPU_RAM_MB)), None)
+        .expect("a CPU worker");
     assert_eq!(
         admitted_gpu(&ledger, 0),
         ("CPU".to_owned(), "g/a".to_owned())
     );
 
-    // A report describing some *other* machine's memory is refused.
-    let foreign = cpu_ledger(no_margin());
-    assert!(
-        foreign
-            .register_worker("g/a", item_cost(4), &loaded_cpu(Some(8192)), None)
-            .is_none(),
-        "8 GB is not this 64 GB machine"
-    );
+    for device_kind in [Some("rocm"), None] {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            gpu_bdf: Some("0000:03:00.0".to_owned()),
+            gpu_total_mb: Some(CPU_RAM_MB),
+            device_kind: device_kind.map(str::to_owned),
+            ..LoadReport::default()
+        }));
+        let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
+        assert!(
+            cpu_ledger(no_margin())
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .is_none(),
+            "{device_kind:?}"
+        );
+    }
 }
 
 /// On a mixed host (two CUDA GPUs and the CPU device) each replica is
@@ -1032,12 +1042,9 @@ fn a_cpu_devices_total_is_never_adopted_from_a_worker() {
     // Inside `(0, RAM]` and far outside the cross-check tolerance: the shape
     // that re-adopts on MPS.
     let handle = loaded_cpu(Some(CPU_RAM_MB / 2));
-    assert!(
-        ledger
-            .register_worker("g/a", item_cost(4), &handle, None)
-            .is_none(),
-        "a report that disagrees with the GPU is refused, not adopted"
-    );
+    let _admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("a CPU worker is placed by its device kind");
     assert_eq!(
         ledger.health()[0].total_mb,
         CPU_RAM_MB,
