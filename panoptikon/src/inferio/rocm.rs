@@ -670,6 +670,7 @@ fn unified_facts(
 /// RAM the kernel could deliver now, in MiB: `MemAvailable` less
 /// `SReclaimable`, slab it counts as available but may not free before it
 /// kills a process. `None` without a `MemAvailable` row.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn ram_deliverable_mb(meminfo: &Path) -> Option<u64> {
     let available = meminfo_mb(meminfo, "MemAvailable")?;
     Some(available.saturating_sub(meminfo_mb(meminfo, "SReclaimable").unwrap_or(0)))
