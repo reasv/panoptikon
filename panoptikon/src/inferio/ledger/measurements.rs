@@ -23,36 +23,17 @@ fn push_fit_sample(ring: &mut VecDeque<FitSample>, sample: FitSample) {
     }
 }
 
-/// The host RAM a GPU replica books, from its samples. Every size is priced
-/// at an upper bound, since the per-unit cost varies with the input and this
-/// is a safety ceiling; no batch books less than the costliest one measured
-/// at a size no larger, or than the smallest one measured.
-///
-/// Up to the largest batch measured it books the Theil–Sen fit, once two
-/// sizes ran: its fixed part plus per unit the largest cost above it among
-/// batches within [`RATCHET_FACTOR`] of the largest, or the slope if higher.
-/// Past the largest, a fixed part read too high would leave part of the
-/// per-unit cost out, so each of those batches is extended from its own
-/// growth at its whole growth per unit, the highest of them, or the slope if
-/// higher. Past [`RamCost::fitted_reach`], where a few small batches price a
-/// far larger one, the rate is at least the one-size rate below.
-///
-/// Samples are measured over a load level that includes what a replica's
-/// first batch (`first_units`) kept (`first_kept_mb`), which may be that
-/// batch's own memory, reused by later ones: up to `reused_mb` of it, by what
-/// later batches kept. That much is added back to a batch's growth. So
-/// batches no larger than the first are left out, and a batch's one-size rate
-/// is the lower of its growth plus the kept memory over its units and its
-/// growth over the units beyond the first batch's: either bounds the cost per
-/// unit, whichever the kept memory is, when every input costs the same. A
-/// one-size cost books its growth up to the size measured and is extended at
-/// that rate. `None` with no sample, or a per-unit cost of 0: unknown, not
-/// free.
+/// The host RAM a GPU replica books, from its samples ([`RamCost`]): an upper
+/// bound at every size, since the per-unit cost varies with the input and
+/// this is a safety ceiling. The samples are measured over a level that holds
+/// what the replica's first batch (`first_units`) kept (`startup_mb`), part
+/// of which later batches may reuse, so batches no larger than the first are
+/// left out. `None` with no sample, or a per-unit cost of 0: unknown, not
+/// free. See docs/batch-calibration-design.md, "RAM ceiling for GPU models".
 pub(super) fn ram_cost(
     samples: &[FitSample],
     first_units: u64,
-    first_kept_mb: u64,
-    reused_mb: u64,
+    startup_mb: u64,
 ) -> Option<RamCost> {
     let mut samples: Vec<FitSample> = samples
         .iter()
@@ -64,43 +45,52 @@ pub(super) fn ram_cost(
     let fit = theil_sen(&samples);
     let fixed_mb = fit.map_or(0.0, |fit| fit.intercept_mb.max(0.0));
     let slope = fit.map_or(0.0, |fit| fit.slope_mb_per_unit);
-    let mut mb_per_unit = slope;
-    let mut lines = Vec::new();
-    for sample in samples
+    let near = |sample: &&FitSample| sample.units.saturating_mul(RATCHET_FACTOR) >= largest;
+    // A sample's growth per unit beyond the first batch's units.
+    let beyond_first =
+        |sample: &FitSample| sample.delta_mb as f64 / (sample.units - first_units) as f64;
+    // What later batches may reuse of the first batch's memory: its units at
+    // the costliest growth per unit near the largest, at most what it kept.
+    let costliest = samples
         .iter()
-        .filter(|sample| sample.units.saturating_mul(RATCHET_FACTOR) >= largest)
-    {
+        .filter(near)
+        .map(beyond_first)
+        .fold(0.0, f64::max);
+    let reused_mb = (first_units as f64 * costliest).min(startup_mb as f64);
+    let mut mb_per_unit = slope;
+    let mut extensions = Vec::new();
+    for sample in samples.iter().filter(near) {
         let (units, delta) = (sample.units as f64, sample.delta_mb as f64);
-        let whole = (delta + reused_mb as f64) / units;
-        let one_size = ((delta + first_kept_mb as f64) / units)
-            .min(delta / (sample.units - first_units) as f64)
-            .max(whole);
-        let (fitted, near) = match fit {
-            Some(_) => ((delta - fixed_mb) / units, whole),
-            None => (one_size, one_size),
+        let past_reach = ((delta + startup_mb as f64) / units).min(beyond_first(sample));
+        let within_reach = if fit.is_some() {
+            mb_per_unit = mb_per_unit.max((delta - fixed_mb) / units);
+            (delta > fixed_mb + slope * units).then_some((delta + reused_mb) / units)
+        } else {
+            mb_per_unit = mb_per_unit.max(past_reach);
+            Some(past_reach)
         };
-        mb_per_unit = mb_per_unit.max(fitted);
-        lines.push(RamLine {
+        extensions.push(RamExtension {
             units: sample.units,
             delta_mb: delta,
-            near_mb_per_unit: near.max(slope),
-            far_mb_per_unit: one_size.max(slope),
+            mb_per_unit: within_reach,
+            past_reach_mb_per_unit: past_reach.max(slope),
         });
     }
-    let mut floor: Vec<FitSample> = Vec::new();
+    let mut lower_bound: Vec<FitSample> = Vec::new();
     for sample in samples {
-        if floor
+        if lower_bound
             .last()
             .is_none_or(|top| sample.delta_mb > top.delta_mb)
         {
-            floor.push(sample);
+            lower_bound.push(sample);
         }
     }
     Some(RamCost {
         fixed_mb,
         mb_per_unit,
-        lines,
-        floor,
+        slope_mb_per_unit: slope,
+        extensions,
+        lower_bound,
         startup_mb: 0.0,
         fitted: fit.is_some(),
         measured_units: largest,
@@ -286,11 +276,9 @@ impl VramLedger {
         let mut ram_at_load = entry.ram_at_load_mb;
         let mut ram_started = entry.ram_started;
         let known_startup = cal_locked(state, entry).map_or(0, |cal| cal.ram_startup_mb);
-        // What the replica's first batch kept (start-up memory) and grew to.
+        // What the replica's first batch kept: start-up memory.
         let mut startup_mb: Option<u64> = None;
-        let mut first_peak_mb = 0u64;
         let mut first_units = 0u64;
-        let mut kept_share = 0.0f64;
         let mut ram_before = entry.ram_resident_mb();
         let mut ram_base = entry.ram_base_mb;
 
@@ -511,9 +499,6 @@ impl VramLedger {
                     let kept = rss.saturating_sub(ram_before);
                     let startup = if item_capped {
                         startup_mb = Some(kept);
-                        first_peak_mb = measurement
-                            .peak_rss_mb
-                            .map_or(kept, |peak| peak.saturating_sub(ram_before));
                         first_units = measurement.units.unwrap_or(0);
                         kept
                     } else {
@@ -599,15 +584,10 @@ impl VramLedger {
                 && peak > batch_ram_before
                 && !first_batch
             {
-                let growth = peak.saturating_sub(base);
                 ram_samples.push(FitSample {
                     units,
-                    delta_mb: growth,
+                    delta_mb: peak.saturating_sub(base),
                 });
-                if let Some(after) = measurement.rss_after_mb {
-                    let kept = after.saturating_sub(base) as f64 / growth as f64;
-                    kept_share = kept_share.max(kept.min(1.0));
-                }
             }
             if item_capped {
                 let per_item = units
@@ -856,10 +836,8 @@ impl VramLedger {
         }
         if let Some(startup) = startup_mb {
             cal.ram_startup_mb = cal.ram_startup_mb.max(startup);
-            cal.ram_first_peak_mb = cal.ram_first_peak_mb.max(first_peak_mb);
             cal.ram_first_units = cal.ram_first_units.max(first_units);
         }
-        cal.ram_kept_share = cal.ram_kept_share.max(kept_share);
         if !ram_samples.is_empty() {
             for sample in ram_samples {
                 // The costlier of two batches at one size stays, so the
@@ -872,14 +850,10 @@ impl VramLedger {
                     .unwrap_or(sample);
                 push_fit_sample(&mut cal.ram_samples, costliest);
             }
-            // The first batch's own memory later batches may reuse: what it
-            // grew to, in the share later batches kept of theirs.
-            let reused = (cal.ram_kept_share * cal.ram_first_peak_mb as f64) as u64;
             cal.ram_cost = ram_cost(
                 cal.ram_samples.make_contiguous(),
                 cal.ram_first_units,
                 cal.ram_startup_mb,
-                reused.min(cal.ram_startup_mb),
             );
         }
         for sample in margin_samples {

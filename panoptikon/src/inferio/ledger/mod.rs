@@ -632,17 +632,18 @@ struct RamCeiling {
 }
 
 /// What a GPU replica's batch books in host RAM ([`measurements::ram_cost`]):
-/// `startup_mb` plus the highest of the costliest growth measured at a size
-/// no larger (`floor`), the fit `fixed_mb + units × mb_per_unit` up to
-/// [`Self::fitted_reach`], and every line from a batch no larger. A one-size
-/// cost books the growth it measured up to that size.
+/// `startup_mb` plus the highest of the lower bound from smaller batches, the
+/// fit `fixed_mb + units × mb_per_unit` (from two sizes; held at
+/// [`Self::fitted_reach`] past it), and, past the largest batch measured, its
+/// extensions.
 #[derive(Debug, Clone, PartialEq)]
 struct RamCost {
     fixed_mb: f64,
     mb_per_unit: f64,
-    lines: Vec<RamLine>,
+    slope_mb_per_unit: f64,
+    extensions: Vec<RamExtension>,
     /// Samples by units, each costlier than every smaller one.
-    floor: Vec<FitSample>,
+    lower_bound: Vec<FitSample>,
     /// Start-up memory a replica's first batch will add.
     startup_mb: f64,
     /// From two sizes or more. From one size it prices item-capped windows,
@@ -652,15 +653,15 @@ struct RamCost {
     measured_units: u64,
 }
 
-/// A batch near the largest measured, extended from its growth by a rate per
-/// further unit: `near_mb_per_unit` up to [`RamCost::fitted_reach`],
-/// `far_mb_per_unit` past it.
+/// An extension past the largest batch: a batch near it, extended from its
+/// growth at `mb_per_unit` per further unit up to [`RamCost::fitted_reach`]
+/// (`None`: not extended there) and at `past_reach_mb_per_unit` past it.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct RamLine {
+struct RamExtension {
     units: u64,
     delta_mb: f64,
-    near_mb_per_unit: f64,
-    far_mb_per_unit: f64,
+    mb_per_unit: Option<f64>,
+    past_reach_mb_per_unit: f64,
 }
 
 impl RamCost {
@@ -669,31 +670,46 @@ impl RamCost {
         self.measured_units.saturating_mul(RATCHET_FACTOR)
     }
 
-    /// The costliest growth measured at `units` or fewer, and below the
-    /// smallest size measured, the growth there.
-    fn floor_mb(&self, units: u64) -> f64 {
-        let below = self.floor.iter().take_while(|sample| sample.units <= units);
-        below
+    /// The costliest growth measured at `units` or fewer. Below the smallest
+    /// batch measured: its growth less the slope per unit short of it, or,
+    /// from one size, its growth.
+    fn lower_bound_mb(&self, units: u64) -> f64 {
+        let Some(smallest) = self.lower_bound.first() else {
+            return 0.0;
+        };
+        match self
+            .lower_bound
+            .iter()
+            .take_while(|sample| sample.units <= units)
             .last()
-            .or(self.floor.first())
-            .map_or(0.0, |sample| sample.delta_mb as f64)
+        {
+            Some(sample) => sample.delta_mb as f64,
+            None if self.fitted => {
+                smallest.delta_mb as f64 - (smallest.units - units) as f64 * self.slope_mb_per_unit
+            }
+            None => smallest.delta_mb as f64,
+        }
     }
 
     fn booking_mb(&self, units: u64) -> u64 {
-        let far = units > self.fitted_reach();
-        let mut mb = if self.fitted {
-            let fit = self.fixed_mb + units as f64 * self.mb_per_unit;
-            self.floor_mb(units).max(if far { 0.0 } else { fit })
-        } else {
-            self.floor_mb(units.max(self.measured_units))
-        };
-        for line in self.lines.iter().filter(|line| line.units <= units) {
-            let rate = if far {
-                line.far_mb_per_unit
-            } else {
-                line.near_mb_per_unit
-            };
-            mb = mb.max(line.delta_mb + (units - line.units) as f64 * rate);
+        let past_reach = units > self.fitted_reach();
+        let mut mb = self.lower_bound_mb(units);
+        if self.fitted {
+            let fitted_units = units.min(self.fitted_reach()) as f64;
+            mb = mb.max(self.fixed_mb + fitted_units * self.mb_per_unit);
+        }
+        if units > self.measured_units {
+            for extension in &self.extensions {
+                let rate = if past_reach {
+                    Some(extension.past_reach_mb_per_unit)
+                } else {
+                    extension.mb_per_unit
+                };
+                if let Some(rate) = rate {
+                    let further = (units - extension.units) as f64;
+                    mb = mb.max(extension.delta_mb + further * rate);
+                }
+            }
         }
         (self.startup_mb + mb).ceil() as u64
     }
@@ -1258,10 +1274,6 @@ struct ModelCalibration {
     ram_startup_mb: u64,
     /// The largest first batch, in units ([`measurements::ram_cost`]).
     ram_first_units: u64,
-    /// The most a first batch grew the resident set at its peak.
-    ram_first_peak_mb: u64,
-    /// The largest share of its growth a later batch left resident.
-    ram_kept_share: f64,
 }
 
 /// A batch size the impl itself reported it cannot run at this corpus's
