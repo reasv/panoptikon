@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -17,6 +19,8 @@ import tomllib
 import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import pytest
 
 HERE = Path(__file__).resolve().parents[1]
 
@@ -172,3 +176,62 @@ def test_healthrec_keeps_the_clients_of_a_gateway_that_answered_504():
     assert health["inference_clients"] == clients
     assert health["detail"] == "frozen"
     assert "running" not in healthrec.flatten_queue(result)
+
+
+# Every child legs starts, replaced by one that exits once its parent is gone.
+DRIVER = """
+import os, subprocess, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import legs
+start = legs.Supervisor.start
+CHILD = ("import os, time\\nparent = os.getppid()\\n"
+         "while os.getppid() == parent: time.sleep(0.1)")
+legs.Supervisor.start = lambda self, name, argv, **kw: start(
+    self, name, [sys.executable, "-c", CHILD], **kw)
+legs.unsampled = lambda paths, timeout: []
+legs.board_total_mb = lambda device: None
+legs.rocm_sysfs.inventory = lambda *roots: []
+directory = Path(sys.argv[2]) / "run" / "S14"
+directory.mkdir(parents=True)
+legs.subprocess.run = lambda argv, **kw: subprocess.CompletedProcess(
+    argv, 0, stdout=f"{directory}\\n", stderr="")
+sys.exit(legs.main(sys.argv[3:]))
+"""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signal")
+def test_sigterm_tears_the_leg_down_and_records_it(tmp_path):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "manifest.json").write_text(json.dumps(
+        {"tier": "smoke", "generator": legs.CORPUS_GENERATOR}))
+    config = tmp_path / "server-X.toml"
+    config.write_text("[server]\nport = 1\n")
+    driver = tmp_path / "driver.py"
+    driver.write_text(DRIVER)
+    log = tmp_path / "out.log"
+    with log.open("wb") as sink:
+        leg = subprocess.Popen(
+            [sys.executable, str(driver), str(HERE), str(tmp_path),
+             "--scenario", "S14", "--config", str(config), "--bin",
+             str(config), "--corpus", str(corpus), "--results",
+             str(tmp_path), "--no-dotenv", "--stop-grace", "5"],
+            stdout=sink, stderr=subprocess.STDOUT)
+        try:
+            assert legs.wait_for(lambda: b"gateway_started" in log.read_bytes(),
+                                 30.0, interval=0.1), log.read_text()
+            leg.send_signal(signal.SIGTERM)
+            assert leg.wait(timeout=30) == 1
+        finally:
+            leg.kill()
+    recorded = json.loads((tmp_path / "run" / "S14" / "legs.json").read_text())
+    assert recorded["outcome"] == "interrupted"
+    assert {"event": "interrupted", "signal": "SIGTERM"}.items() <= next(
+        event for event in recorded["events"]
+        if event["event"] == "interrupted").items()
+    # Each child was stopped and reaped by the leg, not left to its parent's
+    # death.
+    assert set(recorded["processes"]) == {"vramrec", "healthrec", "gateway"}
+    assert all(row["returncode"] == -signal.SIGTERM
+               for row in recorded["processes"].values())

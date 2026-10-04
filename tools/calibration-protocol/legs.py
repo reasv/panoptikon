@@ -106,6 +106,8 @@ The recorders handle `SIGBREAK` for exactly this reason, so a Windows
 teardown flushes its last samples instead of losing them. `hog.py` is asked to
 release over its own HTTP endpoint first, on every platform, because that is
 the only stop that is observably complete before the process exits.
+SIGTERM, SIGHUP or SIGBREAK sent to `legs.py` itself ends the leg as Ctrl-C
+does: the same teardown, and `legs.json` with the outcome `interrupted`.
 """
 
 from __future__ import annotations
@@ -674,6 +676,23 @@ class FdRecorder(threading.Thread):
 def iso_now() -> str:
     now = datetime.now(timezone.utc)
     return now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def stop_on_signals() -> None:
+    """SIGTERM, SIGHUP and SIGBREAK end the leg as Ctrl-C does, through its
+    teardown: the children run in their own sessions, so a driver killed
+    outright leaves them running. Later signals are ignored so the teardown
+    finishes."""
+    names = [name for name in ("SIGTERM", "SIGHUP", "SIGBREAK")
+             if hasattr(signal, name)]
+
+    def interrupt(signum: int, _frame: Any) -> None:
+        for name in names:
+            signal.signal(getattr(signal, name), signal.SIG_IGN)
+        raise KeyboardInterrupt(signal.Signals(signum).name)
+
+    for name in names:
+        signal.signal(getattr(signal, name), interrupt)
 
 
 def wait_for(predicate: Callable[[], bool], timeout: float,
@@ -2108,6 +2127,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     fds: Optional[FdRecorder] = None
     outcome = "incomplete"
+    stop_on_signals()
     try:
         # 1. the oracle, before anything of ours is on the GPU
         vram_argv = [
@@ -2250,9 +2270,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         time.sleep(args.settle)
         save(f"{base}/api/inference/health", leg.path("health-end.json"))
         leg.snapshot_calibration("calibration.after.toml")
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         outcome = "interrupted"
-        leg.mark("interrupted")
+        leg.mark("interrupted", signal=str(exc) or "SIGINT")
     except SystemExit as exc:
         outcome = f"aborted: {exc}"
         leg.mark("aborted", error=str(exc))
