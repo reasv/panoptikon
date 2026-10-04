@@ -2160,11 +2160,14 @@ fn a_first_large_window_priced_from_cheap_small_batches_covers_its_pages() {
 }
 
 /// A worker that pins its first batch's memory, half of it for good or all
-/// of it until its fourth window, under pages costing 650 MiB, then 300 and
-/// 360, then 460 each, plus 200 per batch, with a stored working size that
-/// opens the first uncapped window far past the item-capped ones and short
-/// queues between full windows: no window runs the host out of RAM, and none
-/// past the item-capped sizes books less than its pages add.
+/// of it until its fourth window's batch frees it before or after its peak,
+/// under pages costing 650 MiB, then 300 and 360, then 460 each, plus 200
+/// per batch, with a stored working size that opens the first uncapped
+/// window far past the item-capped ones and short queues between full
+/// windows: no window runs the host out of RAM, none past the item-capped
+/// sizes books less than its pages add, and a batch that frees the memory
+/// after its peak leaves the later windows the sizes they run when it frees
+/// it before.
 #[test]
 fn a_first_batch_pinned_then_freed_leaves_no_large_window_under_booked() {
     const STARTUP: u64 = 700;
@@ -2175,11 +2178,16 @@ fn a_first_batch_pinned_then_freed_leaves_no_large_window_under_booked() {
         2 => 360,
         _ => 460,
     };
-    for (freed_at, others) in [
+    // The window whose batch frees the pinned memory, and whether after its
+    // peak.
+    let mut freed_before = HashMap::new();
+    for (freed, others) in [
         (None, 8_000),
         (None, 20_000),
-        (Some(3), 8_000),
-        (Some(3), 20_000),
+        (Some((3, false)), 8_000),
+        (Some((3, false)), 20_000),
+        (Some((3, true)), 8_000),
+        (Some((3, true)), 20_000),
     ] {
         let profiles = Arc::new(FakeProfiles {
             seed: Some(seeded_anchor(1_024, true)),
@@ -2187,12 +2195,12 @@ fn a_first_batch_pinned_then_freed_leaves_no_large_window_under_booked() {
         });
         let ledger = host(&[GPU], Some(profiles));
         let (handle, admission) = cold_gpu_replica(&ledger, "g/pinned", GPU, item_cost(32));
-        let (mut pinned, mut startup, mut pages_run) = (0, 0, 0);
+        let (mut pinned, mut startup, mut pages_run, mut sizes) = (0, 0, 0, Vec::new());
         for (window, queued) in [1, 2, 4, u64::MAX, u64::MAX, 4, u64::MAX, 1, 3, u64::MAX]
             .into_iter()
             .enumerate()
         {
-            if freed_at == Some(window) {
+            if freed == Some((window, false)) {
                 pinned = 0;
             }
             let level = RSS_AT_LOAD_MB + startup + pinned;
@@ -2208,8 +2216,9 @@ fn a_first_batch_pinned_then_freed_leaves_no_large_window_under_booked() {
             let charged = cpu_row(&ledger).charges_mb;
             let need = TRANSIENT + (pages_run..pages_run + pages).map(page).sum::<u64>();
             pages_run += pages;
+            sizes.push(pages);
             let peak = RSS_AT_LOAD_MB + STARTUP + pinned + need;
-            let case = format!("freed at {freed_at:?}, others {others}, window {window}");
+            let case = format!("freed {freed:?}, others {others}, window {window}");
             assert!(others + peak <= CPU_RAM_MB, "{case}: {pages} pages");
             if pages > 4 {
                 assert!(
@@ -2218,8 +2227,11 @@ fn a_first_batch_pinned_then_freed_leaves_no_large_window_under_booked() {
                 );
             }
             if window == 0 {
-                pinned = need / if freed_at.is_some() { 1 } else { 2 };
+                pinned = need / if freed.is_some() { 1 } else { 2 };
                 startup = STARTUP;
+            }
+            if freed == Some((window, true)) {
+                pinned = 0;
             }
             handle
                 .lock()
@@ -2230,6 +2242,16 @@ fn a_first_batch_pinned_then_freed_leaves_no_large_window_under_booked() {
                 }]);
             token.finish(WindowOutcome::Responded { oom: None });
             admission.earn_next_size();
+        }
+        if let Some((window, after_peak)) = freed {
+            let later = sizes.split_off(window + 1);
+            if after_peak {
+                if let Some(before) = freed_before.get(&(window, others)) {
+                    assert_eq!(&later, before, "freed {freed:?}, others {others}");
+                }
+            } else {
+                freed_before.insert((window, others), later);
+            }
         }
     }
 }

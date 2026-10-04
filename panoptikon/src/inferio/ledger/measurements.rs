@@ -578,18 +578,15 @@ impl VramLedger {
             let units = measurement.units.filter(|units| *units > 0);
             // The batch's envelope in host RAM, over the baseline. A batch
             // that peaked no higher than the resident set before it ran in
-            // memory kept from an earlier one: its own cost is unknown.
+            // memory kept from an earlier one, and one that left it below the
+            // baseline released memory before or after its peak: the cost of
+            // either is unknown.
             if let (Some(units), Some(peak), Some(base)) =
                 (units, measurement.peak_rss_mb, batch_ram_base)
                 && peak > batch_ram_before
                 && !first_batch
+                && measurement.rss_after_mb.is_none_or(|after| after >= base)
             {
-                // A batch that left the resident set below the baseline
-                // released memory, perhaps before its peak: its growth is
-                // measured from there.
-                let base = measurement
-                    .rss_after_mb
-                    .map_or(base, |after| base.min(after));
                 ram_samples.push(FitSample {
                     units,
                     delta_mb: peak.saturating_sub(base),

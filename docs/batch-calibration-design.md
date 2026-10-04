@@ -852,9 +852,8 @@ booked centrally on the CPU device. It is never a throughput signal.
   baseline is the resident set at load, lowered to any lower level a batch
   leaves it at, whether load-time memory was released for good or only for
   now (pages reclaimed under pressure that come back with the next batch).
-  That batch is itself measured from the lower level, since it may have
-  released the memory before its peak (a worker that frees what its first
-  batch pinned).
+  That batch gives no sample, since it may have released the memory before
+  or after its peak; the next one is measured from the lower level.
   No sample is taken from a batch that peaked no higher than the resident
   set before it: that batch ran in memory an earlier one kept (the worker
   trims the C heap after every batch, but partly used pages stay), so its
