@@ -9129,6 +9129,24 @@
             "description": "Trims that freed memory, and the last one's MiB and `empty_cache()`\ntime. Absent off CUDA and MPS.",
             "minimum": 0
           },
+          "pressure_cap_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The batch a macOS paging episode left: caps `unit_budget` until clean\nfull windows double it back to the batch size admitted at normal\npressure; runtime-only.",
+            "minimum": 0
+          },
+          "pressure_regrow_to_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How far `pressure_cap_units` may grow back while macOS reports\nmemory pressure without paging.",
+            "minimum": 0
+          },
           "ram_booked_mb": {
             "type": "integer",
             "format": "int64",

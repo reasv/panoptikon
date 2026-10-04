@@ -1647,9 +1647,17 @@ fn ramp_figures(ledger: &Arc<VramLedger>) -> (Option<u64>, u32, usize, u64) {
     )
 }
 
-/// What paging left of the replica's batch size, if anything.
+/// What paging left of the replica's batch size, if anything, as `/health`
+/// also shows it.
 fn pressure_cap(ledger: &Arc<VramLedger>) -> Option<PressureCap> {
-    ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].pressure_cap
+    let cap = ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].pressure_cap;
+    for worker in &ledger.health()[0].workers {
+        assert_eq!(
+            (worker.pressure_cap_units, worker.pressure_regrow_to_units),
+            (cap.map(|cap| cap.units), cap.map(|cap| cap.regrow_to))
+        );
+    }
+    cap
 }
 
 /// `windows` windows while macOS pages at `pressure`: the worker holds

@@ -36,6 +36,7 @@ impl VramLedger {
                         let anchor = cal.map(|cal| cal.max_units_measured).unwrap_or(0);
                         let knee = cal.and_then(|cal| cal.knee_units).filter(|knee| *knee > 0);
                         let shape_ceiling = shape_ceiling_for(cal, entry);
+                        let pressure_cap = cal.and_then(|cal| cal.pressure_cap);
                         LedgerWorkerHealth {
                             inference_id: entry.inference_id.clone(),
                             footprint_mb: entry.footprint_mb(),
@@ -61,6 +62,8 @@ impl VramLedger {
                             knee_units: knee,
                             shape_ceiling_units: shape_ceiling,
                             death_cap_units: cal.and_then(|cal| cal.death_cap_units),
+                            pressure_cap_units: pressure_cap.map(|cap| cap.units),
+                            pressure_regrow_to_units: pressure_cap.map(|cap| cap.regrow_to),
                             knee_is_local: cal.is_some_and(|cal| cal.knee_is_local),
                             trial_units: cal.and_then(|cal| cal.trial).map(|trial| trial.run),
                             retest_after_windows: cal.map_or(0, |cal| cal.retest_after),
@@ -237,6 +240,13 @@ pub struct LedgerWorkerHealth {
     /// Half the batch a replica of this model was running here when its
     /// process died mid-window: caps `unit_budget` until the server restarts.
     pub death_cap_units: Option<u64>,
+    /// The batch a macOS paging episode left: caps `unit_budget` until clean
+    /// full windows double it back to the batch size admitted at normal
+    /// pressure; runtime-only.
+    pub pressure_cap_units: Option<u64>,
+    /// How far `pressure_cap_units` may grow back while macOS reports
+    /// memory pressure without paging.
+    pub pressure_regrow_to_units: Option<u64>,
     /// Throughput observations held (all occupancies); runtime-only.
     pub throughput_samples: usize,
     /// Local fit samples, including restored ones; the margin widens below
