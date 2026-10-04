@@ -443,7 +443,7 @@ fn rocm_host(
             adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: roots.pci_devices.clone(),
-                ram: roots.ram(),
+                ram: roots.ram.clone(),
                 ambient_hip_restriction,
             },
             cpu_roots: None,
@@ -896,7 +896,7 @@ impl GpuInventory {
             adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: rocm::SysfsRoots::default().pci_devices,
-                ram: rocm::SysfsRoots::default().ram(),
+                ram: cpu::MemRoots::default(),
                 ambient_hip_restriction: false,
             },
             cpu_roots: None,
@@ -1642,7 +1642,7 @@ mod tests {
     }
 
     fn rocm_inventory(pci_devices: PathBuf, gpus: Vec<GpuInfo>) -> GpuInventory {
-        rocm_inventory_with(pci_devices, rocm::SysfsRoots::default().ram(), gpus)
+        rocm_inventory_with(pci_devices, cpu::MemRoots::default(), gpus)
     }
 
     /// The same, with host RAM statistics — only the unified refresh reads them.
@@ -2250,8 +2250,11 @@ mod tests {
             kfd_nodes: dir.path().join("nodes"),
             pci_devices: dir.path().join("pci"),
             dev_dri: dir.path().join("dri"),
-            meminfo: dir.path().join("meminfo"),
             kfd: dir.path().join("kfd"),
+            ram: cpu::MemRoots {
+                meminfo: dir.path().join("meminfo"),
+                ..cpu::MemRoots::default()
+            },
             ..rocm::SysfsRoots::default()
         };
         let node = roots.kfd_nodes.join("1");

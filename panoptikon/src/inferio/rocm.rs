@@ -52,11 +52,9 @@ pub(super) struct SysfsRoots {
     pub dev_dri: PathBuf,
     /// The KFD device ROCr opens read-write; without it no GPU is usable.
     pub kfd: PathBuf,
-    /// `MemTotal` for an APU's identity; `MemAvailable` and `SReclaimable`
-    /// for its GTT clamp.
-    pub meminfo: PathBuf,
-    /// The cgroup root whose limit also bounds an APU's GTT clamp.
-    pub cgroup: PathBuf,
+    /// Host RAM statistics: `MemTotal` for an APU's identity, and
+    /// deliverable RAM for its GTT clamp.
+    pub ram: cpu::MemRoots,
     /// [`amdgpu_fusion`], read on each openable render node.
     pub fusion: fn(&fs::File) -> Option<bool>,
 }
@@ -68,19 +66,8 @@ impl Default for SysfsRoots {
             pci_devices: PathBuf::from("/sys/bus/pci/devices"),
             dev_dri: PathBuf::from("/dev/dri"),
             kfd: PathBuf::from("/dev/kfd"),
-            meminfo: PathBuf::from("/proc/meminfo"),
-            cgroup: cpu::MemRoots::default().cgroup,
+            ram: cpu::MemRoots::default(),
             fusion: amdgpu_fusion,
-        }
-    }
-}
-
-impl SysfsRoots {
-    /// The host RAM statistics an APU's GTT clamp reads.
-    pub(super) fn ram(&self) -> cpu::MemRoots {
-        cpu::MemRoots {
-            meminfo: self.meminfo.clone(),
-            cgroup: self.cgroup.clone(),
         }
     }
 }
@@ -647,11 +634,11 @@ fn unified_facts(
         );
         return None;
     };
-    let Some(mem_total_mb) = meminfo_mb(&roots.meminfo, "MemTotal") else {
+    let Some(mem_total_mb) = meminfo_mb(&roots.ram.meminfo, "MemTotal") else {
         tracing::warn!(
             node,
             bdf = %bdf,
-            meminfo = %roots.meminfo.display(),
+            meminfo = %roots.ram.meminfo.display(),
             "this KFD node is an APU but MemTotal could not be read; the \
              machine's RAM is that GPU's capacity and its calibration name, \
              so there is nothing to name it with — leaving the ROCm GPU \
@@ -861,8 +848,10 @@ mod tests {
                 pci_devices: dir.path().join("pci"),
                 dev_dri: dir.path().join("dri"),
                 kfd: dir.path().join("kfd/device"),
-                meminfo: dir.path().join("meminfo"),
-                cgroup: dir.path().join("cgroup"),
+                ram: cpu::MemRoots {
+                    meminfo: dir.path().join("meminfo"),
+                    cgroup: dir.path().join("cgroup"),
+                },
                 fusion: fixture_fusion,
             };
             for root in [&roots.kfd_nodes, &roots.pci_devices, &roots.dev_dri] {
@@ -882,7 +871,7 @@ mod tests {
                 "MemTotal:       {total_kb} kB\nMemFree:         1234567 kB\n\
                  MemAvailable:   {available_kb} kB\nBuffers:           98765 kB\n"
             );
-            fs::write(&self.roots.meminfo, body).unwrap();
+            fs::write(&self.roots.ram.meminfo, body).unwrap();
             self
         }
 
@@ -1232,7 +1221,7 @@ mod tests {
                 fs::remove_file(gtt_total).unwrap();
             }
             if drop_meminfo {
-                fs::remove_file(&fixture.roots.meminfo).unwrap();
+                fs::remove_file(&fixture.roots.ram.meminfo).unwrap();
             }
             assert!(fixture.build().is_none(), "{label}");
         }
@@ -1539,7 +1528,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.pci(BDF_03, GB24, 4 * GIB).pci(BDF_0C, GB16, 0);
         let roots = &fixture.roots;
-        let read = |gpus: &[GpuRef]| query_memory(&roots.pci_devices, &roots.ram(), gpus);
+        let read = |gpus: &[GpuRef]| query_memory(&roots.pci_devices, &roots.ram, gpus);
         let tuple = |r: GpuMemory| (r.uuid, r.total_mb, r.free_mb);
         let seen = |gpus: &[GpuRef]| {
             read(gpus).map(|rows| rows.into_iter().map(tuple).collect::<Vec<_>>())
@@ -1565,7 +1554,7 @@ mod tests {
             unified,
         };
         let read_from = |f: &Fixture, gpu: GpuRef| {
-            query_memory(&f.roots.pci_devices, &f.roots.ram(), &[gpu])
+            query_memory(&f.roots.pci_devices, &f.roots.ram, &[gpu])
                 .map(|mut r| r.remove(0))
                 .map(|r| (r.total_mb, r.free_mb))
         };
@@ -1587,24 +1576,24 @@ mod tests {
         );
         // 2 GiB of that RAM is reclaimable slab, which is not deliverable.
         let slab = host(8 * 1024 * 1024);
-        let mut rows = fs::read_to_string(&slab.roots.meminfo).unwrap();
+        let mut rows = fs::read_to_string(&slab.roots.ram.meminfo).unwrap();
         rows.push_str("SReclaimable:    2097152 kB\n");
-        fs::write(&slab.roots.meminfo, rows).unwrap();
+        fs::write(&slab.roots.ram.meminfo, rows).unwrap();
         assert_eq!(read_from(&slab, apu(true)), Some((budget, 256 + 6 * 1024)));
-        assert_eq!(ram_deliverable_mb(&slab.roots.meminfo), Some(6 * 1024));
+        assert_eq!(ram_deliverable_mb(&slab.roots.ram.meminfo), Some(6 * 1024));
         // Plenty of RAM: the GTT term is the driver's own figure again.
         let roomy = host(100 * 1024 * 1024);
         let seen = read_from(&roomy, apu(true));
         assert_eq!(seen, Some((budget, 256 + 60 * 1024)));
         // In a container limited to 16 GiB with 10 GiB used, 6 GiB is left.
-        fs::create_dir_all(&roomy.roots.cgroup).unwrap();
+        fs::create_dir_all(&roomy.roots.ram.cgroup).unwrap();
         fs::write(
-            roomy.roots.cgroup.join("memory.max"),
+            roomy.roots.ram.cgroup.join("memory.max"),
             format!("{}\n", 16 * GIB),
         )
         .unwrap();
         fs::write(
-            roomy.roots.cgroup.join("memory.current"),
+            roomy.roots.ram.cgroup.join("memory.current"),
             format!("{}\n", 10 * GIB),
         )
         .unwrap();
@@ -1618,7 +1607,7 @@ mod tests {
         no_meminfo
             .pci(BDF_03, CARVE_512M, 0)
             .gtt(BDF_03, GTT_64G, 0);
-        fs::remove_file(&no_meminfo.roots.meminfo).unwrap();
+        fs::remove_file(&no_meminfo.roots.ram.meminfo).unwrap();
         assert!(
             read_from(&no_meminfo, apu(true)).is_none(),
             "no MemAvailable"
@@ -1634,7 +1623,7 @@ mod tests {
     #[test]
     fn parses_the_two_meminfo_rows() {
         let fixture = Fixture::new().meminfo(MEM_TOTAL_KB, 8 * 1024 * 1024);
-        let path = &fixture.roots.meminfo;
+        let path = &fixture.roots.ram.meminfo;
         assert_eq!(meminfo_mb(path, "MemTotal"), Some(128 * 1024 - 512));
         assert_eq!(meminfo_mb(path, "MemAvailable"), Some(8 * 1024));
         assert_eq!(meminfo_mb(path, "MemShrubbery"), None);
@@ -1697,7 +1686,7 @@ mod tests {
         fixture
             .dgpu(1, LOC_03_00, 128, GB24)
             .dgpu(2, LOC_0C_00, 129, GB16);
-        fs::remove_file(&fixture.roots.meminfo).unwrap();
+        fs::remove_file(&fixture.roots.ram.meminfo).unwrap();
         let rows = fixture.build().expect("no meminfo, no problem");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "AMD gfx1100 (24 GB)");
