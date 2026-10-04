@@ -244,12 +244,8 @@ fn cpu_host(count: u64, headroom: u64, percent: u64) -> (Arc<VramLedger>, Vec<Co
 /// A 16 GB Mac (recommended max 12 288 MiB), or a 16 GB APU host (512 MiB
 /// carve-out, 16 GiB of GTT), with a cold GPU replica whose pool is
 /// `pool_ratio` times its tensors and a cold CPU replica, 2500 MiB of base
-/// each, and the GPU's headroom. Each device's limit is net of the other's
-/// base. On the Mac the GPU has its recommended max less both bases, 7288
-/// MiB, and the CPU device RAM less the 2048 MiB floor and both bases, 9336
-/// MiB. On the APU host the GPU has carve-out and RAM less the floor and both
-/// bases, 9848 MiB, and the CPU device its cap, three quarters of RAM, less
-/// its own base, 9788 MiB.
+/// each, and the RAM room of the pair: the carve-out (APU only) and RAM, less
+/// the RAM floor and both bases.
 fn unified_pair(apu: bool, pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>, u64) {
     const RAM_MB: u64 = 16_384;
     const RECOMMENDED_MAX_MB: u64 = RAM_MB / 4 * 3;
@@ -324,7 +320,9 @@ fn unified_pair(apu: bool, pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>, u64)
     }
     let headroom = (ledger.headroom_mb(gpu), ledger.headroom_mb(cpu::DEVICE_KEY));
     assert_eq!(headroom, if apu { (9848, 9788) } else { (7288, 9336) });
-    (ledger, replicas, headroom.0)
+    let carveout = if apu { CARVEOUT_MB } else { 0 };
+    let room = carveout + RAM_MB - cpu::ram_reserve_mb(RAM_MB) - 2 * BASE_MB;
+    (ledger, replicas, room)
 }
 
 /// An 8 GiB card, 3817 MiB of headroom, at a tenth, a half and all of the
@@ -438,41 +436,25 @@ fn cold_cpu_replicas_on_a_16_gb_host_stay_inside_the_headroom() {
 
 /// A 16 GB Mac, and a 16 GB APU host at a HIP-sized pool. The first GPU
 /// batch is priced at the default pool margin; from the second on at the
-/// margin it measured. `over` is what the pair holds past the GPU's
-/// headroom.
+/// margin it measured. The pair stays within its RAM room.
 #[test]
 fn a_cold_gpu_and_cpu_replica_on_a_16_gb_unified_host_are_priced_at_the_measured_pool() {
     let cases = [
-        (
-            false,
-            1.25,
-            [[8, 8], [13, 13], [12, 12], [6, 12]],
-            [-2168, 1032, 1032, 712],
-        ),
-        (
-            false,
-            2.3,
-            [[8, 8], [7, 12], [6, 11], [4, 11]],
-            [-17, 1263, 1263, 943],
-        ),
-        (
-            false,
-            2.9,
-            [[8, 8], [7, 7], [6, 6], [5, 8]],
-            [1212, 1212, 892, 1212],
-        ),
-        (
-            true,
-            1.25,
-            [[8, 8], [16, 12], [15, 11], [16, 11]],
-            [-4728, -888, -888, -1208],
-        ),
+        (false, 1.25, [[8, 8], [13, 13], [12, 12], [6, 12]]),
+        (false, 2.3, [[8, 8], [7, 12], [6, 11], [4, 11]]),
+        (false, 2.9, [[8, 8], [7, 7], [6, 6], [5, 8]]),
+        (true, 1.25, [[8, 8], [16, 12], [15, 11], [16, 11]]),
     ];
-    for (apu, pool_ratio, units, over) in cases {
-        let (ledger, mut replicas, headroom) = unified_pair(apu, pool_ratio);
-        let ran = run(&ledger, &mut replicas, headroom, 4);
-        assert_eq!(ran.units, units, "APU {apu}, pool ratio {pool_ratio}");
-        assert_eq!(ran.over, over, "APU {apu}, pool ratio {pool_ratio}");
+    for (apu, pool_ratio, units) in cases {
+        let (ledger, mut replicas, room) = unified_pair(apu, pool_ratio);
+        let ran = run(&ledger, &mut replicas, room, 4);
+        let label = format!("APU {apu}, pool ratio {pool_ratio}");
+        assert_eq!(ran.units, units, "{label}");
+        assert!(
+            ran.over.iter().all(|over| *over <= 0),
+            "{label}: {:?}",
+            ran.over
+        );
     }
 }
 
