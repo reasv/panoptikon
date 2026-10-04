@@ -625,7 +625,9 @@ def test_an_unmeasured_context_is_logged_once_with_its_reason(
     ):
         cuda = FakeCuda(initialized=initialized)
         host = (
-            rocm_host(tmp_path, monkeypatch, fdinfo_texts=fdinfo_texts, cuda=cuda)
+            rocm_host(
+                tmp_path, monkeypatch, fdinfo_texts=fdinfo_texts, cuda=cuda
+            )
             if hip
             else isolated(fake_torch_module(cuda))
         )
@@ -1763,7 +1765,8 @@ def test_kfd_is_the_discrete_base_where_it_exceeds_fdinfo(
     me, fork = {pid: [ours()]}, {pid: [ours()], pid + 1: [ours()]}
     under_pool = "free_delta", 1200
     for initial_ns, procs, others, vram, expected, label in (
-        (True, {pid: (OUR_PASID, 1600)}, {}, "1536 MiB", ("kfd", 1600), "by PID"),
+        (True, {pid: (OUR_PASID, 1600)}, {}, "1536 MiB", ("kfd", 1600),
+         "by PID"),
         (True, {pid: (OUR_PASID, 1536)}, {}, "1536 MiB", ("fdinfo", 1536),
          "not above"),
         (True, {host_pid: (OUR_PASID, 1600)}, {}, "1536 MiB", ("fdinfo", 1536),
@@ -2052,9 +2055,8 @@ def test_the_fdinfo_reading_is_bounded_below_and_above(
     with caplog.at_level(logging.INFO, logger="inferio_worker.memory"):
         base_method(900, 3000, 2)
         base_method(total, 1024, 2)
-    rejected = [
-        r for r in caplog.records if r.args[:2] in (("fdinfo", 900), ("fdinfo", total))
-    ]
+    rejections = (("fdinfo", 900), ("fdinfo", total))
+    rejected = [r for r in caplog.records if r.args[:2] in rejections]
     assert [r.levelno for r in rejected] == [logging.INFO, logging.INFO]
 
 
