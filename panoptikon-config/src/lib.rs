@@ -15,7 +15,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 use toml_edit::{
-    Array, ArrayOfTables, Decor, DocumentMut, InlineTable, Item, RawString, Table, Value,
+    Array, ArrayOfTables, Decor, DocumentMut, InlineTable, Item, Key, RawString, Table, Value,
 };
 
 /// An editable TOML document which retains comments, whitespace, key order,
@@ -61,7 +61,7 @@ impl TomlDocument {
         let mut orphans = Vec::new();
         patch_table(self.document.as_table_mut(), before, after, &mut orphans)?;
         for (owner, block) in orphans {
-            self.prepend_after_table_body(owner.unwrap_or(0), &block);
+            self.prepend_after_table_body(owner, &block);
         }
         Ok(())
     }
@@ -104,34 +104,38 @@ impl std::fmt::Display for TomlDocument {
 
 /// Comment blocks of removed keys that were last in their table body, with
 /// the position of that table; placed once the whole document is patched.
-type Orphans = Vec<(Option<usize>, String)>;
+type Orphans = Vec<(usize, String)>;
 
+/// Returns, for a dotted-key table, the comment blocks of removed keys that
+/// were last in it: they belong before what follows it in its parent's body.
 fn patch_table(
     concrete: &mut Table,
     before: &toml::Table,
     after: &toml::Table,
     orphans: &mut Orphans,
-) -> Result<()> {
-    let first_orphan = orphans.len();
+) -> Result<String> {
+    // A block that finds no key-value after it is above the ones collected
+    // here before it, so it goes in front.
+    let mut last = String::new();
     for key in before.keys().filter(|key| !after.contains_key(*key)) {
-        // The lines above a key-value are its key's decor: hand them to the
-        // next key-value of this table, else to what follows the table body.
+        // The lines above a key-value are its key's decor (one key per line
+        // of a dotted-key table): hand them to the next key-value rendered in
+        // this body.
         let Some(index) = concrete.iter().position(|(name, _)| name == key) else {
             continue;
         };
-        let block = concrete.key(key).and_then(|key| key.leaf_decor().prefix());
-        let block = block.and_then(RawString::as_str).unwrap_or("").to_owned();
-        if !concrete.remove(key).is_some_and(|item| item.is_value()) || block.is_empty() {
-            continue;
-        }
-        let owner = concrete.position();
-        match concrete
-            .iter_mut()
-            .skip(index)
-            .find(|(_, item)| item.is_value())
-        {
-            Some((mut next, _)) => prepend_prefix(next.leaf_decor_mut(), &block, ""),
-            None => orphans.push((owner, block)),
+        let (key, item) = concrete.remove_entry(key).expect("the key was found above");
+        let block = match &item {
+            Item::Value(_) => leading_lines(&key).to_owned(),
+            Item::Table(table) if table.is_dotted() => table
+                .get_values()
+                .iter()
+                .filter_map(|(path, _)| path.last().map(|key| leading_lines(key)))
+                .collect(),
+            _ => continue,
+        };
+        if let Some(block) = prepend_to_next_key(concrete, index, block) {
+            last.insert_str(0, &block);
         }
     }
     for (key, new_value) in after {
@@ -139,18 +143,59 @@ fn patch_table(
         if old_value == Some(new_value) {
             continue;
         }
-        match (concrete.get_mut(key), old_value) {
-            (Some(item), Some(old_value)) => patch_item(item, old_value, new_value, orphans)?,
+        match (concrete.get_mut(key), old_value, new_value) {
+            (
+                Some(Item::Table(table)),
+                Some(toml::Value::Table(old_value)),
+                toml::Value::Table(new_value),
+            ) if table.is_dotted() => {
+                let block = patch_table(table, old_value, new_value, orphans)?;
+                let index = concrete.iter().position(|(name, _)| name == key);
+                let index = index.expect("the patched key is in the table");
+                if let Some(block) = prepend_to_next_key(concrete, index + 1, block) {
+                    last.insert_str(0, &block);
+                }
+            }
+            (Some(item), Some(old_value), _) => patch_item(item, old_value, new_value, orphans)?,
             _ => {
                 concrete.insert(key, item_from_toml(new_value)?);
             }
         }
     }
-    // A dotted-key table (no position of its own) renders inside this body.
-    for (owner, _) in &mut orphans[first_orphan..] {
-        *owner = owner.or(concrete.position());
+    if concrete.is_dotted() {
+        return Ok(last);
     }
-    Ok(())
+    if !last.is_empty() {
+        // Only the parsed root has no position; it renders first.
+        orphans.push((concrete.position().unwrap_or(0), last));
+    }
+    Ok(String::new())
+}
+
+fn leading_lines(key: &Key) -> &str {
+    let prefix = key.leaf_decor().prefix();
+    prefix.and_then(RawString::as_str).unwrap_or("")
+}
+
+/// Prepends `block` to the first key-value rendered from item `index` on,
+/// descending into dotted-key tables; gives it back when there is none.
+fn prepend_to_next_key(table: &mut Table, index: usize, mut block: String) -> Option<String> {
+    if block.is_empty() {
+        return None;
+    }
+    for (mut key, item) in table.iter_mut().skip(index) {
+        match item {
+            Item::Value(_) => {
+                prepend_prefix(key.leaf_decor_mut(), &block, "");
+                return None;
+            }
+            Item::Table(table) if table.is_dotted() => {
+                block = prepend_to_next_key(table, 0, block)?
+            }
+            _ => {}
+        }
+    }
+    Some(block)
 }
 
 fn prepend_prefix(decor: &mut Decor, block: &str, default: &str) {
@@ -201,7 +246,7 @@ fn patch_item(
 ) -> Result<()> {
     match (concrete, before, after) {
         (Item::Table(table), toml::Value::Table(before), toml::Value::Table(after)) => {
-            patch_table(table, before, after, orphans)?
+            patch_table(table, before, after, orphans)?;
         }
         (
             Item::Value(Value::InlineTable(table)),
@@ -891,7 +936,8 @@ mod tests {
     /// above it stays where it was, before the comments of whatever follows.
     #[test]
     fn removing_a_key_keeps_the_comment_block_above_it() {
-        let cases: [(&str, &[&str]); 6] = [
+        let dotted = "[vram]\ngpu.a = 1\n# b note\ngpu.b = 2\n# k\nkeep = 1\n# n\n[next]\n";
+        let cases: [(&str, &[&str]); 9] = [
             // Next key in the same table.
             (
                 "[vram]\n# margin note\nmargin = 0.10\n# cap note\ncap_fraction = 0.90\n",
@@ -919,10 +965,16 @@ mod tests {
                 "[vram]\n# m\nmargin = 0.10\n# c\ncap_fraction = 0.90\n# k\n[next]\n",
                 &["margin = 0.10\n", "cap_fraction = 0.90\n"],
             ),
-            // Last key of a dotted-key table, which renders in its parent's body.
+            // Last key of a dotted-key table, which renders in its parent's
+            // body: before the parent's next key, else the next table header.
+            (dotted, &["gpu.b = 2\n"]),
+            (dotted, &["gpu.b = 2\n", "keep = 1\n"]),
+            // The whole dotted-key table.
+            (dotted, &["gpu.a = 1\n", "gpu.b = 2\n"]),
+            // The next line is a dotted key.
             (
-                "[vram]\ngpu.a = 1\n# b note\ngpu.b = 2\n# k\n[next]\n",
-                &["gpu.b = 2\n"],
+                "[vram]\n# a note\na = 1\n# g note\ngpu.x = 1\n",
+                &["a = 1\n"],
             ),
         ];
         for (source, removed) in cases {
