@@ -467,15 +467,17 @@ impl VramLedger {
     }
 
     /// The host RAM behind a device that allocates from it directly: the CPU
-    /// device, and an APU (the RAM the OS manages, its carve-out excluded).
+    /// device, and an APU. An APU's is the RAM the OS manages (its carve-out
+    /// excluded) within the CPU device's total, which the cgroup limit
+    /// bounds; without a CPU device the former alone.
     pub(super) fn host_ram_mb_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let device = state.gpus.get(gpu)?;
         if gpu == cpu::DEVICE_KEY {
             Some(device.total_mb)
         } else if let Some(carveout) = device.vram_carveout_mb {
-            device
-                .unified_ram_mb
-                .map(|ram| ram.saturating_sub(carveout))
+            let os_ram = device.unified_ram_mb?.saturating_sub(carveout);
+            let bound = state.gpus.get(cpu::DEVICE_KEY).map(|cpu| cpu.total_mb);
+            Some(bound.map_or(os_ram, |bound| os_ram.min(bound)))
         } else {
             None
         }

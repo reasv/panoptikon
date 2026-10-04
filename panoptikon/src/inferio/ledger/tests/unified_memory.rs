@@ -1525,6 +1525,32 @@ fn a_cpu_replica_leaves_an_apus_gtt_window_alone() {
     assert_eq!(ledger.headroom_mb(AMD_A), alone);
 }
 
+/// In a container limited to 16 GiB on a 128 GB APU host, the APU's RAM
+/// floor is the container's, as the CPU device's is, and its grant carries
+/// it to the worker.
+#[test]
+fn an_apus_ram_floor_is_taken_within_the_cgroup_limit() {
+    const LIMIT: u64 = 16 * 1024;
+    let inventory = GpuInventory::known_rocm(vec![apu_device(0)])
+        .with_cpu(LIMIT, crate::inferio::cpu::MemRoots::default());
+    let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
+    ledger.install_probe_stub(None);
+    let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
+    let admission = ledger
+        .register_worker("g/apu", item_cost(4), &handle, None)
+        .expect("admitted on the APU");
+    push_apu(&handle, 0, 60 * 1024, 12 * 1024, 0);
+    ledger.ingest_all_for_test();
+    let grant = admission.request_grant(64, None, 1, 0).expect("granted");
+    let health = ledger.health();
+    let apu = device_of(&health, AMD_A);
+    assert_eq!(
+        (apu.reserve_mb, apu.reserve_rule.as_str()),
+        (cpu::ram_reserve_mb(LIMIT), RESERVE_RULE_RAM_FLOOR)
+    );
+    assert_eq!(grant.grant().ram_reserve_mb, apu.reserve_mb);
+}
+
 /// An APU's memory in its carve-out is not in host RAM: a pool that fits in
 /// a 96 GiB carve-out leaves the CPU device's headroom as it was.
 #[test]
