@@ -144,7 +144,7 @@ def test_the_venv_interpreter_follows_the_os(monkeypatch, tmp_path):
     assert legs.venv_python(Path("v")) == Path("v", "bin", "python")
 
 
-def test_the_cudnn_path_follows_the_worker_venv(tmp_path):
+def test_the_cudnn_path_follows_the_worker_venv(monkeypatch, tmp_path):
     """`LD_LIBRARY_PATH` names the `--python` venv's cuDNN, else the tree's,
     in the run's environment and in the env file `--write-config` writes, and
     is left out when that venv has none."""
@@ -159,6 +159,13 @@ def test_the_cudnn_path_follows_the_worker_venv(tmp_path):
     cudnn.mkdir(parents=True)
     python = str(gpu / "bin" / "python")
     assert legs.config_env("C1", REPO, {}, python)["LD_LIBRARY_PATH"] == str(cudnn)
+    # A bare name is the interpreter it names on PATH.
+    found = legs.venv_python(gpu)
+    found.parent.mkdir()
+    found.touch(mode=0o755)
+    monkeypatch.setenv("PATH", str(found.parent))
+    assert legs.config_env("C1", REPO, {}, found.name)["LD_LIBRARY_PATH"] == (
+        str(cudnn))
     cpu = str(tmp_path / "cpu" / "bin" / "python")
     assert "LD_LIBRARY_PATH" not in legs.config_env("C1", REPO, {}, cpu)
 

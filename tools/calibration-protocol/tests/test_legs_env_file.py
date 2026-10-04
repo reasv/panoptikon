@@ -97,7 +97,8 @@ def test_a_missing_tree_or_venv_is_a_message_not_a_traceback(tmp_path):
     (tree / "config" / "server").mkdir(parents=True)
     (tree / "config" / "server" / "default.toml").write_text(
         "[server]\nport = 6342\n", encoding="utf-8")
-    args = argparse.Namespace(config="C1", repo=str(tree), dry_run=False)
+    args = argparse.Namespace(config="C1", repo=str(tree), dry_run=False,
+                              inference_url=None)
     with pytest.raises(SystemExit, match="--python"):
         legs.resolve_config(args, {})
     assert legs.resolve_config(args, {}, "/opt/venv/bin/python")[1] == "server-C1.toml"

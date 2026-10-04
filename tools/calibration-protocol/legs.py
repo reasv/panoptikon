@@ -1599,7 +1599,7 @@ def config_env(name: str, repo: Path, base: Dict[str, str],
     has no cuDNN.
     """
     tree = config_tree(name, repo)
-    cudnn = cudnn_library_dir(Path(python) if python
+    cudnn = cudnn_library_dir(Path(shutil.which(python) or python) if python
                               else venv_python(tree / "python" / ".venv"))
     # A configuration that names its own tree (C0, the master baseline) runs
     # that tree's binary whatever the caller exported; the others share the
@@ -1627,7 +1627,8 @@ def resolve_config(args: argparse.Namespace, base: Dict[str, str],
     Returns (config text, file name, environment, where the environment came
     from). A path's environment is the `env.<id>` file beside it, if any. An
     id's paths follow `--repo`, so its venv must exist there unless
-    `--python` (`python`) replaces it or nothing is started.
+    `--python` (`python`) replaces it or no worker is started (`--dry-run`,
+    `--inference-url`).
     """
     given = str(args.config)
     candidate = Path(given)
@@ -1646,7 +1647,8 @@ def resolve_config(args: argparse.Namespace, base: Dict[str, str],
     repo = Path(args.repo).resolve()
     text = render_config(given, repo)
     venv = venv_python(config_tree(given, repo) / "python" / ".venv")
-    if not venv.exists() and not python and not args.dry_run:
+    if (not venv.exists() and not python and not args.dry_run
+            and not args.inference_url):
         raise SystemExit(f"legs.py: {given} runs the worker on {venv}, which "
                          f"does not exist - pass --repo <checkout with a "
                          f"synced venv> or --python")

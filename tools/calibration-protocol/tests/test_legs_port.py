@@ -166,3 +166,11 @@ def test_run_gateway_passes_the_port_and_the_inference_url(tmp_path):
         ("test", 17913), ("legacy_ui", 17909)}
     assert document["upstreams"]["inference"] == [
         {"base_url": "http://10.0.0.5:7777"}]
+    # No worker is started, so none needs a venv under `--repo`.
+    shipped = tmp_path / "repo" / "config" / "server"
+    shipped.mkdir(parents=True)
+    shutil.copy(HERE.parents[1] / "config" / "server" / "default.toml", shipped)
+    assert legs.main(["--config", "C1", "--repo", str(tmp_path / "repo"),
+                      "--no-dotenv",
+                      "--inference-url", "http://10.0.0.5:7777",
+                      "--write-config", str(tmp_path / "split")]) == 0

@@ -52,6 +52,7 @@ def test_the_leg_waits_for_every_recorder_and_marks_a_silent_one(tmp_path):
 
     # A partly written sample line is not a sample.
     late.write_text(HEADER + SAMPLE[:20])
+    sampled.write_text(HEADER)
     leg = types.SimpleNamespace(path=lambda name: tmp_path / name, events=[])
     leg.mark = lambda name, **detail: legs.Leg.mark(leg, name, **detail)
     legs.Leg.wait_for_recorders(leg, ["healthrec", "healthrec-remote"],
@@ -59,7 +60,7 @@ def test_the_leg_waits_for_every_recorder_and_marks_a_silent_one(tmp_path):
     (event,) = leg.events
     assert (event["event"], event["files"], event["waited_s"]) == (
         "recorder_sample_timeout",
-        ["healthrec.jsonl", "healthrec-remote.jsonl"], 0.3)
+        ["vramrec.jsonl", "healthrec.jsonl", "healthrec-remote.jsonl"], 0.3)
     assert isinstance(event["t_mono"], float)
 
 
