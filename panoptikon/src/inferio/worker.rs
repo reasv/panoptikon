@@ -1594,7 +1594,36 @@ impl Drop for Worker {
 /// oversized chunks are flushed as their own log lines instead.
 const STDERR_LINE_CAP: u64 = 64 * 1024;
 
-/// Forward worker stderr lines to tracing and the shared tail buffer.
+/// A run of identical stderr lines: the first is forwarded, the rest are
+/// counted and reported in one line when the run ends.
+#[derive(Default)]
+struct RepeatedLines {
+    last: Option<String>,
+    repeats: u64,
+}
+
+impl RepeatedLines {
+    /// The lines to forward for `line`: none while it repeats the last one.
+    fn push(&mut self, line: String) -> Vec<String> {
+        if self.last.as_deref() == Some(line.as_str()) {
+            self.repeats += 1;
+            return Vec::new();
+        }
+        let mut out: Vec<String> = self.finish().into_iter().collect();
+        self.last = Some(line.clone());
+        out.push(line);
+        out
+    }
+
+    /// The count line for the run in progress, if it repeated.
+    fn finish(&mut self) -> Option<String> {
+        let repeats = std::mem::take(&mut self.repeats);
+        (repeats > 0).then(|| format!("(the line above repeated {repeats} more times)"))
+    }
+}
+
+/// Forward worker stderr lines to tracing and the shared tail buffer, a run
+/// of identical lines once plus a count.
 ///
 /// The forwarder must stay alive for the worker's whole life no matter what
 /// bytes arrive: if it exits early the stderr pipe fills, the worker blocks
@@ -1605,6 +1634,13 @@ const STDERR_LINE_CAP: u64 = 64 * 1024;
 async fn forward_stderr(stderr: ChildStderr, inference_id: String, tail: Arc<Mutex<StderrTail>>) {
     let mut reader = BufReader::new(stderr);
     let mut buf: Vec<u8> = Vec::new();
+    let mut repeated = RepeatedLines::default();
+    let forward = |line: String| {
+        tracing::info!(worker = %inference_id, "{line}");
+        if let Ok(mut tail) = tail.lock() {
+            tail.push(line);
+        }
+    };
     loop {
         buf.clear();
         // `take` caps a single accumulated line at STDERR_LINE_CAP; a chunk
@@ -1631,11 +1667,9 @@ async fn forward_stderr(stderr: ChildStderr, inference_id: String, tail: Arc<Mut
             continue;
         }
         let line = String::from_utf8_lossy(&buf).into_owned();
-        tracing::info!(worker = %inference_id, "{line}");
-        if let Ok(mut tail) = tail.lock() {
-            tail.push(line);
-        }
+        repeated.push(line).into_iter().for_each(&forward);
     }
+    repeated.finish().into_iter().for_each(&forward);
 }
 
 /// Serialize one frame payload, enforcing [`MAX_FRAME_BYTES`] before any
@@ -2767,6 +2801,25 @@ mod tests {
             let expected = format!("garbage on {step} stdout");
             assert!(text.contains(&expected), "{expected:?} missing from {text}");
         }
+    }
+
+    #[test]
+    fn a_run_of_identical_stderr_lines_is_forwarded_once_with_a_count() {
+        let mut lines = RepeatedLines::default();
+        let mut out = Vec::new();
+        for line in ["a", "w", "w", "w", "b", "b", "w"] {
+            out.extend(lines.push(line.to_owned()));
+        }
+        out.extend(lines.finish());
+        let count = |repeats| {
+            RepeatedLines {
+                last: None,
+                repeats,
+            }
+            .finish()
+            .unwrap()
+        };
+        assert_eq!(out, ["a", "w", &count(2), "b", &count(1), "w"]);
     }
 
     /// The stderr forwarder survives arbitrary bytes: the fixture writes raw
