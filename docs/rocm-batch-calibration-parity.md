@@ -1016,15 +1016,15 @@ Two more things a field pass should settle, neither of which any fixture can:
   a real partitioned GPU actually takes, and the dedicated test shape may
   simply never occur in the field.
 - **torch < 2.6 in a user-managed venv fails at its first GPU use while an
-  operator-set `ROCR_VISIBLE_DEVICES` is set without `HIP_VISIBLE_DEVICES`**
-  (an IndexError seeding the devices; pytorch#140318, fixed in 2.6). This is
-  not something the design does — we never write that variable, precisely
-  because of this — but it is a documented assumption: a Slurm-style
-  scheduler sets ROCR, and a venv the user manages themselves can still hold
-  a torch old enough to fail on it. Our spawner writes `HIP_VISIBLE_DEVICES`
-  on every pinned worker, so only an unpinned worker meets this; the worker
-  reads torch's version from its package metadata and fails the handshake
-  naming the cause.
+  operator-set `ROCR_VISIBLE_DEVICES` is set without `HIP_VISIBLE_DEVICES`
+  or `CUDA_VISIBLE_DEVICES`** (an IndexError seeding the devices;
+  pytorch#140318, fixed in 2.6). This is not something the design does — we
+  never write that variable, precisely because of this — but it is a
+  documented assumption: a Slurm-style scheduler sets ROCR, and a venv the
+  user manages themselves can still hold a torch old enough to fail on it.
+  Our spawner writes `HIP_VISIBLE_DEVICES` on every pinned worker, so only
+  an unpinned worker meets this; the worker reads torch's version from its
+  package metadata and fails the handshake naming the cause.
 
 ## Implementation order (all five landed 2026-07-31)
 
