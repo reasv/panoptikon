@@ -266,17 +266,27 @@ impl VramLedger {
     /// until one is set), or the size a trial runs next. Twice the working
     /// size while memory has granted nothing above it
     /// ([`ModelCalibration::room_cut`]), once the working size has run in
-    /// this process.
-    pub(super) fn size_locked(state: &LedgerState, entry: &WorkerEntry) -> u64 {
+    /// this process. At most the working size under memory `pressure` above
+    /// normal: nothing grows then.
+    pub(super) fn size_locked(
+        state: &LedgerState,
+        entry: &WorkerEntry,
+        pressure: mps::MemoryPressure,
+    ) -> u64 {
         let working = Self::knee_locked(state, entry).unwrap_or(entry.seed_units.max(1));
         let Some(cal) = cal_locked(state, entry) else {
             return working;
         };
         let ran = |sample: &ThroughputSample| is_size(sample.units, working, working / 2);
-        match cal.trial {
+        let size = match cal.trial {
             Some(trial) => trial.run,
             None if cal.room_cut && cal.throughput.iter().any(ran) => working.saturating_mul(2),
             None => working,
+        };
+        if pressure == mps::MemoryPressure::Normal {
+            size
+        } else {
+            size.min(working)
         }
     }
 
@@ -292,10 +302,14 @@ impl VramLedger {
     /// [`admitted_units`] for [`Self::size_locked`] under the batch ceiling
     /// ([`Self::batch_ceiling_locked`]), capped at the size a paging episode
     /// left ([`PressureCap`]).
-    pub(super) fn budget_locked(state: &LedgerState, entry: &WorkerEntry) -> u64 {
+    pub(super) fn budget_locked(
+        state: &LedgerState,
+        entry: &WorkerEntry,
+        pressure: mps::MemoryPressure,
+    ) -> u64 {
         let admitted = admitted_units(
             entry,
-            Self::size_locked(state, entry),
+            Self::size_locked(state, entry, pressure),
             Self::anchor_locked(state, entry),
             Self::batch_ceiling_locked(state, entry),
         );
@@ -327,7 +341,7 @@ impl VramLedger {
         };
         let admitted = admitted_units(
             entry,
-            Self::size_locked(state, entry),
+            Self::size_locked(state, entry, mps::MemoryPressure::Normal),
             Self::anchor_locked(state, entry),
             Self::batch_ceiling_locked(state, entry),
         );

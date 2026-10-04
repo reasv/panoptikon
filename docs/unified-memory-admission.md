@@ -304,9 +304,10 @@ Single synthetic device:
   - **Any window above normal** (the ledger reads `MemoryPressure` itself at
     grant and at settle and keeps the higher) earns no ramp step, feeds no
     knee, does not count as the size the ramp reached or toward a knee's
-    expiry, and its throughput-collapse flags are ignored. So at warning a
-    replica keeps the unit budget it had; a squeeze there (a neighbour, a dip
-    in the reading) lasts only as long as its cause.
+    expiry, and its throughput-collapse flags are ignored. A grant above
+    normal asks for at most the working size: no trial size and no doubling.
+    So at warning a replica keeps the unit budget it had; a squeeze there (a
+    neighbour, a dip in the reading) lasts only as long as its cause.
   - **A paging episode leaves a cap** (`PressureCap`, per model and device, so
     a replica loaded afterwards runs what one that lived through it runs).
     Each paging window that memory or the ramp sized, not the queue, sets the

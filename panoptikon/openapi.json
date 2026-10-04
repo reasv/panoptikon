@@ -9207,7 +9207,7 @@
           "unit_budget": {
             "type": "integer",
             "format": "int64",
-            "description": "The unit budget as of this snapshot: the batch size under the ratchet.",
+            "description": "The unit budget as of this snapshot: the batch size under the ratchet,\nat most the working size while macOS reports memory pressure.",
             "minimum": 0
           }
         }

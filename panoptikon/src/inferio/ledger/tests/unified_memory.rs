@@ -2000,7 +2000,7 @@ fn at_warning_without_paging_the_batch_size_is_held() {
     let held: Vec<u64> = (0..3)
         .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
         .collect();
-    assert_eq!(held, [128, 64, 64], "the trial under way is put off");
+    assert_eq!(held, [64, 64, 64], "the trial under way is put off");
     let (size_during, _, samples_during, _) = ramp_figures(&ledger);
     assert_eq!(size_during, Some(64), "what the trial had measured");
     assert!(samples_during <= samples);

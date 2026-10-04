@@ -5,6 +5,7 @@ use super::*;
 impl VramLedger {
     /// Read-only ledger snapshot for `GET /health`.
     pub fn health(&self) -> Vec<GpuBudgetHealth> {
+        let pressure = self.memory_pressure();
         let mut state = self.lock();
         // Refresh pools first, so `external_mb` is not computed from pool
         // readings older than the free reading.
@@ -55,7 +56,7 @@ impl VramLedger {
                             seed_units: entry.seed_units,
                             deflation: entry.deflation,
                             clean_windows: entry.clean_windows,
-                            unit_budget: Self::budget_locked(state, entry),
+                            unit_budget: Self::budget_locked(state, entry, pressure),
                             max_units_measured: anchor,
                             knee_units: knee,
                             shape_ceiling_units: shape_ceiling,
@@ -213,7 +214,8 @@ pub struct LedgerWorkerHealth {
     pub deflation: u32,
     /// Consecutive clean windows since the last negative sample.
     pub clean_windows: u32,
-    /// The unit budget as of this snapshot: the batch size under the ratchet.
+    /// The unit budget as of this snapshot: the batch size under the ratchet,
+    /// at most the working size while macOS reports memory pressure.
     pub unit_budget: u64,
     /// Ratchet anchor: largest locally measured clean priced batch.
     pub max_units_measured: u64,

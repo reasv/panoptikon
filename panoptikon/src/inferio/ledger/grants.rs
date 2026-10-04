@@ -32,6 +32,7 @@ static RAM_BOUND_LOG: LazyLock<LogThrottle> =
 impl VramLedger {
     /// Units the dispatcher should aim to put in one window.
     pub(super) fn window_target_units(&self, worker: WorkerId) -> u64 {
+        let pressure = self.memory_pressure();
         let mut state = self.lock();
         // Repay first: this is the first read of the deflation counter for
         // an idle replica's next window.
@@ -40,7 +41,7 @@ impl VramLedger {
             return 1;
         };
         // A window is several batches deep.
-        Self::budget_locked(&state, entry)
+        Self::budget_locked(&state, entry, pressure)
             .saturating_mul(WINDOW_DEPTH_MULTIPLIER)
             .max(1)
     }
@@ -111,7 +112,7 @@ impl VramLedger {
         // queue: for a count-priced model it is a unit count.
         let (size_asked, capped, wanted, item_cap) = {
             let entry = state.workers.get(&worker)?;
-            let capped = Self::budget_locked(&state, entry);
+            let capped = Self::budget_locked(&state, entry, pressure);
             let item_cap = Self::item_cap_locked(&state, entry)
                 .map(|cap| user_cap_items.map_or(cap, |user| cap.min(user)));
             let content = match item_cap {
@@ -121,7 +122,7 @@ impl VramLedger {
                 _ => window_units,
             };
             (
-                Self::size_locked(&state, entry),
+                Self::size_locked(&state, entry, pressure),
                 capped,
                 capped.min(content.max(1)).max(1),
                 item_cap,
