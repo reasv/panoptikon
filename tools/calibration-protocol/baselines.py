@@ -9,11 +9,12 @@ half. It takes a calibration store (a local `calibration.toml`, a leg's
 registry, and writes the file that goes in
 `python/inferio/config/calibration/`.
 
-- Only **linux/cuda** rows are accepted as measurements; any other measured
-  platform is refused, because nothing here can tell whether its numbers
-  travel.
-- A row is copied to another platform only when its id declares
+- Only **linux/cuda** and **linux/rocm** rows are accepted as measurements;
+  any other measured platform is refused, because nothing here can tell
+  whether its numbers travel.
+- A cuda row is copied to another platform only when its id declares
   `metadata.cost.platform_copies` in the registry. Absent means do not copy.
+  A rocm row is never copied: the rocm extra is Linux-only.
 - A copy carries the Linux `base_mb` and says so with `base_platform`, keeps
   `measured_at`, and names this tool in `generator`.
 - Local-authority fields (`local_samples`, `knee_clean_windows`, the sample
@@ -49,8 +50,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # The schema the orchestrator reads (`panoptikon/src/inferio/calibration.rs`).
 SCHEMA = 3
-# What a measurement may have been taken on.
-MEASURED_ON = ("linux", "cuda")
+# What a measurement may have been taken on, as (platform, backend).
+MEASURED_ON = (("linux", "cuda"), ("linux", "rocm"))
+# The backend whose rows are copied to other platforms.
+COPIED_BACKEND = "cuda"
 # Platforms a CUDA row may be copied to. macOS is not one: a cuda-keyed row
 # can never answer an mps lookup.
 COPYABLE_TO = ("windows",)
@@ -64,7 +67,7 @@ KEY_FIELDS = (
 )
 VALUE_FIELDS = (
     "base_mb", "base_method", "base_platform", "dtype_method",
-    "slope_mb_per_unit", "knee_units", "samples", "residual_mb",
+    "slope_mb_per_unit", "intercept_mb", "knee_units", "samples", "residual_mb",
     "measured_at", "generator", "max_units_measured",
 )
 # One machine's own evidence; never shipped. The ratchet anchor is not on this
@@ -154,11 +157,12 @@ def generate(
         if row.get("base_platform"):
             continue
         platform, backend = row.get("platform"), row.get("backend")
-        if (platform, backend) != MEASURED_ON:
+        if (platform, backend) not in MEASURED_ON:
             raise BaselineError(
                 f"{row.get('inference_id')}: measured on "
                 f"{platform}/{backend}, and a baseline is generated from "
-                f"{'/'.join(MEASURED_ON)} rows only"
+                f"{' or '.join('/'.join(pair) for pair in MEASURED_ON)} rows "
+                "only"
             )
         # A row with no fit prices nothing, and its ratchet anchor confers
         # nothing either: there is no slope to bound the anchor in MB with.
@@ -174,6 +178,8 @@ def generate(
 
     out = list(measured)
     for row in measured:
+        if row["backend"] != COPIED_BACKEND:
+            continue
         for platform in allowlist.get(row["inference_id"], ()):
             copy = dict(row)
             copy["platform"] = platform

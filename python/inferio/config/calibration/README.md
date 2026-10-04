@@ -147,8 +147,9 @@ places: `platform = "linux"` (the rocm extra is Linux-only), `backend =
 its own: a cuda-keyed profile never answers a rocm lookup, whatever else
 matches.
 
-Nothing ROCm-keyed ships yet: none of it could be measured. The first
-baselines there will come from volunteers' local stores, as below.
+Nothing ROCm-keyed ships yet. `baselines.py` accepts linux/rocm rows as
+measurements and never copies them to another platform; volunteers' local
+stores, as below, are the other source.
 
 ## The platform rule
 
