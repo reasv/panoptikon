@@ -732,8 +732,9 @@ location, relative to the working directory like every other path; a
    Auto detection: macOS → default PyPI wheels (MPS on Apple Silicon); CUDA when
    `nvidia-smi` is on PATH, `System32\nvidia-smi.exe` exists (Windows), or
    `/proc/driver/nvidia` exists (Linux); ROCm on Linux when `/opt/rocm` or
-   `rocm-smi` is found; otherwise CPU. The decision and its evidence are
-   logged.
+   `rocm-smi` is found, or when the kernel's KFD topology lists a GPU whose
+   gfx target the ROCm torch wheel is built for; otherwise CPU. The decision
+   and its evidence are logged.
 3. **Locked sync** — `uv venv --python 3.12` when the venv is missing (uv
    auto-fetches CPython), then `uv sync --locked --extra <variant>` in
    `python/` (`cuda` → the `cu128` extra, `rocm` → pytorch.org multi-arch

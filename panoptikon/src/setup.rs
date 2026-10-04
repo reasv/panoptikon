@@ -639,7 +639,17 @@ struct DetectionProbes {
     rocm_dir: bool,
     /// `rocm-smi` on PATH.
     rocm_smi_on_path: bool,
+    /// Linux: the gfx target of every GPU in the KFD topology (the amdgpu
+    /// kernel driver), whether or not this process can open it.
+    kfd_gpus: Vec<String>,
 }
+
+/// The gfx targets the `rocm` extra's torch wheel is built for:
+/// `PYTORCH_ROCM_ARCH` of PyTorch 2.11's ROCm builds. Update with that pin.
+const ROCM_WHEEL_GFX: [&str; 14] = [
+    "gfx900", "gfx906", "gfx908", "gfx90a", "gfx942", "gfx950", "gfx1030", "gfx1100", "gfx1101",
+    "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+];
 
 impl DetectionProbes {
     fn gather() -> Self {
@@ -656,13 +666,22 @@ impl DetectionProbes {
                 && Path::new("/proc/driver/nvidia").exists(),
             rocm_dir: cfg!(target_os = "linux") && Path::new("/opt/rocm").is_dir(),
             rocm_smi_on_path: on_path("rocm-smi").is_some(),
+            kfd_gpus: if cfg!(target_os = "linux") {
+                crate::inferio::gpu::rocm_topology_gpus()
+                    .into_iter()
+                    .map(|(gfx, _)| gfx)
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 }
 
 /// The auto-detection decision table: macOS always takes the default PyPI
 /// wheels (labelled `mps` on Apple Silicon, `cpu` on Intel), NVIDIA evidence
-/// beats ROCm, ROCm is Linux-only, and no evidence means CPU.
+/// beats ROCm, ROCm is Linux-only, a GPU the kernel driver lists counts only
+/// if the ROCm wheel has its gfx target, and no evidence means CPU.
 fn decide_accelerator(probes: &DetectionProbes) -> (Accelerator, String) {
     if probes.os == "macos" {
         return (
@@ -688,6 +707,27 @@ fn decide_accelerator(probes: &DetectionProbes) -> (Accelerator, String) {
         ];
         if let Some((_, evidence)) = rocm.iter().find(|(hit, _)| *hit) {
             return (Accelerator::Rocm, (*evidence).into());
+        }
+        if let Some(gfx) = probes
+            .kfd_gpus
+            .iter()
+            .find(|gfx| ROCM_WHEEL_GFX.contains(&gfx.as_str()))
+        {
+            return (
+                Accelerator::Rocm,
+                format!("the KFD topology lists a {gfx} GPU"),
+            );
+        }
+        if !probes.kfd_gpus.is_empty() {
+            return (
+                Accelerator::Cpu,
+                format!(
+                    "the KFD topology lists {} GPU(s), none a target of the ROCm \
+                     torch build; set accelerator = \"rocm\" (with \
+                     HSA_OVERRIDE_GFX_VERSION) to use one anyway",
+                    probes.kfd_gpus.join(", ")
+                ),
+            );
         }
     }
     (Accelerator::Cpu, "no NVIDIA or ROCm evidence found".into())
@@ -1267,6 +1307,7 @@ mod tests {
             proc_driver_nvidia: false,
             rocm_dir: false,
             rocm_smi_on_path: false,
+            kfd_gpus: Vec::new(),
         }
     }
 
@@ -1296,6 +1337,7 @@ mod tests {
         // ROCm evidence is ignored off Linux.
         let mut win = probes("windows");
         win.rocm_smi_on_path = true;
+        win.kfd_gpus = vec!["gfx1100".into()];
         assert_eq!(decide_accelerator(&win).0, Accelerator::Cpu);
 
         // Linux: /proc/driver/nvidia or nvidia-smi → CUDA, which beats ROCm.
@@ -1304,6 +1346,7 @@ mod tests {
         linux.proc_driver_nvidia = true;
         assert_eq!(decide_accelerator(&linux).0, Accelerator::Cuda);
         linux.rocm_dir = true;
+        linux.kfd_gpus = vec!["gfx1100".into()];
         assert_eq!(decide_accelerator(&linux).0, Accelerator::Cuda);
         // ROCm without NVIDIA: /opt/rocm or rocm-smi → ROCm.
         let mut linux = probes("linux");
@@ -1312,6 +1355,18 @@ mod tests {
         let mut linux = probes("linux");
         linux.rocm_smi_on_path = true;
         assert_eq!(decide_accelerator(&linux).0, Accelerator::Rocm);
+        // The kernel driver alone (the ROCm wheel bundles the user space):
+        // ROCm when any listed GPU is a target of the wheel, so a supported
+        // dGPU beside an unsupported iGPU counts.
+        let mut linux = probes("linux");
+        linux.kfd_gpus = vec!["gfx1036".into(), "gfx1100".into()];
+        assert_eq!(decide_accelerator(&linux).0, Accelerator::Rocm);
+        // An iGPU the wheel has no kernels for stays on the CPU, and the
+        // logged evidence names its target.
+        linux.kfd_gpus = vec!["gfx1036".into()];
+        let (accelerator, evidence) = decide_accelerator(&linux);
+        assert_eq!(accelerator, Accelerator::Cpu);
+        assert!(evidence.contains("gfx1036"), "{evidence}");
     }
 
     /// A re-sync of an existing venv keeps the accelerator that venv was
