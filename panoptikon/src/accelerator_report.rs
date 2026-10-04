@@ -201,18 +201,27 @@ pub fn resolve_backend_from(
 pub fn build_report(settings: &Settings) -> AcceleratorReport {
     let (backend, backend_source) =
         resolve_backend(settings.inference_local.python_env.accelerator);
-    assemble_report(backend, backend_source, probe_gpu_stacks(backend))
+    assemble_report(
+        backend,
+        backend_source,
+        probe_gpu_stacks(backend),
+        crate::inferio::gpu::under_wsl(),
+    )
 }
 
-/// Pure assembly of warnings + device list (unit-tested).
+/// Pure assembly of warnings + device list (unit-tested). Under WSL a ROCm
+/// GPU has no name to read, and the GPU probe warns about that instead.
 pub fn assemble_report(
     backend: Accelerator,
     backend_source: BackendSource,
     stacks: Vec<GpuStackPresence>,
+    under_wsl: bool,
 ) -> AcceleratorReport {
     let mut warnings = Vec::new();
 
-    if let Some(stack_id) = stack_id_for_backend(backend) {
+    if let Some(stack_id) = stack_id_for_backend(backend)
+        && !(backend == Accelerator::Rocm && under_wsl)
+    {
         let named = stacks
             .iter()
             .filter(|s| s.stack == stack_id)
@@ -468,6 +477,7 @@ mod tests {
                 evidence: "no NVIDIA or ROCm evidence found".into(),
             },
             empty_stacks(),
+            false,
         );
         let text = report.format_text();
         assert!(text.contains("accelerator backend: cpu"), "{text}");
@@ -488,6 +498,7 @@ mod tests {
                 evidence: "explicitly configured".into(),
             },
             nvidia_named(),
+            false,
         );
         let text = report.format_text();
         assert!(text.contains("backend: cuda"), "{text}");
@@ -516,7 +527,12 @@ mod tests {
                 evidence: "test".into(),
             },
         ];
-        let report = assemble_report(Accelerator::Rocm, BackendSource::InstalledVenv, stacks);
+        let report = assemble_report(
+            Accelerator::Rocm,
+            BackendSource::InstalledVenv,
+            stacks,
+            false,
+        );
         let text = report.format_text();
         assert!(text.contains("backend: rocm"), "{text}");
         assert!(text.contains("[amd-rocm] AMD gfx1100\n"), "{text}");
@@ -527,6 +543,10 @@ mod tests {
         assert!(!text.contains("Should Not Appear"), "{text}");
         assert!(!text.contains("using CPU"), "{text}");
         assert!(report.warnings.is_empty());
+        assert_eq!(
+            amd_devices(&[("gfx1030".into(), false)], false)[0].name,
+            "AMD gfx1030"
+        );
     }
 
     #[test]
@@ -535,6 +555,7 @@ mod tests {
             Accelerator::Cuda,
             BackendSource::InstalledVenv,
             empty_stacks(),
+            false,
         );
         assert_eq!(report.backend, Accelerator::Cuda);
         assert_eq!(report.warnings.len(), 1);
@@ -548,9 +569,26 @@ mod tests {
             Accelerator::Rocm,
             BackendSource::InstalledVenv,
             empty_stacks(),
+            false,
         );
         assert_eq!(report.backend, Accelerator::Rocm);
         assert!(report.warnings.iter().any(|w| w.contains("rocm")));
+        let unnamed = GpuStackPresence {
+            stack: "amd-rocm",
+            backend: Accelerator::Rocm,
+            devices: Vec::new(),
+            evidence: "test".into(),
+        };
+        let wsl = assemble_report(
+            Accelerator::Rocm,
+            BackendSource::InstalledVenv,
+            vec![unnamed],
+            true,
+        );
+        assert!(
+            wsl.warnings.is_empty(),
+            "under WSL the GPU probe warns instead"
+        );
     }
 
     #[test]
@@ -561,6 +599,7 @@ mod tests {
                 evidence: "explicitly configured".into(),
             },
             nvidia_named(),
+            false,
         );
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
         let text = report.format_text();
@@ -628,6 +667,7 @@ mod tests {
             Accelerator::Mps,
             BackendSource::InstalledVenv,
             empty_stacks(),
+            false,
         );
         let text = report.format_text();
         assert!(text.contains("accelerator backend: mps"), "{text}");
