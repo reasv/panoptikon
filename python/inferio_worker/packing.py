@@ -218,6 +218,8 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     if grant_mb is None or grant_mb < 0:
         _under_grant_windows = 0
         return False
+    if grant_mb > 0:
+        _blind_released = False
     reserved_mb, allocated_mb = memory.pool_stats_mb()
     if reserved_mb is None or allocated_mb is None:
         _under_grant_windows = 0
@@ -237,10 +239,7 @@ def maybe_shrink(grant_mb: int | None) -> bool:
             return False
     elif grant_mb >= SHRINK_RATIO * slack_mb:
         _under_grant_windows = 0
-        _blind_released = False
         return False
-    else:
-        _blind_released = False
     _under_grant_windows += 1
     if _under_grant_windows < SHRINK_WINDOWS:
         logger.debug(

@@ -2293,20 +2293,31 @@ def test_after_a_release_that_returned_nothing_the_slack_must_grow_first():
         mps.kept = 1000 * MIB
         assert windows(6) == 1, "the release left 1000 MiB of 2000"
         assert windows(6, grow_mb=1) == 1, "the slack grew 6 MiB"
-        mps.driver += 256 * MIB
+        mps.driver += 250 * MIB
         assert windows(2) == 2, "the slack grew 256 MiB past what was left"
         assert windows(4, grant_mb=0) == 2, "memory-blind windows wait as well"
         assert windows(1, grow_mb=300) == 2
         assert windows(1, grow_mb=-100) == 3, "growing past it once is enough"
+        mps.driver += 256 * MIB
+        assert windows(2, grant_mb=0) == 4, "a memory-blind release"
+        assert windows(1) == 4
+        mps.driver += 256 * MIB
+        assert windows(2, grant_mb=0) == 5, "a grant with memory re-armed it"
         packing.note_trimmed()
         mps.kept = 0
-        assert windows(2) == 4, "a trim forgets what a release left"
+        assert windows(2) == 6, "a trim forgets what a release left"
         mps.driver += 200 * MIB
-        assert windows(2) == 5, "a release that returned all its slack left none"
+        assert windows(2) == 7, (
+            "a release that returned all its slack left none"
+        )
         mps.kept = 255 * MIB
         mps.driver += 1000 * MIB
-        assert windows(2) == 6
-        assert windows(2) == 7, "a release that left 255 MiB is not waited on"
+        assert windows(2) == 8
+        assert windows(2) == 9, "a release that left 255 MiB is not waited on"
+        mps.kept = 256 * MIB
+        mps.driver += 1000 * MIB
+        assert windows(2) == 10
+        assert windows(2) == 10, "a release that left 256 MiB is waited on"
 
 
 def test_the_clamp_credits_a_split_pool_the_release_decision_refuses(fake_torch):
