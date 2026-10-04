@@ -2220,19 +2220,27 @@ def test_the_vm_statistics_fields_are_read_at_their_positions() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="vm_stat is macOS's")
-def test_the_swapouts_count_matches_vm_stat() -> None:
-    def vm_stat_swapouts() -> int:
+def test_the_swapouts_and_file_cache_match_vm_stat() -> None:
+    def vm_stat() -> tuple[int, int]:
+        """Swap-outs since boot, and the file cache in bytes."""
         out = subprocess.run(
             ["vm_stat"], capture_output=True, text=True, check=True
         ).stdout
-        return int(re.search(r"Swapouts:\s+(\d+)", out).group(1))
 
-    before = vm_stat_swapouts()
+        def count(label: str) -> int:
+            return int(re.search(label + r"\s+(\d+)", out).group(1))
+
+        page = count("page size of")
+        return count("Swapouts:"), count("File-backed pages:") * page
+
+    before, file_cache = vm_stat()
+    counters = memory._mac_memory_counters()
+    after, _ = vm_stat()
+    assert counters is not None
+    # The file cache moves between the two reads.
+    assert file_cache / 2 <= counters[6] <= file_cache * 2
     if before == 0:
         pytest.skip("no swap-outs since boot to compare")
-    counters = memory._mac_memory_counters()
-    after = vm_stat_swapouts()
-    assert counters is not None
     assert before <= counters[5] <= after
 
 
