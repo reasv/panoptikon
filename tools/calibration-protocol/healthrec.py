@@ -165,6 +165,8 @@ def flatten_health(result: Dict[str, Any], full: bool) -> Dict[str, Any]:
     payload = result.get("payload")
     if not isinstance(payload, dict):
         return out
+    if full:
+        out["raw"] = payload
     if not result["ok"]:
         # A gateway whose inference server did not answer still reports its
         # own clients, and whether it declared that server frozen.
@@ -222,8 +224,6 @@ def flatten_health(result: Dict[str, Any], full: bool) -> Dict[str, Any]:
         ]
         models.append(row)
     out["models"] = models
-    if full:
-        out["raw"] = payload
     return out
 
 

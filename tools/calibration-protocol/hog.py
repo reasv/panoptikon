@@ -933,8 +933,7 @@ def make_handler(hog: Hog):  # noqa: ANN201
                     hog._leave_free_target = None
                     hog._last_free_eval = -1e9
                 elif "leave_free" in query:
-                    hog.override = "leave_free"
-                    hog.override_mb = int(float(query["leave_free"][0]))
+                    hog.override, hog.override_mb = "leave_free", int(float(query["leave_free"][0]))
                     hog._leave_free_target = None
                     hog._last_free_eval = -1e9
                 else:
