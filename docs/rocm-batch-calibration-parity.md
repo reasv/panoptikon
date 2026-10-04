@@ -756,45 +756,45 @@ module is Linux-only by construction (`/sys/class/kfd`, `/dev/dri`) and the
 extra's markers keep ROCm torch off Windows. Both the caveat and the
 out-of-scope statement are in the README's ROCm section.
 
-**APU correction (review, 2026-07-31).** The first statement of this — "a
-node with no readable nonzero `mem_info_vram_total` makes the whole probe
-unknown, so the common integrated-graphics shape is unpriced" — was wrong
-about the *mechanism*, and therefore about the outcome. amdgpu registers
-`mem_info_vram_total` for iGPUs too: it reports the BIOS UMA carve-out (512
-MB is a common default), which is a perfectly readable nonzero number. The
-all-or-nothing VRAM rule therefore did **not** catch APUs; it admitted them
-and priced the host against the carve-out, which collapses every grant to
-batch-1 with nothing in the log to say why. APU nodes are now detected
-positively — KFD models an integrated part as a single node carrying both
-`simd_count > 0` and `cpu_cores_count > 0` (since replaced by HIP's own
-test: unified-memory-admission.md "What counts as an APU") — and any openable one makes the whole probe unknown with a
-WARN naming the node and its gfx target (D1.4). The node is not *skipped*:
-HIP still enumerates it, so excluding one row would shift every later row's
-device index. So the outcome the design always promised — an APU host is
-**unpriced**, i.e. exactly its pre-branch behaviour — is now what actually
-happens, rather than being an accident of a rule that did not apply.
+**APU correction (review, 2026-07-31).** The first statement of this — "a node
+with no readable nonzero `mem_info_vram_total` makes the whole probe unknown,
+so the common integrated-graphics shape is unpriced" — was wrong about the
+*mechanism*, and therefore about the outcome. amdgpu registers
+`mem_info_vram_total` for iGPUs too: it reports the BIOS UMA carve-out (512 MB
+is a common default), which is a perfectly readable nonzero number. The
+all-or-nothing VRAM rule therefore did **not** catch APUs; it admitted them and
+priced the host against the carve-out, which collapses every grant to batch-1
+with nothing in the log to say why. APU nodes are now detected positively — KFD
+models an integrated part as a single node carrying both `simd_count > 0` and
+`cpu_cores_count > 0` (since replaced by HIP's own test:
+unified-memory-admission.md "What counts as an APU") — and any openable one
+makes the whole probe unknown with a WARN naming the node and its gfx target
+(D1.4). The node is not *skipped*: HIP still enumerates it, so excluding one
+row would shift every later row's device index. So the outcome the design
+always promised — an APU host is **unpriced**, i.e. exactly its pre-branch
+behaviour — is now what actually happens, rather than being an accident of a
+rule that did not apply.
 
-**APUs are priced (2026-08-01).** The decline above was a v1 safety measure
-and it is gone: `docs/unified-memory-admission.md` (backend B) makes such a
-node a **unified-memory device** — total = carve-out + GTT, free = the carve-out's own
+**APUs are priced (2026-08-01).** The decline above was a v1 safety measure and
+it is gone: `docs/unified-memory-admission.md` (backend B) makes such a node a
+**unified-memory device** — total = carve-out + GTT, free = the carve-out's own
 free memory plus as much unclaimed GTT as `MemAvailable` says RAM can deliver,
 name `AMD gfx1151 APU (128 GB)` from physical RAM rather than the
 BIOS-configurable carve-out, and the `unified` flag that turns on the ledger's
 death-as-negative-sample (DP-2) and the worker's GTT-inclusive arithmetic
-(DP-5, `PANOPTIKON_UNIFIED_GPU=<the gpu's PCI address>`, which the worker
-only acts on when it is the address it resolved for itself). The positive KFD
-detection survived
-unchanged (since replaced: unified-memory-admission.md "What counts as an APU") — and so did the
-all-or-nothing rule: an APU node whose GTT total or whose `MemTotal` cannot be
-read still takes the whole probe unknown, because pricing such a GPU against
-its carve-out is precisely the batch-1 collapse the decline existed to
-prevent. Two consequences worth stating here rather than only in the other
-doc: a **dGPU+APU host is no longer sunk** (both GPUs become rows, and the
-row indices still cover the whole openable set, so they are still HIP device
-indices), and default placement compares the APU's *carve-out* (floored at an
-eighth of its unified budget) rather than its carve+GTT total, so the discrete
-GPU stays the default unless the operator gave the iGPU that memory outright
-in the BIOS.
+(DP-5, `PANOPTIKON_UNIFIED_GPU=<the gpu's PCI address>`, which the worker only
+acts on when it is the address it resolved for itself). The positive KFD
+detection survived unchanged (since replaced: unified-memory-admission.md "What
+counts as an APU") — and so did the all-or-nothing rule: an APU node whose GTT
+total or whose `MemTotal` cannot be read still takes the whole probe unknown,
+because pricing such a GPU against its carve-out is precisely the batch-1
+collapse the decline existed to prevent. Two consequences worth stating here
+rather than only in the other doc: a **dGPU+APU host is no longer sunk** (both
+GPUs become rows, and the row indices still cover the whole openable set, so
+they are still HIP device indices), and default placement compares the APU's
+*carve-out* (floored at an eighth of its unified budget) rather than its
+carve+GTT total, so the discrete GPU stays the default unless the operator gave
+the iGPU that memory outright in the BIOS.
 
 **One consequence of that worth naming, because it is a behaviour change on
 hardware nobody thought of as an APU host:** a desktop with an AMD dGPU and a
