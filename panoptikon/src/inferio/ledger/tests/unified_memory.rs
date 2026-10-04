@@ -468,6 +468,19 @@ pub(super) fn apu_ledger(gpus: Vec<crate::inferio::gpu::GpuInfo>) -> Arc<VramLed
     )
 }
 
+/// `gpus` beside a CPU device of `cpu_total_mb`, with the probe stubbed out.
+fn apu_host(
+    gpus: Vec<crate::inferio::gpu::GpuInfo>,
+    cpu_total_mb: u64,
+    budgets: impl Into<VramBudgets>,
+) -> Arc<VramLedger> {
+    let inventory = GpuInventory::known_rocm(gpus)
+        .with_cpu(cpu_total_mb, crate::inferio::cpu::MemRoots::default());
+    let ledger = VramLedger::new(&inventory, budgets.into(), None);
+    ledger.install_probe_stub(None);
+    ledger
+}
+
 /// The either-of cross-check.
 #[test]
 fn an_apu_replica_is_admitted_on_either_total() {
@@ -1429,10 +1442,7 @@ fn apus_and_the_cpu_device_charge_each_others_grants() {
         bdf: Some("0000:0c:00.0".to_owned()),
         ..apu_device(1)
     };
-    let inventory = GpuInventory::known_rocm(vec![apu_device(0), apu_b])
-        .with_cpu(RAM, crate::inferio::cpu::MemRoots::default());
-    let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
-    ledger.install_probe_stub(None);
+    let ledger = apu_host(vec![apu_device(0), apu_b], RAM, VramBudget::default());
     let mut replicas = Vec::new();
     for (model, handle, device) in [
         (
@@ -1506,10 +1516,7 @@ fn a_cpu_replica_leaves_an_apus_gtt_side_alone() {
     // 1 GiB of other usage; the APU's 1 000 MiB base fills its carve-out.
     let gtt_free = 64 * 1024 - (1_000 - APU_CARVEOUT_MB);
     for route in ["frame", "pool refresh", "batch", "probe", "load report"] {
-        let inventory = GpuInventory::known_rocm(vec![apu_device(0)])
-            .with_cpu(RAM, crate::inferio::cpu::MemRoots::default());
-        let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
-        ledger.install_probe_stub(None);
+        let ledger = apu_host(vec![apu_device(0)], RAM, VramBudget::default());
         let apu_handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
         let on_apu = ledger
             .register_worker("g/apu", item_cost(4), &apu_handle, None)
@@ -1609,10 +1616,7 @@ fn an_apu_pool_leaves_the_cpu_devices_cap_alone() {
             ..VramBudget::default()
         },
     );
-    let inventory = GpuInventory::known_rocm(vec![apu_device(0)])
-        .with_cpu(RAM, crate::inferio::cpu::MemRoots::default());
-    let ledger = VramLedger::new(&inventory, budgets, None);
-    ledger.install_probe_stub(None);
+    let ledger = apu_host(vec![apu_device(0)], RAM, budgets);
     let cpu_handle = loaded_on_cpu(Some(RAM));
     let _on_cpu = ledger
         .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
@@ -1648,10 +1652,7 @@ fn an_apus_ram_floor_is_taken_within_the_cgroup_limit() {
         (user_margin(0.10), 12 * 1024, 10_640),
         (VramBudget::default(), 1024, VRAM_FREE),
     ] {
-        let inventory = GpuInventory::known_rocm(vec![apu_device(0)])
-            .with_cpu(LIMIT, crate::inferio::cpu::MemRoots::default());
-        let ledger = VramLedger::new(&inventory, budget.into(), None);
-        ledger.install_probe_stub(None);
+        let ledger = apu_host(vec![apu_device(0)], LIMIT, budget);
         let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
         let admission = ledger
             .register_worker("g/apu", item_cost(4), &handle, None)
@@ -1682,10 +1683,7 @@ fn an_apu_grant_reads_its_ram_first() {
     const RAM: u64 = 128 * 1024 - APU_CARVEOUT_MB;
     let taken = 20 * 1024;
     for device in [AMD_A, cpu::DEVICE_KEY] {
-        let inventory = GpuInventory::known_rocm(vec![apu_device(0)])
-            .with_cpu(RAM, crate::inferio::cpu::MemRoots::default());
-        let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
-        ledger.install_probe_stub(None);
+        let ledger = apu_host(vec![apu_device(0)], RAM, VramBudget::default());
         let apu_handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
         let on_apu = ledger
             .register_worker("g/apu", item_cost(4), &apu_handle, None)
@@ -1744,10 +1742,7 @@ fn an_apu_counts_in_host_ram_beyond_the_carve_out_it_can_use() {
             vram_carveout_mb: Some(carveout),
             ..apu_device(0)
         };
-        let inventory = GpuInventory::known_rocm(vec![apu.clone()])
-            .with_cpu(mem_total, crate::inferio::cpu::MemRoots::default());
-        let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
-        ledger.install_probe_stub(None);
+        let ledger = apu_host(vec![apu.clone()], mem_total, VramBudget::default());
         ledger.record_free_for_test(cpu::DEVICE_KEY, ram);
         let before = ledger.headroom_mb(cpu::DEVICE_KEY);
         assert!(before > 0);
