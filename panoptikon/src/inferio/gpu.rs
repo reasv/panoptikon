@@ -2215,6 +2215,10 @@ mod tests {
         assert_eq!(inventory().unified_pin_bdf(None), None);
         assert_eq!(mps_inventory(128).unified_pin_bdf(None), None);
         assert_eq!(uninventoried_rocm(false).unified_pin_bdf(Some("0")), None);
+        let spawn = super::super::worker::testing::test_spawn_config();
+        let config = host.spawn_config(&spawn, Some("GPU-BDF-0000:03:00.0"));
+        let unified = (UNIFIED_GPU_ENV_VAR.to_owned(), APU_BDF.to_owned());
+        assert!(config.env.contains(&unified));
     }
 
     /// The whole refresh end to end against a fixture PCI tree, which the
