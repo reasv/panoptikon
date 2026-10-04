@@ -821,9 +821,12 @@ CPU device on Windows and macOS. The MPS device keeps the GPU rule.
 
 Known limits:
 - A Linux unified-memory GPU (an APU) clamps its unclaimed GTT by the same
-  slab-free RAM reading, but keeps the GPU reserve. Its RAM enters inside
-  the free reading (`min(GTT free, RAM)`), so a RAM floor taken off the
-  device's limit would also withhold GTT that RAM is not short for.
+  free RAM reading, and keeps the same floor, of the RAM the OS manages
+  (`MemTotal`, the carve-out excluded). Its RAM enters inside the free
+  reading (`min(GTT free, RAM)`), and the floor comes off the device's whole
+  limit, so where the GTT window rather than RAM binds it also withholds GTT
+  that RAM is not short for: up to 12.75 GiB of a 64 GiB window on a 128 GB
+  machine.
 - On macOS and Windows only the exit status tells that an idle worker is
   gone. A request that arrives while a killed worker is still being torn
   down (0.4 to 2 s for a process of several GiB) still reads as a death in

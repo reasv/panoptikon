@@ -449,8 +449,8 @@ fn the_reserve_is_capped_only_under_an_unset_margin() {
 /// little other usage the default fraction reserves almost nothing. Once
 /// another process holds more than 30 % of the card the default fraction is
 /// the larger and nothing changes. A margin the user wrote still applies as
-/// written, and the CPU device and Apple's unified memory keep their own
-/// rules. A unified-memory GPU on Linux is a GPU like any other here.
+/// written, and the CPU device, an APU and Apple's unified memory keep their
+/// own rules.
 #[test]
 fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
     let unset = VramBudget::default();
@@ -487,8 +487,7 @@ fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
         );
     }
 
-    // The CPU device keeps its RAM floor. A GPU carved out of host RAM has
-    // the floor on Linux, and on a Mac the fraction alone.
+    // The CPU device keeps its RAM floor; a Mac's GPU, the fraction alone.
     let host = VramLedger::for_test(
         &[
             (GPU, "TEST 9000", 24_576),
@@ -503,7 +502,6 @@ fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
             super::cpu::DEVICE_KEY,
             (6_553, RESERVE_RULE_RAM_FLOOR),
         ),
-        (false, GPU, (737, RESERVE_RULE_GPU_FLOOR)),
         (true, GPU, (17, RESERVE_RULE_CAPPED_DEFAULT)),
     ] {
         let mut state = host.lock();
@@ -511,6 +509,20 @@ fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
         assert_eq!(
             host.reserve_locked(&state, device, 165, DEFAULT_MARGIN),
             expected
+        );
+    }
+    // An APU keeps the RAM floor of the RAM the OS manages, its carve-out
+    // excluded, whatever the margin.
+    for margin in [DEFAULT_MARGIN, 0.0] {
+        let mut state = host.lock();
+        state.metal_allocator = false;
+        state.gpus.get_mut(GPU).unwrap().vram_carveout_mb = Some(512);
+        assert_eq!(
+            host.reserve_locked(&state, GPU, 165, margin),
+            (
+                super::cpu::ram_reserve_mb(65_536 - 512),
+                RESERVE_RULE_RAM_FLOOR
+            )
         );
     }
 

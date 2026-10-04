@@ -296,7 +296,8 @@ impl VramLedger {
     /// Apple's at least [`DEFAULT_RESERVE_FLOOR_FRACTION`] of the card (that
     /// cap at most), and exactly the cap on a GPU that spills to system RAM.
     /// A margin of 0 reserves nothing.
-    /// On the CPU device the reserve is never below [`cpu::ram_reserve_mb`],
+    /// On a device whose memory is host RAM ([`Self::host_ram_mb_locked`])
+    /// the reserve is never below [`cpu::ram_reserve_mb`] of that RAM,
     /// whatever the margin. See docs/batch-calibration-design.md, "The
     /// reserve, and why an unset margin is not the same as `margin = 0.10`".
     pub(super) fn reserve_locked(
@@ -329,15 +330,26 @@ impl VramLedger {
                 (capped, RESERVE_RULE_CAPPED_DEFAULT)
             }
         };
-        let floor = if gpu == cpu::DEVICE_KEY {
-            cpu::ram_reserve_mb(total_mb)
-        } else {
-            0
-        };
+        let floor = Self::host_ram_mb_locked(state, gpu).map_or(0, cpu::ram_reserve_mb);
         if reserve < floor {
             (floor, RESERVE_RULE_RAM_FLOOR)
         } else {
             (reserve, rule)
+        }
+    }
+
+    /// The host RAM behind a device that allocates from it directly: the CPU
+    /// device, and an APU (the RAM the OS manages, its carve-out excluded).
+    pub(super) fn host_ram_mb_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
+        let device = state.gpus.get(gpu)?;
+        if gpu == cpu::DEVICE_KEY {
+            Some(device.total_mb)
+        } else if let Some(carveout) = device.vram_carveout_mb {
+            device
+                .unified_ram_mb
+                .map(|ram| ram.saturating_sub(carveout))
+        } else {
+            None
         }
     }
 

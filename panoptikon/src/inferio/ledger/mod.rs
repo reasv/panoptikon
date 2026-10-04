@@ -22,9 +22,10 @@
 //!
 //! On the CPU device `reserved` is the live resident set and no growth is
 //! reusable: `charge(w) = footprint(w) + Σ grants(w)` and `room(w) = headroom`.
-//! Its reserve is never below [`cpu::ram_reserve_mb`]. A replica whose process
-//! dies mid-window there, or with host RAM booked, caps later batches of its
-//! (model, device) at half that batch ([`VramLedger::note_death_locked`]).
+//! Its reserve is never below [`cpu::ram_reserve_mb`], nor is an APU's. A
+//! replica whose process dies mid-window there, or with host RAM booked,
+//! caps later batches of its (model, device) at half that batch
+//! ([`VramLedger::note_death_locked`]).
 //!
 //! A worker with no reported base contributes only growth; the rest of its
 //! memory reads as `external`. The batch size moves only on measured rates
