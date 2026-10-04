@@ -1987,6 +1987,70 @@ fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
     assert_eq!(ramp_figures(&ledger).3, 3);
 }
 
+/// A pre-fit Mac replica whose first window ran five batches of 8 units
+/// allocating 160 MiB, now asked for 16, holding a 120 MiB pool while macOS
+/// pages.
+fn paging_pre_fit_mac_replica() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
+    let ledger = mps_ledger();
+    let handle = loaded_mps(Some(MAC_TOTAL_MB));
+    let admission = ledger
+        .register_worker("g/a", item_cost(8), &handle, None)
+        .expect("registers");
+    push_ram(&handle, MAC_TOTAL_MB, 90_000, 0, 0);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![measurement(8, 0, 160); 5]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    admission.earn_next_size();
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
+    ledger.install_probe_stub(Some(vec![GpuMemory {
+        uuid: MPS_GPU.to_owned(),
+        total_mb: MAC_RAM_MB,
+        free_mb: 0,
+    }]));
+    push_ram(&handle, MAC_TOTAL_MB, 90_000, 120, 0);
+    ledger.health();
+    (ledger, handle, admission)
+}
+
+/// A window with `work` units in the queue whose batches allocate 20 MiB a
+/// unit, as [`paging_pre_fit_mac_replica`]'s did; its grant.
+fn window_at_20_mib_a_unit(handle: &TelemetryHandle, admission: &Admission, work: u64) -> Grant {
+    let token = admission.request_grant(work, None, 1, 0).expect("granted");
+    let grant = *token.grant();
+    let units = grant.unit_budget;
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![measurement(units, 0, 20 * units)]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    grant
+}
+
+/// While macOS pages, a pre-fit replica alone on the Mac runs what the pool
+/// it holds covers at its pre-fit price, not its batch size: nothing beyond
+/// the pool is free. A window there that the queue sized, squeezed or not,
+/// sets no size kept.
+#[test]
+fn while_the_mac_pages_a_pre_fit_batch_fits_the_pool_held() {
+    let (ledger, handle, admission) = paging_pre_fit_mac_replica();
+    assert_eq!(
+        window_at_20_mib_a_unit(&handle, &admission, u64::MAX).unit_budget,
+        6,
+        "120 MiB of pool at 20 MiB a unit, not the 16 asked"
+    );
+    assert_eq!(pressure_cap(&ledger).map(|cap| cap.units), Some(6));
+
+    let (ledger, handle, admission) = paging_pre_fit_mac_replica();
+    let grant = window_at_20_mib_a_unit(&handle, &admission, 2);
+    assert_eq!((grant.unit_budget, grant.squeezed), (2, true));
+    assert_eq!(pressure_cap(&ledger), None, "2 units of work, a pool for 6");
+}
+
 /// At warning with nothing being paged out the replica keeps its working
 /// size: the trial of the next one is put off, and there is no growth and
 /// no throughput sample. A squeeze there is not kept once its cause is

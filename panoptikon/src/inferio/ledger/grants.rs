@@ -161,10 +161,10 @@ impl VramLedger {
                 if share.mb == 0 {
                     units = 1;
                 }
-                // Beside another replica's reservation, or once two sizes of
-                // this model measured its price here, at most the batch that
-                // the share and what the replica holds cover at its pre-fit
-                // price.
+                // Beside another replica's reservation, once two sizes of
+                // this model measured its price here, or while macOS pages,
+                // at most the batch that the share and what the replica holds
+                // cover at its pre-fit price.
                 let within = share
                     .mb
                     .saturating_add(entry.growth_in_use_mb())
@@ -173,6 +173,7 @@ impl VramLedger {
                 let covered = price.units(within, units);
                 let cut = covered < units
                     && (price.has_measured_rise()
+                        || pressure.paging()
                         || Self::neighbour_reserved_locked(&state, worker));
                 if cut {
                     units = Self::cut_size_locked(&state, entry, covered);
@@ -261,6 +262,7 @@ impl VramLedger {
                     size_asked,
                     granted_at,
                     squeezed,
+                    memory_cut: unit_budget < wanted,
                     room_bound,
                     peak_occupants: 0,
                     queue_bound,

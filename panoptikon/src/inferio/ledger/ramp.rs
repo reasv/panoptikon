@@ -351,7 +351,7 @@ impl VramLedger {
         };
         let cap = cal.pressure_cap;
         cal.pressure_cap = if charge.pressure.paging() {
-            if charge.queue_bound && !charge.squeezed {
+            if charge.queue_bound && !charge.memory_cut {
                 return;
             }
             let regrow_to = match cap {

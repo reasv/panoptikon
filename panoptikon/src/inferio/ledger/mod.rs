@@ -591,6 +591,9 @@ struct GrantCharge {
     granted_at: Instant,
     /// Memory held this window back ([`Grant::squeezed`]).
     squeezed: bool,
+    /// Memory or host RAM cut the unit budget below the batch size and the
+    /// window's content: the size is memory's, not the queue's.
+    memory_cut: bool,
     /// The fitted price cut this window's batch to the device's room: not
     /// pre-fit, not a share beside another replica that is asking, and not
     /// cut further by host RAM or an item cap.
