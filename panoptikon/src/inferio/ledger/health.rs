@@ -95,7 +95,7 @@ impl VramLedger {
                         .free
                         .as_ref()
                         .map(|sample| sample.at.elapsed().as_millis() as u64),
-                    limit_mb: side.limit(),
+                    limit_mb: side.limit,
                     reserve_mb: side.reserve,
                     reserve_rule: side.rule.to_owned(),
                     headroom_mb: side.overdraft().max(0) as u64,

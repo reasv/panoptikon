@@ -104,19 +104,14 @@ pub(super) struct Side {
     pub(super) external: Option<u64>,
     pub(super) reserve: u64,
     pub(super) rule: &'static str,
-    /// Negative when the RAM-domain peers' charges exceed the room.
-    limit: i128,
+    pub(super) limit: u64,
     claims: u64,
 }
 
 impl Side {
-    pub(super) fn limit(&self) -> u64 {
-        self.limit.max(0) as u64
-    }
-
     /// `limit − claims`, before its floor at zero.
     pub(super) fn overdraft(&self) -> i128 {
-        self.limit - i128::from(self.claims)
+        i128::from(self.limit) - i128::from(self.claims)
     }
 }
 
@@ -492,13 +487,13 @@ impl VramLedger {
     /// `limit` under a given margin: the GPU's own, or a model's widened one
     /// ([`Self::effective_margin_locked`]).
     fn limit_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
-        self.side_locked(state, gpu, margin).limit()
+        self.side_locked(state, gpu, margin).limit
     }
 
     /// The limit over `room` (by default the device's own) less `taken`
-    /// (external usage and the reserve), at least 0, then less `peers`, the
-    /// RAM-domain peers' charges in host RAM, which may take it below 0. At
-    /// most the device total and its `cap_fraction` of that.
+    /// (external usage and the reserve) and `peers` (the RAM-domain peers'
+    /// charges in host RAM), at least 0. At most the device total and its
+    /// `cap_fraction` of that.
     fn limit_over_locked(
         &self,
         state: &LedgerState,
@@ -506,7 +501,7 @@ impl VramLedger {
         room: Option<u64>,
         taken: u64,
         peers: u64,
-    ) -> i128 {
+    ) -> u64 {
         let Some(gpu_ledger) = state.gpus.get(gpu) else {
             return 0;
         };
@@ -526,7 +521,9 @@ impl VramLedger {
         {
             ceiling = ceiling.min((total as f64 * fraction.clamp(0.0, 1.0)).floor() as u64);
         }
-        (i128::from(room.saturating_sub(taken)) - i128::from(peers)).min(i128::from(ceiling))
+        room.saturating_sub(taken)
+            .saturating_sub(peers)
+            .min(ceiling)
     }
 
     /// The room a load is refused against, with no reserve: what the card
@@ -542,7 +539,7 @@ impl VramLedger {
         } else {
             self.external_locked(state, gpu).unwrap_or(0)
         };
-        self.limit_over_locked(state, gpu, None, external, 0).max(0) as u64
+        self.limit_over_locked(state, gpu, None, external, 0)
     }
 
     pub(super) fn headroom_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
