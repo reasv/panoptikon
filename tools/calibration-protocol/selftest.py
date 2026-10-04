@@ -1005,6 +1005,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             units = price(batch_inputs)
             free_before, free_before_source = memory._free_mb()
             halvings_before = counter("total_oom_halvings")
+            host_ram_before = counter("total_host_ram_halvings")
             index_before = counter("total_index_limit_events")
             state = memory.begin_batch()
             failure: Optional[BaseException] = None
@@ -1013,9 +1014,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             except Exception as exc:
                 failure = exc
             absorbed = max(0, counter("total_oom_halvings") - halvings_before)
+            absorbed_host_ram = max(
+                0, counter("total_host_ram_halvings") - host_ram_before)
             index_events = max(
                 0, counter("total_index_limit_events") - index_before)
-            oom_class = packing.classify_oom(failure, absorbed)
+            oom_class = packing.classify_oom(failure, absorbed, absorbed_host_ram)
             measurement = memory.measure_batch(
                 state, items=count, units=units, oom=oom_class is not None,
                 oom_class=oom_class, free_mb=free_before,

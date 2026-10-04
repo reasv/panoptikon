@@ -907,8 +907,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception:
         impl_utils = None
 
-    def halvings() -> int:
-        reader = getattr(impl_utils, "total_oom_halvings", None) if impl_utils else None
+    def halvings(name: str = "total_oom_halvings") -> int:
+        reader = getattr(impl_utils, name, None) if impl_utils else None
         try:
             return int(reader()) if reader else 0
         except Exception:
@@ -950,6 +950,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         reserved_before = reserved_mb()
         reset_peak()
         before_halvings = halvings()
+        before_host_ram = halvings("total_host_ram_halvings")
         before_index_limits = index_limit_events()
         # The only way to see the true peak where there is no peak counter.
         sampler = (PeakSampler(device_own_mb, args.sample_ms).start()
@@ -971,10 +972,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         peak_allocated = peak_allocated_mb()
         reserved_after = reserved_mb()
         absorbed = max(0, halvings() - before_halvings)
+        absorbed_host_ram = max(0, halvings("total_host_ram_halvings") - before_host_ram)
         index_limits = max(0, index_limit_events() - before_index_limits)
         # The worker's own `packing.classify_oom`, imported rather than
         # reimplemented, so this tool draws the boundary the ledger acts on.
-        oom_class = packing.classify_oom(failure, absorbed)
+        oom_class = packing.classify_oom(failure, absorbed, absorbed_host_ram)
         oom = oom_class is not None
         record = {
             "batch": count,
