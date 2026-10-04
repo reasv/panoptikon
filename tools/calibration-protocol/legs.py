@@ -2082,6 +2082,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             # not move the hog.
             scenario = replace(scenario, events=timed, hog_hold_fraction=0.0,
                                hog_reeval=999999)
+            if scenario.checks != "all":
+                scenario = replace(scenario, checks=scenario.checks
+                                   + ",hog_tracking,deflation_recovery")
 
     if args.dry_run:
         directory = Path(args.results) / (args.run_id or "<run-id>") / scenario.key

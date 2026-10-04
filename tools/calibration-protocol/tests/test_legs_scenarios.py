@@ -85,6 +85,13 @@ def test_a_hog_event_squeezes_during_the_job_on_any_hog_target(capsys,
     assert [row["at_s"] for row in plan["hog_events"]] == [90.0, 95.0, 100.0]
     assert plan["hog"]["reeval"] is None
 
+    # A scenario with its own check list is judged on the hog too.
+    assert legs.main(["--scenario", "S14", "--gpu-total-mb", "24564",
+                      "--no-dotenv", "--dry-run",
+                      "--hog-event", "at=5,leave_free=4096"]) == 0
+    argv = json.loads(capsys.readouterr().out)["analyze_command"]
+    assert "hog_tracking" in argv[argv.index("--checks") + 1]
+
     for bad in ("at=5,leave_free=1,hold=2", "leave_free=1", "at=5,hold=x",
                 "at=5,release=x", "at=-1,release", "at=nan,release",
                 "at=inf,release", "at=5,hold=-1", "at=1,at=90,hold=5"):
