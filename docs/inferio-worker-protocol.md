@@ -1038,9 +1038,10 @@ sensing module may not create a CUDA context of its own:
   cannot meaningfully outlive the load it belongs to. It is collected from the
   load-failure path as well as on success, and whatever it measured is kept: a
   context is a fact about the process, not about the load that created it.
-- A worker with a live GPU context logs one INFO line naming the figure it
-  uses and, for the estimate, why the context went unmeasured: no driver
-  reading before the load, the GPU already initialised, or no usable reading.
+- A worker that measured its context, or whose base the estimate priced, logs
+  one INFO line naming the figure and, for the estimate, why the context went
+  unmeasured: no driver reading before the load, the GPU already initialised,
+  or no usable reading.
 
 Two plausibility bounds elsewhere in the base measurement are built from the
 same allowance, one pointing each way:
@@ -1059,8 +1060,8 @@ same allowance, one pointing each way:
   and the two innocent shortfalls fit inside 256 MiB with room to spare: MiB
   truncation on both sides, and pages the driver has evicted since we committed
   them, since `drm-resident-vram` counts *resident* pages rather than reserved
-  ones. 256 MiB stays well under the context estimate, so a reading that missed
-  a whole HIP context — the failure this guards — cannot pass as jitter.
+  ones. A reading that missed a HIP context under 256 MiB still passes as
+  jitter (199 MiB was measured on gfx1030).
 
 
 `predict` `ok` may additionally carry:
@@ -1779,8 +1780,8 @@ The orchestrator sets for every worker:
   - ROCm: the host's HIP library directories (`$ROCM_PATH/lib`,
     `$HIP_PATH/lib`, `/opt/rocm/lib`, and the NixOS driver trees), alongside
     `ROCM_PATH`, `HIP_PATH` and the MIOpen `MIOPEN_FIND_MODE=FAST` /
-    `MIOPEN_LOG_LEVEL=3` (errors only) / cache-path defaults — each of those written only when unset, so an
-    operator who chose a value keeps it.
+    `MIOPEN_LOG_LEVEL=3` (errors only) / cache-path defaults — each of those
+    written only when unset, so an operator who chose a value keeps it.
 
   MPS and CPU hosts get none of this. `inferio_worker.cudnn` still registers
   Windows DLL directories (`os.add_dll_directory`, which *does* work

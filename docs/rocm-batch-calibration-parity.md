@@ -74,12 +74,13 @@ and dictate the design that follows.
    indices only, indexing into the ROCR-filtered set when both are set.
    torch-ROCm honours `HIP_VISIBLE_DEVICES` first, then
    `ROCR_VISIBLE_DEVICES`, then `CUDA_VISIBLE_DEVICES` — and **torch < 2.6
-   crashes at init when `ROCR_VISIBLE_DEVICES` is set** (fixed by
-   pytorch#142292). There is no `CUDA_DEVICE_ORDER` analogue and no
-   FASTEST_FIRST reordering on HIP. Because HIP filters *above* ROCr, a
-   HIP-pinned process still initializes ROCr agents for (and holds render
-   nodes of) every ROCR-visible GPU — per-process kernel state is
-   **not** scoped to the HIP-visible device (review F1).
+   fails at its first GPU use while `ROCR_VISIBLE_DEVICES` is set without a
+   HIP-layer variable** (pytorch#140318, fixed in 2.6). There is no
+   `CUDA_DEVICE_ORDER` analogue and no FASTEST_FIRST reordering on HIP.
+   Because HIP filters *above* ROCr, a HIP-pinned process still initializes
+   ROCr agents for (and holds render nodes of) every ROCR-visible GPU —
+   per-process kernel state is **not** scoped to the HIP-visible device
+   (review F1).
 4. **torch 2.11+rocm7.2** (our `rocm` extra, Linux x86_64 only) has the
    full hipified `torch.cuda.*` memory API: allocator statistics are the
    same code path; `mem_get_info` maps to `hipMemGetInfo` but its "free"
@@ -329,8 +330,9 @@ is unset — the weaker of the two aliases, on exactly the hosts that are
 hardest to reason about.
 
 Why HIP and not ROCR form: torch honours HIP first on every relevant
-version, torch < 2.6 (possible in user-managed venvs) crashes outright
-when ROCR is set, and AMD documents HIP-level filtering as the
+version, torch < 2.6 (possible in user-managed venvs) fails at its first
+GPU use while ROCR is set without a HIP-layer variable (pytorch#140318),
+and AMD documents HIP-level filtering as the
 application-scoped mechanism. `CUDA_VISIBLE_DEVICES` is deliberately NOT
 also set on ROCm (it is a HIP alias; setting both is documented as
 "unintended behaviour" territory). The accelerator sentinel's HSA/MIOpen
@@ -614,8 +616,8 @@ unchanged, behind the existing `is_initialized` gates.
   and the free delta only ever appears on a *second* load into a worker that
   already has a device. Consequence for the field pass:
   `HIP_CONTEXT_ESTIMATE_MB` is materially more load-bearing on ROCm than the
-  D4 text above implies — whenever fdinfo is unavailable (an older kernel's
-  VM-walk stats), every first load falls straight to
+  D4 text above implies — whenever neither KFD nor fdinfo answers (an older
+  kernel's VM-walk stats), every first load falls straight to
   `alloc_delta + HIP_CONTEXT_ESTIMATE_MB`, so the HIP context size is
   promoted from "flagged" to the first number to measure on real hardware.
 - **Plausibility floor:** `FDINFO_UNDERREPORT_SLACK_MB = 256`, i.e. an
@@ -625,16 +627,16 @@ unchanged, behind the existing `is_initialized` gates.
   a shortfall is suspicious, and the only innocent shortfalls are MiB
   truncation on both sides and pages evicted since we committed them
   (`drm-resident-vram` counts *resident* pages). 256 covers those while
-  staying under `HIP_CONTEXT_ESTIMATE_MB`; a missed HIP context smaller than
-  256 MiB (199 MiB was measured on gfx1030) still passes, which KFD's
-  per-process counter covers on a discrete GPU. The comparand is the
-  **absolute** post-load pool, not the load window's `reserved_delta`:
-  fdinfo reports absolute whole-process VRAM, the two coincide only on a
-  process's first load, and the ledger explicitly anticipates repeat loads
-  into one worker — where a windowed comparand would wave an under-report
-  through for no better reason than that the second load was small.
-  (`reserved_delta` stays as the fallback for the case where the allocator
-  could not be read after the load at all.)
+  staying under `HIP_CONTEXT_ESTIMATE_MB`. A missed HIP context smaller
+  than 256 MiB (199 MiB was measured on gfx1030) still passes, and whether
+  KFD's per-process counter includes the HIP context is not yet measured.
+  The comparand is the **absolute** post-load pool, not the load window's
+  `reserved_delta`: fdinfo reports absolute whole-process VRAM, the two
+  coincide only on a process's first load, and the ledger explicitly
+  anticipates repeat loads into one worker — where a windowed comparand
+  would wave an under-report through for no better reason than that the
+  second load was small. (`reserved_delta` stays as the fallback for the
+  case where the allocator could not be read after the load at all.)
 - **Upper sanity bound:** a reading at or above the GPU's own
   `total_memory` is rejected too — the twin of the NVML sentinel guard that
   rejects a filled-in `-1`. A per-process figure that equals or exceeds the
