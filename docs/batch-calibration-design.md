@@ -727,9 +727,9 @@ That was the shape of the observed defect (the Metal row's `external_mb` froze
 while a CPU replica grew to 11.7 GiB). The cross-charge removes our grants
 from that gap, not a neighbouring process's memory, and not growth a peer
 kept after its grant settled, which reads as external only once this device
-reads again. So a grant on a GPU that shares RAM (MPS, an APU) reads that RAM
-first, as a CPU-device grant does: RAM statistics and amdgpu's counters are a
-cheap read. Between readings the worker's live clamp is the backstop.
+reads again. So a grant on a device that shares RAM with another (the CPU
+device, MPS, an APU) reads that RAM first: RAM statistics and amdgpu's
+counters are a cheap read. Between readings the worker's live clamp is the backstop.
 
 **Known transient: a load reservation can sit on the wrong device.** The
 reservation is charged before any worker exists, so it is keyed by the device
