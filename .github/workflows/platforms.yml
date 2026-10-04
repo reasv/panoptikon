@@ -59,17 +59,18 @@ jobs:
           touch panoptikon-desktop/src-tauri/resources/pdfium/libpdfium.dylib
 
       - name: Check
+        id: check
         run: cargo check --workspace --all-targets --features panoptikon/bundled
 
       - name: Platform tests
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.check.outcome == 'success' }}
         run: cargo test -p panoptikon --bin panoptikon -- ownership inferio::mps inferio::cpu
 
       - name: Worker tests
         if: ${{ !cancelled() }}
         working-directory: python
         run: |
-          uv sync --locked --group test --extra cpu
+          uv sync --locked --no-default-groups --group test --extra cpu
           uv run --no-sync python -m pytest tests/inferio_worker
 
       # Reports and does not gate.
