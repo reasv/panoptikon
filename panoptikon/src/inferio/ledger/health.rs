@@ -131,8 +131,10 @@ pub struct GpuBudgetHealth {
     pub total_mb: u64,
     /// `max(0, total − free − Σ our footprints)`: what other processes hold.
     /// On unified memory the footprints of every device sharing the RAM
-    /// count, an APU's only beyond the carve-out it can still use. An APU
-    /// reports this, the reserve, the limit and the headroom from the side
+    /// count, an APU's only beyond the carve-out it can still use. On a GPU
+    /// that spills to system RAM, while it reads full or is credited for a
+    /// departure, at least its value at the last pool refresh that was
+    /// neither. An APU reports this, the reserve, the limit and the headroom from the side
     /// that binds: its VRAM and GTT (its own memory only) or the RAM behind
     /// it.
     pub external_mb: u64,
