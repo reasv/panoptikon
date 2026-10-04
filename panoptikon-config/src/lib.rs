@@ -120,9 +120,8 @@ fn patch_table(
     // here before it, so it goes in front.
     let mut last = String::new();
     for key in before.keys().filter(|key| !after.contains_key(*key)) {
-        // The lines above a key-value are its key's decor (one key per line
-        // of a dotted-key table): hand them to the next key-value rendered in
-        // this body.
+        // The lines above a key-value are in the decor of its key's last segment:
+        // hand them to the next key-value rendered in this body.
         let Some(index) = concrete.iter().position(|(name, _)| name == key) else {
             continue;
         };
@@ -170,7 +169,7 @@ fn patch_table(
         return Ok(last);
     }
     if !last.is_empty() {
-        // Only the parsed root has no position; it renders first.
+        // The root is the only table with key-values and no position; it renders first.
         blocks_after_table.push((concrete.position().unwrap_or(0), last));
     }
     Ok(String::new())
@@ -941,7 +940,7 @@ mod tests {
     /// above it stays where it was, before the comments of whatever follows.
     #[test]
     fn removing_a_key_keeps_the_comment_block_above_it() {
-        let dotted = "[vram]\ngpu.a = 1\n# b note\ngpu.b = 2\n# k\nkeep = 1\n# n\n[next]\n";
+        let dotted = "[vram]\n# a note\ngpu.CPU.a = 1\n# b note\ngpu.CPU.b = 2\n# k\nkeep = 1\n# n\n[next]\n";
         let cases: [(&str, &[&str]); 10] = [
             // Next key in the same table.
             (
@@ -965,17 +964,17 @@ mod tests {
                 "# top\n\n# margin note\nmargin = 0.10\n\n[vram]\nkeep = 1\n",
                 &["margin = 0.10\n"],
             ),
-            // Two adjacent keys, the second one last in its table.
+            // Two adjacent keys, the second one last in its table; an indented key with no comment.
             (
-                "[vram]\n  # m\n  margin = 0.10\n  # c\n  cap_fraction = 0.90\n  # k\n[next]\n[after]\n",
-                &["  margin = 0.10\n", "  cap_fraction = 0.90\n"],
+                "[vram]\n  # m\n  margin = 0.10\n  # c\n  cap_fraction = 0.90\n  # k\n[next]\n  n = 1\n  keep = 1\n[after]\n",
+                &["  margin = 0.10\n", "  cap_fraction = 0.90\n", "  n = 1\n"],
             ),
             // Last key of a dotted-key table, which renders in its parent's
             // body: before the parent's next key, else the next table header.
-            (dotted, &["gpu.b = 2\n"]),
-            (dotted, &["gpu.b = 2\n", "keep = 1\n"]),
+            (dotted, &["gpu.CPU.b = 2\n"]),
+            (dotted, &["gpu.CPU.b = 2\n", "keep = 1\n"]),
             // The whole dotted-key table.
-            (dotted, &["gpu.a = 1\n", "gpu.b = 2\n"]),
+            (dotted, &["gpu.CPU.a = 1\n", "gpu.CPU.b = 2\n"]),
             // Last key of an array-of-tables element.
             ("[[p]]\nn = 1\n# x\nx = 1\n[[p]]\nn = 2\n", &["x = 1\n"]),
             // The next line is a dotted key.
