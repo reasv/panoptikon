@@ -441,7 +441,7 @@ fn cold_cpu_replicas_on_a_16_gb_host_stay_inside_the_headroom() {
 /// back between windows, down to one unit under the CPU device's cap.
 #[test]
 fn a_cold_gpu_and_cpu_replica_on_a_16_gb_unified_host_are_priced_at_the_measured_pool() {
-    let cases: [(bool, f64, [[u64; 2]; 4], [i64; 4]); 4] = [
+    let cases = [
         (
             false,
             1.25,
