@@ -177,23 +177,20 @@ impl VramLedger {
                 && state.pressure_warned.insert(key.clone());
             (id, expected, reserved, headroom, pressure_warning)
         };
-        if pressure_warning && pressure.paging() {
-            tracing::warn!(
-                model = %inference_id,
-                gpu = %gpu,
-                memory_pressure = ?pressure,
-                "loading while macOS has no memory to spare: this model's \
-                 batches are cut to the memory it already holds until the \
-                 pressure eases"
-            );
-        } else if pressure_warning {
-            tracing::warn!(
-                model = %inference_id,
-                gpu = %gpu,
-                memory_pressure = ?pressure,
+        if pressure_warning {
+            let message = if pressure.paging() {
+                "loading while macOS has no memory to spare: this model runs \
+                 smaller batches until the pressure eases"
+            } else {
                 "loading while macOS reports memory pressure: this model \
                  tries no larger batch size until the pressure is back to \
                  normal"
+            };
+            tracing::warn!(
+                model = %inference_id,
+                gpu = %gpu,
+                memory_pressure = ?pressure,
+                "{message}"
             );
         }
         if reserved < expected {

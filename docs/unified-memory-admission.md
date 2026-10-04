@@ -296,11 +296,11 @@ Single synthetic device:
     20–38 GiB — so the formula still offered 8–10 GiB that did not exist.
     With 0 available, `external` is everything but our own residents and
     `limit` is what they hold less the reserve: a grant is cut to the
-    replica's own free pool (the squeeze path; before the fit, to the batch
-    that pool covers at the pre-fit price), and the worker's live clamp,
-    which reads the same 0, cuts each batch to the pool it holds
-    (`releasable_pool_mb`); a replica with no pool runs one unit. A squeezed
-    grant asks idle residents for their pools (the trim path).
+    replica's own free pool less the reserve (the squeeze path; before the
+    fit, to the batch that pool covers at the pre-fit price), and the
+    worker's live clamp, which reads the same 0, cuts each batch to the pool
+    it holds (`releasable_pool_mb`); a replica with no pool runs one unit. A
+    squeezed grant asks idle residents for their pools (the trim path).
   - **Warning: the file cache is taken too** (`external_page_count`). At
     warning macOS makes room by compressing and swapping other processes'
     memory, not only by dropping clean file pages, so a grant priced on the
@@ -310,7 +310,8 @@ Single synthetic device:
     knee, does not count as the size the ramp reached or toward a knee's
     expiry, and its throughput-collapse flags are ignored. A grant above
     normal asks for at most the working size: no trial size and no doubling.
-    So at warning a replica keeps the unit budget it had; a squeeze there (a
+    So at warning a replica asks for no larger size than it had; its grant
+    can still be smaller while free memory is short. A squeeze there (a
     neighbour, a dip in the reading) lasts only as long as its cause.
   - **A paging episode leaves a cap** (`PressureCap`, per model and device, so
     a replica loaded afterwards runs what one that lived through it runs).
