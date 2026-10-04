@@ -2181,6 +2181,7 @@ mod tests {
             pci_devices: dir.path().join("pci"),
             dev_dri: dir.path().join("dri"),
             meminfo: dir.path().join("meminfo"),
+            ..rocm::SysfsRoots::default()
         };
         let node = roots.kfd_nodes.join("1");
         std::fs::create_dir_all(&node).unwrap();
