@@ -247,6 +247,7 @@ pub fn probe(accelerator: Accelerator) -> HostGpus {
             );
             if !host.inventory.spilling_gpus().is_empty() {
                 tracing::warn!(
+                    gpus = ?host.inventory.spilling_gpus(),
                     "with the NVIDIA driver's default \"CUDA - Sysmem Fallback Policy\", a GPU \
                      that runs out of memory silently uses system RAM instead of failing, and \
                      batch-size calibration can briefly exceed GPU memory, so inference can run \
