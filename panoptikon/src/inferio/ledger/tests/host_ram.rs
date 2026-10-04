@@ -23,7 +23,7 @@ const RISING: [(u64, f64); 2] = [(1, 100.0), (1 << 20, 2_100.0)];
 /// With no margin, a CPU free reading of `n` MiB leaves `n − RESERVE_MB` to
 /// book while every resident set is at its load baseline. The host is not
 /// probed: free readings are the test's own, or a probe stub's.
-fn host(cards: &[&str], profiles: Option<Arc<FakeProfiles>>) -> Arc<VramLedger> {
+pub(super) fn host(cards: &[&str], profiles: Option<Arc<FakeProfiles>>) -> Arc<VramLedger> {
     host_with_ram(cards, profiles, CPU_RAM_MB)
 }
 
@@ -75,7 +75,7 @@ fn with_rss(handle: TelemetryHandle) -> TelemetryHandle {
 }
 
 /// A GPU replica just loaded: its first window is a single-item window.
-fn cold_gpu_replica(
+pub(super) fn cold_gpu_replica(
     ledger: &Arc<VramLedger>,
     model: &str,
     gpu: &str,

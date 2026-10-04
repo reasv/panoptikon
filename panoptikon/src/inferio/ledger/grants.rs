@@ -479,11 +479,12 @@ impl VramLedger {
         entry.idle_release_gave_nothing = false;
         // Anything but a clean response may not have applied the fit
         // snapshot this window carried, so re-send it.
-        if !matches!(outcome, WindowOutcome::Responded { oom: None }) {
+        if frame_host_ram || !matches!(outcome, WindowOutcome::Responded { oom: None }) {
             entry.fit_version_sent = 0;
         }
         // A failed or crashed window may not mark the anchor "measured here".
         let window_failed = crashed
+            || frame_host_ram
             || matches!(
                 outcome,
                 WindowOutcome::WorkerDied(_) | WindowOutcome::Responded { oom: Some(_) }

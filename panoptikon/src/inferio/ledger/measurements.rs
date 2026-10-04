@@ -548,7 +548,7 @@ impl VramLedger {
                 OomVerdict::None => false,
                 OomVerdict::HostRam => {
                     host_ram_oom = true;
-                    false
+                    continue;
                 }
                 OomVerdict::Trusted(trust) => {
                     trusted_ooms += 1;
@@ -865,7 +865,7 @@ impl VramLedger {
             }
         }
         // The ratchet counts local clean priced batches.
-        let clean_window = !window_failed && !saw_oom;
+        let clean_window = !window_failed && !saw_oom && !host_ram_oom;
         let reached_anchor = anchor > 0 && anchor >= cal.max_units_measured;
         if reached_anchor {
             cal.max_units_measured = anchor;

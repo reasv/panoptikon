@@ -1855,11 +1855,15 @@ fn a_spill_or_collapse_at_the_rooms_limit_leaves_the_pool_margin() {
 
 /// Host RAM running out, read from the error frame or from a batch's class,
 /// is no out-of-memory of a GPU with its own memory: at the room's limit it
-/// deflates nothing and leaves the pool margin, and one-item windows condemn
-/// nothing. On the CPU device, whose memory is host RAM, it is a negative.
+/// deflates nothing and leaves the pool margin; it moves no item cap, warm-up
+/// count or anchor; one-item windows condemn nothing, nor clear the count of
+/// out-of-memory windows at the floor. On the CPU device and on a GPU that
+/// shares host RAM, it is a negative.
 #[test]
 fn host_ram_running_out_is_no_out_of_memory_of_a_gpu() {
     let host_ram_batch = || BatchMeasurement {
+        items: Some(1),
+        units: Some(1),
         oom: true,
         oom_class: Some(OomClass {
             source: OOM_SOURCE_TYPED.to_owned(),
@@ -1898,6 +1902,53 @@ fn host_ram_running_out_is_no_out_of_memory_of_a_gpu() {
         assert_eq!(margin_steps(&limit, "g/a", GPU), 0);
     }
 
+    // A clean batch at a seeded anchor, then host RAM ran out: the anchor is
+    // neither halved nor measured here.
+    let profiles = Arc::new(FakeProfiles {
+        seed: Some(seeded_anchor(512, false)),
+        ..FakeProfiles::default()
+    });
+    let seeded = ledger_with(100_000, no_margin(), &profiles);
+    let handle = loaded(Some(1000), Some(0));
+    let admission = seeded
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    push_memory(&handle, 90_000, 0);
+    seeded.ingest_all_for_test();
+    for from_batch in [false, true] {
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement(512, 0, 5_120)]);
+        fail(&handle, token, from_batch);
+        let state = seeded.lock();
+        let cal = &state.calibration[&("g/a".to_owned(), GPU.to_owned())];
+        assert_eq!(
+            (
+                cal.max_units_measured,
+                cal.anchor_measured_here,
+                cal.max_units_measured_here
+            ),
+            (512, false, 0),
+            "from the batch: {from_batch}"
+        );
+    }
+
+    // An item-capped replica: the failed batch is no batch that ran.
+    let capped = super::host_ram::host(&[GPU], None);
+    let (handle, admission) = super::host_ram::cold_gpu_replica(&capped, "g/a", GPU, item_cost(4));
+    let ran_batches = || capped.lock().workers.values().next().unwrap().ran_batches;
+    for from_batch in [false, true] {
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        fail(&handle, token, from_batch);
+        assert_eq!(
+            (admission.item_cap(), ran_batches()),
+            (Some(1), 0),
+            "from the batch: {from_batch}"
+        );
+    }
+
     let card = ledger(10_000, no_margin());
     let handle = loaded(Some(9_900), Some(0));
     let admission = card
@@ -1911,13 +1962,31 @@ fn host_ram_running_out_is_no_out_of_memory_of_a_gpu() {
         assert!(fail(&handle, token, window % 2 == 1).unrunnable.is_none());
     }
     assert!(!card.was_condemned("g/big", GPU));
+    // Out of memory, out of memory, host RAM, out of memory: condemned.
+    let condemned: Vec<bool> = [false, false, true, false]
+        .into_iter()
+        .map(|host_ram| {
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            let outcome = if host_ram {
+                host_ram_frame
+            } else {
+                OUT_OF_MEMORY
+            };
+            token.finish(outcome).is_some()
+        })
+        .collect();
+    assert_eq!(condemned, [false, false, false, true]);
 
     let ledger = cpu_ledger(no_margin());
-    let (handle, admission) = cpu_replica(&ledger);
-    for from_batch in [false, true] {
-        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        let window = fail(&handle, token, from_batch).window.expect("settled");
-        assert_eq!(window.negative_reason, Some("oom"));
+    let (cpu_handle, cpu_admission) = cpu_replica(&ledger);
+    let (shared, handle, admission) = at_the_rooms_limit();
+    shared.lock().gpus.get_mut(GPU).unwrap().unified_ram_mb = Some(65_536);
+    for (handle, admission) in [(&cpu_handle, &cpu_admission), (&handle, &admission)] {
+        for from_batch in [false, true] {
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            let window = fail(handle, token, from_batch).window.expect("settled");
+            assert_eq!(window.negative_reason, Some("oom"));
+        }
     }
 }
 
