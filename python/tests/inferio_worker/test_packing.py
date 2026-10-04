@@ -2892,6 +2892,7 @@ def test_no_release_or_spill_flag_off_a_spill_capable_host(
     larger than the card is not flagged."""
     monkeypatch.setattr(memory, "DXG_DEVICE", str(tmp_path / "dxg"))
     monkeypatch.setattr(memory.sys, "platform", "linux")
+    monkeypatch.setattr(memory, "_malloc_trim", lambda: None)
     nvml_card(fake_torch, monkeypatch)
     payloads = run_growing_windows(fake_torch)
     impl = caching_impl(fake_torch, [8192 + 1000])

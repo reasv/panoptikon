@@ -2483,7 +2483,7 @@ def test_the_vm_statistics_fields_are_read_at_their_positions() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="vm_stat is macOS's")
-def test_the_swapouts_and_file_cache_match_vm_stat() -> None:
+def test_the_mac_counters_match_vm_stat() -> None:
     def vm_stat() -> tuple[int, int, int]:
         """Swap-outs since boot, and the wired memory and file cache in
         bytes."""
