@@ -491,15 +491,18 @@ def test_hog_on_hip_reads_sysfs_by_torchs_pci_address(tmp_path, monkeypatch,
 # --- legs, selftest, newrun --------------------------------------------------
 
 
-def test_legs_rocm_configs_name_the_accelerator_and_drop_cudnn():
+def test_legs_rocm_configs_name_the_accelerator_and_drop_cudnn(tmp_path):
     import tomllib
 
     rendered = tomllib.loads(legs.render_config("R1", HERE.parents[1]))
     assert rendered["inference_local"]["python_env"]["accelerator"] == "rocm"
-    env = legs.config_env("R1", HERE.parents[1], {})
+    (tmp_path / "lib" / "python3.12" / "site-packages" / "nvidia" / "cudnn"
+     / "lib").mkdir(parents=True)
+    python = str(tmp_path / "bin" / "python")
+    env = legs.config_env("R1", HERE.parents[1], {}, python)
     assert "LD_LIBRARY_PATH" not in env
     assert env["RUST_LOG"].endswith(",panoptikon::db::batch_auto=debug")
-    assert "LD_LIBRARY_PATH" in legs.config_env("C1", HERE.parents[1], {})
+    assert "LD_LIBRARY_PATH" in legs.config_env("C1", HERE.parents[1], {}, python)
 
 
 @pytest.mark.parametrize("name,variable,pin", [

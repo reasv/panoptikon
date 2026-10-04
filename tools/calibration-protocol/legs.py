@@ -1444,6 +1444,21 @@ def config_tree(name: str, repo: Path) -> Path:
     return (repo / CONFIGS[name].get("tree", ".")).resolve()
 
 
+def venv_python(venv: Path) -> Path:
+    """The interpreter of virtualenv `venv` on this OS."""
+    if IS_WINDOWS:
+        return venv / "Scripts" / "python.exe"
+    return venv / "bin" / "python"
+
+
+def cudnn_library_dir(python: Path) -> Optional[Path]:
+    """The `nvidia/cudnn/lib` directory in the venv of interpreter `python`,
+    or None when that venv has none."""
+    found = sorted(python.parent.parent.glob(
+        "lib/python3*/site-packages/nvidia/cudnn/lib"))
+    return found[-1] if found else None
+
+
 _TOML_BASE_URL = re.compile(r'^(\s*base_url\s*=\s*"[^"]*:)(\d+)(.*)$')
 
 
@@ -1491,8 +1506,7 @@ def render_config(name: str, repo: Path) -> str:
         config_dirs.append(tree / "tools" / "calibration-protocol" / "config"
                            / spec["registry"])
     for key, value in (
-            ("python", json.dumps(str(tree / "python" / ".venv" / "bin"
-                                      / "python"))),
+            ("python", json.dumps(str(venv_python(tree / "python" / ".venv")))),
             ("impl_dirs", paths(tree / "python" / "inferio" / "impl",
                                 tree / "inferio_custom")),
             ("config_dirs", paths(*config_dirs)),
@@ -1504,15 +1518,20 @@ def render_config(name: str, repo: Path) -> str:
     return text
 
 
-def config_env(name: str, repo: Path, base: Dict[str, str]) -> Dict[str, str]:
+def config_env(name: str, repo: Path, base: Dict[str, str],
+               python: Optional[str] = None) -> Dict[str, str]:
     """The gateway's environment for configuration `name`, over `base`.
 
     The trace directive carries the ledger's grant/settle/refit lines, and the
-    worker's DEBUG level its batch plans. `LD_LIBRARY_PATH` names the venv's
-    cuDNN because CTranslate2 (faster-whisper) dlopens `libcudnn_ops.so.9` and
-    that directory is not on the loader path; torch finds its own copy.
+    worker's DEBUG level its batch plans. `LD_LIBRARY_PATH` names the cuDNN
+    in the worker's venv (`python`, else the tree's) because CTranslate2
+    (faster-whisper) dlopens `libcudnn_ops.so.9` and that directory is not on
+    the loader path; torch finds its own copy. It is left out when that venv
+    has no cuDNN.
     """
     tree = config_tree(name, repo)
+    cudnn = cudnn_library_dir(Path(python) if python
+                              else venv_python(tree / "python" / ".venv"))
     # A configuration that names its own tree (C0, the master baseline) runs
     # that tree's binary whatever the caller exported; the others share the
     # checkout, so a caller's PANOPTIKON_BIN only picks which build of it.
@@ -1523,24 +1542,23 @@ def config_env(name: str, repo: Path, base: Dict[str, str]) -> Dict[str, str]:
                            or str(tree / "target" / "release" / "panoptikon")),
         "RUST_LOG": "info,panoptikon::inferio=trace",
         "INFERIO_WORKER_LOG_LEVEL": "DEBUG",
-        "LD_LIBRARY_PATH": str(tree / "python" / ".venv" / "lib" / "python3.12"
-                               / "site-packages" / "nvidia" / "cudnn" / "lib"),
     }
     if CONFIGS[name].get("accelerator") == "rocm":
-        del env["LD_LIBRARY_PATH"]
         env["RUST_LOG"] += ",panoptikon::db::batch_auto=debug"
+    elif cudnn is not None:
+        env["LD_LIBRARY_PATH"] = str(cudnn)
     return {**env, **CONFIGS[name].get("env", {})}
 
 
 def resolve_config(args: argparse.Namespace, base: Dict[str, str],
-                   python_given: bool = False
+                   python: Optional[str] = None
                    ) -> Tuple[str, str, Dict[str, str], str]:
     """`--config` as a configuration id or a path to a TOML.
 
     Returns (config text, file name, environment, where the environment came
     from). A path's environment is the `env.<id>` file beside it, if any. An
     id's paths follow `--repo`, so its venv must exist there unless
-    `--python` replaces it or nothing is started.
+    `--python` (`python`) replaces it or nothing is started.
     """
     given = str(args.config)
     candidate = Path(given)
@@ -1558,12 +1576,12 @@ def resolve_config(args: argparse.Namespace, base: Dict[str, str],
                          f"of {', '.join(CONFIGS)}")
     repo = Path(args.repo).resolve()
     text = render_config(given, repo)
-    venv = config_tree(given, repo) / "python" / ".venv" / "bin" / "python"
-    if not venv.exists() and not python_given and not args.dry_run:
+    venv = venv_python(config_tree(given, repo) / "python" / ".venv")
+    if not venv.exists() and not python and not args.dry_run:
         raise SystemExit(f"legs.py: {given} runs the worker on {venv}, which "
                          f"does not exist - pass --repo <checkout with a "
                          f"synced venv> or --python")
-    return (text, f"server-{given}.toml", config_env(given, repo, base),
+    return (text, f"server-{given}.toml", config_env(given, repo, base, python),
             f"CONFIGS[{given!r}]")
 
 
@@ -1847,7 +1865,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.write_config:
         # What `config/run-gateway.sh` starts a gateway with.
         text, name, variables, _ = resolve_config(args, dict(os.environ),
-                                                  explicit_python is not None)
+                                                  explicit_python)
         refuse_inherited_visibility(text, variables, env)
         if explicit_python:
             text = repin_inference_python(text, explicit_python)
@@ -1874,7 +1892,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                      f"starts the recorders and the hog before it is noticed")
 
     original, config_name, config_vars, env_source = resolve_config(
-        args, env, explicit_python is not None)
+        args, env, explicit_python)
     refuse_inherited_visibility(original, config_vars, env)
     env.update(config_vars)
     env.setdefault("RUST_LOG", "info,panoptikon::inferio=trace")

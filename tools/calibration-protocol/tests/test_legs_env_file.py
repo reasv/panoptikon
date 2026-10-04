@@ -100,4 +100,4 @@ def test_a_missing_tree_or_venv_is_a_message_not_a_traceback(tmp_path):
     args = argparse.Namespace(config="C1", repo=str(tree), dry_run=False)
     with pytest.raises(SystemExit, match="--python"):
         legs.resolve_config(args, {})
-    assert legs.resolve_config(args, {}, python_given=True)[1] == "server-C1.toml"
+    assert legs.resolve_config(args, {}, "/opt/venv/bin/python")[1] == "server-C1.toml"
