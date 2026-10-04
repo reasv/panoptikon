@@ -29,7 +29,7 @@ _MIB = 1024 * 1024
 
 # Accelerator-context allowance when this process could not measure its own,
 # at least the largest context measured on each backend (CUDA 668 MiB, HIP
-# 286 MiB). CUDA's figure also covers any other backend.
+# 286 MiB). 700 is the default for every backend without a figure of its own.
 CONTEXT_ESTIMATE_MB = 700
 HIP_CONTEXT_ESTIMATE_MB = 300
 

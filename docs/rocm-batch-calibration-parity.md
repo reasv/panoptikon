@@ -610,14 +610,14 @@ unchanged, behind the existing `is_initialized` gates.
   pre-load `amdgpu-sysfs` reading to difference against, the source pin has
   nothing to pin, and the tier is skipped. NVML is why the rung lives on
   CUDA at all: it answers pre-load without a context, from the UUID pin. The
-  real ROCm first-load ladder is therefore **fdinfo → alloc_delta**, and the
-  free delta only ever appears on a *second* load into a worker that already
-  has a device. Consequence for the field pass: `HIP_CONTEXT_ESTIMATE_MB` is
-  materially more load-bearing on ROCm than the D4 text above implies —
-  whenever fdinfo is unavailable (an older kernel's VM-walk stats), every
-  first load falls straight to `alloc_delta + HIP_CONTEXT_ESTIMATE_MB`, so
-  the HIP context size is promoted from "flagged" to the first number to
-  measure on real hardware.
+  real ROCm first-load ladder is therefore **kfd or fdinfo → alloc_delta**,
+  and the free delta only ever appears on a *second* load into a worker that
+  already has a device. Consequence for the field pass:
+  `HIP_CONTEXT_ESTIMATE_MB` is materially more load-bearing on ROCm than the
+  D4 text above implies — whenever fdinfo is unavailable (an older kernel's
+  VM-walk stats), every first load falls straight to
+  `alloc_delta + HIP_CONTEXT_ESTIMATE_MB`, so the HIP context size is
+  promoted from "flagged" to the first number to measure on real hardware.
 - **Plausibility floor:** `FDINFO_UNDERREPORT_SLACK_MB = 256`, i.e. an
   fdinfo reading below `reserved_mb - 256 MB` is rejected (one-shot INFO
   line) and the next tier answers. Rationale: the reading is *expected*

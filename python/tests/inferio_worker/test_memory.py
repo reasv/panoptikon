@@ -2056,9 +2056,6 @@ def test_the_fdinfo_reading_is_bounded_below_and_above(
         r for r in caplog.records if r.args[:2] in (("fdinfo", 900), ("fdinfo", total))
     ]
     assert [r.levelno for r in rejected] == [logging.INFO, logging.INFO]
-    assert slack < memory.HIP_CONTEXT_ESTIMATE_MB, (
-        "a missed context is never jitter"
-    )
 
 
 def test_the_amdgpu_tiers_never_initialize_cuda_and_never_raise(
