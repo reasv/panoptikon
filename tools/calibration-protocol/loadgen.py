@@ -16,7 +16,7 @@ Usage
 Model spec (comma-separated `key=value`, repeatable `--model`; defaults in ()):
     id=<inference_id>  required   | concurrency=N (1)   | items=N (8)
     corpus=PATH (--corpus) | group=NAME | kind=NAME | requests=N | max_batch=N
-    mode=file|text|auto (auto)
+    mode=file|text|auto (auto); text sends the corpus's text items only
     cache_key=S (`loadgen`)       | lru_size=N (1)      | ttl_seconds=N (600)
     order=sequential|random (sequential)  | data=<json>, merged into each entry
     interval=SECONDS    minimum wall time between the *starts* of two requests
@@ -80,6 +80,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import corpus as corpus_files  # noqa: E402
+
 _stop = threading.Event()
 _write_lock = threading.Lock()
 
@@ -97,7 +100,7 @@ def load_manifest(path: str) -> Dict[str, Any]:
         candidate = candidate / "manifest.json"
     if not candidate.is_file():
         raise SystemExit(f"loadgen: no manifest at {candidate}")
-    return json.loads(candidate.read_text(encoding="utf-8"))
+    return corpus_files.read_manifest(candidate)
 
 
 def select_items(manifest: Dict[str, Any], group: Optional[str],
@@ -159,6 +162,12 @@ class ModelSpec:
         self.group = fields.get("group") or None
         self.kind = fields.get("kind") or None
         self.mode = fields.get("mode", "auto")
+        if self.mode == "text":
+            # Every item is sent as text, so only text items qualify.
+            if self.kind not in (None, "text"):
+                raise SystemExit(f"loadgen: model {self.id} has mode=text "
+                                 f"and kind={self.kind}")
+            self.kind = "text"
         self.requests = int(fields["requests"]) if "requests" in fields else defaults.requests
         self.max_batch = int(fields["max_batch"]) if "max_batch" in fields else None
         self.cache_key = fields.get("cache_key", "loadgen")
@@ -233,7 +242,7 @@ def build_request(spec: ModelSpec, items: List[Dict[str, Any]]) -> Tuple[bytes, 
     files: List[Tuple[int, bytes]] = []
     units = {"item": 0, "pixel": 0, "token": 0, "audio-second": 0}
     for index, item in enumerate(items):
-        path = Path(item.get("abspath") or (Path(spec.manifest["root"]) / item["path"]))
+        path = Path(item["abspath"])
         as_text = spec.mode == "text" or (spec.mode == "auto" and item["kind"] == "text")
         if as_text:
             entry: Dict[str, Any] = {"text": path.read_text(encoding="utf-8", errors="replace")}

@@ -115,6 +115,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import corpus as corpus_files  # noqa: E402
+
 MIB = 1024 * 1024
 
 # The orchestrator's device key for the single unified device (`mps.rs`).
@@ -547,7 +550,7 @@ def load_items(corpus: Optional[str], group: Optional[str],
     path = Path(corpus)
     if path.is_dir():
         path = path / "manifest.json"
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest = corpus_files.read_manifest(path)
     items = manifest.get("items", [])
     if group:
         items = [item for item in items if item.get("group") == group]

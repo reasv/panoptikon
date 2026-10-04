@@ -447,7 +447,10 @@ loadgen.py [--base URL] --out FILE [--corpus manifest.json]
 
 `interval=S` paces the *starts* of one slot's requests S seconds apart (a
 model's rate is `concurrency / interval`), which is what a soak's low-rate
-background load needs; without it a slot runs flat out.
+background load needs; without it a slot runs flat out. `mode=text` sends
+the corpus's text items only (a `kind` other than `text` is refused). Items
+are read relative to the manifest's directory, so a copied corpus is read
+from the copy (`ceiling_probe.py` does the same).
 
 Records per request: latency, status, item count, the corpus item ids, the
 summed units in every dimension, the output count and any
