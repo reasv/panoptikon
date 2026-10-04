@@ -155,14 +155,20 @@ fn a_death_mid_window_caps_the_model_at_half_the_batch_that_died() {
 }
 
 /// Each further death halves the cap, down to one unit and no further. A
-/// window that ends any other way leaves it alone.
+/// window that ends any other way leaves it alone. A worker that stated the
+/// batch it was running caps at half that batch, never more than half the
+/// window's budget.
 #[test]
 fn repeated_deaths_halve_the_cap_down_to_one_unit() {
-    let ledger = cpu_ledger(no_margin());
-    let (handle, admission) = cpu_replica(&ledger);
-    for units in [4, 8, 16, 32] {
-        measured_window(&handle, &admission, units);
-    }
+    let measured = || {
+        let ledger = cpu_ledger(no_margin());
+        let (handle, admission) = cpu_replica(&ledger);
+        for units in [4, 8, 16, 32] {
+            measured_window(&handle, &admission, units);
+        }
+        (ledger, handle, admission)
+    };
+    let (ledger, _handle, admission) = measured();
     assert_eq!(death_cap(&ledger), None);
     for outcome in [
         WindowOutcome::Aborted,
@@ -195,19 +201,9 @@ fn repeated_deaths_halve_the_cap_down_to_one_unit() {
     }
     // The first of them runs the 64 units the last was about to try.
     assert_eq!(caps, [32, 16, 8, 4, 2, 1, 1]);
-}
 
-/// A worker states each batch's units before running it, and a death caps at
-/// half the batch that died rather than half the window's budget, never more
-/// than half the budget.
-#[test]
-fn a_death_caps_at_half_the_batch_the_worker_said_it_was_running() {
     for (stated, cap) in [(16, 8), (100, 32)] {
-        let ledger = cpu_ledger(no_margin());
-        let (handle, admission) = cpu_replica(&ledger);
-        for units in [4, 8, 16, 32] {
-            measured_window(&handle, &admission, units);
-        }
+        let (ledger, handle, admission) = measured();
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
