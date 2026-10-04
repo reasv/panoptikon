@@ -2123,9 +2123,11 @@ unpriced and without spill handling, and the host warns at startup.
   - The worker also releases the pool and runs the rest of the window at
     half that batch's size (never above the grant), instead of more spilled
     batches until settle.
-    A spill that the release does not clear, or that no release could, is
-    live memory that does not fit (weights larger than the card): it is
-    warned of once, then logged at debug, and still flagged each batch.
+    A spill that the release does not clear is live memory that does not
+    fit (weights larger than the card): it is warned of once, then logged at
+    debug, and still flagged each batch. Its later spills release nothing,
+    since the next batch would only regrow the pool, until a batch that does
+    not spill re-arms the release and the warning.
   - A spilled batch never becomes the throughput-collapse comparator.
   - P and U must come from the same sample. A remembered P paired with a
     later NVML reading was wrong by up to 58 GB around a release.

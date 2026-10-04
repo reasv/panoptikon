@@ -3066,15 +3066,16 @@ def test_halving_after_a_spill_never_exceeds_the_grant(spill_host):
     assert all(m["units"] <= 100 for m in measurements[1:])
 
 
-def test_a_model_that_cannot_fit_warns_once_and_stops_halving_at_one_item(
+def test_a_spill_that_outlives_its_release_releases_nothing_until_one_fits(
     spill_host, caplog
 ):
-    """Live memory past the card: releasing gives nothing back, so after the
-    halving reaches one item every batch is still flagged and released, the
-    next one re-growing from it, and the warning is given once."""
+    """Live memory past the card: the first release gives nothing back, so
+    later spills release nothing and log at debug, until a batch that fits
+    re-arms the release and the warning."""
+    live_mb = [8192 + 1000]
 
     def predict(inputs):
-        spill_host.reserved = spill_host.allocated = (8192 + 1000) * MIB
+        spill_host.reserved = spill_host.allocated = live_mb[0] * MIB
         spill_host.peak_reserved = spill_host.reserved
         return [None] * len(inputs)
 
@@ -3082,12 +3083,18 @@ def test_a_model_that_cannot_fit_warns_once_and_stops_halving_at_one_item(
     with caplog.at_level(logging.DEBUG, logger="inferio_worker.packing"):
         first = packing.run_window(impl, items(7), grant(unit_budget=4, mb=0))
         second = packing.run_window(impl, items(2), grant(unit_budget=1, mb=0))
+        live_mb[0] = 100
+        packing.run_window(impl, items(1), grant(unit_budget=1, mb=0))
+        live_mb[0] = 8192 + 1000
+        packing.run_window(impl, items(1), grant(unit_budget=1, mb=0))
     measurements = first["measurements"] + second["measurements"]
     assert [m["items"] for m in measurements] == [4, 2, 1, 1, 1]
     assert all(m["spilled"] for m in measurements)
-    assert spill_host.empty_cache_calls == 5
-    assert [m.get("regrow_after") for m in measurements] == [None] + [
-        memory.SPILL_RELEASE
-    ] * 4
+    assert [m.get("regrow_after") for m in measurements] == [
+        None, memory.SPILL_RELEASE, None, None, None
+    ]
+    assert spill_host.empty_cache_calls == 2, "the first spill, and the last"
     spills = [r for r in caplog.records if "system memory" in r.getMessage()]
-    assert [r.levelno for r in spills] == [logging.WARNING] + [logging.DEBUG] * 4
+    assert [r.levelno for r in spills] == (
+        [logging.WARNING] + [logging.DEBUG] * 4 + [logging.WARNING]
+    )

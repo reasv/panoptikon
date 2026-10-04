@@ -138,7 +138,8 @@ SHRINK_WINDOWS = 2
 SHRINK_BLIND_SLACK_MB = 256
 
 # Set once a spill outlived its release, or had no release: the live memory
-# itself does not fit, so later spills are logged at debug.
+# itself does not fit, so later spills release nothing and are logged at
+# debug. A batch that does not spill clears it.
 _spill_persists = False
 
 # Consecutive granted windows below `SHRINK_RATIO` × the releasable slack.
@@ -989,10 +990,10 @@ def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]
     if spill_host:
         memory.note_batch_units(size, "grantless_size")
         off_device_mb = pool_off_device_mb(payload.get("memory"))
-        if off_device_mb is not None and off_device_mb > SPILL_TOLERANCE_MB:
+        if _spilled(off_device_mb):
             payload["measurements"][0]["spilled"] = True
             reserved_mb = payload["memory"]["reserved_mb"]
-            released = memory.empty_cache(memory.SPILL_RELEASE)
+            released = _release_spilled_pool()
             if released:
                 payload["memory"] = memory.device_memory_sample() or payload["memory"]
             after_mb = pool_off_device_mb(payload["memory"])
@@ -1272,6 +1273,23 @@ def pool_off_device_mb(sample: dict[str, Any] | None) -> int | None:
     if reserved is None or free is None or total is None:
         return None
     return reserved - (total - free)
+
+
+def _spilled(off_device_mb: int | None) -> bool:
+    """Whether a batch's pool is more than `SPILL_TOLERANCE_MB` above NVML's
+    used memory. A batch that is not clears `_spill_persists`; one with no
+    NVML reading leaves it."""
+    global _spill_persists
+    if off_device_mb is None:
+        return False
+    spilled = off_device_mb > SPILL_TOLERANCE_MB
+    _spill_persists = _spill_persists and spilled
+    return spilled
+
+
+def _release_spilled_pool() -> bool:
+    """Release the pool after a spill, unless a spill persists."""
+    return not _spill_persists and memory.empty_cache(memory.SPILL_RELEASE)
 
 
 def _log_spill(
@@ -1570,7 +1588,7 @@ def run_window(
             # One sample after the batch, so pool and NVML are paired.
             sample = memory.device_memory_sample() if spill_host else None
             off_device_mb = pool_off_device_mb(sample)
-            if off_device_mb is not None and off_device_mb > SPILL_TOLERANCE_MB:
+            if _spilled(off_device_mb):
                 # A negative for this size; its outputs stand.
                 measurement["spilled"] = True
             if next_over_budget:
@@ -1591,12 +1609,14 @@ def run_window(
         # last). A fresh reading, so free and pool describe the same instant.
         if measurement.get("spilled"):
             reserved_mb = sample["reserved_mb"]
-            released = memory.empty_cache(memory.SPILL_RELEASE)
+            released = _release_spilled_pool()
+            before = budget
             if released:
                 budget = max(1, min(budget, priced // 2))
                 sample = memory.device_memory_sample()
             after_mb = pool_off_device_mb(sample)
-            _log_spill(reserved_mb, off_device_mb, released, released, after_mb)
+            halved = budget < before and bool(pending)
+            _log_spill(reserved_mb, off_device_mb, released, halved, after_mb)
         if emit_memory is not None and pending:
             if sample is None:
                 sample = memory.device_memory_sample()
