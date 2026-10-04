@@ -887,9 +887,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit(
             f"ceiling_probe: neither NVML nor KFD has a GPU with index "
             f"{device_index} (nvml error: "
-            f"{None if nvml is None else nvml.error}; a ROCm GPU also needs no "
-            f"visibility variable but a single-index HIP_VISIBLE_DEVICES)"
-            + hint
+            f"{None if nvml is None else nvml.error}; on ROCm, a visibility "
+            f"variable other than a single-index HIP_VISIBLE_DEVICES leaves "
+            f"nothing to pin)" + hint
         )
     if not items:
         raise SystemExit("ceiling_probe: --corpus is required for a real run")
