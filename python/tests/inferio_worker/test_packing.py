@@ -1399,23 +1399,27 @@ def test_the_oom_classifier_covers_the_non_cuda_backends(fake_torch):
     and on CPU the condition arrives untyped, and the deflation path only ever
     hears about it through this flag. Conservative all the same — a
     `RuntimeError` saying nothing about memory is not one."""
-    failures = {
-        "mps": RuntimeError(
+    # (name, failure, inputs in the batch)
+    failures = [
+        ("mps", RuntimeError(
             "MPS backend out of memory (MPS allocated: 18.09 GB, max allowed: "
             "18.13 GB)."
-        ),
-        "cpu-allocator": RuntimeError(
+        ), 2),
+        ("cpu-allocator", RuntimeError(
             "[enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator: can't "
             "allocate memory: you tried to allocate 12884901888 bytes."
-        ),
-        "cpu-allocator-bare": RuntimeError(
+        ), 2),
+        ("cpu-allocator-bare", RuntimeError(
             "DefaultCPUAllocator: can't allocate memory: you tried to allocate 8 bytes"
-        ),
-        "memory-error": MemoryError(),
-    }
-    for name, failure in failures.items():
+        ), 2),
+        ("memory-error", MemoryError(), 2),
+        ("memory-error-one-item", MemoryError("Unable to allocate 8.00 GiB"), 1),
+    ]
+    for name, failure, count in failures:
         with pytest.raises(packing.WindowFailure) as caught:
-            packing.run_window(Recorder(raises=failure), items(2), grant(unit_budget=2))
+            packing.run_window(
+                Recorder(raises=failure), items(count), grant(unit_budget=count)
+            )
         oom_class = caught.value.measurements[0]["oom_class"]
         assert caught.value.measurements[0]["oom"] is True, name
         # The CPU allocator's failures are host RAM's, and say so.

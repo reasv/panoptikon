@@ -1416,6 +1416,12 @@ def run_window(
                         f"{prefix} out of {what} on a packed batch of "
                         f"{len(batch)} inputs ({priced} {unit} units): {exc}"
                     )
+                elif oom and oom_class["host_ram"] and OOM_MARKER not in message:
+                    # An impl that raised `MemoryError` itself at one item.
+                    message = (
+                        f"{OOM_HOST_RAM_PREFIX} out of host RAM on a single "
+                        f"input: {exc}"
+                    )
                 raise WindowFailure(message, measurements, exc) from exc
             elapsed = time.perf_counter() - started
             if len(produced) != len(batch):

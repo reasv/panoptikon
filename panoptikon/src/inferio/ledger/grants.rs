@@ -547,8 +547,8 @@ impl VramLedger {
             &mut state,
             worker,
             charge,
-            frame_oom.is_some() || ingested.oom || died,
-            died,
+            frame_oom.is_some() || ingested.oom || died || frame_host_ram,
+            died || frame_host_ram,
             matches!(outcome, WindowOutcome::Responded { .. }) && !responded_negative && !host_ram,
         );
         Self::refit_locked(&mut state, worker);

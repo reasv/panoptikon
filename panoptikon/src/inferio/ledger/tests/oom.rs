@@ -1859,9 +1859,11 @@ fn a_spill_or_collapse_at_the_rooms_limit_leaves_the_pool_margin() {
 /// Host RAM running out, read from the error frame or from a batch's class,
 /// is no out-of-memory of a GPU with its own memory: at the room's limit it
 /// deflates nothing, repays no deflation and leaves the pool margin; it moves
-/// no item cap, warm-up count or anchor; one-item windows condemn nothing, nor
-/// clear the count of out-of-memory windows at the floor. On the CPU device and on a GPU that
-/// shares host RAM, it is a negative.
+/// no item cap, warm-up count or anchor. A one-item window whose error frame
+/// says host RAM is a strike at the floor, as a memory kill is, and three
+/// condemn with a death verdict; one read from a batch's class neither counts
+/// nor clears. On the CPU device and on a GPU that shares host RAM, it is a
+/// negative.
 #[test]
 fn host_ram_running_out_is_no_out_of_memory_of_a_gpu() {
     let host_ram_batch = || BatchMeasurement {
@@ -1962,21 +1964,31 @@ fn host_ram_running_out_is_no_out_of_memory_of_a_gpu() {
         );
     }
 
-    let card = ledger(10_000, no_margin());
-    let handle = loaded(Some(9_900), Some(0));
-    let admission = card
-        .register_worker("g/big", item_cost(4), &handle, None)
-        .expect("registers");
-    push_memory(&handle, 0, 0);
-    card.ingest_all_for_test();
-    for window in 0..2 * OOM_WINDOWS_AT_FLOOR {
-        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        assert_eq!(token.grant().unit_budget, 1);
-        assert!(fail(&handle, token, window % 2 == 1).unrunnable.is_none());
-    }
-    assert!(!card.was_condemned("g/big", GPU));
-    // Out of memory, out of memory, host RAM, out of memory: condemned.
-    let condemned: Vec<bool> = [false, false, true, false]
+    let card = || {
+        let card = ledger(10_000, no_margin());
+        let handle = loaded(Some(9_900), Some(0));
+        let admission = card
+            .register_worker("g/big", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 0, 0);
+        card.ingest_all_for_test();
+        (card, handle, admission)
+    };
+    // Frame, batch, frame, batch, frame: the third frame condemns.
+    let (_card, handle, admission) = card();
+    let verdicts: Vec<Option<(u64, bool)>> = (0..5)
+        .map(|window| {
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            assert_eq!(token.grant().unit_budget, 1);
+            fail(&handle, token, window % 2 == 1)
+                .unrunnable
+                .map(|verdict| (verdict.needs_mb, verdict.death_lapse_secs.is_some()))
+        })
+        .collect();
+    assert_eq!(verdicts, [None, None, None, None, Some((0, true))]);
+    // Out of memory, out of memory, host RAM: condemned.
+    let (_card, _handle, admission) = card();
+    let condemned: Vec<bool> = [false, false, true]
         .into_iter()
         .map(|host_ram| {
             let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
@@ -1988,7 +2000,7 @@ fn host_ram_running_out_is_no_out_of_memory_of_a_gpu() {
             token.finish(outcome).is_some()
         })
         .collect();
-    assert_eq!(condemned, [false, false, false, true]);
+    assert_eq!(condemned, [false, false, true]);
 
     let ledger = cpu_ledger(no_margin());
     let (cpu_handle, cpu_admission) = cpu_replica(&ledger);

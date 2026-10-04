@@ -1967,8 +1967,11 @@ Worker, per batch within its window:
   - **Host RAM** (`MemoryError`, the CPU allocator, `oom_class.host_ram`) is
     the device's memory on the CPU device, MPS and an APU, and counts there as
     above. On a GPU with its own memory it is no negative of the GPU: no
-    deflation, anchor, pool-margin change or one-item strike, and the window is
-    neither clean nor a negative for the GPU (the gain rule sees it fail).
+    deflation, anchor or pool-margin change, and the window is neither clean
+    nor a negative for the GPU (the gain rule sees it fail). A one-item window
+    whose error frame says host RAM is a strike toward the one-item verdict,
+    as a memory kill is: whatever the room, and the verdict it reaches is a
+    death verdict.
   - **Without one** (the error frame: a `predict` that failed with nothing
     measured), the host mirrors the worker's classifier exactly: the
     `INFERENCE_OOM_*` markers, the closed list of allocator and driver

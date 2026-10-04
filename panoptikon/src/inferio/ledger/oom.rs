@@ -86,20 +86,23 @@ impl VramLedger {
     /// one that failed while macOS was paging, which leaves every window that
     /// little room.
     ///
-    /// A worker killed for memory (`died`) running one item counts whatever
-    /// room the ledger saw: the batch cannot shrink further. The count passes
-    /// to the next replica.
+    /// A `memory_kill` (a worker killed for memory, or host RAM running out on
+    /// a GPU with its own memory) running one item counts whatever room the
+    /// ledger saw: the batch cannot shrink further. The count passes to the
+    /// next replica.
     ///
-    /// Condemning remembers the model's working set on this GPU: the next load
-    /// is refused while the refusal room ([`Self::refusal_room_locked`],
-    /// reserve not deducted) is below it.
+    /// Condemning on a memory kill is a death verdict: it lapses, and remembers
+    /// no working set and nothing about the GPU's memory. Condemning otherwise
+    /// remembers the model's working set on this GPU: the next load is refused
+    /// while the refusal room ([`Self::refusal_room_locked`], reserve not
+    /// deducted) is below it.
     pub(super) fn note_floor_oom_locked(
         &self,
         state: &mut LedgerState,
         worker: WorkerId,
         charge: Option<GrantCharge>,
         failed: bool,
-        died: bool,
+        memory_kill: bool,
         clean: bool,
     ) -> Option<UnrunnableReplica> {
         let entry = state.workers.get(&worker)?;
@@ -108,8 +111,9 @@ impl VramLedger {
             && charge
                 .filter(|charge| !charge.pressure.paging() && charge.one_item())
                 .is_some_and(|charge| {
-                    died || (charge.room as f64)
-                        < self.one_item_appetite_mb_locked(state, entry, charge.item_units)
+                    memory_kill
+                        || (charge.room as f64)
+                            < self.one_item_appetite_mb_locked(state, entry, charge.item_units)
                 });
         let entry = state.workers.get_mut(&worker)?;
         if clean {
@@ -128,7 +132,7 @@ impl VramLedger {
         }
         entry.oom_at_floor = entry.oom_at_floor.saturating_add(1);
         let strikes = entry.oom_at_floor;
-        if died {
+        if memory_kill {
             state.calibration.entry(key).or_default().floor_strikes = strikes;
         }
         let entry = state.workers.get(&worker)?;
@@ -139,7 +143,7 @@ impl VramLedger {
         let gpu = entry.gpu.clone();
         let base_mb = entry.base_mb.unwrap_or(0);
         // A death says nothing about what the model needs: no working set.
-        if died {
+        if memory_kill {
             state
                 .death_verdicts
                 .insert((inference_id.clone(), gpu.clone()), Instant::now());
