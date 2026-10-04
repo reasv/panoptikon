@@ -186,16 +186,16 @@ exactly what changed. The fractions come from this host's legs: S4a `leave-free`
 12 288 / 97 887, S4b's step `hold` 30 720 / 97 887 at t+60 s, S4d
 `leave-free` 8 192 / 97 887 released at t+120 s. **S4c's spike is not a
 fraction**: its "~2 GB free" is the defensive clamp's own threshold, the
-number the scenario is defined against, so it is 2 048 MiB on every board,
-not scaled, and raised only by a `--min-free-mb` above it, at t+90 s and
-released at t+100 s. On a 32 607 MiB
-board the four resolve to S4a 4 093, S4b 10 233, S4c 2 048 and S4d 2 729 MiB. Every event is timed **from the job's POST**, not from
-the leg's start, because what the scenario describes is a change during the
-job. `--hog-event` adds such an event in MiB to any scenario (`at=60,
-leave_free=4096`, `at=120,release`), with any `--hog-target`; its figures are
-not scaled, but bounded like every figure. On a scenario
-without a hog of its own, one starts holding 0 with its leave-free level
-pinned, as S4a's, so the job's own pool does not move it after the event.
+number the scenario is defined against, so it is 2 048 MiB on every GPU, not
+scaled, and raised only by a `--min-free-mb` above it, at t+90 s and released
+at t+100 s. On a 32 607 MiB board the four resolve to S4a 4 093, S4b 10 233,
+S4c 2 048 and S4d 2 729 MiB. Every event is timed **from the job's POST**,
+not from the leg's start, because what the scenario describes is a change
+during the job. `--hog-event` adds such an event in MiB to any scenario
+(`at=60,leave_free=4096`, `at=120,release`), with any `--hog-target`; its
+figures are not scaled, but bounded like every figure. On a scenario without
+a hog of its own, one starts holding 0 with its leave-free level pinned, as
+S4a's, so the job's own pool does not move it after the event.
 
 **Descriptors.** `fds.jsonl` is written here, in the JSONL form
 `analyze.py::read_fds` accepts — which closes, for the bare-host case, the gap

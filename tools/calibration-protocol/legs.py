@@ -1214,7 +1214,6 @@ class Leg:
 
     def resolved_events(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
-        # A figure in MiB is not scaled, but bounded as a scaled one is.
         for event in self.scenario.events:
             at = event.label or f"t+{event.at_s:g}s"
             row: Dict[str, Any] = {"at_s": event.at_s, "label": event.label}
@@ -2064,8 +2063,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "host, not the inference server's")
     if ((wants_hog or args.hog_event) and not args.gpu_total_mb
             and measured_total_mb is None):
-        # Scaling a fraction against another machine's board is not a
-        # degraded measurement, it is a different experiment.
+        # Scaling or bounding a figure by another machine's total is a
+        # different experiment, not a degraded measurement.
         raise SystemExit(
             "legs.py: this leg drives a hog and no device total could be "
             "read (no NVML or amdgpu sysfs here). Pass --gpu-total-mb with "
@@ -2172,7 +2171,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"PRECONDITION: {line}", flush=True)
     for note in leg.floor_notes:
         print(f"PRECONDITION: the --min-free-mb {note['min_free_mb']} floor "
-              f"binds on this {note['gpu_total_mb']} MiB board - {note['at']} "
+              f"binds on this {note['gpu_total_mb']} MiB GPU - {note['at']} "
               f"{note['kind']} {note['scaled_mb']} -> {note['resolved_mb']} "
               f"MiB, so this leg applies the floor's pressure"
               + ("" if note["fraction"] is None else ", not the fraction's"),
