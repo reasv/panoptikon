@@ -1585,8 +1585,18 @@ fn oom_messages_are_classified() {
             ErrorFrameOom::HostRam,
         ),
         (
+            "RuntimeError: DefaultCPUAllocator: can't allocate memory: you tried to allocate 8 bytes",
+            ErrorFrameOom::HostRam,
+        ),
+        (
             "INFERENCE_OOM_HOST_RAM: out of host RAM on a single input: ",
             ErrorFrameOom::HostRam,
+        ),
+        // The outermost wrap is the batch's verdict.
+        (
+            "INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 4 inputs \
+             (4 item units): INFERENCE_OOM_HOST_RAM: out of host RAM on a single input: ",
+            ErrorFrameOom::Marker,
         ),
         (
             "DefaultCPUAllocator: can't allocate memory\nCUDA out of memory",

@@ -249,11 +249,12 @@ impl VramLedger {
     /// the worker last said it was running, else the window's unit budget),
     /// at least the window's smallest item: for the life of this process, or,
     /// while macOS was paging, through the [`PressureCap`], which lifts as the
-    /// batch grows back at normal pressure. Without the cap the next replica is admitted
-    /// for the batch that died, and dies again. A window the queue sized sets
-    /// no cap: its size says nothing about the batch the model can run. An
-    /// item-capped window does, since the cap sized it. On a GPU with its own
-    /// memory the kill was for host RAM: nothing else about the GPU changes.
+    /// batch grows back at normal pressure. Without the cap the next replica
+    /// is admitted for the batch that died, and dies again. A window the queue
+    /// sized sets no cap: its size says nothing about the batch the model can
+    /// run. An item-capped window does, since the cap sized it. On a GPU with
+    /// its own memory the kill was for host RAM: nothing else about the GPU
+    /// changes.
     ///
     /// On a unified-memory device the kill is also a negative: the replica
     /// is deflated and its (model, GPU) anchor halved, for this run only.
@@ -607,19 +608,25 @@ fn contains_word(line: &str, token: &str) -> bool {
 /// Whether a worker error message names an out-of-memory condition:
 /// [`ErrorFrameOom::HostRam`] for the host RAM prefix or the CPU allocator's
 /// wording, [`ErrorFrameOom::Marker`] for another `INFERENCE_OOM_*` prefix,
-/// [`ErrorFrameOom::Prose`] for a device's wording, `None` otherwise. A
-/// device's wording outranks the CPU allocator's.
+/// [`ErrorFrameOom::Prose`] for a device's wording, `None` otherwise. Of the
+/// prefixes, the earliest decides: it is the outermost wrap, the batch's
+/// verdict. A device's wording outranks the CPU allocator's.
 ///
 /// Must match the worker's `packing._pattern_oom` exactly. A bare "out of
 /// memory" only counts beside a device-API token, and every rule is tested
 /// per line, so a traceback's file path cannot supply the token.
 pub fn message_oom_tier(message: &str) -> Option<ErrorFrameOom> {
-    if message.contains("INFERENCE_OOM_HOST_RAM:") {
-        return Some(ErrorFrameOom::HostRam);
-    }
-    if message.contains("INFERENCE_OOM_BATCH_SIZE_1:") || message.contains("INFERENCE_OOM_WINDOW:")
-    {
-        return Some(ErrorFrameOom::Marker);
+    let host_ram = message.find("INFERENCE_OOM_HOST_RAM:");
+    let device = ["INFERENCE_OOM_BATCH_SIZE_1:", "INFERENCE_OOM_WINDOW:"]
+        .iter()
+        .filter_map(|prefix| message.find(prefix))
+        .min();
+    match (host_ram, device) {
+        (Some(host_ram), device) if device.is_none_or(|device| host_ram < device) => {
+            return Some(ErrorFrameOom::HostRam);
+        }
+        (_, Some(_)) => return Some(ErrorFrameOom::Marker),
+        _ => {}
     }
     let lines: Vec<String> = message.lines().map(str::to_ascii_lowercase).collect();
     let device = lines.iter().any(|lowered| {
