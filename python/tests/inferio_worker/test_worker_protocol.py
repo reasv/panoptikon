@@ -894,13 +894,18 @@ def test_the_batch_memory_frames_capability_is_read_off_the_handshake() -> None:
 def test_a_predict_is_acknowledged_and_states_each_batch(
     worker: WorkerProcess,
 ) -> None:
-    """A granted window on a host with no accelerator: the acknowledgement,
-    then one frame per batch with its units and no sample, then the `ok`."""
+    """Every request is acknowledged by an id-less frame once its length header
+    is read. A granted window on a host with no accelerator then writes one
+    frame per batch with its units and no sample, then the `ok`. A predict cut
+    short in its payload was still acknowledged."""
+    acknowledgement = {"type": "memory"}
     worker.send({**handshake_msg(req_id=1), "batch_memory_frames": True})
     assert worker.recv()["type"] == "ok"
     worker.send(configure_msg(req_id=2))
+    assert worker.recv() == acknowledgement
     assert worker.recv()["type"] == "ok"
     worker.send({"type": "load", "id": 3})
+    assert worker.recv() == acknowledgement
     assert worker.recv()["type"] == "ok"
 
     worker.send(
@@ -914,7 +919,7 @@ def test_a_predict_is_acknowledged_and_states_each_batch(
             },
         }
     )
-    assert worker.recv() == {"type": "memory", "id": 4}
+    assert worker.recv() == acknowledgement
     for _ in range(4):
         assert worker.recv() == {"type": "memory", "id": 4, "units": 1}
     resp = worker.recv()
@@ -922,9 +927,14 @@ def test_a_predict_is_acknowledged_and_states_each_batch(
     assert resp["id"] == 4
     assert len(resp["measurements"]) == 4
 
-    # The next frame on the stream is the next reply, not a straggler.
+    # The next frames on the stream are the next request's, not a straggler.
     worker.send({"type": "ping", "id": 5})
+    assert worker.recv() == acknowledgement
     assert worker.recv() == {"type": "ok", "id": 5}
-    worker.send({"type": "unload", "id": 6})
-    assert worker.recv()["type"] == "ok"
-    assert worker.wait() == 0
+
+    payload = msgpack.packb({"type": "predict", "id": 6, "inputs": []})
+    assert worker.proc.stdin is not None
+    worker.proc.stdin.write(struct.pack("<I", len(payload)) + payload[:-1])
+    worker.proc.stdin.close()
+    assert worker.recv() == acknowledgement
+    assert worker.wait() != 0

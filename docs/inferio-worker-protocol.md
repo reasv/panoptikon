@@ -172,7 +172,7 @@ Normal spawn flow: `handshake` → `configure` → `load`. Pooled flow:
 |---|---|---|
 | `ok` | request-specific payload (below) | Success for the echoed `id`. |
 | `error` | `message` (str), `traceback` (str, may be empty) | Failure for the echoed `id`. The worker stays alive and serviceable after an `error` (a failed predict/load must not require a respawn) — except a failed `handshake`, after which it exits non-zero. |
-| `memory` | `memory` (a memory sample map, optional), `units` (int, optional) | **Not a response.** Telemetry for the request whose `id` it echoes, written *before* that request's `ok`/`error` — the only frame that may precede a terminal reply. Sent only from inside a `predict` (its acknowledgement, then one per batch of a granted one), and only when the orchestrator set `batch_memory_frames` in the handshake. Host tolerance is wider than worker behaviour: the reference orchestrator accepts such a frame for the id in flight on **any** request type, not only `predict`, so an impl that emits one elsewhere is absorbed rather than killed — but the frame is still specified as `predict`-only and nothing in tree sends one otherwise. See "Per-batch memory frames". |
+| `memory` | `memory` (a memory sample map, optional), `units` (int, optional) | **Not a response.** Telemetry for the request in flight, written *before* its `ok`/`error` — the only frame that may precede a terminal reply. Every request is acknowledged by one with no `id` once its length header is read; a granted `predict` then writes one per batch, echoing its `id`. Sent only when the orchestrator set `batch_memory_frames` in the handshake. See "Per-batch memory frames". |
 
 ### Memory grants (optional `predict` request fields)
 
@@ -1332,38 +1332,35 @@ whole grant — as another process's memory. Measured on a 4 h soak: on a
 GPU with two residents, 29 % of samples breached the external-usage oracle,
 median shortfall 52 GB, `headroom` pinned at 0 for 23.8 % of busy samples.
 
-So a `predict` writes, on the same stream and **before** its terminal reply,
-frames of the form:
+So the worker writes, on the same stream and **before** a request's terminal
+reply, frames of the form:
 
 ```
-{"type": "memory", "id": <the request now in flight>}
+{"type": "memory"}
 {"type": "memory", "id": <the request now in flight>, "units": <the batch about to run>, "memory": <a memory sample>}
 ```
 
-The first is the **acknowledgement**, written as soon as the worker has read
-the request, before it decodes the inputs. A worker that dies before its
-acknowledgement did not die running the request: the window settles as an abort (an idle
-death), however long the operating system takes to report the exit. A death
-after it is a death holding the window. A granted window then writes one frame
-before each batch, stating that batch's `units` (in the grant's cost unit)
-and, when the worker can measure anything, a memory sample. The orchestrator
-keeps the last `units` as the batch in flight, clearing it as it sends each
-request: a worker killed for memory caps the model at half that batch rather
-than half the window's budget. The sample map is the same as everywhere else
+The first is the **acknowledgement**, written for every request once the
+worker has read its length header, before it reads the body. A worker that
+dies before its acknowledgement did not die running the request: the window
+settles as an abort (an idle death), however long the operating system takes
+to report the exit. A death after it is a death holding the window; when the
+worker died reading a request larger than the pipe, so that sending it failed,
+the orchestrator still reads what the worker wrote before dying. A granted
+window then writes one frame before each batch, stating that batch's `units`
+(in the grant's cost unit) and, when the worker can measure anything, a memory
+sample. The orchestrator keeps the last `units` as the batch in flight,
+clearing it at each acknowledgement: a worker killed for memory caps the model
+at half that batch rather than half the window's budget. The sample map is the same as everywhere else
 in this section — no sequence number, since ordering is stream order and every
 consumer rule is by capture instant. The rules:
 
-- **Opt-in, one-way.** The frame is written only when the handshake request
-  carried `batch_memory_frames: true`. An orchestrator that predates the
-  capability never sets the key and so receives nothing; a worker that
-  predates it ignores the key like any other unknown one and sends nothing;
-  without the acknowledgement the gateway reads every death during a predict
-  as idle (no cap, no strike). Neither side needs the other's answer, which is why the version stays 2 —
-  it is exact-equality on both sides, and bumping it would break every stale
-  environment over an additive key.
-- **The id is the request in flight**, never a fresh one. A `memory` frame
-  carrying any other id is a desynchronized stream and is fatal, exactly as an
-  unexpected frame type is. An orchestrator that asked for the frames reads
+- **Opt-in, one-way.** The gateway always asks for the frames
+  (`batch_memory_frames: true`); a worker that sends none has every death
+  during a request read as idle.
+- **The id is the request in flight**, or absent on the acknowledgement; never
+  a fresh one. A `memory` frame carrying any other id is a desynchronized
+  stream and is fatal, exactly as an unexpected frame type is. An orchestrator that asked for the frames reads
   them in a loop until a frame that is *not* one arrives, and judges that
   frame exactly as it would have without the capability.
 - **Only from inside the window.** A frame written after a request's terminal
@@ -1391,8 +1388,8 @@ consumer rule is by capture instant. The rules:
   check every memory sample obeys.
 
 A worker with nothing to measure (no torch, no CUDA context, no driver source)
-sends no frames at all, whatever the handshake asked for — the same silence it
-answers every other memory-sensing field with.
+still sends the acknowledgement and each batch's `units`, with no sample — the
+same silence it answers every other memory-sensing field with.
 
 Timeouts are unchanged and cover the whole exchange rather than one frame, so
 a worker that streams frames instead of replying runs out of time exactly when

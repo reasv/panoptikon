@@ -66,8 +66,9 @@ const PROTOCOL_VERSION: u64 = 2;
 /// older worker venv over an additive key.
 const BATCH_MEMORY_FRAMES_FIELD: &str = "batch_memory_frames";
 
-/// That frame's type: the in-flight request id, and a memory sample and the
-/// units of the batch about to run when it has them.
+/// That frame's type: the in-flight request id (none on the acknowledgement),
+/// and a memory sample and the units of the batch about to run when it has
+/// them.
 const MEMORY_FRAME_TYPE: &str = "memory";
 
 /// Max frame size (2 GiB; must stay below the u32 length-prefix ceiling).
@@ -405,7 +406,7 @@ pub struct WorkerTelemetry {
     /// Freshest sample, from whichever response carried one last.
     pub memory: Option<Timestamped<MemorySample>>,
     /// Units of the batch the worker said it is running for the request in
-    /// flight; cleared as each request is sent.
+    /// flight; cleared as each request is acknowledged.
     pub batch_units: Option<u64>,
     /// Bounded ring of the most recent measurements, oldest first.
     measurements: VecDeque<BatchSample>,
@@ -1196,9 +1197,16 @@ impl Worker {
         let stdin = &mut self.stdin;
         let stdout = &mut self.stdout;
         let child = &mut self.child;
+        let telemetry = &self.telemetry;
         let graceful = async {
             send_bytes(stdin, &bytes).await?;
-            let value = read_frame(stdout).await?;
+            let value = loop {
+                let frame = read_frame(stdout).await?;
+                if !is_batch_memory_frame(&frame, id) {
+                    break frame;
+                }
+                record_memory_frame(telemetry, &frame);
+            };
             let map = match value {
                 Value::Map(map) => map,
                 other => bail!("unload response is not a map: {other}"),
@@ -1335,26 +1343,37 @@ impl Worker {
         };
 
         self.in_flight = true;
-        if let Ok(mut telemetry) = self.telemetry.lock() {
-            telemetry.batch_units = None;
-        }
         let stdin = &mut self.stdin;
         let stdout = &mut self.stdout;
         let telemetry = &self.telemetry;
-        // A worker acknowledges a `predict` with a `memory` frame on reading
-        // it: one that dies before that did not die running it.
+        // A worker acknowledges a request with a `memory` frame once it has
+        // read its length header: one that dies before that did not die
+        // running it.
         let mut acknowledged = false;
         let cycle = async {
-            send_bytes(stdin, &bytes).await?;
+            let sent = send_bytes(stdin, &bytes).await;
             // Skip this request's `memory` frames; any other frame falls
             // through to the checks below. The deadline covers the loop.
-            loop {
-                let frame = read_frame(stdout).await?;
-                if !is_batch_memory_frame(&frame, id) {
-                    return Ok(frame);
+            let response = async {
+                loop {
+                    let frame = read_frame(stdout).await?;
+                    if !is_batch_memory_frame(&frame, id) {
+                        return Ok(frame);
+                    }
+                    acknowledged = true;
+                    record_memory_frame(telemetry, &frame);
                 }
-                acknowledged = true;
-                record_memory_frame(telemetry, &frame);
+            };
+            match sent {
+                Ok(()) => response.await,
+                Err(err) => {
+                    // A worker that died reading a request larger than the
+                    // pipe fails the send; read what it wrote before dying.
+                    if request_type == "predict" {
+                        let _ = timeout(FATAL_REAP_GRACE, response).await;
+                    }
+                    Err(err)
+                }
             }
         };
         let outcome = match deadline {
@@ -1787,14 +1806,15 @@ fn field_string(map: &[(Value, Value)], key: &str) -> Option<String> {
     map_get(map, key)?.as_str().map(str::to_owned)
 }
 
-/// Whether this is a `memory` frame for the in-flight request; one for any
-/// other id is a desync.
+/// Whether this is a `memory` frame for the in-flight request: one with its
+/// id, or the acknowledgement, which has none. One for any other id is a
+/// desync.
 fn is_batch_memory_frame(frame: &Value, id: u64) -> bool {
     let Value::Map(map) = frame else {
         return false;
     };
     map_get(map, "type").and_then(Value::as_str) == Some(MEMORY_FRAME_TYPE)
-        && map_get(map, "id").and_then(Value::as_u64) == Some(id)
+        && map_get(map, "id").is_none_or(|frame_id| frame_id.as_u64() == Some(id))
 }
 
 /// Fold such a frame's sample into the telemetry as the freshest reading, and
@@ -2766,6 +2786,25 @@ mod tests {
         assert!(worker.take_death().is_none());
     }
 
+    /// A worker killed after acknowledging a predict larger than the pipe
+    /// buffer fails the send, and what it wrote before dying is still read: it
+    /// died running the request, with no batch stated, so the ledger caps the
+    /// window at half its budget.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_worker_killed_reading_an_acknowledged_predict_died_running_it() {
+        let mut worker = frame_harness("killed_reading", Vec::new())
+            .await
+            .expect("the fake harness comes up");
+        let large = one(json!("x".repeat(1 << 20)));
+        worker
+            .predict(&large, Some(&item_grant(4)), None)
+            .await
+            .expect_err("the worker was killed");
+        assert_eq!(worker.take_death(), Some(DeathKind::MemoryKill));
+        assert_eq!(worker.telemetry().lock().unwrap().batch_units, None);
+    }
+
     /// The fatal path kills the worker's whole process group, also after the
     /// worker exited by itself and was reaped.
     #[cfg(target_os = "linux")]
@@ -2884,10 +2923,14 @@ mod tests {
         assert!(!worker.stdout_at_eof().await, "the frame is still there");
         assert_eq!(worker.attribute_death().await, DeathAttribution::Dying);
 
-        let frame = read_frame(&mut worker.stdout)
+        let acknowledgement = read_frame(&mut worker.stdout)
             .await
-            .expect("neither probe consumed the frame");
-        let Value::Map(map) = frame else {
+            .expect("neither probe consumed a frame");
+        assert!(is_batch_memory_frame(&acknowledgement, 9_999));
+        let answer = read_frame(&mut worker.stdout)
+            .await
+            .expect("nor the answer");
+        let Value::Map(map) = answer else {
             panic!("the worker answers with a map");
         };
         assert_eq!(map_get(&map, "id").and_then(Value::as_u64), Some(9_999));
@@ -3294,14 +3337,11 @@ mod tests {
         worker.kill().await;
     }
 
-    /// Both directions of the skew, and the two frames that must stay fatal.
-    ///
-    /// A worker predating the capability sends nothing and is served as
-    /// before, except that without the acknowledgement every death during a
-    /// predict reads as idle (no cap, no strike). A `memory` frame for another
-    /// id is a desynchronized stream, and so is any other unexpected type for
-    /// the id in flight — neither reading changed when the reader learned to
-    /// loop.
+    /// A worker that sends no frames is served as before, except that every
+    /// death during a predict reads as idle (no cap, no strike). The id-less
+    /// acknowledgement is skipped for every request type, unload included. A
+    /// `memory` frame for another id is a desynchronized stream, and so is any
+    /// other unexpected type for the id in flight.
     #[tokio::test]
     async fn only_a_memory_frame_for_the_id_in_flight_is_tolerated() {
         let mut silent = frame_harness("silent", Vec::new())
@@ -3314,6 +3354,18 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(pool_and_free(&silent).0, Some(300), "the reply's sample");
         silent.kill().await;
+
+        let mut acknowledging = frame_harness("acknowledged", Vec::new())
+            .await
+            .expect("configure and load are acknowledged");
+        let outputs = acknowledging
+            .predict(&one(json!("x")), Some(&item_grant(4)), None)
+            .await
+            .expect("so is a predict");
+        assert_eq!(outputs.len(), 1);
+        acknowledging.ping().await.expect("and a ping");
+        let status = acknowledging.shutdown().await.expect("and an unload");
+        assert_eq!(status.code(), Some(0));
 
         for (mode, label, verdict) in [
             (

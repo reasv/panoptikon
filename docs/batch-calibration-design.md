@@ -796,8 +796,9 @@ therefore differs from a GPU in six ways.
   ends). A window the gateway tore down itself (a cancel) and the death of an
   idle replica cap nothing; the latter includes a replica that had already
   exited, or was still being torn down, when the next request reached it.
-  The worker acknowledges a request as soon as it reads it, and a death
-  before that acknowledgement is an idle one on every operating system. A
+  The worker acknowledges a request once it has read its length header,
+  before its body, and a death before that acknowledgement is an idle one on
+  every operating system. A
   window the queue sized (fewer units in hand than the model is admitted
   for) caps nothing either: one failed search query
   must not hold a model that ran 256 at one unit. An item-capped cold-start

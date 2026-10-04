@@ -18,6 +18,12 @@ sequence named by INFERIO_FAKE_FRAMES before each `predict` reply:
     require  as `memory`, but the handshake FAILS unless the orchestrator
              announced `batch_memory_frames: true` — so a spawn that
              succeeds is the assertion that it did
+    acknowledged    as `memory`, and every request after the handshake is
+             first acknowledged by an id-less `memory` frame, as the real
+             worker does once it has read the length header
+    killed_reading  as `acknowledged`, but a request larger than the 64 KiB
+             pipe buffer is acknowledged and the worker SIGKILLs itself
+             before reading its body
 
 INFERIO_FAKE_REPLY_MEMORY=0 drops the response-level sample from the reply,
 which is how a test reads what the frames alone left behind.
@@ -25,6 +31,7 @@ See panoptikon/src/inferio/worker.rs's per-batch memory frame tests.
 """
 
 import os
+import signal
 import struct
 import sys
 
@@ -32,6 +39,7 @@ import msgpack
 
 FREE_MB = 4096
 TOTAL_MB = 8192
+PIPE_BUFFER_BYTES = 64 * 1024
 
 
 def _read_exact(stream, size: int) -> bytes:
@@ -44,8 +52,9 @@ def _read_exact(stream, size: int) -> bytes:
     return bytes(buf)
 
 
-def _read_frame(stream) -> dict:
+def _read_frame(stream, on_header) -> dict:
     (length,) = struct.unpack("<I", _read_exact(stream, 4))
+    on_header(length)
     return msgpack.unpackb(_read_exact(stream, length), raw=False)
 
 
@@ -68,7 +77,7 @@ def _sample(reserved_mb: int) -> dict:
 def _mid_request_frames(out, req_id: int, mode: str, count: int) -> None:
     if mode == "silent":
         return
-    if mode == "require":
+    if mode in ("require", "acknowledged", "killed_reading"):
         mode = "memory"
     if mode == "foreign":
         _write_frame(out, {"type": "memory", "id": req_id + 1000,
@@ -95,9 +104,17 @@ def main() -> None:
         msvcrt.setmode(in_fd, os.O_BINARY)
     proto_in = os.fdopen(in_fd, "rb", buffering=0)
     proto_out = os.fdopen(out_fd, "wb", buffering=0)
+    handshaken = False
+
+    def on_header(length: int) -> None:
+        if not handshaken or mode not in ("acknowledged", "killed_reading"):
+            return
+        _write_frame(proto_out, {"type": "memory"})
+        if mode == "killed_reading" and length > PIPE_BUFFER_BYTES:
+            os.kill(os.getpid(), signal.SIGKILL)
 
     while True:
-        msg = _read_frame(proto_in)
+        msg = _read_frame(proto_in, on_header)
         req_id = msg.get("id", 0)
         mtype = msg.get("type")
         if mtype == "handshake":
@@ -117,6 +134,7 @@ def main() -> None:
                 proto_out,
                 {"type": "ok", "id": req_id, "protocol_version": 2},
             )
+            handshaken = True
         elif mtype == "predict":
             _mid_request_frames(proto_out, req_id, mode, count)
             inputs = msg.get("inputs") or []

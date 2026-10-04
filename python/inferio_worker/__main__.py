@@ -25,9 +25,10 @@ State machine (protocol v2):
   survives.
 - A failed handshake is the one error the worker does not survive (exit
   non-zero).
-- With the handshake's `batch_memory_frames` flag, a `predict` writes a
-  `memory` frame (with the request id) as soon as it is read, and a granted
-  one another before each batch, stating its units.
+- With the handshake's `batch_memory_frames` flag, every request is
+  acknowledged by a `memory` frame with no id once its length header is read,
+  and a granted `predict` writes one with its id before each batch, stating
+  its units.
 """
 
 from __future__ import annotations
@@ -101,8 +102,7 @@ def _memory_frame_emitter(
 ) -> Callable[..., None] | None:
     """The `memory` frame writer for one in-flight `predict`, or None when not
     wanted. Only valid until that request's reply is sent. `units` is the
-    batch about to run; a frame with neither it nor a sample is the
-    acknowledgement.
+    batch about to run.
     """
     if not wanted:
         return None
@@ -189,13 +189,20 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
     if impl_cls is None:
         return EXIT_HANDSHAKE_FAILED
 
+    # Each request is acknowledged before its body is read: a death before
+    # the acknowledgement did not run it.
+    acknowledge = (
+        (lambda: protocol.write_frame(proto_out, {"type": "memory"}))
+        if batch_memory_frames
+        else None
+    )
     instance: Any | None = None
     inference_id = "<unconfigured>"
     prewarmed = False
     loaded = False
     batching_off_logged = False
     while True:
-        msg = protocol.read_frame(proto_in)
+        msg = protocol.read_frame(proto_in, acknowledge)
         if msg is None:
             # Parent closed our stdin (orchestrator gone); exit quietly.
             logger.info("stdin EOF; exiting.")
@@ -299,10 +306,6 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
 
         elif mtype == "predict":
             emit = _memory_frame_emitter(proto_out, req_id, batch_memory_frames)
-            if emit is not None:
-                # The acknowledgement, before anything that takes time: a
-                # death before it did not run this request.
-                emit()
             if instance is None:
                 _send_error(
                     proto_out,

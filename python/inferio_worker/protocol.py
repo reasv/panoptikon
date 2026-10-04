@@ -7,7 +7,7 @@ bytes of a single msgpack-encoded map. See docs/inferio-worker-protocol.md.
 from __future__ import annotations
 
 import struct
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 import msgpack
 
@@ -54,8 +54,14 @@ def _read_exact(stream: BinaryIO, size: int) -> bytes:
     return bytes(buf)
 
 
-def read_frame(stream: BinaryIO) -> dict | None:
-    """Read one frame. Returns None on clean EOF at a frame boundary."""
+def read_frame(
+    stream: BinaryIO, on_header: Callable[[], None] | None = None
+) -> dict | None:
+    """Read one frame. Returns None on clean EOF at a frame boundary.
+
+    `on_header` runs once a complete, in-limit length header is read, before
+    the payload.
+    """
     header = _read_exact(stream, 4)
     if len(header) == 0:
         return None
@@ -66,6 +72,8 @@ def read_frame(stream: BinaryIO) -> dict | None:
         raise ProtocolError(
             f"Declared frame length {length} exceeds the {MAX_FRAME_BYTES} limit"
         )
+    if on_header is not None:
+        on_header()
     payload = _read_exact(stream, length)
     if len(payload) < length:
         raise ProtocolError("EOF in the middle of a frame payload")
