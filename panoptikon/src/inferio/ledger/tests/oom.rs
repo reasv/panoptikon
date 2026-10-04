@@ -198,21 +198,24 @@ fn repeated_deaths_halve_the_cap_down_to_one_unit() {
 }
 
 /// A worker states each batch's units before running it, and a death caps at
-/// half the batch that died rather than half the window's budget.
+/// half the batch that died rather than half the window's budget, never more
+/// than half the budget.
 #[test]
 fn a_death_caps_at_half_the_batch_the_worker_said_it_was_running() {
-    let ledger = cpu_ledger(no_margin());
-    let (handle, admission) = cpu_replica(&ledger);
-    for units in [4, 8, 16, 32] {
-        measured_window(&handle, &admission, units);
+    for (stated, cap) in [(16, 8), (100, 32)] {
+        let ledger = cpu_ledger(no_margin());
+        let (handle, admission) = cpu_replica(&ledger);
+        for units in [4, 8, 16, 32] {
+            measured_window(&handle, &admission, units);
+        }
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().unit_budget, 64);
+        handle.lock().unwrap().batch_units = Some(stated);
+        token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
+        assert_eq!(death_cap(&ledger), Some(cap), "{stated} units stated");
     }
-    let token = admission
-        .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
-    assert_eq!(token.grant().unit_budget, 64);
-    handle.lock().unwrap().batch_units = Some(16);
-    token.finish(WindowOutcome::WorkerDied(DeathKind::MemoryKill));
-    assert_eq!(death_cap(&ledger), Some(8));
 }
 
 /// A window the queue sized says nothing about the batch the model can run:

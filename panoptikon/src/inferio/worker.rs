@@ -696,13 +696,14 @@ pub struct Worker {
 /// device is a negative sample for the ledger; a desync is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FatalCause {
-    /// EOF, broken pipe, undecodable frame or expired deadline (`predict`
-    /// has no deadline, so a timeout never settles a window).
+    /// EOF, broken pipe, undecodable frame or expired deadline; for a
+    /// `predict`, only after the worker acknowledged it (`predict` has no
+    /// deadline, so a timeout never settles a window).
     Unreachable,
     /// We killed a live worker whose stream can no longer be trusted.
     Desync,
-    /// The process had exited before the request was sent: it died idle, not
-    /// running this request.
+    /// The process had exited, or the request failed before the worker
+    /// acknowledged it: it died idle, not running this request.
     ExitedIdle,
 }
 
@@ -2743,6 +2744,27 @@ mod tests {
         assert!(!death.attribution.killed_by_gateway());
         // The request was sent, but the worker never acknowledged it, so it
         // did not die running it.
+        assert!(worker.take_death().is_none());
+    }
+
+    /// A worker killed after a predict was sent but before it read it died
+    /// idle: its memory kill claims no window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_worker_killed_before_it_reads_a_predict_died_idle() {
+        let mut worker = loaded("test/echo", "echo_test").await;
+        let pid = worker.pid.expect("a pid") as libc::pid_t;
+        // Stopped, it reads nothing; the small frame fits the pipe buffer.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        let kill = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        };
+        let input = one(json!(1));
+        let (result, ()) = tokio::join!(worker.predict(&input, None, None), kill);
+        result.expect_err("the worker was killed");
+        let death = worker.last_death().expect("the fatal path recorded it");
+        assert_eq!(death.kind(), Some(DeathKind::MemoryKill), "{death}");
         assert!(worker.take_death().is_none());
     }
 
