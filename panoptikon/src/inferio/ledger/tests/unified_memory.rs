@@ -1662,8 +1662,9 @@ fn paging_windows(
     pressure: mps::MemoryPressure,
     windows: usize,
 ) {
-    ledger.set_memory_pressure_for_test(pressure);
     push_ram(handle, MAC_TOTAL_MB, 90_000, 180, 0);
+    ledger.health();
+    ledger.set_memory_pressure_for_test(pressure);
     ledger.install_probe_stub(Some(vec![GpuMemory {
         uuid: MPS_GPU.to_owned(),
         total_mb: MAC_RAM_MB,
@@ -1770,7 +1771,8 @@ fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
 
 /// While the Mac pages, a load re-reads the host too, and is priced against
 /// what it reads rather than a reading taken before the paging, unless a
-/// probe of the device is already in flight.
+/// probe of the device is already in flight. A worker's reading recorded
+/// while it pages is 0.
 #[tokio::test]
 async fn while_the_mac_pages_a_load_is_priced_from_a_fresh_reading() {
     for (pressure, refreshing, over_headroom, probes) in [
@@ -1779,8 +1781,8 @@ async fn while_the_mac_pages_a_load_is_priced_from_a_fresh_reading() {
         (mps::MemoryPressure::Paging, true, false, 0),
     ] {
         let ledger = mps_ledger();
-        ledger.set_memory_pressure_for_test(pressure);
         ledger.record_free_for_test(MPS_GPU, 90_000);
+        ledger.set_memory_pressure_for_test(pressure);
         ledger
             .lock()
             .gpus
@@ -1799,6 +1801,24 @@ async fn while_the_mac_pages_a_load_is_priced_from_a_fresh_reading() {
             .expect("a reservation");
         assert_eq!(exceeds, over_headroom, "{pressure:?} {refreshing}");
         assert_eq!(ledger.probe_calls(), probes, "{pressure:?} {refreshing}");
+    }
+
+    for (pressure, recorded) in [
+        (mps::MemoryPressure::Paging, 0),
+        (mps::MemoryPressure::Normal, 9_000),
+    ] {
+        let ledger = mps_ledger();
+        let handle = loaded_mps(Some(MAC_TOTAL_MB));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        ledger.set_memory_pressure_for_test(pressure);
+        push_ram(&handle, MAC_TOTAL_MB, 9_000, 0, 0);
+        ledger.health();
+        let state = ledger.lock();
+        let free = state.gpus[MPS_GPU].free.as_ref().expect("a reading");
+        let ram = free.ram.as_ref().expect("its RAM basis");
+        assert_eq!((free.free_mb, ram.available_mb), (recorded, recorded));
     }
 }
 
@@ -1893,25 +1913,35 @@ fn the_bound_of_a_one_unit_batch_is_one_unit() {
 }
 
 /// Paging that began as the grant read the pressure counts at settle: the
-/// window is a paging window.
+/// window is a paging window. Paging from before the grant does not.
 #[test]
 fn paging_that_began_at_the_grants_own_reading_counts_at_settle() {
-    let ledger = mps_ledger();
-    let handle = loaded_mps(Some(MAC_TOTAL_MB));
-    let admission = ledger
-        .register_worker("g/a", item_cost(1), &handle, None)
-        .expect("registers");
-    push_ram(&handle, MAC_TOTAL_MB, 0, 0, 0);
-    let token = admission
-        .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
-    ledger.set_paging_rise_for_test(ledger.pressure_read_at_for_test());
-    handle
-        .lock()
-        .unwrap()
-        .record_measurements(vec![measurement(1, 0, 10)]);
-    token.finish(WindowOutcome::Responded { oom: None });
-    assert!(pressure_cap(&ledger).is_some_and(|cap| cap.paging));
+    for before_grant in [false, true] {
+        let ledger = mps_ledger();
+        let handle = loaded_mps(Some(MAC_TOTAL_MB));
+        let admission = ledger
+            .register_worker("g/a", item_cost(1), &handle, None)
+            .expect("registers");
+        push_ram(&handle, MAC_TOTAL_MB, 0, 0, 0);
+        let before = Instant::now() - Duration::from_millis(1);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        ledger.set_paging_rise_for_test(if before_grant {
+            before
+        } else {
+            ledger.pressure_read_at_for_test()
+        });
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement(1, 0, 10)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            pressure_cap(&ledger).is_some_and(|cap| cap.paging),
+            !before_grant
+        );
+    }
 }
 
 /// The size paging left belongs to the model on the device, so a replica

@@ -453,8 +453,8 @@ impl VramLedger {
             return Settled::default();
         };
         // This window's requests leave the demand signal on every outcome.
-        // The pressure at settle counts as well, as does paging any time
-        // since the grant.
+        // The pressure at settle counts as well, and paging at warning or
+        // above any time since the grant counts as paging.
         let charge = entry.grants.remove(&grant_id).map(|charge| GrantCharge {
             pressure: charge.pressure.max(pressure.unwrap_or_default()),
             ..charge

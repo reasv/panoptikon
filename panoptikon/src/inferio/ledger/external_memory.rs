@@ -116,15 +116,16 @@ impl VramLedger {
         }
     }
 
-    /// [`Self::memory_pressure`], also paging when the swap-out counter rose
-    /// after `since`; in tests, paging when the test's rise is at or after
-    /// `since`, else the stub.
+    /// [`Self::memory_pressure`], and at least paging when the swap-out
+    /// counter rose after `since` at warning or above
+    /// ([`mps::memory_pressure_since`]); in tests, the stub, at least paging
+    /// when the test's rise is at or after `since`.
     pub(super) fn memory_pressure_since(&self, since: Instant) -> mps::MemoryPressure {
         #[cfg(test)]
         {
             let state = self.lock();
             if state.paging_rose_at.is_some_and(|at| at >= since) {
-                mps::MemoryPressure::Paging
+                state.pressure_stub.max(mps::MemoryPressure::Paging)
             } else {
                 state.pressure_stub
             }
@@ -132,6 +133,20 @@ impl VramLedger {
         #[cfg(not(test))]
         {
             mps::memory_pressure_since(since)
+        }
+    }
+
+    /// Whether macOS pages now, read under the ledger lock; the stub in
+    /// tests.
+    fn paging_locked(state: &LedgerState) -> bool {
+        #[cfg(test)]
+        {
+            state.pressure_stub.paging()
+        }
+        #[cfg(not(test))]
+        {
+            let _ = state;
+            mps::memory_pressure().paging()
         }
     }
 
@@ -182,6 +197,17 @@ impl VramLedger {
         model: Option<&str>,
         ram: Option<RamBasis>,
     ) {
+        // Every device of a Mac is its RAM, and while macOS pages none is
+        // available, whatever a formula reading counts as file cache.
+        let (free_mb, ram) = if state.metal_allocator && Self::paging_locked(state) {
+            let ram = ram.map(|ram| RamBasis {
+                available_mb: 0,
+                ..ram
+            });
+            (0, ram)
+        } else {
+            (free_mb, ram)
+        };
         let Some(gpu_ledger) = state.gpus.get_mut(gpu) else {
             return;
         };

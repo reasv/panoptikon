@@ -277,17 +277,20 @@ Single synthetic device:
   per process). A rise is dated by the earlier reading of the pair
   that saw it, since it happened after that reading. Paging is a rise within
   the 10 s before now (`PAGING_WINDOW` / `MAC_PAGING_SECONDS`) or after a
-  given instant: the gateway settles a window with the instant its grant
-  began, before the grant's own reading, and a worker reads before each batch with the reading its
-  window's previous batch started from, so a batch longer than 10 s still
-  counts paging that began during it and a window's first batch does not
-  count swap-outs from the idle time before it. The gateway also reads the
-  counter on a background thread every 2 s (`SWAPOUT_TICK`), so its first
+  given instant. The gateway settles a window with the instant its grant
+  began, before the grant's own reading; a rise after it read at warning
+  or above settles the window as paging whatever the level at settle. A
+  worker reads before each batch with the reading its window's previous
+  batch started from, so a batch longer than 10 s still counts paging that
+  began during it and a window's first batch does not count swap-outs from
+  the idle time before it. The gateway also reads the counter and the
+  level on a background thread every 2 s (`SWAPOUT_TICK`), so its first
   grant after an idle time dates a rise just before it within one tick.
   While the gateway reads paging, a grant or a load re-reads the device
   from the host instead of pricing from the worker's last report, which
-  may predate the paging. `MemoryPressure` is the two facts together:
-  `Normal`, `Warning`, `Paging` (warning while paging), `Critical`.
+  may predate the paging, and every free reading it records, a worker's
+  included, is 0. `MemoryPressure` is the two facts together: `Normal`,
+  `Warning`, `Paging` (warning while paging), `Critical`.
   - **Paging or critical: `ram_available` is 0.** macOS keeps file-backed
     pages while it swaps — about 9 GiB on the M3 Max while it swapped
     20–38 GiB — so the formula still offered 8–10 GiB that did not exist.

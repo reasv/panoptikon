@@ -109,7 +109,7 @@ pub(super) fn physical_ram_mb() -> Option<u64> {
 }
 
 /// macOS's memory pressure, from `kern.memorystatus_vm_pressure_level` and
-/// whether the kernel is swapping pages out ([`Swapouts::paging`]).
+/// whether the kernel is swapping pages out ([`Swapouts::pressure`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(super) enum MemoryPressure {
     #[default]
@@ -149,8 +149,8 @@ pub(super) fn memory_pressure() -> MemoryPressure {
     pressure(None)
 }
 
-/// [`memory_pressure`], also paging when the swap-out counter rose after
-/// `since` ([`Swapouts::paging`]).
+/// [`memory_pressure`], and at least paging when the swap-out counter rose
+/// after `since` at the warning level or above ([`Swapouts::pressure`]).
 #[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
 pub(super) fn memory_pressure_since(since: Instant) -> MemoryPressure {
     pressure(Some(since))
@@ -198,48 +198,65 @@ const SWAPOUT_TICK: Duration = Duration::from_secs(2);
 
 /// The swap-out counter at the last reading and when that was, and the time
 /// of the earlier reading of the most recent pair whose counter rose: the
-/// rise happened after it.
+/// rise happened after it. `paged_after` is the same for the most recent
+/// rise whose later reading had the pressure level at warning or above.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct Swapouts {
     last: Option<(u64, Instant)>,
     rose_after: Option<Instant>,
+    paged_after: Option<Instant>,
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl Swapouts {
-    /// Record a reading of the counter taken at `at`.
-    fn record(&mut self, count: u64, at: Instant) {
+    /// Record a reading of the counter and the sysctl pressure level taken
+    /// at `at`; a reading older than the last is ignored.
+    fn record(&mut self, count: u64, level: u32, at: Instant) {
+        if self.last.is_some_and(|(_, read_at)| at < read_at) {
+            return;
+        }
         if let Some((previous, read_at)) = self.last
             && count > previous
         {
             self.rose_after = Some(read_at);
+            if level >= 2 {
+                self.paged_after = Some(read_at);
+            }
         }
         self.last = Some((count, at));
     }
 
-    /// Whether the kernel swapped pages out within [`PAGING_WINDOW`] before
-    /// `now`, or after `since`.
-    fn paging(&self, now: Instant, since: Option<Instant>) -> bool {
-        self.rose_after.is_some_and(|after| {
-            now.saturating_duration_since(after) <= PAGING_WINDOW
-                || since.is_some_and(|since| after >= since)
-        })
+    /// The pressure at sysctl `level` and `now`, paging if the counter rose
+    /// within [`PAGING_WINDOW`] before `now`. A rise after `since` read at
+    /// the warning level or above makes it at least `Paging`, whatever the
+    /// level is now.
+    fn pressure(&self, level: u32, now: Instant, since: Option<Instant>) -> MemoryPressure {
+        let recent = self
+            .rose_after
+            .is_some_and(|after| now.saturating_duration_since(after) <= PAGING_WINDOW);
+        let pressure = MemoryPressure::from_level(level, recent);
+        if since.is_some_and(|since| self.paged_after.is_some_and(|after| after >= since)) {
+            pressure.max(MemoryPressure::Paging)
+        } else {
+            pressure
+        }
     }
 }
 
 /// Feed `swapouts` a reading every [`SWAPOUT_TICK`] until `wait` returns
-/// true. `read` answers the counter and when it was read, or `None`.
+/// true. `read` answers the counter, the pressure level and when they were
+/// read, or `None`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn follow_swapouts(
     swapouts: &Mutex<Swapouts>,
-    mut read: impl FnMut() -> Option<(u64, Instant)>,
+    mut read: impl FnMut() -> Option<(u64, u32, Instant)>,
     mut wait: impl FnMut(Duration) -> bool,
 ) {
     while !wait(SWAPOUT_TICK) {
-        if let Some((count, at)) = read()
+        if let Some((count, level, at)) = read()
             && let Ok(mut swapouts) = swapouts.lock()
         {
-            swapouts.record(count, at);
+            swapouts.record(count, level, at);
         }
     }
 }
@@ -249,6 +266,7 @@ fn follow_swapouts(
 static SWAPOUTS: Mutex<Swapouts> = Mutex::new(Swapouts {
     last: None,
     rose_after: None,
+    paged_after: None,
 });
 
 /// Start [`follow_swapouts`] on [`SWAPOUTS`] for the life of the process,
@@ -262,7 +280,7 @@ fn start_following_swapouts() {
             .spawn(|| {
                 follow_swapouts(
                     &SWAPOUTS,
-                    || sys::swapouts().map(|count| (count, Instant::now())),
+                    || sys::swapouts().map(|count| (count, sys::pressure_level(), Instant::now())),
                     |tick| {
                         std::thread::sleep(tick);
                         false
@@ -420,7 +438,13 @@ mod sys {
         vm_statistics().map(|stats| stats.swapouts)
     }
 
-    /// The counters now; paging as [`super::Swapouts::paging`] with `since`.
+    /// `kern.memorystatus_vm_pressure_level`, 0 when unreadable.
+    pub(super) fn pressure_level() -> u32 {
+        sysctl_u32("kern.memorystatus_vm_pressure_level").unwrap_or(0)
+    }
+
+    /// The counters now; the pressure as [`super::Swapouts::pressure`] with
+    /// `since`.
     pub(super) fn memory_facts(since: Option<Instant>) -> Option<super::MemoryFacts> {
         super::start_following_swapouts();
         let stats = vm_statistics()?;
@@ -428,20 +452,21 @@ mod sys {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page = u64::try_from(page).ok().filter(|page| *page > 0)?;
         let pages = |count: u32| u64::from(count).saturating_mul(page);
+        let level = pressure_level();
         let now = Instant::now();
-        let paging = super::SWAPOUTS.lock().is_ok_and(|mut swapouts| {
-            swapouts.record(stats.swapouts, now);
-            swapouts.paging(now, since)
-        });
+        let pressure = super::SWAPOUTS.lock().map_or(
+            super::MemoryPressure::from_level(level, false),
+            |mut swapouts| {
+                swapouts.record(stats.swapouts, level, now);
+                swapouts.pressure(level, now, since)
+            },
+        );
         Some(super::MemoryFacts {
             ram: sysctl_u64("hw.memsize").filter(|bytes| *bytes > 0)?,
             wired: pages(stats.wire_count),
             compressed: pages(stats.compressor_page_count),
             anonymous: pages(stats.internal_page_count),
-            pressure: super::MemoryPressure::from_level(
-                sysctl_u32("kern.memorystatus_vm_pressure_level").unwrap_or(0),
-                paging,
-            ),
+            pressure,
         })
     }
 }
@@ -577,12 +602,14 @@ mod tests {
         let swapouts = Mutex::new(Swapouts {
             last: None,
             rose_after: None,
+            paged_after: None,
         });
-        swapouts.lock().unwrap().record(count(0), start);
+        swapouts.lock().unwrap().record(count(0), 2, start);
         let secs = std::cell::Cell::new(0);
+        let at = |offset: u64| start + Duration::from_secs(offset);
         follow_swapouts(
             &swapouts,
-            || Some((count(secs.get()), start + Duration::from_secs(secs.get()))),
+            || Some((count(secs.get()), 2, at(secs.get()))),
             |tick| {
                 secs.set(secs.get() + tick.as_secs());
                 secs.get() > to
@@ -603,48 +630,80 @@ mod tests {
         let mut swapouts = Swapouts {
             last: None,
             rose_after: None,
+            paged_after: None,
         };
-        swapouts.record(500, at(0));
+        swapouts.record(500, 2, at(0));
         assert!(
-            !swapouts.paging(at(0), Some(at(0))),
+            !swapouts.pressure(2, at(0), Some(at(0))).paging(),
             "one reading cannot tell"
         );
-        swapouts.record(900, at(90));
+        swapouts.record(900, 2, at(90));
         assert!(
-            swapouts.paging(at(90), Some(at(0))),
+            swapouts.pressure(2, at(90), Some(at(0))).paging(),
             "rose after batch 1 was granted"
         );
         assert!(
-            !swapouts.paging(at(90), None),
+            !swapouts.pressure(2, at(90), None).paging(),
             "the rise is dated 90 s ago, outside the window"
         );
-        swapouts.record(1300, at(180));
+        swapouts.record(1300, 2, at(180));
         assert!(
-            swapouts.paging(at(180), Some(at(90))),
+            swapouts.pressure(2, at(180), Some(at(90))).paging(),
             "rose after batch 2 was granted"
         );
-        swapouts.record(100, at(181));
-        swapouts.record(100, at(200));
+        swapouts.record(100, 2, at(181));
+        swapouts.record(100, 2, at(200));
         assert!(
-            !swapouts.paging(at(200), Some(at(181))),
+            !swapouts.pressure(2, at(200), Some(at(181))).paging(),
             "a counter that fell did not rise"
         );
 
         // A burst 20-24 s into a 45 s window, read every tick.
         let mut swapouts = followed(start, |secs| 500 + secs.clamp(20, 24) - 20, 44);
-        swapouts.record(504, at(45));
+        swapouts.record(504, 2, at(45));
         assert!(
-            swapouts.paging(at(45), Some(at(0))),
+            swapouts.pressure(2, at(45), Some(at(0))).paging(),
             "rose after the window was granted"
         );
         assert!(
-            !swapouts.paging(at(45), None),
+            !swapouts.pressure(2, at(45), None).paging(),
             "the rise is dated 23 s ago, outside the window"
         );
-        swapouts.record(505, at(55));
+        swapouts.record(505, 2, at(55));
         assert!(
-            swapouts.paging(at(55), None),
+            swapouts.pressure(2, at(55), None).paging(),
             "a rise dated exactly 10 s ago is paging"
+        );
+
+        // After an instant, only a rise read at warning or above counts, and
+        // it counts whatever the level is now.
+        let mut swapouts = Swapouts {
+            last: None,
+            rose_after: None,
+            paged_after: None,
+        };
+        swapouts.record(500, 2, at(0));
+        swapouts.record(600, 1, at(60));
+        assert_eq!(
+            swapouts.pressure(2, at(90), Some(at(0))),
+            MemoryPressure::Warning,
+            "a rise read at normal"
+        );
+        swapouts.record(700, 2, at(120));
+        assert_eq!(
+            swapouts.pressure(1, at(150), Some(at(0))),
+            MemoryPressure::Paging,
+            "a rise read at warning, normal now"
+        );
+        assert_eq!(
+            swapouts.pressure(4, at(150), Some(at(0))),
+            MemoryPressure::Critical
+        );
+        swapouts.record(800, 2, at(100));
+        assert_eq!(
+            swapouts.pressure(2, at(125), None),
+            MemoryPressure::Warning,
+            "a reading older than the last is ignored"
         );
     }
 
@@ -658,28 +717,28 @@ mod tests {
         // A rise in the last 5 s of a 120 s idle wait.
         let rose_at_115 = |secs: u64| if secs >= 115 { 600 } else { 500 };
         let mut swapouts = followed(start, rose_at_115, 119);
-        swapouts.record(600, at(120));
+        swapouts.record(600, 2, at(120));
         assert!(
-            swapouts.paging(at(120), None),
+            swapouts.pressure(2, at(120), None).paging(),
             "dated 6 s before the grant by the background readings"
         );
         let mut unfollowed = followed(start, rose_at_115, 0);
-        unfollowed.record(600, at(120));
+        unfollowed.record(600, 2, at(120));
         assert!(
-            !unfollowed.paging(at(120), None),
+            !unfollowed.pressure(2, at(120), None).paging(),
             "without them it is dated at the reading 120 s before"
         );
 
         // A rise 50 s before a job.
         let mut swapouts = followed(start, |secs| if secs >= 5 { 600 } else { 500 }, 54);
-        swapouts.record(600, at(55));
+        swapouts.record(600, 2, at(55));
         assert!(
-            !swapouts.paging(at(55), None),
+            !swapouts.pressure(2, at(55), None).paging(),
             "dated 51 s before the grant, outside the window"
         );
-        swapouts.record(600, at(65));
+        swapouts.record(600, 2, at(65));
         assert!(
-            !swapouts.paging(at(65), Some(at(55))),
+            !swapouts.pressure(2, at(65), Some(at(55))).paging(),
             "the rise came before the job's first window was granted"
         );
     }
