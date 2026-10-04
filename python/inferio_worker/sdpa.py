@@ -128,10 +128,13 @@ def expand_kv_heads_without_fused_gqa() -> None:
         if sdpa.use_gqa_in_sdpa is not _use_gqa_in_sdpa:
             _transformers_use_gqa = sdpa.use_gqa_in_sdpa
             sdpa.use_gqa_in_sdpa = _use_gqa_in_sdpa
-        logger.info(
-            "PyTorch %s has no fused attention kernel for grouped-query "
-            "attention in %s on %s; expanding key/value heads before attention "
-            "instead (uses less GPU memory)",
+        # fp32 alone is the common case: flash attention takes no fp32.
+        level = logging.DEBUG if expanded == ["float32"] else logging.INFO
+        logger.log(
+            level,
+            "PyTorch %s has no fused grouped-query attention kernel in %s on "
+            "%s; such calls expand their key/value heads first (uses less GPU "
+            "memory)",
             torch.__version__,
             ", ".join(expanded),
             device,
