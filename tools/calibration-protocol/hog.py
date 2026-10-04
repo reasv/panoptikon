@@ -787,14 +787,18 @@ class Hog:
                 del self.chunks[want_chunks:]
                 self.backend.reclaim()
                 return
+            unread_mb = 1024  # the first chunk reads free
             while len(self.chunks) < want_chunks:
                 if _stop.is_set():
                     return
-                if self.leave_mb is not None:
+                if self.leave_mb is not None and unread_mb >= 1024:
                     # Where allocating past physical memory succeeds (WSL,
                     # WDDM's system-memory fallback) no failure ends the
                     # fill; free reaching the level does, and what is held
-                    # then is the target.
+                    # then is the target. Free is re-read once 1 GiB has been
+                    # taken since the last read, so the fill stops at most
+                    # 1 GiB past the level.
+                    unread_mb = 0
                     free_mb, _ = self.backend.free_total_mb()
                     if free_mb is not None and free_mb <= self.leave_mb:
                         self._leave_free_target = self.target_mb = self.held_mb
@@ -807,6 +811,7 @@ class Hog:
                     # Back off: hold what we got and stop trying this tick.
                     self.backend.reclaim()
                     return
+                unread_mb += chunk_mb
                 if emit is not None and (
                     time.monotonic() - last_emit >= self.args.progress_every
                 ):

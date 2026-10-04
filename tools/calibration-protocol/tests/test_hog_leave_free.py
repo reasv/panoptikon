@@ -122,7 +122,8 @@ def test_the_fill_stops_once_free_reaches_the_level():
     """Where allocation past physical memory succeeds, no failure stops the
     fill. Here every chunk the hog takes, the job's pool takes another, so
     the one solve at the start (10 240 - 2 048 = 8 192 MiB) would overshoot
-    by twice what the level allows; the fill stops at 4 096 MiB held."""
+    by twice what the level allows; the fill stops at 4 096 MiB held, from
+    the schedule's level as from a `/set?leave_free=`."""
 
     class _Backend(hog.Backend):
         name = "overcommits"
@@ -138,15 +139,25 @@ def test_the_fill_stops_once_free_reaches_the_level():
         def free_total_mb(self):
             return self.free, 24576
 
-    backend = _Backend()
     args = argparse.Namespace(touch_period=0.0, progress_every=2.0,
                               reeval=999999.0)
-    made = hog.Hog(backend, hog.LeaveFree(2048), args)
-    made.target_mb = made.resolve_target(0.0)
-    assert made.target_mb == 8192
-    made.apply(made.target_mb)
-    assert (made.held_mb, made.target_mb, backend.free) == (4096, 4096, 2048)
-    # The next tick holds there: the level is reached and the solve pinned.
-    made.target_mb = made.resolve_target(0.5)
-    made.apply(made.target_mb)
-    assert made.held_mb == 4096
+    for override in (None, "leave_free"):
+        backend = _Backend()
+        made = hog.Hog(backend, hog.LeaveFree(2048), args)
+        made.override, made.override_mb = override, 2048
+        made.target_mb = made.resolve_target(0.0)
+        assert made.target_mb == 8192
+        made.apply(made.target_mb)
+        assert (made.held_mb, made.target_mb, backend.free) == (
+            4096, 4096, 2048)
+        # The next tick holds there, pinned, though the job gave memory back.
+        backend.free = 6144
+        made.target_mb = made.resolve_target(0.5)
+        made.apply(made.target_mb)
+        assert (made.held_mb, made.target_mb) == (4096, 4096)
+
+    # A hold is not stopped by the last leave-free level.
+    backend.free = 2048
+    made.override, made.override_mb = "mb", 6144
+    made.apply(made.resolve_target(1.0))
+    assert made.held_mb == 6144
