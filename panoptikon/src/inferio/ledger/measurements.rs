@@ -584,6 +584,12 @@ impl VramLedger {
                 && peak > batch_ram_before
                 && !first_batch
             {
+                // A batch that left the resident set below the baseline
+                // released memory, perhaps before its peak: its growth is
+                // measured from there.
+                let base = measurement
+                    .rss_after_mb
+                    .map_or(base, |after| base.min(after));
                 ram_samples.push(FitSample {
                     units,
                     delta_mb: peak.saturating_sub(base),

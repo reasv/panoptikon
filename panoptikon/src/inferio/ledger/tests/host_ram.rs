@@ -2159,6 +2159,81 @@ fn a_first_large_window_priced_from_cheap_small_batches_covers_its_pages() {
     assert!(OTHERS + level + need <= CPU_RAM_MB, "{pages} pages");
 }
 
+/// A worker that pins its first batch's memory, half of it for good or all
+/// of it until its fourth window, under pages costing 650 MiB, then 300 and
+/// 360, then 460 each, plus 200 per batch, with a stored working size that
+/// opens the first uncapped window far past the item-capped ones and short
+/// queues between full windows: no window runs the host out of RAM, and none
+/// past the item-capped sizes books less than its pages add.
+#[test]
+fn a_first_batch_pinned_then_freed_leaves_no_large_window_under_booked() {
+    const STARTUP: u64 = 700;
+    const TRANSIENT: u64 = 200;
+    let page = |index: u64| match index {
+        0 => 650,
+        1 => 300,
+        2 => 360,
+        _ => 460,
+    };
+    for (freed_at, others) in [
+        (None, 8_000),
+        (None, 20_000),
+        (Some(3), 8_000),
+        (Some(3), 20_000),
+    ] {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(seeded_anchor(1_024, true)),
+            ..FakeProfiles::default()
+        });
+        let ledger = host(&[GPU], Some(profiles));
+        let (handle, admission) = cold_gpu_replica(&ledger, "g/pinned", GPU, item_cost(32));
+        let (mut pinned, mut startup, mut pages_run) = (0, 0, 0);
+        for (window, queued) in [1, 2, 4, u64::MAX, u64::MAX, 4, u64::MAX, 1, 3, u64::MAX]
+            .into_iter()
+            .enumerate()
+        {
+            if freed_at == Some(window) {
+                pinned = 0;
+            }
+            let level = RSS_AT_LOAD_MB + startup + pinned;
+            ledger.record_free_for_test(cpu::DEVICE_KEY, CPU_RAM_MB - others - level);
+            let token = admission
+                .request_grant(queued.min(admission.window_item_bound() as u64), None, 1, 0)
+                .expect("granted");
+            let grant = *token.grant();
+            let pages = grant
+                .unit_budget
+                .min(grant.user_cap_items.map_or(u64::MAX, u64::from))
+                .min(queued);
+            let charged = cpu_row(&ledger).charges_mb;
+            let need = TRANSIENT + (pages_run..pages_run + pages).map(page).sum::<u64>();
+            pages_run += pages;
+            let peak = RSS_AT_LOAD_MB + STARTUP + pinned + need;
+            let case = format!("freed at {freed_at:?}, others {others}, window {window}");
+            assert!(others + peak <= CPU_RAM_MB, "{case}: {pages} pages");
+            if pages > 4 {
+                assert!(
+                    peak <= charged,
+                    "{case}: {pages} pages, {peak} > {charged} MiB"
+                );
+            }
+            if window == 0 {
+                pinned = need / if freed_at.is_some() { 1 } else { 2 };
+                startup = STARTUP;
+            }
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![BatchMeasurement {
+                    duration_ms: Some(pages as f64 * 1000.0 / ladder_rate(&RISING, pages)),
+                    ..ram_batch(pages, peak, RSS_AT_LOAD_MB + STARTUP + pinned)
+                }]);
+            token.finish(WindowOutcome::Responded { oom: None });
+            admission.earn_next_size();
+        }
+    }
+}
+
 /// A cold replica's 40 windows of pages costing 45–130 MiB each in random
 /// order, beside other processes using 1–3 GB of a `ram_mb`
 /// host, with a worker that keeps every page it decoded (`retain`) or none.
