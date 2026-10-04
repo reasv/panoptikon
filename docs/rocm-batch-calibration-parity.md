@@ -1013,14 +1013,14 @@ Two more things a field pass should settle, neither of which any fixture can:
   contained; what cannot be known without hardware is which of the two paths
   a real partitioned GPU actually takes, and the dedicated test shape may
   simply never occur in the field.
-- **S6: torch < 2.6 in a user-managed venv dies at import under an
+- **torch < 2.6 in a user-managed venv dies at import under an
   operator-set `ROCR_VISIBLE_DEVICES`** (pytorch#142292). This is not
   something the design does — we never write that variable, precisely
   because of this — but it is a documented assumption: a Slurm-style
   scheduler sets ROCR, and a venv the user manages themselves can still hold
-  a torch old enough to crash on it. Such a host cannot run workers at all,
-  with or without this branch; the symptom is an import-time crash in the
-  worker, not an admission problem.
+  a torch old enough to crash on it. Such a host cannot run workers at all;
+  the worker reads torch's version from its package metadata and fails the
+  handshake naming the cause instead of crashing at import.
 
 ## Implementation order (all five landed 2026-07-31)
 

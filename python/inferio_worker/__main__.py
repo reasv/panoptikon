@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import traceback
 from typing import Any, BinaryIO, Callable
@@ -43,6 +44,34 @@ EXIT_PROTOCOL_ERROR = 2
 EXIT_INTERNAL_ERROR = 3
 
 logger = logging.getLogger("inferio_worker")
+
+# The first torch that imports on ROCm with `ROCR_VISIBLE_DEVICES` set
+# (pytorch#142292).
+ROCR_TORCH_MIN = (2, 6)
+
+
+def rocr_torch_problem() -> str | None:
+    """Why this interpreter's torch cannot import under the inherited
+    `ROCR_VISIBLE_DEVICES`, or None. Read from the package metadata, since
+    importing such a torch is what crashes."""
+    if not os.environ.get("ROCR_VISIBLE_DEVICES"):
+        return None
+    from importlib import metadata
+
+    try:
+        version = metadata.version("torch")
+    except metadata.PackageNotFoundError:
+        return None
+    release = re.match(r"(\d+)\.(\d+)", version)
+    if "+rocm" not in version or release is None:
+        return None
+    if tuple(map(int, release.groups())) >= ROCR_TORCH_MIN:
+        return None
+    return (
+        f"torch {version} crashes at import while ROCR_VISIBLE_DEVICES is set "
+        "(pytorch#142292): install torch 2.6 or newer in the inference_local "
+        "python interpreter, or start the gateway without ROCR_VISIBLE_DEVICES"
+    )
 
 
 def _setup_stdio() -> tuple[BinaryIO, BinaryIO]:
@@ -149,6 +178,10 @@ def _handshake(
         )
         return None, False
     batch_memory_frames = msg.get("batch_memory_frames") is True
+    problem = rocr_torch_problem()
+    if problem is not None:
+        _send_error(proto_out, req_id, problem)
+        return None, False
 
     # cuDNN path setup before any impl module import; failure is only a
     # warning.
