@@ -77,4 +77,4 @@ jobs:
       - name: Clippy
         if: ${{ !cancelled() }}
         continue-on-error: true
-        run: cargo clippy --workspace --all-targets --features panoptikon/bundled
+        run: cargo clippy --workspace --all-targets --keep-going --features panoptikon/bundled
