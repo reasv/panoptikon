@@ -331,7 +331,7 @@ fn probe_rocm() -> HostGpus {
 
 /// [`probe_rocm`] over injected roots and visibility variables. A blank
 /// visibility variable, or no GPU this process can use, leaves no visible GPU:
-/// models run on the CPU device.
+/// models run on the CPU device. Under WSL the inventory is unknown.
 fn probe_rocm_at(
     roots: &rocm::SysfsRoots,
     ambient: [Option<&str>; rocm::VISIBILITY_VARS.len()],
@@ -348,21 +348,24 @@ fn probe_rocm_at(
         return rocm_host(roots, Some(Vec::new().into()), true, true);
     }
     let ambient_hip_restriction = rocm::ambient_hip_restriction(ambient);
+    // WSL has no amdkfd: ROCm reaches the GPU through /dev/dxg.
+    if wsl {
+        tracing::warn!(
+            "ROCm under WSL2 runs through the Windows display driver, which \
+             exposes none of the amdgpu memory counters this host reads: models \
+             on the GPU run without a memory ledger or batch-size calibration, \
+             and a GPU that runs out of memory may move it to system RAM and \
+             slow down instead of failing"
+        );
+        return rocm_host(roots, None, ambient_hip_restriction, false);
+    }
     let gpus = match rocm::build(roots, ambient) {
-        Ok(gpus) if gpus.is_empty() => return rocm_host(roots, Some(gpus.into()), true, true),
+        Ok(gpus) if gpus.is_empty() => {
+            return rocm_host(roots, Some(gpus.into()), ambient_hip_restriction, true);
+        }
         Ok(gpus) => gpus,
         Err(failure) => {
-            if wsl {
-                tracing::warn!(
-                    "ROCm under WSL2 runs through the Windows display driver, which \
-                     exposes none of the amdgpu memory counters this host reads: models \
-                     on the GPU run without a memory ledger or batch-size calibration, \
-                     and a GPU that runs out of memory may move it to system RAM and \
-                     slow down instead of failing"
-                );
-            } else {
-                failure.log();
-            }
+            failure.log();
             return rocm_host(roots, None, ambient_hip_restriction, false);
         }
     };
@@ -2191,7 +2194,10 @@ mod tests {
             "simd_count 96\ndrm_render_minor 128\ngfx_target_version 110000\n",
         )
         .unwrap();
-        for ambient in [[None; 4], [Some(""), None, None, None]] {
+        for ambient in [
+            [None; rocm::VISIBILITY_VARS.len()],
+            [Some(""), None, None, None],
+        ] {
             let host = probe_rocm_at(&roots, ambient, false).inventory;
             assert!(host.no_visible_gpu, "{ambient:?}");
             assert_eq!(host.accelerators(), None, "{ambient:?}");
@@ -2199,6 +2205,20 @@ mod tests {
             let host = host.with_cpu(64 * 1024, cpu::MemRoots::default());
             assert_eq!(host.resolve_device_key(None).as_deref(), Some("CPU"));
         }
+    }
+
+    /// Under WSL, ROCm reaches the GPU through the Windows driver and KFD
+    /// lists nothing, so the inventory is unknown, not empty.
+    #[test]
+    fn rocm_under_wsl_leaves_the_inventory_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = rocm::SysfsRoots {
+            kfd_nodes: dir.path().join("absent"),
+            ..rocm::SysfsRoots::default()
+        };
+        let host = probe_rocm_at(&roots, [None; rocm::VISIBILITY_VARS.len()], true).inventory;
+        assert!(!host.no_visible_gpu);
+        assert_eq!(host.gpus(), None);
     }
 
     /// The dispatch itself: each accelerator gets its own backend, whatever
