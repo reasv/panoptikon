@@ -633,7 +633,7 @@ struct RamCeiling {
 
 /// What a GPU replica's batch books in host RAM ([`measurements::ram_cost`]):
 /// `startup_mb` plus the highest of the lower bound from smaller batches, the
-/// fit `fixed_mb + units × mb_per_unit` (from two sizes; held at
+/// fit `fixed_mb + units × mb_per_unit` (when fitted; held at
 /// [`Self::fitted_reach`] past it), and, past the largest batch measured, its
 /// extensions.
 #[derive(Debug, Clone, PartialEq)]
@@ -646,8 +646,8 @@ struct RamCost {
     lower_bound: Vec<FitSample>,
     /// Start-up memory a replica's first batch will add.
     startup_mb: f64,
-    /// From two sizes or more. From one size it prices item-capped windows,
-    /// and after those at most [`Self::fitted_reach`].
+    /// From a rising fit over two sizes or more. Without one it prices
+    /// item-capped windows, and after those at most [`Self::fitted_reach`].
     fitted: bool,
     /// The largest batch it was measured at.
     measured_units: u64,

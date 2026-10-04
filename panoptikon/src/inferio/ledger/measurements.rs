@@ -26,14 +26,14 @@ fn push_fit_sample(ring: &mut VecDeque<FitSample>, sample: FitSample) {
 /// The host RAM a GPU replica books, from its samples ([`RamCost`]): an upper
 /// bound at every size, since the per-unit cost varies with the input and
 /// this is a safety ceiling. The samples are measured over a level that holds
-/// what the replica's first batch (`first_units`) kept (`startup_mb`), part
+/// what the replica's first batch (`first_units`) kept (`first_kept_mb`), part
 /// of which later batches may reuse, so batches no larger than the first are
 /// left out. `None` with no sample, or a per-unit cost of 0: unknown, not
 /// free. See docs/batch-calibration-design.md, "RAM ceiling for GPU models".
 pub(super) fn ram_cost(
     samples: &[FitSample],
     first_units: u64,
-    startup_mb: u64,
+    first_kept_mb: u64,
 ) -> Option<RamCost> {
     let mut samples: Vec<FitSample> = samples
         .iter()
@@ -56,12 +56,12 @@ pub(super) fn ram_cost(
         .filter(near)
         .map(beyond_first)
         .fold(0.0, f64::max);
-    let reused_mb = (first_units as f64 * costliest).min(startup_mb as f64);
+    let reused_mb = (first_units as f64 * costliest).min(first_kept_mb as f64);
     let mut mb_per_unit = slope;
     let mut extensions = Vec::new();
     for sample in samples.iter().filter(near) {
         let (units, delta) = (sample.units as f64, sample.delta_mb as f64);
-        let past_reach = ((delta + startup_mb as f64) / units).min(beyond_first(sample));
+        let past_reach = ((delta + first_kept_mb as f64) / units).min(beyond_first(sample));
         let within_reach = if fit.is_some() {
             mb_per_unit = mb_per_unit.max((delta - fixed_mb) / units);
             (delta > fixed_mb + slope * units).then_some((delta + reused_mb) / units)
