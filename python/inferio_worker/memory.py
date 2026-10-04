@@ -342,7 +342,7 @@ def _hip_pinned() -> bool:
     return any(entry.strip() for entry in value.split(","))
 
 
-def _unified_gpu() -> bool:
+def unified_gpu() -> bool:
     """Whether this worker is on a unified-memory device. The spawner's
     `PANOPTIKON_UNIFIED_GPU=<pci address>` is checked against `_identity_bdf`.
     """
@@ -356,7 +356,7 @@ def _memory_regions() -> tuple[str, ...]:
     """DRM regions this worker's usage is summed over: VRAM, plus GTT on a
     unified-memory device (an APU spills into GTT once the carve-out fills).
     """
-    return ("vram", "gtt") if _unified_gpu() else ("vram",)
+    return ("vram", "gtt") if unified_gpu() else ("vram",)
 
 
 def pinned_device_missing() -> str | None:
@@ -867,7 +867,7 @@ def _rocm_base(
     """
     if not _is_hip(_torch()):
         return None
-    unified = _unified_gpu()
+    unified = unified_gpu()
     candidates = [(fdinfo_own_vram_mb(), "fdinfo")]
     if not unified:
         candidates.append((kfd_own_vram_mb(), "kfd"))
@@ -930,7 +930,7 @@ def amdgpu_free_total_mb(root: str | None = None) -> tuple[int | None, int | Non
     used = _sysfs_bytes(os.path.join(device, "mem_info_vram_used"))
     if total is None or used is None:
         return (None, None)
-    if _unified_gpu():
+    if unified_gpu():
         gtt_total = _sysfs_bytes(os.path.join(device, "mem_info_gtt_total"))
         gtt_used = _sysfs_bytes(os.path.join(device, "mem_info_gtt_used"))
         available = _ram_available_bytes()
@@ -950,7 +950,7 @@ def amdgpu_device_total_mb(root: str | None = None) -> int | None:
     total = _sysfs_bytes(os.path.join(device, "mem_info_vram_total"))
     if total is None:
         return None
-    if _unified_gpu():
+    if unified_gpu():
         gtt_total = _sysfs_bytes(os.path.join(device, "mem_info_gtt_total"))
         if gtt_total is None:
             return None

@@ -1384,13 +1384,14 @@ fn the_unified_pair_charges_each_others_residents() {
 }
 
 /// An APU and the CPU device draw on the same RAM: a grant on either is room
-/// the other no longer has, before any new reading.
+/// the other no longer has, before any new reading. Each grant carries its
+/// own device's reserve, which on the APU is the RAM floor, to the worker.
 #[test]
 fn an_apu_and_the_cpu_device_charge_each_others_grants() {
     const RAM: u64 = 128 * 1024 - APU_CARVEOUT_MB;
     let inventory = GpuInventory::known_rocm(vec![apu_device(0)])
         .with_cpu(RAM, crate::inferio::cpu::MemRoots::default());
-    let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+    let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
     ledger.install_probe_stub(None);
     let apu_handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
     let on_apu = ledger
@@ -1410,7 +1411,12 @@ fn an_apu_and_the_cpu_device_charge_each_others_grants() {
     push_memory_with_total(&cpu_handle, 32 * 1024, 0, Some(RAM), "ram");
     ledger.ingest_all_for_test();
 
-    for (admission, other) in [(&on_cpu, AMD_A), (&on_apu, cpu::DEVICE_KEY)] {
+    let reserve = |key: &str| device_of(&ledger.health(), key).reserve_mb;
+    assert_eq!(reserve(AMD_A), cpu::ram_reserve_mb(RAM));
+    for (admission, own, other) in [
+        (&on_cpu, cpu::DEVICE_KEY, AMD_A),
+        (&on_apu, AMD_A, cpu::DEVICE_KEY),
+    ] {
         let before = ledger.headroom_mb(other);
         let grant = admission.request_grant(64, None, 1, 0).expect("granted");
         assert!(grant.grant().mb > 0);
@@ -1419,6 +1425,7 @@ fn an_apu_and_the_cpu_device_charge_each_others_grants() {
             grant.grant().mb,
             "{other} lost the grant"
         );
+        assert_eq!(grant.grant().ram_reserve_mb, reserve(own));
         grant.finish(WindowOutcome::Responded { oom: None });
     }
 }

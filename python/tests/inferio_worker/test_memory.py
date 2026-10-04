@@ -1988,16 +1988,16 @@ def test_the_unified_signal_is_an_address_the_worker_verifies(
             with mock.patch.dict(
                 os.environ, {"PANOPTIKON_UNIFIED_GPU": value}, clear=False
             ):
-                assert memory._unified_gpu() is expected, value
+                assert memory.unified_gpu() is expected, value
                 regions = ("vram", "gtt") if expected else ("vram",)
                 assert memory._memory_regions() == regions, value
-        assert memory._unified_gpu() is False, "absent is the default everywhere"
+        assert memory.unified_gpu() is False, "absent is the default everywhere"
     # With no identity yet — the pre-load reading — the answer is discrete.
     with isolated():
         with mock.patch.dict(
             os.environ, {"PANOPTIKON_UNIFIED_GPU": "0000:03:00.0"}, clear=False
         ):
-            assert memory._unified_gpu() is False
+            assert memory.unified_gpu() is False
     # And a worker that landed on another GPU keeps the discrete currency.
     root = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 256 * MIB)})
     write_gtt(root, "0000:03:00.0", APU_GTT_MIB * MIB, 4096 * MIB)

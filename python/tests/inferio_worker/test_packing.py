@@ -922,7 +922,7 @@ def test_a_gpu_worker_keeps_the_ram_reserve_free(fake_torch):
     """A GPU worker's grant books host RAM too. Its batch is scaled by free
     RAM above the reserve against that booking, and runs at the smaller of
     this and the device's own budget. The reserve is not taken from the
-    device's free reading.
+    device's free reading, unless the device is an APU.
     """
     fake_torch.free = 8_000 * MIB
     host = {"free_mb": 20_000}
@@ -962,6 +962,11 @@ def test_a_gpu_worker_keeps_the_ram_reserve_free(fake_torch):
             grant(unit_budget=8, ram_mb=14_000, ram_reserve_mb=6_000),
         )
         assert [len(batch) for batch in model.batches] == [4, 4]
+
+    # An APU's memory is host RAM: its own reading keeps the reserve.
+    with mock.patch.object(memory, "unified_gpu", return_value=True):
+        apu = packing.clamp_to_live_memory(64, 4_000, 6_000)
+    assert apu.clamped == {"from_units": 64, "to_units": 32, "free_mb": 8_000}
 
 
 def test_an_mps_worker_credits_the_metal_pool():

@@ -875,9 +875,9 @@ def clamp_to_live_memory(
     taken even for a memory-blind grant (`mb <= 0`), so it is always reported.
 
     Free host RAM counts only above `ram_reserve_mb`, which the orchestrator
-    keeps free: in a RAM-priced worker's reading, and for a GPU worker whose
-    grant books `ram_grant_mb` of host RAM, which is scaled the same way
-    against free RAM and runs at the smaller of the two budgets.
+    keeps free: in a RAM-priced worker's reading and an APU's, and for a GPU
+    worker whose grant books `ram_grant_mb` of host RAM, which is scaled the
+    same way against free RAM and runs at the smaller of the two budgets.
     """
     reading = memory.free_total_reading()
     free_mb, free_source = reading.free_mb, reading.source
@@ -888,7 +888,9 @@ def clamp_to_live_memory(
     )
     shrunk, clamped = unit_budget, None
     if grant_mb and grant_mb > 0 and free_mb is not None:
-        reserve_mb = ram_reserve_mb if free_source == "ram" else 0
+        reserve_mb = (
+            ram_reserve_mb if free_source == "ram" or memory.unified_gpu() else 0
+        )
         pool_mb = memory.releasable_pool_mb() or 0
         held_mb = min(fixed_mb, memory.held_since_load_mb())
         spendable_mb = max(free_mb - reserve_mb, 0) + pool_mb + held_mb

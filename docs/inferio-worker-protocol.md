@@ -192,7 +192,7 @@ ignores them per the unknown-key rule and behaves exactly as before.
 | `aggregation` | `"count"` \| `"sum"` \| `"max-times-count"` — how per-item units combine into batch units |
 | `user_cap_items` | optional per-request cap on **item count** per batch (the user-facing "max batch size"). Never converted to units; enforced as an additional bound at pack time |
 | `fixed_mb` | the part of `mb` a batch costs whatever its size (the fitted cost's intercept); 0 before the cost is fitted, and absent from an older orchestrator, which means 0. The clamp scales only the rest: `unit_budget × (spendable − fixed_mb) / (mb − fixed_mb)`. What the worker still holds allocated since its load, up to `fixed_mb`, counts as spendable, because the batch does not allocate it again |
-| `ram_reserve_mb` | free host RAM the orchestrator keeps for the rest of the machine (the CPU device's reserve). The clamp counts free RAM only above it. 0 on a grant neither priced nor booked in host RAM |
+| `ram_reserve_mb` | free host RAM the orchestrator keeps for the rest of the machine (the reserve of the CPU device, or of an APU on its grants). The clamp counts free RAM only above it. 0 on a grant neither priced nor booked in host RAM |
 | `ram_mb` | host RAM a CUDA or ROCm worker's window may add to its resident set: its booking on the CPU device less the growth it already holds. 0 when nothing is booked. The clamp scales the batch by `(free RAM − ram_reserve_mb) / ram_mb` as well, and the batch runs at the smaller of the two budgets |
 | `max_tokens` | **new (2026-09-06)**: the model's *sequence window* — the most tokens of one input that ever occupy the GPU at once, whatever the input's length. Integer tokens; nil when there is none; meaningful only for a `token`-priced model. When present the worker prices every input at `min(raw_tokens, max_tokens)` before packing. Resolved and denominated exactly as `canvas_pixels` is, and on the same both-sides rule |
 | `canvas_pixels` | **new (2026-09-04)**: the model's *canvas* — the largest number of decoded pixels one input can actually cost it, whatever resolution the input was submitted at. Integer pixels; nil when there is none; meaningful only for a `pixel`-priced model. When present the worker prices every input at `min(raw_pixels, canvas_pixels)` before packing. It is the figure the orchestrator resolved for this model — `metadata.cost.canvas_pixels` from the registry, else the canvas the worker itself reported on its `load` response — and it is what the orchestrator's *own* window pricing used, so both sides denominate one quantity |
@@ -493,8 +493,9 @@ arithmetic. Nothing is credited on a `"ram"` host, where the "pool" is the OS
 high-water and a freed page is already in the free reading; there the free
 reading counts only above `grant.ram_reserve_mb`
 (`spendable = free − reserve + pool`), so a batch cannot take the RAM the
-ledger left free. A GPU worker's own free reading is the device's and has no
-reserve taken from it; its host RAM is checked separately against
+ledger left free, and an APU's reading, which is host RAM too, counts only
+above it as well. A discrete GPU worker's own free reading is the device's and
+has no reserve taken from it; its host RAM is checked separately against
 `grant.ram_mb`, and a batch that check shrank reports
 `clamped.reason = "host_ram"`. Uncredited, the
 clamp shrank 120 of 123 batches per job on an M3 Max holding 20–47 GiB of
