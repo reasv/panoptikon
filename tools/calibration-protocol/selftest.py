@@ -154,7 +154,7 @@ FREE_TIERS = ("ram", "nvml", "amdgpu-sysfs", "mps", "torch")
 # Base tiers that measure *this process* directly, as opposed to inferring it
 # from a driver-level delta. A `base_method` outside this set is a degraded
 # path.
-DIRECT_BASE_METHODS = ("nvml", "fdinfo", "mps", "rss")
+DIRECT_BASE_METHODS = ("nvml", "kfd", "fdinfo", "mps", "rss")
 
 
 # --- loading the sibling tools and the worker ------------------------------
@@ -321,8 +321,10 @@ def probe_base_tiers(
     except Exception as exc:  # pragma: no cover - defensive
         row("nvml", None, f"raised {type(exc).__name__}: {exc}"[:200])
     try:
-        row("fdinfo", memory._fdinfo_base_mb(reserved_mb, reserved_delta),
-            "no DRM fdinfo VRAM figure for this process (not a ROCm host)")
+        rocm = memory._rocm_base(reserved_mb, reserved_delta)
+        row(rocm[1] if rocm else "fdinfo", rocm[0] if rocm else None,
+            "no plausible KFD or DRM fdinfo VRAM figure for this process "
+            "(not a ROCm host)")
     except Exception as exc:  # pragma: no cover - defensive
         row("fdinfo", None, f"raised {type(exc).__name__}: {exc}"[:200])
     try:

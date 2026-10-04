@@ -515,6 +515,19 @@ def test_selftest_pins_like_the_spawner(tmp_path):
     assert selftest.rocm_pin(5, {}, host.roots) == {}
 
 
+def test_selftest_asks_every_base_tier_of_the_worker(monkeypatch):
+    # The tiers are the worker's own private functions; a renamed one would
+    # only show as an except arm's "raised" reason.
+    monkeypatch.syspath_prepend(str(HERE.parents[1] / "python"))
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    from inferio_worker import memory
+
+    monkeypatch.setitem(memory._nvml_state, "module_tried", True)
+    monkeypatch.setitem(memory._nvml_state, "module", None)
+    rows = selftest.probe_base_tiers(memory, {}, 1024, 1024, 1024)
+    assert [r["reason"] for r in rows if "raised" in (r["reason"] or "")] == []
+
+
 def test_newrun_records_the_gpu_nodes(tmp_path):
     host = Host(tmp_path).gpu(1, 0x0300).gpu(2, 0x0C00, openable=False)
     facts = newrun.rocm_facts(host.roots, module=str(tmp_path / "absent"))
