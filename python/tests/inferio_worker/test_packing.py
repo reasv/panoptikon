@@ -1002,10 +1002,14 @@ def test_paging_during_a_long_batch_cuts_the_next_one():
         mock.patch("time.monotonic", side_effect=lambda: 1000.0 + clock[0]),
         mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN),
     ):
-        payload = packing.run_window(Slow(), items(16), grant(unit_budget=8, mb=4000))
+        payload = packing.run_window(
+            Slow(), items(16), grant(unit_budget=8, mb=4000)
+        )
         memory.count_paging_from_last_reading(False)
         clock[0] = 400
-        next_window = packing.run_window(Slow(), items(8), grant(unit_budget=8, mb=4000))
+        next_window = packing.run_window(
+            Slow(), items(8), grant(unit_budget=8, mb=4000)
+        )
     first, cut, after = payload["measurements"]
     assert (first["items"], cut["items"], after["items"]) == (8, 4, 4)
     assert cut["free_mb"] == 0

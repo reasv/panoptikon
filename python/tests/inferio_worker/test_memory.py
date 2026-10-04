@@ -2139,7 +2139,7 @@ def test_nothing_is_available_while_the_mac_pages_under_pressure() -> None:
         assert available == expected, (level, paging)
 
 
-NO_SWAPOUTS_SEEN = {"count": None, "read_at": None, "rose_after": None, "since": None}
+NO_SWAPOUTS_SEEN = dict.fromkeys(("count", "read_at", "rose_after", "since"))
 
 
 def paging_at(seconds: float, swapouts: int) -> bool:
