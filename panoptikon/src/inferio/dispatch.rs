@@ -2331,35 +2331,6 @@ mod tests {
         }
     }
 
-    /// A release a batch size trial left pending runs when the replica's
-    /// window returns, and the replica keeps serving.
-    #[tokio::test]
-    async fn a_trial_trim_runs_when_the_window_returns() {
-        let harness = one_replica(32_768, "echo_test", item_cost(4)).await;
-        harness
-            .ledger
-            .trial_trim_for_test(harness.worker_id, Some(true));
-        for text in ["before", "after"] {
-            let outputs = harness
-                .predict(
-                    vec![WorkerInput {
-                        data: Some(json!(text)),
-                        file: None,
-                    }],
-                    None,
-                )
-                .await
-                .expect("served");
-            assert_eq!(outputs[0], WorkerOutput::Json(json!({"echo": text})));
-        }
-        assert!(
-            !harness.ledger.trial_trim_for_test(harness.worker_id, None),
-            "taken at the first window's return"
-        );
-        assert_eq!(harness.stats.total_batches.load(Relaxed), 2);
-        harness.shutdown().await;
-    }
-
     /// A release that comes due with the queue empty, a run that ended
     /// inside a batch size trial, runs on the free replica, which keeps
     /// serving.
@@ -2399,49 +2370,62 @@ mod tests {
         harness.shutdown().await;
     }
 
-    /// With work queued behind the window the release runs all the same,
-    /// before the next window: the second request is served by a replica
-    /// that has answered the trim.
+    /// A release a batch size trial left pending runs when the replica's
+    /// window returns, before the next queued window: the second request is
+    /// served by a replica that has answered the trim. Each window holds its
+    /// reply until the test opens its gate, so the order of the steps is fixed.
     #[tokio::test]
     async fn a_trial_trim_runs_before_the_next_queued_window() {
         let harness = one_replica(32_768, "slow_test", item_cost(4)).await;
-        harness
-            .ledger
-            .trial_trim_for_test(harness.worker_id, Some(true));
-        let send = || {
+        let gates = tempfile::tempdir().unwrap();
+        let send = |gate: &str| {
             let (reply, answer) = oneshot::channel();
+            let gate = gates.path().join(gate);
             harness
                 .tx
                 .send(DispatchMsg::Predict(DispatchRequest {
                     inputs: vec![WorkerInput {
-                        data: Some(json!("slow")),
+                        data: Some(json!({ "wait_for": gate })),
                         file: None,
                     }],
                     max_batch: None,
                     reply,
                 }))
                 .expect("queued");
-            answer
+            (answer, gate)
         };
-        let first = send();
-        // The second arrives while the first holds the only replica.
-        while harness.stats.in_flight_windows.load(Relaxed) == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let second = send();
-        for answer in [first, second] {
-            answer
-                .await
-                .expect("the dispatcher replied")
-                .expect("served");
-        }
-        let served = std::time::Instant::now();
-        let trimmed = harness
+        let until = async |done: &dyn Fn() -> bool| {
+            timeout(Duration::from_secs(30), async {
+                while !done() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the dispatcher never reached the awaited state");
+        };
+        let stats = &harness.stats;
+        let (first, first_gate) = send("first");
+        until(&|| stats.in_flight_windows.load(Relaxed) == 1).await;
+        // Set while the window runs, as a trial does: an idle replica would
+        // take it at once.
+        harness
             .ledger
-            .last_trim_for_test(harness.worker_id)
-            .expect("trimmed");
-        assert!(trimmed < served);
-        assert_eq!(harness.stats.total_batches.load(Relaxed), 2);
+            .trial_trim_for_test(harness.worker_id, Some(true));
+        // The second is queued while the first holds the only replica.
+        let (second, second_gate) = send("second");
+        until(&|| stats.queue_len.load(Relaxed) == 1).await;
+        std::fs::write(first_gate, "").unwrap();
+        first.await.unwrap().expect("served");
+        until(&|| stats.total_batches.load(Relaxed) == 2).await;
+        assert!(
+            harness
+                .ledger
+                .last_trim_for_test(harness.worker_id)
+                .is_some(),
+            "the second window started before the trim"
+        );
+        std::fs::write(second_gate, "").unwrap();
+        second.await.unwrap().expect("served");
         harness.shutdown().await;
     }
 
