@@ -1751,12 +1751,21 @@ fn an_apu_counts_in_host_ram_beyond_the_carve_out_it_can_use() {
         let on_apu = ledger
             .register_worker("g/apu", item_cost(4), &handle, None)
             .expect("admitted on the APU");
+        // Without the GTT terms (a torch reading) all of the APU's charge
+        // comes off the CPU device's room.
+        push_pool(&handle, ram, pool, pool, "torch");
+        ledger.ingest_all_for_test();
+        let charges = || device_of(&ledger.health(), AMD_A).charges_mb;
+        let health = ledger.health();
+        let row = device_of(&health, cpu::DEVICE_KEY);
+        let left = (row.total_mb - row.external_mb - row.reserve_mb).saturating_sub(charges());
+        assert_eq!(row.headroom_mb, left, "{carveout}");
+
         let vram_free = carveout - others - 1_000 - pool;
         push_apu(&handle, vram_free, gtt, ram, pool);
         ledger.ingest_all_for_test();
         assert_eq!(ledger.headroom_mb(cpu::DEVICE_KEY), before, "{carveout}");
 
-        let charges = || device_of(&ledger.health(), AMD_A).charges_mb;
         let charged = charges();
         let _grant = on_apu.request_grant(64, None, 1, 0).expect("granted");
         let added = charges() - charged;
