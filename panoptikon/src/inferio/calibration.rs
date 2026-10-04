@@ -2055,22 +2055,20 @@ sample_delta_mb = [80, 160]
             waited += Duration::from_millis(20);
         }
         assert!(path.exists(), "the first update reaches disk");
-        assert!(fs::read_to_string(&path).unwrap().contains("0.79"));
+        let on_disk = || read_file(&path).unwrap()[0].slope_mb_per_unit;
+        approx(on_disk(), 0.79);
 
         // The next one is inside the debounce window: in memory now, on disk
         // later.
         store.record(update("clip/vit", "fp16", 0.5));
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !fs::read_to_string(&path).unwrap().contains("0.5"),
-            "the second update is still behind the debounce"
-        );
+        approx(on_disk(), 0.79);
         // ...but it is what the ledger reads back.
         approx(lookup(&store, "clip/vit").unwrap().slope_mb_per_unit, 0.5);
 
         // Shutdown does not wait out the debounce.
         CalibrationProfiles::flush(store.as_ref());
-        assert!(fs::read_to_string(&path).unwrap().contains("0.5"));
+        approx(on_disk(), 0.5);
     }
 
     fn registry_with(toml: &str) -> (Registry, tempfile::TempDir) {

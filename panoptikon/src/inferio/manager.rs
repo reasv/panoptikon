@@ -2759,17 +2759,23 @@ metadata.cost.seed_units = 1000000
             waited += Duration::from_millis(20);
         }
         assert!(path.exists(), "the first update reaches disk");
+        let slope_on_disk = || {
+            let file: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            file["profile"][0]["slope_mb_per_unit"].as_float()
+        };
 
         // The second is an hour behind the debounce — only a flush saves it.
         store.record(update(0.75));
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !fs::read_to_string(&path).unwrap().contains("0.75"),
+        assert_eq!(
+            slope_on_disk(),
+            Some(0.25),
             "still waiting out the debounce"
         );
         setup.manager.shutdown().await;
-        assert!(
-            fs::read_to_string(&path).unwrap().contains("0.75"),
+        assert_eq!(
+            slope_on_disk(),
+            Some(0.75),
             "the quit flushed what the debounce was holding"
         );
     }
