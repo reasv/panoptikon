@@ -1941,6 +1941,7 @@ def mps_host(
         max(0, ram_mb - available_mb) * MIB,
         pressure,
         0,
+        0,
     )
     memory_info = SimpleNamespace(total=ram_mb * MIB, available=7 * MIB)
     with isolated(fake_mps_torch_module(mps)), mac_counters(counters, paging):
@@ -2065,12 +2066,14 @@ def available_mb(
     anonymous_mb: int,
     pressure: int = 1,
     paging: bool = False,
+    file_backed_mb: int = 0,
 ) -> int:
     """`mac_available_bytes` over one set of counters, in MiB."""
     counters = (
         *(value * MIB for value in (ram_mb, wired_mb, compressed_mb, anonymous_mb)),
         pressure,
         0,
+        file_backed_mb * MIB,
     )
     with mac_counters(counters, paging):
         available = memory.mac_available_bytes()
@@ -2123,19 +2126,21 @@ def test_the_mac_reading_falls_with_this_processs_own_allocation() -> None:
 
 
 def test_nothing_is_available_while_the_mac_pages_under_pressure() -> None:
-    """At critical (4), or at warning (2) while it is paging, macOS keeps
-    several GiB of file cache that the formula counts as available: 9 963 MiB
-    here. Warning without paging only means memory is held compressed."""
+    """Nothing at critical (4), or at warning (2) while it is paging. Warning
+    without paging takes the ~9 GiB of file cache macOS kept out of the
+    formula's 9 963 MiB."""
     for level, paging, expected in [
         (1, False, 9_963),
         (1, True, 9_963),
-        (2, False, 9_963),
+        (2, False, 963),
         (2, True, 0),
         (3, True, 0),
         (4, False, 0),
         (4, True, 0),
     ]:
-        available = available_mb(131_072, 5_189, 55_599, 60_321, level, paging)
+        available = available_mb(
+            131_072, 5_189, 55_599, 60_321, level, paging, file_backed_mb=9_000
+        )
         assert available == expected, (level, paging)
 
 
@@ -2194,7 +2199,7 @@ def test_the_swap_out_counter_is_followed_at_every_pressure_level() -> None:
     """A reading at normal is the one the next is compared with, so paging
     that starts as the level turns to warning is seen at once."""
     def available(seconds: int, level: int, swapouts: int) -> int | None:
-        counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, level, swapouts)
+        counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, level, swapouts, 0)
         with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
             with mock.patch("time.monotonic", return_value=1000.0 + seconds):
                 return memory.mac_available_bytes()
@@ -2205,11 +2210,12 @@ def test_the_swap_out_counter_is_followed_at_every_pressure_level() -> None:
 
 
 def test_the_vm_statistics_fields_are_read_at_their_positions() -> None:
-    # wire_count, compressor_page_count, internal_page_count and swapouts:
+    # wire_count, compressor_page_count, internal_page_count, swapouts and
+    # external_page_count:
     # each value is its own 1-based position in `vm_statistics64_data_t`
     # (<mach/vm_statistics.h>).
     raw = struct.pack("@4I9Q2I4Q4IQ", *range(1, 25))
-    assert memory._vm_statistics(raw) == (4, 20, 23, 19)
+    assert memory._vm_statistics(raw) == (4, 20, 23, 19, 22)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="vm_stat is macOS's")
@@ -2253,7 +2259,7 @@ def test_while_the_mac_pages_an_mps_batch_fits_the_pool_it_holds() -> None:
 
 def test_while_the_mac_pages_a_cpu_worker_on_it_has_nothing_free() -> None:
     """A CPU replica draws from the same RAM as Metal, so the same reading."""
-    counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 4, 0)
+    counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 4, 0, 0)
     memory_info = SimpleNamespace(total=128 * 1024 * MIB, available=40 * 1024 * MIB)
     with mac_counters(counters):
         with mock.patch("psutil.virtual_memory", return_value=memory_info):
@@ -3424,7 +3430,7 @@ def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:
     with mps_host(available_mb=40 * 1024):
         with mock.patch.object(
             memory, "_mac_memory_counters",
-            side_effect=[(128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 1, 0)],
+            side_effect=[(128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 1, 0, 0)],
         ) as counters:
             reading = memory.free_total_reading()
         assert counters.call_count == 1, "one read, not one per term"

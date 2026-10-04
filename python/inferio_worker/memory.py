@@ -965,20 +965,23 @@ def mac_available_bytes() -> int | None:
     return _mac_available(facts)
 
 
-def _mac_available(facts: tuple[int, int, int, int, int, int]) -> int:
-    """Total RAM minus wired, compressed and anonymous pages; 0 at critical
-    memory pressure, and at warning while the kernel is paging
-    (`_mac_paging`): the file cache this formula counts as available is not
-    free then. Warning without paging only means memory is held compressed.
-    Same as `mps.rs::available_bytes`.
+def _mac_available(facts: tuple[int, ...]) -> int:
+    """Total RAM minus wired, compressed and anonymous pages, and at warning
+    the file cache too: macOS then makes room by compressing and swapping
+    other memory, not only by dropping it. 0 at critical memory pressure, and
+    at warning while the kernel is paging (`_mac_paging`). Same as
+    `mps.rs::available_bytes`.
     """
-    ram, wired, compressed, anonymous, pressure, swapouts = facts
+    ram, wired, compressed, anonymous, pressure, swapouts, file_backed = facts
     paging = _mac_paging(swapouts)
     if pressure >= MAC_PRESSURE_CRITICAL:
         return 0
     if pressure >= MAC_PRESSURE_WARNING and paging:
         return 0
-    return max(0, ram - wired - compressed - anonymous)
+    taken = wired + compressed + anonymous
+    if pressure >= MAC_PRESSURE_WARNING:
+        taken += file_backed
+    return max(0, ram - taken)
 
 
 def _mac_paging(swapouts: int) -> bool:
@@ -1009,9 +1012,11 @@ def count_paging_from_last_reading(counted: bool) -> None:
 
 # `vm_statistics64_data_t` (<mach/vm_statistics.h>) layout and the flavour
 # that fills it. Indexes: `wire_count`, `swapouts`, `compressor_page_count`,
-# `internal_page_count` (pageable anonymous pages, so wired are not counted).
+# `external_page_count` (the file cache) and `internal_page_count` (pageable
+# anonymous pages, so wired are not counted).
 _VM_STATISTICS64 = "@4I9Q2I4Q4IQ"
-_VM_WIRE, _VM_SWAPOUTS, _VM_COMPRESSOR, _VM_INTERNAL = 3, 18, 19, 22
+_VM_WIRE, _VM_SWAPOUTS, _VM_COMPRESSOR = 3, 18, 19
+_VM_EXTERNAL, _VM_INTERNAL = 21, 22
 _HOST_VM_INFO64 = 4
 
 # `kern.memorystatus_vm_pressure_level` values.
@@ -1038,9 +1043,10 @@ def _mac_pressure_level() -> int:
     return level or MAC_PRESSURE_NORMAL
 
 
-def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
-    """`(ram, wired, compressed, anonymous)` bytes, the memory pressure level
-    and the pages swapped out since boot, from macOS; or None.
+def _mac_memory_counters() -> tuple[int, ...] | None:
+    """`(ram, wired, compressed, anonymous)` bytes, the memory pressure level,
+    the pages swapped out since boot and the file cache in bytes, from macOS;
+    or None.
     """
     if sys.platform != "darwin":
         return None
@@ -1063,25 +1069,36 @@ def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
         )
         if failed:
             return None
-        wired, compressed, anonymous, swapouts = _vm_statistics(buffer.raw)
+        wired, compressed, anonymous, swapouts, file_backed = _vm_statistics(
+            buffer.raw
+        )
         page = os.sysconf("SC_PAGE_SIZE")
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("macOS memory counters unreadable: %s", exc)
         return None
     if not isinstance(page, int) or page <= 0:
         return None
-    return (ram, wired * page, compressed * page, anonymous * page, pressure, swapouts)
+    return (
+        ram,
+        wired * page,
+        compressed * page,
+        anonymous * page,
+        pressure,
+        swapouts,
+        file_backed * page,
+    )
 
 
-def _vm_statistics(raw: bytes) -> tuple[int, int, int, int]:
-    """`(wire_count, compressor_page_count, internal_page_count, swapouts)`
-    from a packed `vm_statistics64_data_t`."""
+def _vm_statistics(raw: bytes) -> tuple[int, int, int, int, int]:
+    """`(wire_count, compressor_page_count, internal_page_count, swapouts,
+    external_page_count)` from a packed `vm_statistics64_data_t`."""
     stats = struct.unpack(_VM_STATISTICS64, raw)
     return (
         stats[_VM_WIRE],
         stats[_VM_COMPRESSOR],
         stats[_VM_INTERNAL],
         stats[_VM_SWAPOUTS],
+        stats[_VM_EXTERNAL],
     )
 
 

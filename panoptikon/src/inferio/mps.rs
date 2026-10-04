@@ -181,6 +181,8 @@ pub(super) struct MemoryFacts {
     pub compressed: u64,
     /// `internal_page_count`: anonymous pageable pages, wired ones excluded.
     pub anonymous: u64,
+    /// `external_page_count`: the file cache.
+    pub file_backed: u64,
     /// Read with the counters.
     pub pressure: MemoryPressure,
 }
@@ -298,23 +300,27 @@ fn start_following_swapouts() {
 }
 
 /// RAM a new allocation could get: RAM minus wired, compressed and anonymous
-/// pages (Activity Monitor's "used"). File cache counts as available. Must
-/// not use `free + inactive`: macOS moves pages another process still holds
-/// onto the inactive queue, so that figure rises without anything freed.
+/// pages (Activity Monitor's "used"). File cache counts as available at
+/// normal pressure. Must not use `free + inactive`: macOS moves pages
+/// another process still holds onto the inactive queue, so that figure rises
+/// without anything freed.
 ///
-/// 0 while the kernel is paging ([`MemoryPressure::paging`]): it keeps
-/// several GiB of file cache while it swaps, which this formula would still
-/// count as available. Warning without paging only means memory is held
-/// compressed, and the formula stands.
+/// At warning the file cache is taken too: macOS then makes room by
+/// compressing and swapping other memory, not only by dropping it. 0 while
+/// the kernel is paging ([`MemoryPressure::paging`]): it keeps several GiB
+/// of file cache while it swaps.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn available_bytes(facts: &MemoryFacts) -> u64 {
     if facts.pressure.paging() {
         return 0;
     }
-    let taken = facts
+    let mut taken = facts
         .wired
         .saturating_add(facts.compressed)
         .saturating_add(facts.anonymous);
+    if facts.pressure == MemoryPressure::Warning {
+        taken = taken.saturating_add(facts.file_backed);
+    }
     facts.ram.saturating_sub(taken)
 }
 
@@ -466,6 +472,7 @@ mod sys {
             wired: pages(stats.wire_count),
             compressed: pages(stats.compressor_page_count),
             anonymous: pages(stats.internal_page_count),
+            file_backed: pages(stats.external_page_count),
             pressure,
         })
     }
@@ -544,6 +551,7 @@ mod tests {
             wired: wired_mb * MIB,
             compressed: compressed_mb * MIB,
             anonymous: anonymous_mb * MIB,
+            file_backed: 0,
             pressure: MemoryPressure::Normal,
         }
     }
@@ -564,19 +572,22 @@ mod tests {
     }
 
     /// Nothing is available at critical pressure, or at warning while the
-    /// kernel is paging; warning without paging leaves the formula's figure,
-    /// here the ~9 GiB of file cache macOS kept.
+    /// kernel is paging. Warning without paging takes the ~9 GiB of file
+    /// cache macOS kept out of the formula's figure.
     #[test]
     fn nothing_is_available_while_the_kernel_pages_under_pressure() {
         use MemoryPressure::{Critical, Normal, Paging, Warning};
-        let counters = facts_mb(5_189, 55_599, 60_321);
+        let counters = MemoryFacts {
+            file_backed: 9_000 * MIB,
+            ..facts_mb(5_189, 55_599, 60_321)
+        };
         for (level, paging, pressure, available) in [
             (0, true, Normal, 9_963),
             (1, false, Normal, 9_963),
             (1, true, Normal, 9_963),
-            (2, false, Warning, 9_963),
+            (2, false, Warning, 963),
             (2, true, Paging, 0),
-            (3, false, Warning, 9_963),
+            (3, false, Warning, 963),
             (3, true, Paging, 0),
             (4, false, Critical, 0),
             (4, true, Critical, 0),

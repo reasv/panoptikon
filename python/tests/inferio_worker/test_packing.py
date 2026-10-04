@@ -987,7 +987,7 @@ def test_paging_during_a_long_batch_cuts_the_next_one():
 
     def counters():
         swapouts = 500 + 100 * (clock[0] >= 5) + 100 * (clock[0] >= 300)
-        return (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 2, swapouts)
+        return (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 2, swapouts, 0)
 
     class Slow:
         def predict(self, inputs):

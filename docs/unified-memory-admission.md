@@ -301,7 +301,10 @@ Single synthetic device:
     which reads the same 0, cuts each batch to the pool it holds
     (`releasable_pool_mb`); a replica with no pool runs one unit. A squeezed
     grant asks idle residents for their pools (the trim path).
-  - **Warning: the formula stands.**
+  - **Warning: the file cache is taken too** (`external_page_count`). At
+    warning macOS makes room by compressing and swapping other processes'
+    memory, not only by dropping clean file pages, so a grant priced on the
+    file cache swaps someone else out.
   - **Any window above normal** (the ledger reads `MemoryPressure` itself at
     grant and at settle and keeps the higher) earns no ramp step, feeds no
     knee, does not count as the size the ramp reached or toward a knee's

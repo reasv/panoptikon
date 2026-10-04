@@ -861,9 +861,11 @@ exists minus the RAM the kernel says is held: `hw.memsize − wired −
 compressor − anonymous pageable`, from `host_statistics64`'s `wire_count`,
 `compressor_page_count` and `internal_page_count` (the last being
 `vm.page_pageable_internal_count`, which excludes wired pages). That is what
-Activity Monitor calls used. The file-backed cache is left counted as
-available — the kernel drops clean file pages on demand — and purgeable pages
-counted as taken, the conservative side. The RAM term is the load-bearing
+Activity Monitor calls used. The file-backed cache (`external_page_count`) is
+left counted as available at normal pressure — the kernel drops clean file
+pages on demand — but taken at warning, where macOS makes room by compressing
+and swapping other memory; purgeable pages are counted as taken, the
+conservative side. The RAM term is the load-bearing
 part: the memory is the whole machine's, so external pressure has to be read
 from the OS — there is no accelerator-level free counter on that GPU at all —
 and a browser eating 40 GB then shows up exactly the way a game eating VRAM
