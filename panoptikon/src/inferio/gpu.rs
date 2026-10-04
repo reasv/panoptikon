@@ -364,7 +364,11 @@ fn probe_rocm() -> HostGpus {
         return rocm_host(&roots, None, false, false);
     }
     let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
-    probe_rocm_at(&roots, ambient.each_ref().map(Option::as_deref), under_wsl())
+    probe_rocm_at(
+        &roots,
+        ambient.each_ref().map(Option::as_deref),
+        under_wsl(),
+    )
 }
 
 /// This process runs under WSL2, where GPUs are reached through the Windows
