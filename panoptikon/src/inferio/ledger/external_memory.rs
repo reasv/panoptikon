@@ -106,7 +106,9 @@ impl VramLedger {
     pub(super) fn memory_pressure(&self) -> mps::MemoryPressure {
         #[cfg(test)]
         {
-            self.lock().pressure_stub
+            let mut state = self.lock();
+            state.pressure_read_at = Some(Instant::now());
+            state.pressure_stub
         }
         #[cfg(not(test))]
         {
@@ -115,12 +117,17 @@ impl VramLedger {
     }
 
     /// [`Self::memory_pressure`], also paging when the swap-out counter rose
-    /// after `since`; the same stub in tests.
+    /// after `since`; in tests, paging when the test's rise is at or after
+    /// `since`, else the stub.
     pub(super) fn memory_pressure_since(&self, since: Instant) -> mps::MemoryPressure {
         #[cfg(test)]
         {
-            let _ = since;
-            self.lock().pressure_stub
+            let state = self.lock();
+            if state.paging_rose_at.is_some_and(|at| at >= since) {
+                mps::MemoryPressure::Paging
+            } else {
+                state.pressure_stub
+            }
         }
         #[cfg(not(test))]
         {

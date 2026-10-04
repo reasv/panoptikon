@@ -75,6 +75,8 @@ impl VramLedger {
         queued_behind: usize,
         byte_bound: bool,
     ) -> Option<GrantToken> {
+        // Before the pressure reading, so settle counts paging from it on.
+        let granted_at = Instant::now();
         let pressure = self.memory_pressure();
         // Fold in neighbours' per-batch pool growth before pricing, or it reads
         // as external usage. Before the probe, which reads the same clock.
@@ -256,7 +258,7 @@ impl VramLedger {
                     requests: window_requests,
                     unit_budget,
                     size_asked,
-                    granted_at: Instant::now(),
+                    granted_at,
                     squeezed,
                     room_bound,
                     peak_occupants: 0,

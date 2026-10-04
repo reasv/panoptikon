@@ -277,8 +277,8 @@ Single synthetic device:
   per process). A rise is dated by the earlier reading of the pair
   that saw it, since it happened after that reading. Paging is a rise within
   the 10 s before now (`PAGING_WINDOW` / `MAC_PAGING_SECONDS`) or after a
-  given instant: the gateway settles a window with the instant it was
-  granted, and a worker reads before each batch with the reading its
+  given instant: the gateway settles a window with the instant its grant
+  began, before the grant's own reading, and a worker reads before each batch with the reading its
   window's previous batch started from, so a batch longer than 10 s still
   counts paging that began during it and a window's first batch does not
   count swap-outs from the idle time before it. The gateway also reads the

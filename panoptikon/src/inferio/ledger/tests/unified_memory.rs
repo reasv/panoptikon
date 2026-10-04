@@ -1884,6 +1884,28 @@ fn the_bound_of_a_one_unit_batch_is_one_unit() {
     );
 }
 
+/// Paging that began as the grant read the pressure counts at settle: the
+/// window is a paging window.
+#[test]
+fn paging_that_began_at_the_grants_own_reading_counts_at_settle() {
+    let ledger = mps_ledger();
+    let handle = loaded_mps(Some(MAC_TOTAL_MB));
+    let admission = ledger
+        .register_worker("g/a", item_cost(1), &handle, None)
+        .expect("registers");
+    push_ram(&handle, MAC_TOTAL_MB, 0, 0, 0);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    ledger.set_paging_rise_for_test(ledger.pressure_read_at_for_test());
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![measurement(1, 0, 10)]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    assert!(pressure_cap(&ledger).is_some_and(|cap| cap.paging));
+}
+
 /// The size paging left belongs to the model on the device, so a replica
 /// loaded afterwards runs what the one that lived through it runs.
 #[test]

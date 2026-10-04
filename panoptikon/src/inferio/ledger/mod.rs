@@ -585,8 +585,9 @@ struct GrantCharge {
     /// The batch size the gain rule asked for this window
     /// ([`VramLedger::size_locked`]), before anything cut it.
     size_asked: u64,
-    /// When the grant was issued: a throughput sample is charged its share
-    /// of the time from here to the settle.
+    /// When the grant began, before its pressure reading: a throughput
+    /// sample is charged its share of the time from here to the settle, and
+    /// settle counts paging from here on.
     granted_at: Instant,
     /// Memory held this window back ([`Grant::squeezed`]).
     squeezed: bool,
@@ -1445,6 +1446,12 @@ struct LedgerState {
     /// Test seam for [`VramLedger::memory_pressure`].
     #[cfg(test)]
     pressure_stub: mps::MemoryPressure,
+    /// When [`VramLedger::memory_pressure`] was last called.
+    #[cfg(test)]
+    pressure_read_at: Option<Instant>,
+    /// The swap-out rise [`VramLedger::memory_pressure_since`] answers from.
+    #[cfg(test)]
+    paging_rose_at: Option<Instant>,
 }
 
 /// The fake host probe a test installs (see [`LedgerState::probe_stub`]).
