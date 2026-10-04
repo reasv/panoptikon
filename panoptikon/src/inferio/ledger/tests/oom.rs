@@ -1858,9 +1858,9 @@ fn a_spill_or_collapse_at_the_rooms_limit_leaves_the_pool_margin() {
 
 /// Host RAM running out, read from the error frame or from a batch's class,
 /// is no out-of-memory of a GPU with its own memory: at the room's limit it
-/// deflates nothing and leaves the pool margin; it moves no item cap, warm-up
-/// count or anchor; one-item windows condemn nothing, nor clear the count of
-/// out-of-memory windows at the floor. On the CPU device and on a GPU that
+/// deflates nothing, repays no deflation and leaves the pool margin; it moves
+/// no item cap, warm-up count or anchor; one-item windows condemn nothing, nor
+/// clear the count of out-of-memory windows at the floor. On the CPU device and on a GPU that
 /// shares host RAM, it is a negative.
 #[test]
 fn host_ram_running_out_is_no_out_of_memory_of_a_gpu() {
@@ -1903,6 +1903,16 @@ fn host_ram_running_out_is_no_out_of_memory_of_a_gpu() {
         );
         assert_eq!(window.deflation, 0);
         assert_eq!(margin_steps(&limit, "g/a", GPU), 0);
+    }
+    // Nor do host-RAM windows repay a deflation.
+    let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+    token.finish(OUT_OF_MEMORY);
+    for window in 0..CLEAN_WINDOWS_TO_RESTORE {
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let settled = fail(&handle, token, window % 2 == 1)
+            .window
+            .expect("settled");
+        assert_eq!(settled.deflation, 1);
     }
 
     // A clean batch at a seeded anchor, then host RAM ran out: the anchor is

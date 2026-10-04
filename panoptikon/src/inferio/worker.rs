@@ -1810,9 +1810,7 @@ fn record_memory_frame(telemetry: &TelemetryHandle, frame: &Value) {
         if let Some(sample) = sample {
             telemetry.memory = Some(Timestamped::now(sample));
         }
-        if units.is_some() {
-            telemetry.batch_units = units;
-        }
+        telemetry.batch_units = units;
     }
 }
 

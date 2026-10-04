@@ -1026,11 +1026,7 @@ async fn run_batch_inner(
                     Err(individual_err) => {
                         let fatal = individual_err.downcast_ref::<WorkerError>().is_none();
                         let settle = fatal_settlement(worker);
-                        // A device's out-of-memory outranks host RAM's.
-                        oom = match (oom, error_reports_oom(&individual_err)) {
-                            (None | Some(ErrorFrameOom::HostRam), Some(later)) => Some(later),
-                            (kept, _) => kept,
-                        };
+                        oom = oom.or(error_reports_oom(&individual_err));
                         let message = format!("{individual_err:#}");
                         let _ = request.reply.send(Err(individual_err));
                         if fatal {

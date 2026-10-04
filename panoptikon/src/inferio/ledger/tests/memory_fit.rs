@@ -393,6 +393,11 @@ fn an_undelivered_fit_is_re_sent_on_the_next_window() {
         oom: Some(ErrorFrameOom::Prose),
     });
     assert!(admission.fit_to_send().is_some());
+    let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+    token.finish(WindowOutcome::Responded {
+        oom: Some(ErrorFrameOom::HostRam),
+    });
+    assert!(admission.fit_to_send().is_some());
 }
 
 /// A replica of `model` whose batches allocate `fixed_mb + per_unit_mb ×
