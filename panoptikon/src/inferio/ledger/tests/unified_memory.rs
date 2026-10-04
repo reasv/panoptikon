@@ -1900,6 +1900,11 @@ fn a_load_under_memory_pressure_warns_once_per_model_and_episode() {
     );
     assert_eq!(warnings(Normal, 90_000, MPS_GPU, &["g/a"]), 0);
     assert_eq!(
+        warnings(Normal, 0, MPS_GPU, &["g/a"]),
+        1,
+        "over the headroom"
+    );
+    assert_eq!(
         warnings(Warning, 500, MPS_GPU, &["g/a", "g/a", "g/a"]),
         1,
         "a new episode, short of free pages"
