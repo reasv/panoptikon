@@ -163,6 +163,9 @@ pub struct InferioState {
     pub registry: Arc<StdMutex<RegistryCache>>,
     /// Probed at startup; drives the `/metadata` availability overlay.
     pub compute_caps: super::capability::HostComputeCaps,
+    /// The backend models run on by default (`cuda`, `rocm`, `mps`, `cpu`),
+    /// for the same overlay.
+    pub worker_backend: &'static str,
     /// Calibration profiles for the `/metadata` overlay; also the ledger's.
     pub calibration: Option<Arc<super::calibration::CalibrationStore>>,
     /// Model name of the default GPU; `None` (no overlay) without inventory.
@@ -244,6 +247,13 @@ impl InferioState {
                 generator: format!("panoptikon {}", crate::resources::VERSION),
             },
         );
+        // The CPU on a host whose models are placed on the CPU device.
+        let worker_backend =
+            if host.inventory.resolve_device_key(None).as_deref() == Some(super::cpu::DEVICE_KEY) {
+                "cpu"
+            } else {
+                accelerator_backend(accelerator)
+            };
         let default_gpu_name = host.inventory.default_gpu_name();
         let default_gpu_arch = host.inventory.default_gpu_arch();
         let spilling = host.inventory.spilling_gpus().to_vec();
@@ -268,6 +278,7 @@ impl InferioState {
             manager,
             registry,
             compute_caps: host.caps,
+            worker_backend,
             calibration: Some(calibration),
             default_gpu_name,
             default_gpu_arch,
@@ -1144,7 +1155,11 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
     match snapshot {
         Ok(registry) => {
             let mut body = registry.metadata_json();
-            super::capability::overlay_metadata(&mut body, &state.compute_caps);
+            super::capability::overlay_metadata(
+                &mut body,
+                &state.compute_caps,
+                state.worker_backend,
+            );
             if let Some(store) = state.calibration.as_ref() {
                 // Fall back to the live inventory where the probe cannot answer.
                 let arch = state
@@ -1657,6 +1672,7 @@ metadata.description = "echo fixture"
             manager,
             registry,
             compute_caps: super::super::capability::HostComputeCaps::unknown(),
+            worker_backend: "cuda",
             calibration: Some(calibration),
             // The overlay still needs *a* GPU to answer for, so name one.
             default_gpu_name: Some(TEST_GPU.to_owned()),

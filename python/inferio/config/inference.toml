@@ -240,6 +240,9 @@ metadata.description = "DotsOCR - rednote-hilab/dots.ocr (FlashAttention 2 is re
 # bf16 + FlashAttention 2 both need Ampere (sm_80); the gateway marks the
 # model unavailable on older GPUs and jobs refuse to start it.
 metadata.min_compute_capability = 8.0
+# The load asks for FlashAttention 2, which needs an NVIDIA GPU; unavailable
+# on ROCm, MPS and CPU hosts.
+metadata.accelerators = ["cuda"]
 # Variable-resolution VLM: memory scales with decoded pixels.
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
