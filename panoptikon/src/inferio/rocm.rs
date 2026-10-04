@@ -421,6 +421,7 @@ fn amdgpu_fusion(render: &fs::File) -> Option<bool> {
         query: u32,
         arguments: [u32; 4],
     }
+    const _: () = assert!(size_of::<DrmAmdgpuInfo>() == 32);
     let mut device = [0u64; IDS_FLAGS_WORD + 1];
     let mut request = DrmAmdgpuInfo {
         return_pointer: device.as_mut_ptr() as u64,
