@@ -98,6 +98,7 @@ too old to send one leaves the reader on its previous fallback.
 |---|---|---|
 | `reserved_after_mb` | a measurement map | **every backend**, CUDA and ROCm included. It is not a Metal-only field and it is not inert off MPS: on CUDA it differs from `peak_reserved_mb` whenever the allocator released cached blocks mid-batch to retry an allocation, and such a batch changes from pool-growing to **warm**, so it now enters the orchestrator's knee ring. Measured on an idle 5090: a wd-vit cold ramp's largest granted budget fell 718 → 48 and its published one 1 024 → 64, at 1.119× the items/s; a GPU-bound MiniLM job moved 1.011× with its ring already full |
 | `ram_total_mb` / `ram_available_mb` | a measurement map | **`free_source: "mps"` only** — double-gated on the source and on the orchestrator's Metal-allocator flag, so a CUDA frame carries neither and prices exactly as it did before |
+| `gtt_free_mb` / `ram_available_mb` | a measurement map | a GTT-inclusive `"amdgpu-sysfs"` reading only (an APU) |
 
 Contract between the Rust orchestrator (parent) and a Python inference worker
 (child process). Companion to `inferio-rust-orchestrator-design.md` §4.
@@ -493,8 +494,9 @@ arithmetic. Nothing is credited on a `"ram"` host, where the "pool" is the OS
 high-water and a freed page is already in the free reading; there the free
 reading counts only above `grant.ram_reserve_mb`
 (`spendable = free − reserve + pool`), so a batch cannot take the RAM the
-ledger left free, and an APU's reading, which is host RAM too, counts only
-above it as well. A discrete GPU worker's own free reading is the device's and
+ledger left free. On an APU the reserve comes off the RAM term of its reading
+only (`spendable = VRAM free + min(GTT free, RAM − reserve) + pool`), so
+where the GTT window is short it withholds nothing. A discrete GPU worker's own free reading is the device's and
 has no reserve taken from it; its host RAM is checked separately against
 `grant.ram_mb`, and a batch that check shrank reports
 `clamped.reason = "host_ram"`. Uncredited, the
@@ -809,7 +811,8 @@ state at one instant, each key present but possibly nil:
 | `reserved_mb` | torch caching-allocator pool size (`memory_reserved`); on a `"ram"` host, this process's OS high-water resident set |
 | `allocated_mb` | live tensor bytes (`memory_allocated`); on a `"ram"` host, the live RSS |
 | `ram_total_mb` | **new**: `hw.memsize`, the host RAM an `"mps"` free reading is really measured out of. Present exactly when `free_source` is `"mps"`, absent from every other source and from a worker too old to report it |
-| `ram_available_mb` | **new**: the same instant's `available`, **before** `free_mb` clips it to `total_mb`. Paired with `ram_total_mb` — one counter read, so the pair is coherent |
+| `ram_available_mb` | **new**: the same instant's `available`, **before** `free_mb` clips it to `total_mb`. Paired with `ram_total_mb` — one counter read, so the pair is coherent. On a GTT-inclusive `"amdgpu-sysfs"` reading (an APU) it is the deliverable RAM of the GTT clamp, beside `gtt_free_mb` |
+| `gtt_free_mb` | an APU's unclaimed GTT (`mem_info_gtt_total − mem_info_gtt_used`): its `free_mb` is free VRAM plus the smaller of this and `ram_available_mb`. Present exactly when an `"amdgpu-sysfs"` reading is GTT-inclusive |
 
 `free_mb`/`total_mb` always come from **one** source, named by `free_source`.
 The two do not agree — NVML sees the whole GPU, `mem_get_info` the calling
@@ -838,8 +841,9 @@ files are the same, but the arithmetic covers the whole GPU an APU actually
 has: `total = mem_info_vram_total + mem_info_gtt_total` (the BIOS UMA
 carve-out plus the GTT window its allocations spill into as soon as the
 carve-out fills), and `free = (vram_total - vram_used) + min(gtt_total -
-gtt_used, ram_available)`, with `ram_available` from
-`psutil.virtual_memory().available`. The clamp is the load-bearing part:
+gtt_used, ram_available)`, with `ram_available` the RAM the CPU device reads
+as deliverable (within the cgroup limit), and both terms of the `min` sent
+beside it. The clamp is the load-bearing part:
 unclaimed GTT is address space, and the pages behind it come out of the same
 RAM every other process is using, so without it a machine under real memory
 pressure would read as idle. Every term is required — a GPU whose GTT
@@ -1094,6 +1098,7 @@ A measurement map describes one GPU batch the worker actually ran:
 | `oom_class` | **new 2026-09-04**: present exactly when `oom` is `true`, as `{source, exception, free_mb_at_failure, device}` — *why* the harness called this an out-of-memory condition, so the orchestrator can trust a structural signal and corroborate a textual one instead of guessing from a message it never sees. Absent when `oom` is absent, and **absent means the worker saw no out-of-memory condition**, including on a batch that failed for some other reason: the orchestrator must not deflate on such a failure |
 | `free_mb` | **new 2026-09-04**: driver-reported free memory on the worker's GPU, read immediately **before** this batch ran — the very sample the defensive clamp compares against `grant.mb`, reported rather than discarded. Absent when nothing could be read, and absent on the grantless compatibility path, which takes no pre-batch reading |
 | `free_source` | **new 2026-09-04**: which driver produced `free_mb`, from the same vocabulary a memory sample's `free_source` uses (`"nvml"`, `"amdgpu-sysfs"`, `"mps"`, `"ram"`, `"torch"`). Present exactly when `free_mb` is |
+| `gtt_free_mb` / `ram_available_mb` | the two terms of an APU's GTT clamp, exactly as a memory sample carries them and from the same read as `free_mb`. Present exactly when that reading is GTT-inclusive |
 | `ram_total_mb` / `ram_available_mb` | **new 2026-09-07**: the RAM domain `free_mb` was clipped from, exactly as a memory sample carries it and from the **same counter read** as `free_mb` itself. Present exactly when `free_source` is `"mps"`. Without it a per-batch reading was priced down the orchestrator's no-basis fallback while the response-level sample beside it took the RAM branch — the same instant, two prices, `hw.memsize - recommended_max_memory()` apart (8 192 MiB on the M3 Max) |
 | `clamped` | **new 2026-09-04**: present only when this batch actually ran **smaller** than its granted budget, as `{from_units, to_units, free_mb}` — the granted per-batch unit budget, what it was shrunk to, and the free reading taken before the batch. Absent on every batch that ran at its granted budget. **Extended** with an optional fourth key, `reason`: `"index_limit"` when what shrank the batch was an impl's shape ceiling (`max_batch_for`, or the impl's own equivalent inside `predict` — see "Memory grants") rather than the defensive memory clamp, and `"host_ram"` when a GPU worker's batch was shrunk by free host RAM against `grant.ram_mb`, which the orchestrator treats as the memory clamp. `reason` is **additive and absent by default**, and absent means the memory clamp, so nothing an older orchestrator reads changes. When both bound the same batch, one map spans them: `from_units` is the granted budget, `to_units` is what ran, and `reason` names the constraint that set `to_units`. `free_mb` is **optional**: the memory clamp always has the reading that decided it, but a shape ceiling is decided by the batch's shapes and carries one only when the worker happened to have taken it |
 

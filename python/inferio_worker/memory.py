@@ -922,23 +922,37 @@ def amdgpu_free_total_mb(root: str | None = None) -> tuple[int | None, int | Non
     (the files the orchestrator reads), or `(None, None)`. On a unified-memory
     device GTT is added, its free part clamped by `_ram_available_bytes`.
     """
+    reading = _amdgpu_reading(root)
+    return (reading.free_mb, reading.total_mb)
+
+
+def _amdgpu_reading(root: str | None = None) -> FreeReading:
+    """`amdgpu_free_total_mb` as a reading; on a unified-memory device with
+    both terms of its GTT clamp, unclaimed GTT and deliverable RAM."""
     bdf = _identity_bdf()
     if bdf is None:
-        return (None, None)
+        return FreeReading(None, None, None)
     device = _pci_device_dir(PCI_DEVICES_ROOT if root is None else root, bdf)
     total = _sysfs_bytes(os.path.join(device, "mem_info_vram_total"))
     used = _sysfs_bytes(os.path.join(device, "mem_info_vram_used"))
     if total is None or used is None:
-        return (None, None)
+        return FreeReading(None, None, None)
     if unified_gpu():
         gtt_total = _sysfs_bytes(os.path.join(device, "mem_info_gtt_total"))
         gtt_used = _sysfs_bytes(os.path.join(device, "mem_info_gtt_used"))
         available = _ram_available_bytes()
         if gtt_total is None or gtt_used is None or available is None:
-            return (None, None)
-        free = max(total - used, 0) + min(max(gtt_total - gtt_used, 0), available)
-        return (_mb(free), _mb(total + gtt_total))
-    return (_mb(total - used), _mb(total))
+            return FreeReading(None, None, None)
+        gtt_free = max(gtt_total - gtt_used, 0)
+        free = max(total - used, 0) + min(gtt_free, available)
+        return FreeReading(
+            _mb(free),
+            _mb(total + gtt_total),
+            "amdgpu-sysfs",
+            ram_available_mb=_mb(available),
+            gtt_free_mb=_mb(gtt_free),
+        )
+    return FreeReading(_mb(total - used), _mb(total), "amdgpu-sysfs")
 
 
 def amdgpu_device_total_mb(root: str | None = None) -> int | None:
@@ -1615,6 +1629,9 @@ def device_memory_sample() -> dict[str, Any] | None:
     if reading.source == "mps":
         sample["ram_total_mb"] = reading.ram_total_mb
         sample["ram_available_mb"] = reading.ram_available_mb
+    if reading.gtt_free_mb is not None:
+        sample["gtt_free_mb"] = reading.gtt_free_mb
+        sample["ram_available_mb"] = reading.ram_available_mb
     if all(value is None for value in sample.values()):
         return None
     return sample
@@ -1845,13 +1862,16 @@ def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
 
 
 class FreeReading(NamedTuple):
-    """One free-memory reading, its source and, on MPS, its RAM basis."""
+    """One free-memory reading, its source and, on MPS, its RAM basis. On an
+    APU `free_mb` is free VRAM plus the smaller of `gtt_free_mb` and
+    `ram_available_mb`."""
 
     free_mb: int | None
     total_mb: int | None
     source: str | None
     ram_total_mb: int | None = None
     ram_available_mb: int | None = None
+    gtt_free_mb: int | None = None
 
 
 def _free_total_reading(source: str | None = None) -> FreeReading:
@@ -1872,9 +1892,9 @@ def _free_total_reading(source: str | None = None) -> FreeReading:
         if free is not None:
             return FreeReading(free, total, "nvml")
     if source in (None, "amdgpu-sysfs"):
-        free, total = amdgpu_free_total_mb()
-        if free is not None:
-            return FreeReading(free, total, "amdgpu-sysfs")
+        reading = _amdgpu_reading()
+        if reading.free_mb is not None:
+            return reading
     if source in (None, "mps"):
         free, total, ram_total, ram_available = _mps_free_with_basis()
         if free is not None:
@@ -2686,6 +2706,7 @@ def measure_batch(
     free_source: str | None = None,
     ram_mb: tuple[int | None, int | None] | None = None,
     clamped: dict[str, Any] | None = None,
+    gtt_mb: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """One measurement map for the batch bracketed by `state` (never raises).
 
@@ -2763,6 +2784,9 @@ def measure_batch(
         if ram_mb is not None:
             # The RAM basis of this same reading (MPS).
             measurement["ram_total_mb"], measurement["ram_available_mb"] = ram_mb
+        if gtt_mb is not None:
+            # The two terms of this same reading's GTT clamp (an APU).
+            measurement["gtt_free_mb"], measurement["ram_available_mb"] = gtt_mb
     if clamped:
         measurement["clamped"] = clamped
     if state.get("host_ram") and sampled_rss is not None:

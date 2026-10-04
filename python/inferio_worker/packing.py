@@ -827,7 +827,8 @@ def plan_batches(
 
 class LiveBudget(NamedTuple):
     """One pre-batch memory reading and the budget it allowed. `ram_mb` is the
-    reading's RAM basis on MPS; `clamped` only when the budget shrank.
+    reading's RAM basis on MPS, `gtt_mb` its `(GTT free, deliverable RAM)` on
+    an APU; `clamped` only when the budget shrank.
     """
 
     units: int
@@ -835,6 +836,7 @@ class LiveBudget(NamedTuple):
     free_source: str | None
     ram_mb: tuple[int | None, int | None] | None
     clamped: dict[str, Any] | None
+    gtt_mb: tuple[int, int] | None = None
 
 
 # `clamped.reason` when host RAM, not the device, shrank a GPU worker's batch.
@@ -875,9 +877,10 @@ def clamp_to_live_memory(
     taken even for a memory-blind grant (`mb <= 0`), so it is always reported.
 
     Free host RAM counts only above `ram_reserve_mb`, which the orchestrator
-    keeps free: in a RAM-priced worker's reading and an APU's, and for a GPU
-    worker whose grant books `ram_grant_mb` of host RAM, which is scaled the
-    same way against free RAM and runs at the smaller of the two budgets.
+    keeps free: in a RAM-priced worker's reading, in an APU's RAM term (its
+    free VRAM and GTT window do not shrink by it), and for a GPU worker whose
+    grant books `ram_grant_mb` of host RAM, which is scaled the same way
+    against free RAM and runs at the smaller of the two budgets.
     """
     reading = memory.free_total_reading()
     free_mb, free_source = reading.free_mb, reading.source
@@ -886,14 +889,24 @@ def clamp_to_live_memory(
         if reading.ram_total_mb is not None
         else None
     )
+    gtt_mb = None
+    if reading.gtt_free_mb is not None and reading.ram_available_mb is not None:
+        gtt_mb = (reading.gtt_free_mb, reading.ram_available_mb)
     shrunk, clamped = unit_budget, None
     if grant_mb and grant_mb > 0 and free_mb is not None:
-        reserve_mb = (
-            ram_reserve_mb if free_source == "ram" or memory.unified_gpu() else 0
-        )
+        if gtt_mb is not None:
+            # Free VRAM, plus the GTT that RAM above the reserve backs.
+            gtt_free_mb, available_mb = gtt_mb
+            above_mb = max(available_mb - ram_reserve_mb, 0)
+            room_mb = free_mb - min(gtt_free_mb, available_mb)
+            room_mb += min(gtt_free_mb, above_mb)
+            reserve_mb = free_mb - room_mb
+        else:
+            reserve_mb = ram_reserve_mb if free_source == "ram" else 0
+            room_mb = max(free_mb - reserve_mb, 0)
         pool_mb = memory.releasable_pool_mb() or 0
         held_mb = min(fixed_mb, memory.held_since_load_mb())
-        spendable_mb = max(free_mb - reserve_mb, 0) + pool_mb + held_mb
+        spendable_mb = room_mb + pool_mb + held_mb
         shrunk = _scaled(unit_budget, spendable_mb, grant_mb, fixed_mb)
         if shrunk < unit_budget:
             logger.info(
@@ -932,7 +945,7 @@ def clamp_to_live_memory(
                     "free_mb": host_free_mb,
                     "reason": HOST_RAM_REASON,
                 }
-    return LiveBudget(shrunk, free_mb, free_source, ram_mb, clamped)
+    return LiveBudget(shrunk, free_mb, free_source, ram_mb, clamped, gtt_mb)
 
 
 # --- Running a window ---
@@ -1445,6 +1458,7 @@ def run_window(
                         free_mb=live.free_mb,
                         free_source=live.free_source,
                         ram_mb=live.ram_mb,
+                        gtt_mb=live.gtt_mb,
                         clamped=live.clamped if split else clamped,
                     )
                 )
@@ -1487,6 +1501,7 @@ def run_window(
                         free_mb=live.free_mb,
                         free_source=live.free_source,
                         ram_mb=live.ram_mb,
+                        gtt_mb=live.gtt_mb,
                         clamped=clamped,
                     ))
                 raise WindowFailure(str(exc), measurements, exc) from exc
@@ -1535,6 +1550,7 @@ def run_window(
                 free_mb=live.free_mb,
                 free_source=live.free_source,
                 ram_mb=live.ram_mb,
+                gtt_mb=live.gtt_mb,
                 clamped=clamped,
             )
             if absorbed_ooms:

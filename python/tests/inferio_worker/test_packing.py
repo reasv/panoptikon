@@ -28,6 +28,10 @@ from test_memory import (
     fake_mps_torch_module,
     isolated,
     mps_host,
+    pci_root,
+    rocm_host,
+    unified,
+    write_gtt,
 )
 
 MIB = 1024 * 1024
@@ -922,7 +926,7 @@ def test_a_gpu_worker_keeps_the_ram_reserve_free(fake_torch):
     """A GPU worker's grant books host RAM too. Its batch is scaled by free
     RAM above the reserve against that booking, and runs at the smaller of
     this and the device's own budget. The reserve is not taken from the
-    device's free reading, unless the device is an APU.
+    device's free reading.
     """
     fake_torch.free = 8_000 * MIB
     host = {"free_mb": 20_000}
@@ -963,10 +967,30 @@ def test_a_gpu_worker_keeps_the_ram_reserve_free(fake_torch):
         )
         assert [len(batch) for batch in model.batches] == [4, 4]
 
-    # An APU's memory is host RAM: its own reading keeps the reserve.
-    with mock.patch.object(memory, "unified_gpu", return_value=True):
-        apu = packing.clamp_to_live_memory(64, 4_000, 6_000)
-    assert apu.clamped == {"from_units": 64, "to_units": 32, "free_mb": 8_000}
+
+def test_an_apu_keeps_the_ram_reserve_in_its_ram_term(tmp_path, monkeypatch):
+    """An APU's reading is free VRAM plus the smaller of unclaimed GTT and
+    free RAM. The grant's RAM reserve comes off the RAM term only: it bites
+    when RAM is short, and withholds nothing when the GTT window is."""
+    bdf = "0000:03:00.0"
+    root = pci_root(tmp_path, {bdf: (512 * MIB, 256 * MIB)})
+    with rocm_host(tmp_path, monkeypatch, pci=root):
+        write_gtt(root, bdf, 64 * 1024 * MIB, 4 * 1024 * MIB)
+        with unified(ram_available_mb=8_000):
+            ram_short = packing.clamp_to_live_memory(64, 4_000, 6_000)
+        write_gtt(root, bdf, 64 * 1024 * MIB, 60 * 1024 * MIB)
+        with unified(ram_available_mb=100 * 1024):
+            gtt_short = packing.clamp_to_live_memory(64, 4_000, 6_000)
+            window = packing.run_window(Recorder(), items(1), grant(unit_budget=1))
+    assert ram_short.clamped == {
+        "from_units": 64,
+        "to_units": 36,
+        "free_mb": 256 + 8_000,
+    }, "256 + 2 000 above the reserve, of 4 000"
+    assert (gtt_short.units, gtt_short.clamped) == (64, None)
+    assert gtt_short.gtt_mb == (4 * 1024, 100 * 1024)
+    batch = window["measurements"][0]
+    assert (batch["gtt_free_mb"], batch["ram_available_mb"]) == gtt_short.gtt_mb
 
 
 def test_an_mps_worker_credits_the_metal_pool():

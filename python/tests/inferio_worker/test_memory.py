@@ -1869,6 +1869,10 @@ def test_the_amdgpu_tier_is_gtt_inclusive_on_a_unified_device(
             sample = memory.device_memory_sample()
     assert sample["free_source"] == "amdgpu-sysfs", "the driver, not the formula"
     assert (sample["free_mb"], sample["total_mb"]) == (256 + 8 * 1024, total)
+    assert (sample["gtt_free_mb"], sample["ram_available_mb"]) == (
+        60 * 1024,
+        8 * 1024,
+    ), "and both terms of its GTT clamp"
 
 
 def test_the_fdinfo_tier_counts_gtt_on_a_unified_device(tmp_path, monkeypatch) -> None:
