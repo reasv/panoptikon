@@ -338,7 +338,10 @@ Single synthetic device:
   the same rule; their batches have no pool to reuse and run at one unit
   while the Mac pages. Linux and Windows readings are unchanged. Loads are
   not refused under pressure: refusal on a unified device is judged against
-  capacity.
+  capacity. A load that starts above normal logs one WARN per model and
+  device per episode (until a reading at normal), naming the level and what
+  it does; while paging it does not also log the VRAM-headroom WARN, whose
+  headroom the paging set to 0.
 - **External usage is summed in the RAM domain.** `free` above is
   clipped to a `total` that is `recommended_max_memory()`, so the shipped
   `external = total − free − Σ ours` is arithmetic in two currencies and loses

@@ -1437,6 +1437,9 @@ struct LedgerState {
     arch_mismatch_logged: HashSet<String>,
     /// Once-per-card guard on the unpriced-dispatch WARN.
     unpriced_warned: HashSet<String>,
+    /// (model, device) pairs whose load logged the memory pressure WARN in
+    /// this pressure episode; a reading at normal ends the episode.
+    pressure_warned: HashSet<(String, String)>,
     /// Once-per-reason guard on the calibration-store skip DEBUG lines.
     profile_skip_logged: HashSet<(String, String, &'static str)>,
     next_id: u64,

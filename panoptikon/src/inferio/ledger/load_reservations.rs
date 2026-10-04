@@ -117,7 +117,8 @@ impl VramLedger {
             };
         // Measure the GPU first: one with no resident has no reading yet.
         self.refresh_external_for_load(inference_id, gpu).await;
-        let (id, expected, reserved, headroom) = {
+        let pressure = self.memory_pressure();
+        let (id, expected, reserved, headroom, pressure_warning) = {
             let mut state = self.lock();
             Self::refresh_pools_locked(&mut state);
             // Re-read: a load may have finished while the lock was dropped.
@@ -172,8 +173,29 @@ impl VramLedger {
                 .expect("presence checked above")
                 .load_reservations
                 .insert(id, reserved);
-            (id, expected, reserved, headroom)
+            let pressure_warning = pressure != mps::MemoryPressure::Normal
+                && state.pressure_warned.insert(key.clone());
+            (id, expected, reserved, headroom, pressure_warning)
         };
+        if pressure_warning && pressure.paging() {
+            tracing::warn!(
+                model = %inference_id,
+                gpu = %gpu,
+                memory_pressure = ?pressure,
+                "loading while macOS has no memory to spare: this model's \
+                 batches are cut to the memory it already holds until the \
+                 pressure eases"
+            );
+        } else if pressure_warning {
+            tracing::warn!(
+                model = %inference_id,
+                gpu = %gpu,
+                memory_pressure = ?pressure,
+                "loading while macOS reports memory pressure: this model \
+                 keeps its batch size and tries no larger one until the \
+                 pressure is back to normal"
+            );
+        }
         if reserved < expected {
             tracing::debug!(
                 model = %inference_id,
@@ -186,7 +208,9 @@ impl VramLedger {
             );
         }
         let exceeds_headroom = expected > headroom;
-        if exceeds_headroom {
+        // While macOS pages the headroom is 0 by construction, not a VRAM
+        // shortage; the pressure line above says what happens.
+        if exceeds_headroom && !pressure.paging() {
             tracing::warn!(
                 model = %inference_id,
                 gpu = %gpu,

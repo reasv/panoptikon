@@ -102,18 +102,21 @@ pub(super) fn free_source_is_authoritative(source: &str) -> bool {
 impl VramLedger {
     /// macOS's memory pressure level now; `Normal` on every other OS. On a
     /// Mac every device's memory is its RAM, so the level applies to all of
-    /// them. Read without the ledger lock held.
+    /// them. Read without the ledger lock held. A reading at normal ends the
+    /// pressure episode ([`LedgerState::pressure_warned`]).
     pub(super) fn memory_pressure(&self) -> mps::MemoryPressure {
         #[cfg(test)]
-        {
+        let pressure = {
             let mut state = self.lock();
             state.pressure_read_at = Some(Instant::now());
             state.pressure_stub
-        }
+        };
         #[cfg(not(test))]
-        {
-            mps::memory_pressure()
+        let pressure = mps::memory_pressure();
+        if pressure == mps::MemoryPressure::Normal {
+            self.lock().pressure_warned.clear();
         }
+        pressure
     }
 
     /// [`Self::memory_pressure`], and at least paging when the swap-out

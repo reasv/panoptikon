@@ -1850,6 +1850,44 @@ async fn while_the_mac_pages_a_load_is_priced_from_a_fresh_reading() {
     }
 }
 
+/// A load under memory pressure warns once per model and device per
+/// episode, at any level; while macOS pages it does not also warn that it
+/// needs more VRAM than the headroom, which the paging set to 0. A reading at
+/// normal ends the episode.
+#[test]
+fn a_load_under_memory_pressure_warns_once_per_model_and_episode() {
+    use mps::MemoryPressure::{Normal, Paging, Warning};
+    let ledger = mps_ledger();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let warnings = |pressure: mps::MemoryPressure, models: &[&str]| {
+        // A host reading at each load: none free while paging, else plenty.
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: MPS_GPU.to_owned(),
+            total_mb: MAC_RAM_MB,
+            free_mb: if pressure.paging() { 0 } else { 90_000 },
+        }]));
+        ledger.lock().gpus.get_mut(MPS_GPU).expect("the Mac").free = None;
+        ledger.set_memory_pressure_for_test(pressure);
+        let logs = captured_logs(|| {
+            for model in models {
+                let load =
+                    ledger.reserve_load_signalling_for_test(model, item_cost(4), MPS_GPU, None);
+                runtime.block_on(load).expect("a reservation");
+            }
+        });
+        logs.iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .count()
+    };
+    assert_eq!(warnings(Paging, &["g/a", "g/a", "g/a", "g/b"]), 2);
+    assert_eq!(warnings(Warning, &["g/a"]), 0, "the same episode");
+    assert_eq!(warnings(Normal, &["g/a"]), 0);
+    assert_eq!(warnings(Warning, &["g/a", "g/a"]), 1, "a new episode");
+}
+
 /// At warning, once the paging has stopped, the batch grows back by doubling
 /// to half the size our batch ran at when the paging began, and no further;
 /// a second episode our batch began at that bound halves it again. The full
