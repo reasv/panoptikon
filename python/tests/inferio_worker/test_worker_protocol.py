@@ -902,32 +902,38 @@ def test_the_batch_memory_frames_capability_is_read_off_the_handshake() -> None:
 def test_a_rocm_torch_before_2_6_fails_the_handshake_under_rocr(
     monkeypatch,
 ) -> None:
-    """Such a torch crashes at import while `ROCR_VISIBLE_DEVICES` is set, so
-    the handshake fails first and names the cause."""
+    """Such a torch fails at its first GPU use while `ROCR_VISIBLE_DEVICES`
+    is set without `HIP_VISIBLE_DEVICES`, so the handshake fails first and
+    names the cause."""
     import importlib.metadata
 
     from inferio_worker import __main__ as worker_main
     from inferio_worker import protocol
 
-    for version, rocr, fails in (
-        ("2.5.1+rocm6.2", "0", True),
-        ("2.5.1+rocm6.2", None, False),
-        ("2.6.0+rocm6.2", "0", False),
-        ("2.10.0+rocm7.2", "0", False),
-        ("2.5.1+cu124", "0", False),
+    for version, rocr, hip, fails in (
+        ("2.5.1+rocm6.2", "0", None, True),
+        ("2.5.1+rocm6.2", "0", "0", False),
+        ("2.5.1+rocm6.2", "0", "", False),
+        ("2.5.1+rocm6.2", None, None, False),
+        ("2.6.0+rocm6.2", "0", None, False),
+        ("2.10.0+rocm7.2", "0", None, False),
+        ("2.5.1+cu124", "0", None, False),
     ):
         monkeypatch.setattr(importlib.metadata, "version", lambda _: version)
-        if rocr is None:
-            monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
-        else:
-            monkeypatch.setenv("ROCR_VISIBLE_DEVICES", rocr)
+        for name, value in (
+            ("ROCR_VISIBLE_DEVICES", rocr), ("HIP_VISIBLE_DEVICES", hip)
+        ):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
         request, reply = io.BytesIO(), io.BytesIO()
         protocol.write_frame(request, handshake_msg(req_id=1))
         request.seek(0)
         impl_cls, _ = worker_main._handshake(request, reply)
         reply.seek(0)
         frame = protocol.read_frame(reply)
-        assert (impl_cls is None) == fails, version
+        assert (impl_cls is None) == fails, (version, rocr, hip)
         if fails:
             assert frame["type"] == "error"
             assert version in frame["message"]

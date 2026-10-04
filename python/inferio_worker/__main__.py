@@ -45,16 +45,19 @@ EXIT_INTERNAL_ERROR = 3
 
 logger = logging.getLogger("inferio_worker")
 
-# The first torch that imports on ROCm with `ROCR_VISIBLE_DEVICES` set
-# (pytorch#142292).
+# ROCm torch < 2.6 fails at its first GPU use (an IndexError seeding the
+# devices) while ROCR_VISIBLE_DEVICES is set without HIP_VISIBLE_DEVICES
+# (pytorch#140318, fixed in 2.6).
 ROCR_TORCH_MIN = (2, 6)
 
 
 def rocr_torch_problem() -> str | None:
-    """Why this interpreter's torch cannot import under the inherited
-    `ROCR_VISIBLE_DEVICES`, or None. Read from the package metadata, since
-    importing such a torch is what crashes."""
+    """Why this interpreter's torch would fail at its first GPU use under the
+    inherited `ROCR_VISIBLE_DEVICES`, or None. An empty `HIP_VISIBLE_DEVICES`
+    is set. Read from the package metadata, before anything imports torch."""
     if not os.environ.get("ROCR_VISIBLE_DEVICES"):
+        return None
+    if "HIP_VISIBLE_DEVICES" in os.environ:
         return None
     from importlib import metadata
 
@@ -68,9 +71,11 @@ def rocr_torch_problem() -> str | None:
     if tuple(map(int, release.groups())) >= ROCR_TORCH_MIN:
         return None
     return (
-        f"torch {version} crashes at import while ROCR_VISIBLE_DEVICES is set "
-        "(pytorch#142292): install torch 2.6 or newer in the inference_local "
-        "python interpreter, or start the gateway without ROCR_VISIBLE_DEVICES"
+        f"torch {version} fails at its first GPU use while "
+        "ROCR_VISIBLE_DEVICES is set without HIP_VISIBLE_DEVICES "
+        "(pytorch#140318, fixed in 2.6): install torch 2.6 or newer in the "
+        "inference_local python interpreter, or start the gateway without "
+        "ROCR_VISIBLE_DEVICES"
     )
 
 
