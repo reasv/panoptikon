@@ -796,8 +796,8 @@ class Hog:
                     # WDDM's system-memory fallback) no failure ends the
                     # fill; free reaching the level does, and what is held
                     # then is the target. Free is re-read once 1 GiB has been
-                    # taken since the last read, so the fill stops at most
-                    # 1 GiB past the level.
+                    # taken since the last read, so the fill stops less than
+                    # 1 GiB plus one chunk past the level.
                     unread_mb = 0
                     free_mb, _ = self.backend.free_total_mb()
                     if free_mb is not None and free_mb <= self.leave_mb:

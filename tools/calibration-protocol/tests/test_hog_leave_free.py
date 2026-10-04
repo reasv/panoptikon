@@ -121,9 +121,10 @@ def _target(free_mb: int, held_mb: int, leave: int) -> int:
 def test_the_fill_stops_once_free_reaches_the_level():
     """Where allocation past physical memory succeeds, no failure stops the
     fill. Here every chunk the hog takes, the job's pool takes another, so
-    the one solve at the start (10 240 - 2 048 = 8 192 MiB) would overshoot
-    by twice what the level allows; the fill stops at 4 096 MiB held, from
-    the schedule's level as from a `/set?leave_free=`."""
+    the one solve at the start (10 240 - 6 000 = 4 240 MiB) would overshoot
+    the level. Free is re-read once per GiB taken (at 0, 1 024, 2 048 and
+    3 072 MiB held), so the fill stops at 3 072 MiB held with 4 096 free,
+    from the schedule's level as from a `/set?leave_free=`."""
 
     class _Backend(hog.Backend):
         name = "overcommits"
@@ -143,21 +144,21 @@ def test_the_fill_stops_once_free_reaches_the_level():
                               reeval=999999.0)
     for override in (None, "leave_free"):
         backend = _Backend()
-        made = hog.Hog(backend, hog.LeaveFree(2048), args)
-        made.override, made.override_mb = override, 2048
+        made = hog.Hog(backend, hog.LeaveFree(6000), args)
+        made.override, made.override_mb = override, 6000
         made.target_mb = made.resolve_target(0.0)
-        assert made.target_mb == 8192
+        assert made.target_mb == 4240
         made.apply(made.target_mb)
         assert (made.held_mb, made.target_mb, backend.free) == (
-            4096, 4096, 2048)
+            3072, 3072, 4096)
         # The next tick holds there, pinned, though the job gave memory back.
-        backend.free = 6144
+        backend.free = 8192
         made.target_mb = made.resolve_target(0.5)
         made.apply(made.target_mb)
-        assert (made.held_mb, made.target_mb) == (4096, 4096)
+        assert (made.held_mb, made.target_mb) == (3072, 3072)
 
     # A hold is not stopped by the last leave-free level.
-    backend.free = 2048
+    backend.free = 6000
     made.override, made.override_mb = "mb", 6144
     made.apply(made.resolve_target(1.0))
     assert made.held_mb == 6144

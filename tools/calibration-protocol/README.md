@@ -341,9 +341,11 @@ Control endpoint on `127.0.0.1:<port>`: `GET /state`, `POST /set?mb=N`,
 `POST /set?leave_free=N`, `POST /resume`, `POST /stop`. Every allocation is
 touched; every shrink calls `torch.cuda.empty_cache()` so the driver sees the
 release. An allocation failure increments `oom`, records `last_error`, holds
-what it got and keeps serving. A leave-free fill re-reads free before each
-chunk and stops once free is at the level, where allocating past physical
-memory succeeds (WSL, WDDM's system-memory fallback) and no failure would.
+what it got and keeps serving. A leave-free fill re-reads free once per GiB
+it takes and stops once free is at the level, so it can take less than 1 GiB
+plus one chunk past it. That stop is what ends the fill where allocating past
+physical memory succeeds (WSL, WDDM's system-memory fallback) and no failure
+would.
 
 **On macOS the hog stops being counted, and `--touch-period` does not fix
 it.** A page touched once and then left idle is aged onto the inactive queue
