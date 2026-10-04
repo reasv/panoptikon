@@ -1779,7 +1779,7 @@ The orchestrator sets for every worker:
   - ROCm: the host's HIP library directories (`$ROCM_PATH/lib`,
     `$HIP_PATH/lib`, `/opt/rocm/lib`, and the NixOS driver trees), alongside
     `ROCM_PATH`, `HIP_PATH` and the MIOpen `MIOPEN_FIND_MODE=FAST` /
-    cache-path defaults — each of those written only when unset, so an
+    `MIOPEN_LOG_LEVEL=3` (errors only) / cache-path defaults — each of those written only when unset, so an
     operator who chose a value keeps it.
 
   MPS and CPU hosts get none of this. `inferio_worker.cudnn` still registers
