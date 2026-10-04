@@ -172,7 +172,8 @@ Linux only:
    CPU. A render node that cannot be opened while KFD still exposes the
    GPU is different: on ROCm 7.2, with that restriction emulated, ROCr
    enumerated no GPU at all, which the worker's pin check refuses. If *no*
-   GPU node is openable, the inventory is unknown. Accepted cost: briefly opening
+   GPU node is openable, or `/dev/kfd` does not open read-write, the
+   inventory is known empty and models run on the CPU device. Accepted cost: briefly opening
    every render node at startup can resume a runtime-suspended GPU, once
    per boot.
 4. From `/sys/bus/pci/devices/<bdf>/`: `mem_info_vram_total` → `total_mb`.

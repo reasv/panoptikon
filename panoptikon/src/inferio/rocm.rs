@@ -39,7 +39,7 @@ const HIP_LAYER_VISIBILITY_VARS: [&str; 3] = [
     "GPU_DEVICE_ORDINAL",
 ];
 
-/// The four filesystem roots the probe reads, and how it asks amdgpu whether a
+/// The filesystem paths the probe reads, and how it asks amdgpu whether a
 /// GPU is an APU, injectable for fixture trees.
 #[derive(Debug, Clone)]
 pub(super) struct SysfsRoots {
@@ -49,6 +49,8 @@ pub(super) struct SysfsRoots {
     pub pci_devices: PathBuf,
     /// DRM nodes; `renderD<minor>` is the per-GPU render node.
     pub dev_dri: PathBuf,
+    /// The KFD device ROCr opens read-write; without it no GPU is usable.
+    pub kfd: PathBuf,
     /// `MemTotal` for an APU's identity; `MemAvailable` and `SReclaimable`
     /// for its GTT clamp.
     pub meminfo: PathBuf,
@@ -62,6 +64,7 @@ impl Default for SysfsRoots {
             kfd_nodes: PathBuf::from("/sys/class/kfd/kfd/topology/nodes"),
             pci_devices: PathBuf::from("/sys/bus/pci/devices"),
             dev_dri: PathBuf::from("/dev/dri"),
+            kfd: PathBuf::from("/dev/kfd"),
             meminfo: PathBuf::from("/proc/meminfo"),
             fusion: amdgpu_fusion,
         }
@@ -166,11 +169,12 @@ pub(super) fn build(
             tracing::warn!(
                 gpu_nodes,
                 hidden_nodes = openable.hidden,
+                kfd_openable = openable.kfd_openable,
                 "this process can open none of this host's AMD GPUs, so ROCm \
                  enumerates none and models run on the CPU device, priced \
-                 against RAM; to use them, pass /dev/kfd and /dev/dri to the \
-                 container and add the user running panoptikon to the group \
-                 that owns /dev/dri/renderD* (usually render: group_add with \
+                 against RAM; to use them, add the user running panoptikon to \
+                 the group that owns /dev/kfd and /dev/dri/renderD*, usually \
+                 render (in Docker, pass /dev/kfd and /dev/dri, and set \
                  RENDER_GID in deploy/docker-compose.rocm.yml)"
             );
         }
@@ -293,6 +297,8 @@ struct OpenableNodes {
     gpu_nodes: usize,
     /// Nodes skipped because a device cgroup hides them; not in `gpu_nodes`.
     hidden: usize,
+    /// Whether `/dev/kfd` opens read-write; if not, no node survives.
+    kfd_openable: bool,
     /// The survivors, in ascending KFD node order, with [`amdgpu_fusion`].
     nodes: Vec<(u32, HashMap<String, u64>, Option<bool>)>,
 }
@@ -308,6 +314,7 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
     let mut nodes = node_dirs(&roots.kfd_nodes);
     // Numeric order: a string sort would put node 10 before node 2.
     nodes.sort_by_key(|(node, _)| *node);
+    let kfd_openable = opens_read_write(&roots.kfd);
     let mut gpu_nodes = 0usize;
     let mut hidden = 0usize;
     let mut out = Vec::new();
@@ -361,6 +368,9 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
             continue;
         }
         gpu_nodes += 1;
+        if !kfd_openable {
+            continue;
+        }
         let Some(minor) = props.get("drm_render_minor").copied().filter(|m| *m > 0) else {
             tracing::info!(
                 node,
@@ -388,6 +398,7 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
     Ok(OpenableNodes {
         gpu_nodes,
         hidden,
+        kfd_openable,
         nodes: out,
     })
 }
@@ -397,6 +408,11 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
 fn open_render_node(dev_dri: &Path, minor: u64) -> io::Result<fs::File> {
     let render = dev_dri.join(format!("renderD{minor}"));
     OpenOptions::new().read(true).write(true).open(render)
+}
+
+/// Whether `path` opens read-write, as ROCr opens `/dev/kfd`.
+fn opens_read_write(path: &Path) -> bool {
+    OpenOptions::new().read(true).write(true).open(path).is_ok()
 }
 
 /// Whether amdgpu flags this GPU as an APU: `AMDGPU_IDS_FLAGS_FUSION` in the
@@ -469,11 +485,12 @@ fn node_dirs(root: &Path) -> Vec<(u32, PathBuf)> {
 }
 
 /// Every GPU node in the KFD topology that this process can see, in node
-/// order: its ISA name (`gfx1100`) and whether its render node opens
-/// read-write, which is what [`build`] admits it by. Quiet and best-effort.
+/// order: its ISA name (`gfx1100`) and whether `/dev/kfd` and its render node
+/// open read-write, which is what [`build`] admits it by. Quiet and best-effort.
 pub(super) fn topology_gpus(roots: &SysfsRoots) -> Vec<(String, bool)> {
     let mut nodes = node_dirs(&roots.kfd_nodes);
     nodes.sort_by_key(|(node, _)| *node);
+    let kfd_openable = opens_read_write(&roots.kfd);
     nodes
         .into_iter()
         .filter_map(|(_, dir)| {
@@ -482,9 +499,10 @@ pub(super) fn topology_gpus(roots: &SysfsRoots) -> Vec<(String, bool)> {
                 return None;
             }
             let gfx = gfx_name(u32::try_from(*props.get("gfx_target_version")?).ok()?)?;
-            let openable = props.get("drm_render_minor").is_some_and(|minor| {
-                *minor > 0 && open_render_node(&roots.dev_dri, *minor).is_ok()
-            });
+            let openable = kfd_openable
+                && props.get("drm_render_minor").is_some_and(|minor| {
+                    *minor > 0 && open_render_node(&roots.dev_dri, *minor).is_ok()
+                });
             Some((gfx, openable))
         })
         .collect()
@@ -825,12 +843,14 @@ mod tests {
                 kfd_nodes: dir.path().join("kfd/nodes"),
                 pci_devices: dir.path().join("pci"),
                 dev_dri: dir.path().join("dri"),
+                kfd: dir.path().join("kfd/device"),
                 meminfo: dir.path().join("meminfo"),
                 fusion: fixture_fusion,
             };
             for root in [&roots.kfd_nodes, &roots.pci_devices, &roots.dev_dri] {
                 fs::create_dir_all(root).unwrap();
             }
+            fs::write(&roots.kfd, "").unwrap();
             // A 128 GiB machine whose 512 MiB carve-out firmware already took
             // out of MemTotal, which the cases that care overwrite.
             Self { _dir: dir, roots }.meminfo(MEM_TOTAL_KB, MEM_TOTAL_KB / 2)
@@ -1329,9 +1349,9 @@ mod tests {
         assert_eq!(indexed(rows), vec![at(0, BDF_0C)], "one openable GPU");
     }
 
-    /// GPU nodes this process cannot open, no GPU nodes, no topology, and
-    /// every GPU node hidden by a device cgroup: ROCr enumerates nothing, so
-    /// the inventory is known empty.
+    /// GPU nodes this process cannot open (no render node, or no
+    /// `/dev/kfd`), no GPU nodes, no topology, and every GPU node hidden by a
+    /// device cgroup: ROCr enumerates nothing, so the inventory is known empty.
     #[test]
     fn no_usable_gpu_node_is_an_empty_inventory() {
         let fixture = Fixture::new();
@@ -1340,6 +1360,14 @@ mod tests {
             .node(1, &gpu_props(LOC_03_00, 128, 0, 110000))
             .pci(BDF_03, GB24, 0);
         assert_eq!(fixture.build(), Some(Vec::new()));
+        let no_kfd = Fixture::new();
+        no_kfd.dgpu(1, LOC_03_00, 128, GB24);
+        fs::remove_file(&no_kfd.roots.kfd).unwrap();
+        assert_eq!(no_kfd.build(), Some(Vec::new()));
+        assert_eq!(
+            topology_gpus(&no_kfd.roots),
+            [("gfx1100".to_owned(), false)]
+        );
         let empty = Fixture::new();
         assert_eq!(empty.build(), Some(Vec::new()));
         let rootless = SysfsRoots {
