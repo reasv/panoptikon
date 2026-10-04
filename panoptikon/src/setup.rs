@@ -643,6 +643,8 @@ struct DetectionProbes {
     /// Linux: the gfx target of every GPU in the KFD topology (the amdgpu
     /// kernel driver), whether or not this process can open it.
     kfd_gpus: Vec<String>,
+    /// `HSA_OVERRIDE_GFX_VERSION` is set: any GPU can run the wheel's kernels.
+    gfx_override: bool,
 }
 
 impl DetectionProbes {
@@ -668,6 +670,7 @@ impl DetectionProbes {
             } else {
                 Vec::new()
             },
+            gfx_override: crate::inferio::gpu::gfx_override(),
         }
     }
 }
@@ -675,8 +678,8 @@ impl DetectionProbes {
 /// The auto-detection decision table: macOS always takes the default PyPI
 /// wheels (labelled `mps` on Apple Silicon, `cpu` on Intel), NVIDIA evidence
 /// beats ROCm, ROCm is x86_64 Linux only, a GPU the kernel driver lists
-/// counts only if the ROCm wheel has its gfx target, and no evidence means
-/// CPU.
+/// counts only if the ROCm wheel has its gfx target or the gfx override is
+/// set, and no evidence means CPU.
 fn decide_accelerator(probes: &DetectionProbes) -> (Accelerator, String) {
     if probes.os == "macos" {
         return (
@@ -711,6 +714,14 @@ fn decide_accelerator(probes: &DetectionProbes) -> (Accelerator, String) {
             return (
                 Accelerator::Rocm,
                 format!("the KFD topology lists a {gfx} GPU"),
+            );
+        }
+        if probes.gfx_override
+            && let Some(gfx) = probes.kfd_gpus.first()
+        {
+            return (
+                Accelerator::Rocm,
+                format!("the KFD topology lists a {gfx} GPU and HSA_OVERRIDE_GFX_VERSION is set"),
             );
         }
         if !probes.kfd_gpus.is_empty() {
@@ -1303,6 +1314,7 @@ mod tests {
             rocm_dir: false,
             rocm_smi_on_path: false,
             kfd_gpus: Vec::new(),
+            gfx_override: false,
         }
     }
 
@@ -1362,9 +1374,14 @@ mod tests {
         let (accelerator, evidence) = decide_accelerator(&linux);
         assert_eq!(accelerator, Accelerator::Cpu);
         assert!(evidence.contains("gfx1036"), "{evidence}");
+        // Unless the gfx override makes it run the wheel's kernels.
+        linux.kfd_gpus = vec!["gfx1031".into()];
+        linux.gfx_override = true;
+        assert_eq!(decide_accelerator(&linux).0, Accelerator::Rocm);
         // The ROCm wheels are x86_64 only.
         let mut arm = probes("linux");
         arm.arch = "aarch64";
+        arm.rocm_dir = true;
         arm.kfd_gpus = vec!["gfx1100".into()];
         assert_eq!(decide_accelerator(&arm).0, Accelerator::Cpu);
     }

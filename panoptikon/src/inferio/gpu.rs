@@ -217,6 +217,12 @@ pub const ROCM_WHEEL_GFX: [&str; 14] = [
 /// [`ROCM_WHEEL_GFX`] can still run the wheel's kernels.
 const GFX_OVERRIDE_ENV_VAR: &str = "HSA_OVERRIDE_GFX_VERSION";
 
+/// `HSA_OVERRIDE_GFX_VERSION` is set and non-empty in this process's
+/// environment, which workers inherit.
+pub fn gfx_override() -> bool {
+    std::env::var_os(GFX_OVERRIDE_ENV_VAR).is_some_and(|v| !v.is_empty())
+}
+
 /// The GPUs in the KFD topology: ISA name (`gfx1100`) and whether this
 /// process can open it; empty without amdgpu.
 pub fn rocm_topology_gpus() -> Vec<(String, bool)> {
@@ -802,8 +808,7 @@ fn accelerators_of(gpus: &[GpuInfo]) -> &[GpuInfo] {
 /// Where an unpinned replica lands: [`default_gpu_with`], with the gfx
 /// override read from this process's environment, which workers inherit.
 fn default_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
-    let gfx_override = std::env::var_os(GFX_OVERRIDE_ENV_VAR).is_some_and(|v| !v.is_empty());
-    default_gpu_with(gpus, gfx_override)
+    default_gpu_with(gpus, gfx_override())
 }
 
 /// A ROCm GPU outside [`ROCM_WHEEL_GFX`] last (unless `gfx_override`), then
