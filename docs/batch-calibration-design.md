@@ -696,21 +696,25 @@ the same bytes twice — measured on an M3 Max: Σ `limit_mb`
 199 915 MiB against 130 663 of RAM, and Σ headroom 1.83× of what was actually
 free. What is shared is **our own memory**, which the ledger knows in process
 at grant time and needs no frame for: each device's `external_mb` nets the
-*pair's* footprints out of its free reading rather than only its own, and each
-device's headroom subtracts the pair's charges and load reservations. `limit_mb`
-stays per device — it is that allocator's own ceiling, `recommended_max_memory()`
-on Metal and `cap_fraction × RAM` on the CPU device — and the shared room is
-enforced in `headroom_mb`, so on either device `headroom + Σ charges` stays
-inside `memsize − external`. The ledger lock serialises grant issuance, which
-is what makes "the other device's headroom drops immediately" true rather than
-eventually. An AMD APU shares only RAM with the CPU device and with other
-APUs: its carve-out is not RAM the OS manages, and its GTT window is a bound
-of its own. Its memory counts on the others only beyond its carve-out, which
-fills first. The APU itself is priced on two sides and the smaller headroom
-binds: its GTT window (VRAM and GTT free, its own memory only, under the
-GPU's reserve, the device total and `cap_fraction`), and the RAM behind it
-(carve-out plus host RAM, over VRAM free plus deliverable RAM, with the
-others' memory netted and charged as above, under the RAM floor). Its free
+*pair's* footprints out of its free reading rather than only its own, and the
+other device's charges and load reservations come off the shared room before
+the device's own ceiling applies: `limit_mb = min(room − external − reserve −
+the other's charges, ceiling)`, the ceiling being that allocator's own,
+`recommended_max_memory()` on Metal and `cap_fraction × RAM` on the CPU
+device. `headroom_mb` subtracts the device's own charges, so on either device
+`headroom + Σ charges` stays inside `memsize − external`, and a cap bounds
+only its own device's memory. The ledger lock serialises grant issuance,
+which is what makes "the other device's headroom drops immediately" true
+rather than eventually. An AMD APU shares only RAM with the CPU device and
+with other APUs: its carve-out is not RAM the OS manages, and its GTT is a
+bound of its own. Its memory counts on the others only beyond the carve-out
+it can still use, its footprint plus the VRAM its reading has free. The APU
+itself is priced on two sides, each under the device total and
+`cap_fraction`, and the smaller headroom binds: its VRAM and GTT (VRAM and
+GTT free, its own memory only, under the GPU's reserve), and the RAM behind
+it (carve-out plus host RAM, over VRAM free plus deliverable RAM, with the
+others' memory netted and their charges taken off the room as above, under
+the RAM floor, of which it withholds at most the deliverable RAM). Its free
 reading carries the GTT and RAM terms for this (`gtt_free_mb`,
 `ram_available_mb`). A discrete GPU's VRAM is its own.
 
@@ -834,12 +838,15 @@ Known limits:
 - A Linux unified-memory GPU (an APU) clamps its unclaimed GTT by the same
   free RAM reading, and keeps the same floor, of the RAM the OS manages
   (`MemTotal`, the carve-out excluded) within the cgroup limit. The floor
-  comes off the RAM term only (`VRAM free + min(GTT free, RAM − floor)`, in
-  the ledger's RAM side and the worker's clamp), so where the GTT window
+  comes off the RAM term only (`VRAM free + min(GTT free, max(RAM − floor,
+  0))`, in the ledger's two sides and the worker's clamp), so where GTT
   binds it withholds none of it. Not measured: that an APU's GTT pages count
   in its container's `memory.current`, which the RAM term assumes, and that
-  amdgpu fills the carve-out before GTT, which the share counted on the CPU
-  device assumes.
+  amdgpu places an APU's memory in the carve-out while it has room there,
+  which the share counted on the CPU device assumes. Memory an APU placed in
+  GTT while other processes filled the carve-out is under-counted on the CPU
+  device until a reading shows it; the CPU worker's live clamp is the
+  backstop.
 - On macOS and Windows only the exit status tells that an idle worker is
   gone. A request that arrives while a killed worker is still being torn
   down (0.4 to 2 s for a process of several GiB) still reads as a death in

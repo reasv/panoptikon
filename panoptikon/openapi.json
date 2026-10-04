@@ -7920,7 +7920,7 @@
           "external_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.\nOn unified memory the footprints of every device sharing the RAM\ncount, an APU's only beyond its carve-out. An APU reports this, the\nreserve, the limit and the headroom from the side that binds: its GTT\nwindow (VRAM and GTT, its own memory only) or the RAM behind it.",
+            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.\nOn unified memory the footprints of every device sharing the RAM\ncount, an APU's only beyond the carve-out it can still use. An APU\nreports this, the reserve, the limit and the headroom from the side\nthat binds: its VRAM and GTT (its own memory only) or the RAM behind\nit.",
             "minimum": 0
           },
           "external_sample_age_ms": {
@@ -7968,13 +7968,13 @@
           "headroom_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "`limit − Σ charges − Σ load reservations`; on unified memory the\ncharges of every device sharing the RAM, an APU's only beyond its\ncarve-out, except on an APU's GTT window.",
+            "description": "`limit_mb − charges_mb − load_reservations_mb`.",
             "minimum": 0
           },
           "limit_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "The admission budget: `min(total × cap_fraction,\ntotal − external − reserve_mb)`. On an APU's RAM side\n`carve-out + host RAM − external − reserve_mb`: the total and the cap\nbound its GTT window instead.",
+            "description": "The admission budget: `min(total × cap_fraction, room − external −\nreserve_mb − the charges and load reservations of the other devices\nsharing the RAM)`, an APU's only beyond the carve-out it can still\nuse. The room is `total`; on an APU's RAM side carve-out plus host\nRAM, of which the reserve withholds at most the deliverable RAM.",
             "minimum": 0
           },
           "load_reservations_mb": {

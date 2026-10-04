@@ -242,11 +242,14 @@ fn cpu_host(count: u64, headroom: u64, percent: u64) -> (Arc<VramLedger>, Vec<Co
 }
 
 /// A 16 GB Mac (recommended max 12 288 MiB), or a 16 GB APU host (512 MiB
-/// carve-out, 16 GiB GTT window), with a cold GPU replica whose pool is
+/// carve-out, 16 GiB of GTT), with a cold GPU replica whose pool is
 /// `pool_ratio` times its tensors and a cold CPU replica, 2500 MiB of base
-/// each, and the GPU's headroom. On the Mac both devices have 7288 MiB. On
-/// the APU host the GPU has the RAM left after the 2048 MiB floor, 9848 MiB,
-/// and the CPU device its cap, three quarters of RAM, less both bases.
+/// each, and the GPU's headroom. Each device's limit is net of the other's
+/// base. On the Mac the GPU has its recommended max less both bases, 7288
+/// MiB, and the CPU device RAM less the 2048 MiB floor and both bases, 9336
+/// MiB. On the APU host the GPU has carve-out and RAM less the floor and both
+/// bases, 9848 MiB, and the CPU device its cap, three quarters of RAM, less
+/// its own base, 9788 MiB.
 fn unified_pair(apu: bool, pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>, u64) {
     const RAM_MB: u64 = 16_384;
     const RECOMMENDED_MAX_MB: u64 = RAM_MB / 4 * 3;
@@ -320,7 +323,7 @@ fn unified_pair(apu: bool, pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>, u64)
         ledger.record_free_for_test(cpu::DEVICE_KEY, RAM_MB - 2 * BASE_MB);
     }
     let headroom = (ledger.headroom_mb(gpu), ledger.headroom_mb(cpu::DEVICE_KEY));
-    assert_eq!(headroom, if apu { (9848, 7800) } else { (7288, 7288) });
+    assert_eq!(headroom, if apu { (9848, 9788) } else { (7288, 9336) });
     (ledger, replicas, headroom.0)
 }
 
@@ -435,36 +438,34 @@ fn cold_cpu_replicas_on_a_16_gb_host_stay_inside_the_headroom() {
 
 /// A 16 GB Mac, and a 16 GB APU host at a HIP-sized pool. The first GPU
 /// batch is priced at the default pool margin; from the second on at the
-/// margin it measured. A Metal pool 2.9 times its tensors is 1212 MiB over
-/// in the first two windows and inside after. On the APU host the GPU
-/// replica, which keeps its pool, grows into the RAM the CPU replica hands
-/// back between windows, down to one unit under the CPU device's cap.
+/// margin it measured. `over` is what the pair holds past the GPU's
+/// headroom.
 #[test]
 fn a_cold_gpu_and_cpu_replica_on_a_16_gb_unified_host_are_priced_at_the_measured_pool() {
     let cases = [
         (
             false,
             1.25,
-            [[8, 8], [14, 6], [13, 5], [14, 7]],
-            [-2168, -248, -888, -568],
+            [[8, 8], [13, 13], [12, 12], [6, 12]],
+            [-2168, 1032, 1032, 712],
         ),
         (
             false,
             2.3,
-            [[8, 8], [7, 6], [6, 5], [8, 6]],
-            [-17, -17, -657, -657],
+            [[8, 8], [7, 12], [6, 11], [4, 11]],
+            [-17, 1263, 1263, 943],
         ),
         (
             false,
             2.9,
-            [[8, 8], [7, 2], [6, 3], [8, 3]],
-            [1212, 1212, -388, -388],
+            [[8, 8], [7, 7], [6, 6], [5, 8]],
+            [1212, 1212, 892, 1212],
         ),
         (
             true,
             1.25,
-            [[8, 8], [16, 6], [22, 1], [28, 1]],
-            [-4728, -2168, -888, -568],
+            [[8, 8], [16, 12], [15, 11], [16, 11]],
+            [-4728, -888, -888, -1208],
         ),
     ];
     for (apu, pool_ratio, units, over) in cases {

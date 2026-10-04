@@ -85,8 +85,7 @@ impl VramLedger {
             let mut state = self.lock();
             Self::refresh_pools_locked(&mut state);
             let entry = state.workers.get(&worker)?;
-            let shares_ram = entry.gpu != cpu::DEVICE_KEY
-                && Self::ram_domain_peers(&state, &entry.gpu).next().is_some();
+            let shares_ram = Self::ram_domain_peers(&state, &entry.gpu).next().is_some();
             (entry.gpu.clone(), entry.has_ram_side(), shares_ram)
         };
         // The worker's last reading may predate a RAM-domain peer's growth

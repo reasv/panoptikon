@@ -95,7 +95,7 @@ impl VramLedger {
                         .free
                         .as_ref()
                         .map(|sample| sample.at.elapsed().as_millis() as u64),
-                    limit_mb: side.limit,
+                    limit_mb: side.limit(),
                     reserve_mb: side.reserve,
                     reserve_rule: side.rule.to_owned(),
                     headroom_mb: side.overdraft().max(0) as u64,
@@ -131,9 +131,10 @@ pub struct GpuBudgetHealth {
     pub total_mb: u64,
     /// `max(0, total − free − Σ our footprints)`: what other processes hold.
     /// On unified memory the footprints of every device sharing the RAM
-    /// count, an APU's only beyond its carve-out. An APU reports this, the
-    /// reserve, the limit and the headroom from the side that binds: its GTT
-    /// window (VRAM and GTT, its own memory only) or the RAM behind it.
+    /// count, an APU's only beyond the carve-out it can still use. An APU
+    /// reports this, the reserve, the limit and the headroom from the side
+    /// that binds: its VRAM and GTT (its own memory only) or the RAM behind
+    /// it.
     pub external_mb: u64,
     /// False when no free reading exists yet and `external_mb` is assumed 0.
     pub external_known: bool,
@@ -141,10 +142,11 @@ pub struct GpuBudgetHealth {
     /// `"nvidia-smi"` or `"amdgpu-sysfs"`.
     pub external_source: Option<String>,
     pub external_sample_age_ms: Option<u64>,
-    /// The admission budget: `min(total × cap_fraction,
-    /// total − external − reserve_mb)`. On an APU's RAM side
-    /// `carve-out + host RAM − external − reserve_mb`: the total and the cap
-    /// bound its GTT window instead.
+    /// The admission budget: `min(total × cap_fraction, room − external −
+    /// reserve_mb − the charges and load reservations of the other devices
+    /// sharing the RAM)`, an APU's only beyond the carve-out it can still
+    /// use. The room is `total`; on an APU's RAM side carve-out plus host
+    /// RAM, of which the reserve withholds at most the deliverable RAM.
     pub limit_mb: u64,
     /// The reserve applied to this GPU on top of `external_mb`.
     pub reserve_mb: u64,
@@ -155,9 +157,7 @@ pub struct GpuBudgetHealth {
     /// RAM) or `"ram_floor"` (the minimum on the CPU device and an APU: a
     /// tenth of RAM, at most 16 GiB, at least 2 GiB or a quarter of RAM).
     pub reserve_rule: String,
-    /// `limit − Σ charges − Σ load reservations`; on unified memory the
-    /// charges of every device sharing the RAM, an APU's only beyond its
-    /// carve-out, except on an APU's GTT window.
+    /// `limit_mb − charges_mb − load_reservations_mb`.
     pub headroom_mb: u64,
     /// `Σ` per-worker `footprint + max(0, grants − pool growth)`; what
     /// `headroom_mb` subtracts. On the CPU device it includes GPU replicas'

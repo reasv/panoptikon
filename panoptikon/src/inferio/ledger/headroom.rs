@@ -98,19 +98,25 @@ impl FitPrice {
 }
 
 /// What a device is priced over: other processes' usage, the reserve kept on
-/// top of it, the limit they leave, and what we hold against that limit.
+/// top of it, the limit they leave, and what the device holds against that
+/// limit.
 pub(super) struct Side {
     pub(super) external: Option<u64>,
     pub(super) reserve: u64,
     pub(super) rule: &'static str,
-    pub(super) limit: u64,
+    /// Negative when the RAM-domain peers' charges exceed the room.
+    limit: i128,
     claims: u64,
 }
 
 impl Side {
+    pub(super) fn limit(&self) -> u64 {
+        self.limit.max(0) as u64
+    }
+
     /// `limit − claims`, before its floor at zero.
     pub(super) fn overdraft(&self) -> i128 {
-        i128::from(self.limit) - i128::from(self.claims)
+        self.limit - i128::from(self.claims)
     }
 }
 
@@ -155,14 +161,16 @@ impl VramLedger {
     }
 
     /// What of `mb` held on `peer` is in host RAM: on an APU only what is
-    /// above its carve-out, which fills first and is not RAM the OS manages;
-    /// on any other device all of it.
+    /// above the carve-out it can still use, its footprints plus the VRAM its
+    /// reading has free (all of it without a [`GttBasis`]); on any other
+    /// device all of it.
     fn in_host_ram(state: &LedgerState, peer: &str, mb: u64) -> u64 {
-        let carveout = state
-            .gpus
-            .get(peer)
-            .and_then(|device| device.vram_carveout_mb);
-        mb.saturating_sub(carveout.unwrap_or(0))
+        let in_carveout = state.gpus.get(peer).and_then(|device| {
+            let vram_free = device.free.as_ref()?.vram_free_mb()?;
+            let usable = Self::footprints_locked(state, peer).saturating_add(vram_free);
+            Some(device.vram_carveout_mb?.min(usable))
+        });
+        mb.saturating_sub(in_carveout.unwrap_or(0))
     }
 
     /// `of(peer)` summed over `gpu`'s RAM-domain peers, each as far as it is
@@ -336,77 +344,72 @@ impl VramLedger {
     }
 
     /// The side `gpu` is priced on: on an APU whose reading carries its
-    /// [`GttBasis`], whichever of [`Self::window_side_locked`] and
+    /// [`GttBasis`], whichever of [`Self::gtt_side_locked`] and
     /// [`Self::shared_side_locked`] leaves less headroom; on any other device
     /// its only side.
     pub(super) fn side_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> Side {
         let shared = self.shared_side_locked(state, gpu, margin);
-        match self.window_side_locked(state, gpu, margin) {
-            Some(window) if window.overdraft() < shared.overdraft() => window,
+        match self.gtt_side_locked(state, gpu, margin) {
+            Some(gtt) if gtt.overdraft() < shared.overdraft() => gtt,
             _ => shared,
         }
     }
 
-    /// An APU's GTT window: its total (carve-out plus GTT) over its VRAM and
-    /// GTT free, under the GPU's reserve. Only its own memory is in it.
+    /// An APU's VRAM and GTT: its total (carve-out plus GTT) over its VRAM
+    /// and GTT free, under the GPU's reserve. Only its own memory is in it.
     /// `None` without a [`GttBasis`].
-    fn window_side_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> Option<Side> {
+    fn gtt_side_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> Option<Side> {
         let device = state.gpus.get(gpu)?;
-        let (window_free, _) = device.free.as_ref()?.apu_free_mb()?;
+        let (gtt_free, _) = device.free.as_ref()?.apu_free_mb()?;
         let external = device
             .total_mb
-            .saturating_sub(window_free)
+            .saturating_sub(gtt_free)
             .saturating_sub(Self::footprints_locked(state, gpu));
         let (reserve, rule) = self.gpu_reserve_locked(state, gpu, external, margin);
         Some(Side {
             external: Some(external),
             reserve,
             rule,
-            limit: self.limit_over_locked(state, gpu, external, reserve),
+            limit: self.limit_over_locked(state, gpu, None, external.saturating_add(reserve), 0),
             claims: Self::claims_locked(state, gpu),
         })
     }
 
     /// What `gpu` is priced over together with its RAM-domain peers: their
-    /// memory in host RAM is netted from its external usage and counted in
-    /// its claims. On an APU whose reading carries its [`GttBasis`] that is
-    /// the RAM behind it: carve-out plus [`Self::host_ram_mb_locked`], over
-    /// VRAM free plus the RAM the OS could deliver. Elsewhere the device's
-    /// own reading.
+    /// memory in host RAM is netted from its external usage and their charges
+    /// there come off its room. On an APU whose reading carries its
+    /// [`GttBasis`] that room is the RAM behind it: carve-out plus
+    /// [`Self::host_ram_mb_locked`], over VRAM free plus the RAM the OS could
+    /// deliver, of which the reserve withholds at most that RAM. Elsewhere
+    /// the device's own reading.
     pub(super) fn shared_side_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> Side {
-        let claims = Self::claims_locked(state, gpu).saturating_add(
-            Self::peers_in_host_ram_locked(state, gpu, |peer| Self::claims_locked(state, peer)),
-        );
+        // An APU's (room, external usage, deliverable RAM).
         let apu = state.gpus.get(gpu).and_then(|device| {
             let room = device
                 .vram_carveout_mb?
                 .saturating_add(Self::host_ram_mb_locked(state, gpu)?);
-            let (_, ram_free) = device.free.as_ref()?.apu_free_mb()?;
-            Some((room, ram_free))
-        });
-        if let Some((room, ram_free)) = apu {
+            let sample = device.free.as_ref()?;
+            let (_, ram_free) = sample.apu_free_mb()?;
             let external = room
                 .saturating_sub(ram_free)
                 .saturating_sub(Self::ours_locked(state, gpu));
-            let (reserve, rule) = self.reserve_locked(state, gpu, external, margin);
-            // Not bounded by the device total or its cap: those bound the
-            // window side, which holds this APU's memory and no peer's.
-            return Side {
-                external: Some(external),
-                reserve,
-                rule,
-                limit: room.saturating_sub(external).saturating_sub(reserve),
-                claims,
-            };
-        }
-        let external = self.external_locked(state, gpu);
+            Some((room, external, sample.gtt?.ram_available_mb))
+        });
+        let (room, external) = match apu {
+            Some((room, external, _)) => (Some(room), Some(external)),
+            None => (None, self.external_locked(state, gpu)),
+        };
         let (reserve, rule) = self.reserve_locked(state, gpu, external.unwrap_or(0), margin);
+        let withheld = apu.map_or(reserve, |(_, _, ram)| reserve.min(ram));
+        let taken = external.unwrap_or(0).saturating_add(withheld);
+        let peers =
+            Self::peers_in_host_ram_locked(state, gpu, |peer| Self::claims_locked(state, peer));
         Side {
             external,
             reserve,
             rule,
-            limit: self.limit_over_locked(state, gpu, external.unwrap_or(0), reserve),
-            claims,
+            limit: self.limit_over_locked(state, gpu, room, taken, peers),
+            claims: Self::claims_locked(state, gpu),
         }
     }
 
@@ -489,28 +492,31 @@ impl VramLedger {
     /// `limit` under a given margin: the GPU's own, or a model's widened one
     /// ([`Self::effective_margin_locked`]).
     fn limit_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
-        self.side_locked(state, gpu, margin).limit
+        self.side_locked(state, gpu, margin).limit()
     }
 
-    /// The limit over a given external figure and reserve.
+    /// The limit over `room` (by default the device's own) less `taken`
+    /// (external usage and the reserve), at least 0, then less `peers`, the
+    /// RAM-domain peers' charges in host RAM, which may take it below 0. At
+    /// most the device total and its `cap_fraction` of that.
     fn limit_over_locked(
         &self,
         state: &LedgerState,
         gpu: &str,
-        external: u64,
-        reserve: u64,
-    ) -> u64 {
+        room: Option<u64>,
+        taken: u64,
+        peers: u64,
+    ) -> i128 {
         let Some(gpu_ledger) = state.gpus.get(gpu) else {
             return 0;
         };
         let total = gpu_ledger.total_mb;
         // The room is in `external`'s domain (`hw.memsize` on Metal); `total`
         // stays the allocator's ceiling over it.
-        let room = Self::ram_domain_locked(state, gpu_ledger).unwrap_or(total);
-        let mut limit = room
-            .saturating_sub(external)
-            .saturating_sub(reserve)
-            .min(total);
+        let room = room
+            .or_else(|| Self::ram_domain_locked(state, gpu_ledger))
+            .unwrap_or(total);
+        let mut ceiling = total;
         // A non-finite fraction counts as unset: a NaN cap would admit nothing.
         if let Some(fraction) = self
             .budgets
@@ -518,9 +524,9 @@ impl VramLedger {
             .cap_fraction
             .filter(|fraction| fraction.is_finite())
         {
-            limit = limit.min((total as f64 * fraction.clamp(0.0, 1.0)).floor() as u64);
+            ceiling = ceiling.min((total as f64 * fraction.clamp(0.0, 1.0)).floor() as u64);
         }
-        limit
+        (i128::from(room.saturating_sub(taken)) - i128::from(peers)).min(i128::from(ceiling))
     }
 
     /// The room a load is refused against, with no reserve: what the card
@@ -536,7 +542,7 @@ impl VramLedger {
         } else {
             self.external_locked(state, gpu).unwrap_or(0)
         };
-        self.limit_over_locked(state, gpu, external, 0)
+        self.limit_over_locked(state, gpu, None, external, 0).max(0) as u64
     }
 
     pub(super) fn headroom_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
@@ -548,9 +554,9 @@ impl VramLedger {
     }
 
     /// Headroom before its floor at zero ([`Side::overdraft`] of
-    /// [`Self::side_locked`], may be negative). The claims include the
-    /// RAM-domain peers' in host RAM, which is where the shared room of a Mac
-    /// or an APU host is enforced.
+    /// [`Self::side_locked`], may be negative). The limit is net of the
+    /// RAM-domain peers' charges in host RAM, which is where the shared room
+    /// of a Mac or an APU host is enforced.
     pub(super) fn overdraft_with_margin_locked(
         &self,
         state: &LedgerState,

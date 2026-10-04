@@ -512,19 +512,17 @@ fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
         );
     }
     // An APU keeps the RAM floor of the RAM the OS manages, its carve-out
-    // excluded, whatever the margin.
-    for margin in [DEFAULT_MARGIN, 0.0] {
-        let mut state = host.lock();
-        state.metal_allocator = false;
-        state.gpus.get_mut(GPU).unwrap().vram_carveout_mb = Some(512);
-        assert_eq!(
-            host.reserve_locked(&state, GPU, 165, margin),
-            (
-                super::cpu::ram_reserve_mb(65_536 - 512),
-                RESERVE_RULE_RAM_FLOOR
-            )
-        );
-    }
+    // excluded.
+    let mut state = host.lock();
+    state.metal_allocator = false;
+    state.gpus.get_mut(GPU).unwrap().vram_carveout_mb = Some(512);
+    assert_eq!(
+        host.reserve_locked(&state, GPU, 165, DEFAULT_MARGIN),
+        (
+            super::cpu::ram_reserve_mb(65_536 - 512),
+            RESERVE_RULE_RAM_FLOOR
+        )
+    );
 
     // `/health` names the rule and prices the limit under it.
     let ledger = ledger(16_368, unset);

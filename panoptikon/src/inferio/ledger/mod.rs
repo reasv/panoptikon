@@ -1366,15 +1366,21 @@ struct FreeSample {
 }
 
 impl FreeSample {
-    /// An APU's free memory in its GTT window and in the RAM behind it:
-    /// `(VRAM + GTT free, VRAM free + deliverable RAM)`. Free VRAM is what
-    /// `free_mb` holds beyond the smaller GTT term, so a shift of `free_mb`
-    /// moves both. `None` without a [`GttBasis`].
-    fn apu_free_mb(&self) -> Option<(u64, u64)> {
+    /// An APU's free VRAM: what `free_mb` holds beyond the smaller GTT term,
+    /// so a shift of `free_mb` moves it. `None` without a [`GttBasis`].
+    fn vram_free_mb(&self) -> Option<u64> {
         let gtt = self.gtt?;
-        let vram_free = self
-            .free_mb
-            .saturating_sub(gtt.gtt_free_mb.min(gtt.ram_available_mb));
+        Some(
+            self.free_mb
+                .saturating_sub(gtt.gtt_free_mb.min(gtt.ram_available_mb)),
+        )
+    }
+
+    /// An APU's free memory on its GTT side and in the RAM behind it:
+    /// `(VRAM + GTT free, VRAM free + deliverable RAM)`. `None` without a
+    /// [`GttBasis`].
+    fn apu_free_mb(&self) -> Option<(u64, u64)> {
+        let (vram_free, gtt) = (self.vram_free_mb()?, self.gtt?);
         Some((
             vram_free.saturating_add(gtt.gtt_free_mb),
             vram_free.saturating_add(gtt.ram_available_mb),
