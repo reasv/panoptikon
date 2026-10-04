@@ -138,9 +138,10 @@ pub struct GpuInventory {
     backend: MemoryBackend,
     /// CPU device RAM statistics roots; `Some` iff there is a CPU device.
     cpu_roots: Option<cpu::MemRoots>,
-    /// The visibility variable is set and empty (`CUDA_VISIBLE_DEVICES=`): no
-    /// GPU is visible, no pin may be written, everything runs on the CPU.
-    blank_mask: bool,
+    /// No GPU is visible to a worker: the visibility variable is set and empty
+    /// (`CUDA_VISIBLE_DEVICES=`), or this process can open no ROCm GPU. No pin
+    /// may be written; everything runs on the CPU.
+    no_visible_gpu: bool,
 }
 
 /// Which interface answers live-memory queries and which pin vocabulary
@@ -184,10 +185,10 @@ pub struct HostGpus {
     pub inventory: GpuInventory,
 }
 
-/// ISA names of the GPUs in the KFD topology (`gfx1100`), for the startup
-/// accelerator report; empty without amdgpu.
-pub fn rocm_topology_gfx_names() -> Vec<String> {
-    rocm::topology_gfx_names(&rocm::SysfsRoots::default().kfd_nodes)
+/// The GPUs in the KFD topology: ISA name (`gfx1100`) and whether this
+/// process can open it; empty without amdgpu.
+pub fn rocm_topology_gpus() -> Vec<(String, bool)> {
+    rocm::topology_gpus(&rocm::SysfsRoots::default())
 }
 
 /// Probe once at startup; never fails. `accelerator` must be the resolved
@@ -320,13 +321,23 @@ fn with_cpu_device(mut host: HostGpus) -> HostGpus {
 /// off Linux there are no GPUs. The backend is `RocmSysfs` on every path.
 fn probe_rocm() -> HostGpus {
     let roots = rocm::SysfsRoots::default();
-    let blank = if cfg!(target_os = "linux") {
-        let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
-        rocm::blank_visibility_var(ambient.each_ref().map(Option::as_deref))
-    } else {
-        None
-    };
-    if let Some(var) = blank {
+    if !cfg!(target_os = "linux") {
+        return rocm_host(&roots, None, false, false);
+    }
+    let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
+    let wsl = DriverPlatform::current(Path::new(WSL_GPU_DEVICE)) == DriverPlatform::Wsl;
+    probe_rocm_at(&roots, ambient.each_ref().map(Option::as_deref), wsl)
+}
+
+/// [`probe_rocm`] over injected roots and visibility variables. A blank
+/// visibility variable, or no GPU this process can use, leaves no visible GPU:
+/// models run on the CPU device.
+fn probe_rocm_at(
+    roots: &rocm::SysfsRoots,
+    ambient: [Option<&str>; rocm::VISIBILITY_VARS.len()],
+    wsl: bool,
+) -> HostGpus {
+    if let Some(var) = rocm::blank_visibility_var(ambient) {
         tracing::info!(
             variable = var,
             "{var} is set and names no device, which is how the runtime is \
@@ -334,52 +345,14 @@ fn probe_rocm() -> HostGpus {
              it, so this host has no GPU devices and its models run on the CPU \
              device and are priced against RAM"
         );
-        return HostGpus {
-            caps: HostComputeCaps::unknown(),
-            inventory: GpuInventory {
-                gpus: Some(Vec::new().into()),
-                adoptable: None,
-                adopted: Arc::default(),
-                backend: MemoryBackend::RocmSysfs {
-                    pci_devices: roots.pci_devices.clone(),
-                    meminfo: roots.meminfo.clone(),
-                    ambient_hip_restriction: true,
-                },
-                cpu_roots: None,
-                blank_mask: true,
-            },
-        };
+        return rocm_host(roots, Some(Vec::new().into()), true, true);
     }
-    let (inventory, ambient_hip_restriction) = if cfg!(target_os = "linux") {
-        let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
-        let ambient = ambient.each_ref().map(Option::as_deref);
-        (
-            Some(rocm::build(&roots, ambient)),
-            rocm::ambient_hip_restriction(ambient),
-        )
-    } else {
-        (None, false)
-    };
-    let backend = MemoryBackend::RocmSysfs {
-        pci_devices: roots.pci_devices.clone(),
-        meminfo: roots.meminfo.clone(),
-        ambient_hip_restriction,
-    };
-    let host = |gpus: Option<Arc<[GpuInfo]>>| HostGpus {
-        caps: HostComputeCaps::unknown(),
-        inventory: GpuInventory {
-            gpus,
-            adoptable: None,
-            adopted: Arc::default(),
-            backend: backend.clone(),
-            cpu_roots: None,
-            blank_mask: false,
-        },
-    };
-    let gpus = match inventory {
-        Some(Ok(gpus)) => gpus,
-        Some(Err(failure)) => {
-            if DriverPlatform::current(Path::new(WSL_GPU_DEVICE)) == DriverPlatform::Wsl {
+    let ambient_hip_restriction = rocm::ambient_hip_restriction(ambient);
+    let gpus = match rocm::build(roots, ambient) {
+        Ok(gpus) if gpus.is_empty() => return rocm_host(roots, Some(gpus.into()), true, true),
+        Ok(gpus) => gpus,
+        Err(failure) => {
+            if wsl {
                 tracing::warn!(
                     "ROCm under WSL2 runs through the Windows display driver, which \
                      exposes none of the amdgpu memory counters this host reads: models \
@@ -390,9 +363,8 @@ fn probe_rocm() -> HostGpus {
             } else {
                 failure.log();
             }
-            return host(None);
+            return rocm_host(roots, None, ambient_hip_restriction, false);
         }
-        None => return host(None),
     };
     for gpu in &gpus {
         tracing::info!(
@@ -406,7 +378,31 @@ fn probe_rocm() -> HostGpus {
             "detected GPU"
         );
     }
-    host(Some(gpus.into()))
+    rocm_host(roots, Some(gpus.into()), ambient_hip_restriction, false)
+}
+
+/// A ROCm host over `roots`: unknown capabilities, nothing adoptable.
+fn rocm_host(
+    roots: &rocm::SysfsRoots,
+    gpus: Option<Arc<[GpuInfo]>>,
+    ambient_hip_restriction: bool,
+    no_visible_gpu: bool,
+) -> HostGpus {
+    HostGpus {
+        caps: HostComputeCaps::unknown(),
+        inventory: GpuInventory {
+            gpus,
+            adoptable: None,
+            adopted: Arc::default(),
+            backend: MemoryBackend::RocmSysfs {
+                pci_devices: roots.pci_devices.clone(),
+                meminfo: roots.meminfo.clone(),
+                ambient_hip_restriction,
+            },
+            cpu_roots: None,
+            no_visible_gpu,
+        },
+    }
 }
 
 /// One synthetic unified-memory device from macOS sysctls (`mps.rs`). With
@@ -420,7 +416,7 @@ fn probe_mps() -> HostGpus {
             adopted: Arc::default(),
             backend: MemoryBackend::Mps,
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         },
     };
     let Some(facts) = mps::probe() else {
@@ -458,7 +454,7 @@ fn probe_cpu() -> HostGpus {
             adopted: Arc::default(),
             backend: MemoryBackend::Cpu,
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         },
     }
 }
@@ -636,7 +632,7 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
                     adopted: Arc::default(),
                     backend: MemoryBackend::default(),
                     cpu_roots: None,
-                    blank_mask: true,
+                    no_visible_gpu: true,
                 },
             };
         }
@@ -649,7 +645,7 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
                     adopted: Arc::default(),
                     backend: MemoryBackend::default(),
                     cpu_roots: None,
-                    blank_mask: false,
+                    no_visible_gpu: false,
                 },
             };
         }
@@ -672,7 +668,7 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
             adopted: Arc::default(),
             backend: MemoryBackend::default(),
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         },
     }
 }
@@ -796,7 +792,7 @@ impl GpuInventory {
             adopted: Arc::default(),
             backend: MemoryBackend::default(),
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -809,7 +805,7 @@ impl GpuInventory {
             adopted: Arc::default(),
             backend: MemoryBackend::Cpu,
             cpu_roots: Some(cpu::MemRoots::default()),
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -826,7 +822,7 @@ impl GpuInventory {
             adopted: Arc::default(),
             backend: MemoryBackend::Mps,
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
         .with_cpu(ram_mb, cpu::MemRoots::default())
     }
@@ -844,7 +840,7 @@ impl GpuInventory {
                 ambient_hip_restriction: false,
             },
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -872,7 +868,7 @@ impl GpuInventory {
     /// device on a host known to have none. Never both.
     fn rankable<'a>(&self, gpus: &'a [GpuInfo]) -> &'a [GpuInfo] {
         match accelerators_of(gpus) {
-            [] if self.blank_mask || matches!(self.backend, MemoryBackend::Cpu) => gpus,
+            [] if self.no_visible_gpu || matches!(self.backend, MemoryBackend::Cpu) => gpus,
             accelerators => accelerators,
         }
     }
@@ -987,7 +983,7 @@ impl GpuInventory {
             adopted: Arc::default(),
             backend: MemoryBackend::default(),
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -1160,15 +1156,15 @@ impl GpuInventory {
             }
             return None;
         }
-        // A pin could only re-expose a GPU the operator hid.
-        if self.blank_mask {
+        // A pin could only re-expose a GPU the operator hid, or name one the
+        // worker cannot open.
+        if self.no_visible_gpu {
             if let Some(requested) = requested.map(str::trim).filter(|pin| !pin.is_empty()) {
                 tracing::warn!(
                     pin = %requested,
-                    "ignoring this device pin: this host's ambient visibility \
-                     variable is set to a value that names no device, so no \
-                     GPU is visible to a worker at all and this model runs on \
-                     the CPU device, priced against RAM"
+                    "ignoring this device pin: no GPU is visible to a worker \
+                     on this host (see the startup warning for why), so this \
+                     model runs on the CPU device, priced against RAM"
                 );
             }
             return None;
@@ -1608,7 +1604,7 @@ mod tests {
                 ambient_hip_restriction: false,
             },
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -1623,7 +1619,7 @@ mod tests {
             adopted: Arc::default(),
             backend: MemoryBackend::Mps,
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -1652,7 +1648,7 @@ mod tests {
                 ambient_hip_restriction,
             },
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -1913,7 +1909,7 @@ mod tests {
             );
             // The capability view never blanks, whichever answer it was.
             assert_eq!(host.caps.meets_floor(8.6), Some(true), "{mask:?}");
-            assert!(!host.inventory.blank_mask, "{mask:?}");
+            assert!(!host.inventory.no_visible_gpu, "{mask:?}");
         }
 
         // Set and naming no device — `CUDA_VISIBLE_DEVICES=`, or a value of
@@ -1926,7 +1922,7 @@ mod tests {
             let host = build(Some(TWO_GPUS), mask);
             assert_eq!(uuids(&host, visible), Vec::<String>::new(), "{mask:?}");
             assert!(uuids(&host, adoptable).is_empty(), "{mask:?}");
-            assert!(host.inventory.blank_mask, "{mask:?}");
+            assert!(host.inventory.no_visible_gpu, "{mask:?}");
             assert_eq!(host.caps.meets_floor(8.6), None, "{mask:?}");
             assert_eq!(host.inventory.accelerators(), None, "{mask:?}");
             // No pin in any form, so no worker is handed a GPU back.
@@ -2174,6 +2170,36 @@ mod tests {
         assert!(partial.memory_query().run().is_none());
     }
 
+    /// A ROCm host whose GPU this process cannot open (no render node, as
+    /// without the render group) has no visible GPU: models are placed on the
+    /// CPU device and no pin is written, as under a blank visibility variable.
+    #[test]
+    fn a_rocm_gpu_this_process_cannot_open_puts_models_on_the_cpu_device() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = rocm::SysfsRoots {
+            kfd_nodes: dir.path().join("nodes"),
+            pci_devices: dir.path().join("pci"),
+            dev_dri: dir.path().join("dri"),
+            meminfo: dir.path().join("meminfo"),
+        };
+        let node = roots.kfd_nodes.join("1");
+        std::fs::create_dir_all(&node).unwrap();
+        std::fs::create_dir_all(&roots.dev_dri).unwrap();
+        std::fs::write(
+            node.join("properties"),
+            "simd_count 96\ndrm_render_minor 128\ngfx_target_version 110000\n",
+        )
+        .unwrap();
+        for ambient in [[None; 4], [Some(""), None, None, None]] {
+            let host = probe_rocm_at(&roots, ambient, false).inventory;
+            assert!(host.no_visible_gpu, "{ambient:?}");
+            assert_eq!(host.accelerators(), None, "{ambient:?}");
+            assert_eq!(host.resolve_pin(Some("0")), None, "{ambient:?}");
+            let host = host.with_cpu(64 * 1024, cpu::MemRoots::default());
+            assert_eq!(host.resolve_device_key(None).as_deref(), Some("CPU"));
+        }
+    }
+
     /// The dispatch itself: each accelerator gets its own backend, whatever
     /// the host running the test has installed. ROCm off Linux and MPS off
     /// macOS are unknown-but-still-themselves.
@@ -2372,7 +2398,7 @@ mod tests {
             adopted: Arc::default(),
             backend: MemoryBackend::Cpu,
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         };
         assert!(
             matches!(unprobed_cpu.cpu_memory_query(), MemoryQuery::Unavailable),
@@ -2385,7 +2411,7 @@ mod tests {
                 adopted: Arc::default(),
                 backend: MemoryBackend::Mps,
                 cpu_roots: None,
-                blank_mask: false,
+                no_visible_gpu: false,
             },
             unprobed_cpu,
         ] {
@@ -2575,7 +2601,7 @@ mod tests {
                 ambient_hip_restriction: true,
             },
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         };
         for host in [uninventoried_rocm(true), with_gpus] {
             for requested in [

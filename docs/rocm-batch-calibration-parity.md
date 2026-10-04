@@ -209,10 +209,14 @@ Linux only:
    Known cost, accepted for v1: one quirky node costs a hybrid host the
    whole ledger. Partial inventories are worse, because row indices must
    cover the full openable set to mean anything to HIP. Every one of these
-   paths logs a WARN naming the node or GPU; the probe additionally emits
-   one summary WARN for the three paths that name nothing (no KFD GPU
-   nodes at all, every KFD GPU node hidden by a device cgroup, and no
-   openable render node), so a ROCm host is never *silently* unpriced.
+   paths logs a WARN naming the node or GPU, so a ROCm host is never
+   *silently* unpriced. A host where this process can use no GPU (no KFD
+   GPU nodes at all, every KFD GPU node hidden by a device cgroup, or no
+   openable render node) is not a failure: ROCr enumerates nothing there
+   either, so the inventory is known empty and models run on the CPU
+   device, priced against RAM, as under a blank visibility variable. One
+   WARN says so and names the fix (`/dev/kfd`, `/dev/dri` and the render
+   group).
 5. **Device key** (the ledger/config/pin identity, `GpuInfo::uuid`):
    `GPU-<16 lower hex>` from `unique_id` when it is present, nonzero and
    unique across the **openable** GPUs (the post-filter set, i.e. the
@@ -965,10 +969,9 @@ whole host.
   the pin's belief too.
 - The **unpriced-probe** line — *"this host is configured for ROCm but no
   GPU inventory could be built"* (WARN), carrying `reason`, `gpu_nodes` and
-  `openable_nodes`. Emitted once at startup for the three failure paths
-  that name nothing themselves (`no KFD GPU nodes`, `every KFD GPU node is
-  hidden by a device cgroup`, `no openable render node`).
-  It is the answer to "the ledger is simply not there and nothing said why".
+  `openable_nodes`. Emitted once at startup for a failure path that names
+  nothing itself. It is the answer to "the ledger is simply not there and
+  nothing said why".
 - The per-node refusals, each naming the node or GPU that tripped: the
   partitioned-GPU warning — *"this PCI device publishes several KFD
   nodes"* — the absent `simd_count`, unreadable-properties,

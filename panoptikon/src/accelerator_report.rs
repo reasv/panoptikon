@@ -321,7 +321,7 @@ fn probe_amd_rocm_stack() -> Option<GpuStackPresence> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    let kfd_gpus = crate::inferio::gpu::rocm_topology_gfx_names();
+    let kfd_gpus = crate::inferio::gpu::rocm_topology_gpus();
     let mut evidence = Vec::new();
     if std::path::Path::new("/opt/rocm").is_dir() {
         evidence.push("/opt/rocm exists");
@@ -338,25 +338,29 @@ fn probe_amd_rocm_stack() -> Option<GpuStackPresence> {
     if evidence.is_empty() {
         return None;
     }
-    // The ROCm tools are optional (the Docker image and a driver-only host
-    // have neither); the kernel's topology still names each GPU's ISA.
-    let mut names = amd_device_names();
-    if names.is_empty() {
-        names = kfd_gpus.iter().map(|gfx| format!("AMD {gfx}")).collect();
-    }
     Some(GpuStackPresence {
         stack: "amd-rocm",
         backend: Accelerator::Rocm,
-        devices: names
-            .into_iter()
-            .map(|name| GpuDevice {
-                stack: "amd-rocm",
-                name,
-                compute_cap: None,
-            })
-            .collect(),
+        devices: amd_devices(&kfd_gpus),
         evidence: evidence.join("; "),
     })
+}
+
+/// One device per KFD GPU node, named by ISA as the GPU inventory names it;
+/// a GPU this process cannot open, which the inventory leaves out, says so.
+fn amd_devices(kfd_gpus: &[(String, bool)]) -> Vec<GpuDevice> {
+    kfd_gpus
+        .iter()
+        .map(|(gfx, openable)| GpuDevice {
+            stack: "amd-rocm",
+            name: if *openable {
+                format!("AMD {gfx}")
+            } else {
+                format!("AMD {gfx} (not openable by this process)")
+            },
+            compute_cap: None,
+        })
+        .collect()
 }
 
 fn nvidia_devices() -> Vec<GpuDevice> {
@@ -407,97 +411,6 @@ fn parse_nvidia_query_lines(text: &str) -> Vec<GpuDevice> {
             })
         })
         .collect()
-}
-
-fn amd_device_names() -> Vec<String> {
-    if let Some(names) = rocm_smi_product_names()
-        && !names.is_empty()
-    {
-        return names;
-    }
-    rocminfo_marketing_names()
-}
-
-fn rocm_smi_product_names() -> Option<Vec<String>> {
-    let bin = which("rocm-smi")?;
-    let output = Command::new(bin)
-        .args(["--showproductname"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut names = Vec::new();
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        for key in ["card series:", "card model:"] {
-            if let Some(idx) = lower.find(key) {
-                let v = line[idx + key.len()..].trim();
-                if !v.is_empty() {
-                    names.push(v.to_string());
-                }
-            }
-        }
-    }
-    Some(names)
-}
-
-fn rocminfo_marketing_names() -> Vec<String> {
-    let Some(bin) = which("rocminfo") else {
-        return Vec::new();
-    };
-    let output = match Command::new(bin).output() {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-    parse_rocminfo_gpu_marketing_names(&String::from_utf8_lossy(&output.stdout))
-}
-
-/// Collect marketing names only for **GPU** agents.
-///
-/// `rocminfo` prints a `Marketing Name` for every HSA agent, including the
-/// host CPU (usually listed first). Naively taking every Marketing Name line
-/// reports "CPU then GPU" under the ROCm stack even when only the GPU is used
-/// for inference. Fields may appear in either order within an agent block;
-/// agent blocks are separated by lines of asterisks.
-fn parse_rocminfo_gpu_marketing_names(text: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut marketing: Option<String> = None;
-    let mut device_type: Option<String> = None;
-
-    let flush = |marketing: &mut Option<String>,
-                 device_type: &mut Option<String>,
-                 names: &mut Vec<String>| {
-        let name = marketing.take();
-        let dtype = device_type.take();
-        if let (Some(name), Some(dtype)) = (name, dtype)
-            && dtype.eq_ignore_ascii_case("GPU")
-            && !name.is_empty()
-            && !name.eq_ignore_ascii_case("N/A")
-        {
-            names.push(name);
-        }
-    };
-
-    for line in text.lines() {
-        let t = line.trim();
-        // Agent separator: "*******" (rocminfo) between Agent blocks.
-        if !t.is_empty() && t.chars().all(|c| c == '*') {
-            flush(&mut marketing, &mut device_type, &mut names);
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix("Marketing Name:") {
-            marketing = Some(rest.trim().to_string());
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix("Device Type:") {
-            device_type = Some(rest.trim().to_string());
-            continue;
-        }
-    }
-    flush(&mut marketing, &mut device_type, &mut names);
-    names
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -584,11 +497,7 @@ mod tests {
             GpuStackPresence {
                 stack: "amd-rocm",
                 backend: Accelerator::Rocm,
-                devices: vec![GpuDevice {
-                    stack: "amd-rocm",
-                    name: "Radeon RX 7900 XTX".into(),
-                    compute_cap: None,
-                }],
+                devices: amd_devices(&[("gfx1100".into(), true), ("gfx1030".into(), false)]),
                 evidence: "test".into(),
             },
             // Unrelated stack should not appear under selected ROCm devices.
@@ -606,7 +515,11 @@ mod tests {
         let report = assemble_report(Accelerator::Rocm, BackendSource::InstalledVenv, stacks);
         let text = report.format_text();
         assert!(text.contains("backend: rocm"), "{text}");
-        assert!(text.contains("[amd-rocm] Radeon RX 7900 XTX"), "{text}");
+        assert!(text.contains("[amd-rocm] AMD gfx1100\n"), "{text}");
+        assert!(
+            text.contains("[amd-rocm] AMD gfx1030 (not openable by this process)"),
+            "{text}"
+        );
         assert!(!text.contains("Should Not Appear"), "{text}");
         assert!(!text.contains("using CPU"), "{text}");
         assert!(report.warnings.is_empty());
@@ -721,85 +634,5 @@ mod tests {
         assert!(!text.contains("using CPU"), "{text}");
         assert!(!text.contains("none detected"), "{text}");
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
-    }
-
-    /// Minimal rocminfo-shaped output: CPU agent first, then GPU (real tools
-    /// list both Marketing Names; we must keep only Device Type GPU).
-    #[test]
-    fn rocminfo_skips_cpu_agent_marketing_name() {
-        let sample = r#"
-ROCm System Management Interface
-===============================
-*******                      
-Agent 1                      
-*******                      
-  Name:                    AMD Ryzen 9 7950X 16-Core Processor
-  Uuid:                    CPU-XX                             
-  Marketing Name:          AMD Ryzen 9 7950X 16-Core Processor
-  Vendor Name:             CPU                                
-  Feature:                 None specified                     
-  Profile:                 FULL_PROFILE                       
-  Float Round Mode:        NEAR                               
-  Max Queue Number:         0(0x0)                             
-  Queue Min Size:           0(0x0)                             
-  Queue Max Size:           0(0x0)                             
-  Queue Type:              MULTI                              
-  Node:                    0                                  
-  Device Type:             CPU                                
-*******                      
-Agent 2                      
-*******                      
-  Name:                    gfx1100                            
-  Uuid:                    GPU-XX                             
-  Marketing Name:          Radeon RX 7900 XTX                 
-  Vendor Name:             AMD                                
-  Feature:                 KERNEL_DISPATCH                    
-  Profile:                 BASE_PROFILE                       
-  Float Round Mode:        NEAR                               
-  Max Queue Number:         128(0x80)                          
-  Queue Min Size:           64(0x40)                           
-  Queue Max Size:           131072(0x20000)                    
-  Queue Type:              MULTI                              
-  Node:                    1                                  
-  Device Type:             GPU                                
-"#;
-        let names = parse_rocminfo_gpu_marketing_names(sample);
-        assert_eq!(names, vec!["Radeon RX 7900 XTX".to_string()]);
-    }
-
-    /// Device Type may appear before Marketing Name within an agent block.
-    #[test]
-    fn rocminfo_accepts_device_type_before_marketing_name() {
-        let sample = r#"
-*******
-Agent 1
-*******
-  Device Type:             GPU
-  Marketing Name:          Radeon RX 6800 XT
-*******
-Agent 2
-*******
-  Device Type:             CPU
-  Marketing Name:          Some CPU
-"#;
-        let names = parse_rocminfo_gpu_marketing_names(sample);
-        assert_eq!(names, vec!["Radeon RX 6800 XT".to_string()]);
-    }
-
-    #[test]
-    fn rocminfo_drops_na_and_empty_gpu_names() {
-        let sample = r#"
-*******
-  Device Type:             GPU
-  Marketing Name:          N/A
-*******
-  Marketing Name:          
-  Device Type:             GPU
-*******
-  Marketing Name:          Real GPU
-  Device Type:             GPU
-"#;
-        let names = parse_rocminfo_gpu_marketing_names(sample);
-        assert_eq!(names, vec!["Real GPU".to_string()]);
     }
 }
