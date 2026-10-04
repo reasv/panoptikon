@@ -228,6 +228,29 @@ fn deflation_is_also_repaid_by_elapsed_time() {
     assert_eq!(token.grant().unit_budget, 64, "back to the full budget");
 }
 
+/// Only time with no window granted repays: two failed windows that each
+/// take two intervals deflate twice.
+#[test]
+fn time_with_a_window_granted_repays_no_deflation() {
+    let ledger = ledger(100_000, no_margin());
+    let handle = loaded(Some(1000), Some(0));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .unwrap();
+    push_memory(&handle, 90_000, 0);
+    for expected in [4, 8, 16, 32] {
+        assert_eq!(measured_window(&handle, &admission, expected), expected);
+    }
+    for _ in 0..2 {
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        ledger.age_deflation_clock_for_test(admission.worker_id(), DEFLATION_REPAY_SECS * 2);
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        });
+    }
+    assert_eq!(ledger.health()[0].workers[0].deflation, 2);
+}
+
 /// The window **target** repays deflation before reading the counter, since
 /// the grant path repays too late to size an idle replica's next window.
 #[test]

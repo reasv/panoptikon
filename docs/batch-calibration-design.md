@@ -1960,8 +1960,9 @@ Worker, per batch within its window:
     about admission while still having to be repaid before the budget can
     move. The one spare level preserves the difference between "as deflated as
     it can be" and "one more negative just arrived".
-  - **Repay one level per 30 s of wall time**, in addition to the
-    three-clean-windows rule. Clean windows can only repay while windows are
+  - **Repay one level per 30 s of wall time with no window granted**, in
+    addition to the three-clean-windows rule. A window's own time repays
+    nothing, or a failing window longer than 60 s could never deepen it. Clean windows can only repay while windows are
     flowing, and the expensive case is the one where they are not: the fault
     storm deflates the replica, the queue drains, and nothing is left to earn
     the halvings back. 30 s is the idle-resident trim's debounce — the interval

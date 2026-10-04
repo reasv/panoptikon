@@ -372,13 +372,19 @@ impl VramLedger {
         })
     }
 
-    /// Repay deflation for elapsed wall time ([`DEFLATION_REPAY_SECS`]).
-    /// Called wherever the counter is about to be read, not on a timer.
+    /// Repay deflation for elapsed wall time ([`DEFLATION_REPAY_SECS`]) with
+    /// no window granted: while one is, the clock restarts, so a window's own
+    /// time, which ends at its settle, repays nothing. Called wherever the
+    /// counter is about to be read, not on a timer.
     pub(super) fn repay_deflation_locked(state: &mut LedgerState, worker: WorkerId) {
         let now = Instant::now();
         let Some(entry) = state.workers.get_mut(&worker) else {
             return;
         };
+        if !entry.grants.is_empty() {
+            entry.deflation_repaid_at = entry.deflation_repaid_at.map(|_| now);
+            return;
+        }
         let before = entry.deflation;
         if entry.repay_deflation_by_time(now) == 0 {
             return;

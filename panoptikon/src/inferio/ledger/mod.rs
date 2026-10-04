@@ -156,8 +156,8 @@ pub const OOM_WINDOWS_AT_FLOOR: u32 = CLEAN_WINDOWS_TO_RESTORE;
 /// The default ceiling of the load-failure cooldown.
 pub const DEATH_VERDICT_LAPSE: Duration = Duration::from_secs(300);
 
-/// Wall time that repays one level of deflation, for a replica too idle to
-/// earn clean windows.
+/// Wall time with no window granted that repays one level of deflation, for
+/// a replica too idle to earn clean windows.
 pub const DEFLATION_REPAY_SECS: Duration = TRIM_DEBOUNCE;
 
 /// Extrapolation ratchet: a unit budget never exceeds this times the anchor
