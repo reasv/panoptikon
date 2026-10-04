@@ -644,13 +644,6 @@ struct DetectionProbes {
     kfd_gpus: Vec<String>,
 }
 
-/// The gfx targets the `rocm` extra's torch wheel is built for:
-/// `PYTORCH_ROCM_ARCH` of PyTorch 2.11's ROCm builds. Update with that pin.
-const ROCM_WHEEL_GFX: [&str; 14] = [
-    "gfx900", "gfx906", "gfx908", "gfx90a", "gfx942", "gfx950", "gfx1030", "gfx1100", "gfx1101",
-    "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
-];
-
 impl DetectionProbes {
     fn gather() -> Self {
         let system32_nvidia_smi = cfg!(windows)
@@ -711,7 +704,7 @@ fn decide_accelerator(probes: &DetectionProbes) -> (Accelerator, String) {
         if let Some(gfx) = probes
             .kfd_gpus
             .iter()
-            .find(|gfx| ROCM_WHEEL_GFX.contains(&gfx.as_str()))
+            .find(|gfx| crate::inferio::gpu::ROCM_WHEEL_GFX.contains(&gfx.as_str()))
         {
             return (
                 Accelerator::Rocm,

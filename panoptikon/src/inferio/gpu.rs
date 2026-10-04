@@ -185,6 +185,17 @@ pub struct HostGpus {
     pub inventory: GpuInventory,
 }
 
+/// The gfx targets the `rocm` extra's torch wheel is built for:
+/// `PYTORCH_ROCM_ARCH` of PyTorch 2.11's ROCm builds. Update with that pin.
+pub const ROCM_WHEEL_GFX: [&str; 14] = [
+    "gfx900", "gfx906", "gfx908", "gfx90a", "gfx942", "gfx950", "gfx1030", "gfx1100", "gfx1101",
+    "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+];
+
+/// Makes HIP run kernels built for another gfx target, so a GPU outside
+/// [`ROCM_WHEEL_GFX`] can still run the wheel's kernels.
+const GFX_OVERRIDE_ENV_VAR: &str = "HSA_OVERRIDE_GFX_VERSION";
+
 /// The GPUs in the KFD topology: ISA name (`gfx1100`) and whether this
 /// process can open it; empty without amdgpu.
 pub fn rocm_topology_gpus() -> Vec<(String, bool)> {
@@ -767,11 +778,25 @@ fn accelerators_of(gpus: &[GpuInfo]) -> &[GpuInfo] {
     &gpus[..end]
 }
 
-/// Where an unpinned replica lands: the highest compute capability, ties
-/// broken by [`GpuInfo::placement_total_mb`] and then the lowest index.
+/// Where an unpinned replica lands: [`default_gpu_with`], with the gfx
+/// override read from this process's environment, which workers inherit.
 fn default_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
+    let gfx_override = std::env::var_os(GFX_OVERRIDE_ENV_VAR).is_some_and(|v| !v.is_empty());
+    default_gpu_with(gpus, gfx_override)
+}
+
+/// A ROCm GPU outside [`ROCM_WHEEL_GFX`] last (unless `gfx_override`), then
+/// the highest compute capability, ties broken by
+/// [`GpuInfo::placement_total_mb`] and then the lowest index.
+fn default_gpu_with(gpus: &[GpuInfo], gfx_override: bool) -> Option<&GpuInfo> {
     gpus.iter().min_by_key(|gpu| {
+        let no_kernels = !gfx_override
+            && gpu.gfx_target_version.is_some()
+            && !gpu
+                .arch()
+                .is_some_and(|arch| ROCM_WHEEL_GFX.contains(&arch.as_str()));
         (
+            no_kernels,
             std::cmp::Reverse(gpu.cap_tenths()),
             std::cmp::Reverse(gpu.placement_total_mb()),
             gpu.index,
@@ -2030,6 +2055,17 @@ mod tests {
             assert_eq!(host.default_gpu_name().as_deref(), Some(name), "{label}");
             assert_eq!(host.default_pin().as_deref(), Some(pin), "{label}");
         }
+    }
+
+    /// A GPU the ROCm wheel has no kernels for ranks last, however large,
+    /// unless the gfx override makes HIP run another target's kernels.
+    #[test]
+    fn default_placement_ranks_a_gpu_the_wheel_lacks_last() {
+        let mut igpu = amd_apu(0, "0000:0e:00.0", 512, 65_536, 128 * 1024);
+        igpu.gfx_target_version = Some(100_306);
+        let gpus = [igpu, amd_gpu(1, "0000:03:00.0", 8176)];
+        assert_eq!(default_gpu_with(&gpus, false).map(|gpu| gpu.index), Some(1));
+        assert_eq!(default_gpu_with(&gpus, true).map(|gpu| gpu.index), Some(0));
     }
 
     /// The refresh interface follows the inventory, so a ROCm host never asks
