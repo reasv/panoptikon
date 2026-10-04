@@ -102,6 +102,7 @@ legs.py --scenario S2 --bin PATH --config C1 --results DIR
         [--note "..."] [--port N] [--inference-url URL]
         [--legacy-port 6339] [--seed-calibration FILE] [--job-cap S]
         [--settle S] [--hog-device N] [--hog-port N] [--min-free-mb 1024]
+        [--hog-event at=S,leave_free=MIB|hold=MIB|release ...]
         [--health-full] [--repo DIR] [--no-dotenv] [--list] [--dry-run]
 ```
 
@@ -188,7 +189,10 @@ number the scenario is defined against, so it is 2 048 MiB on every board,
 neither scaled nor floored, at t+90 s and released at t+100 s. On a 32 607 MiB
 board the four resolve to S4a 4 093, S4b 10 233, S4c 2 048 and S4d 2 729 MiB. Every event is timed **from the job's POST**, not from
 the leg's start, because what the scenario describes is a change during the
-job.
+job. `--hog-event` adds such an event in MiB to any scenario (`at=60,
+leave_free=4096`, `at=120,release`), with any `--hog-target`; on a scenario
+without a hog of its own, one starts holding 0 with its leave-free level
+pinned, as S4a's, so the job's own pool does not move it after the event.
 
 **Descriptors.** `fds.jsonl` is written here, in the JSONL form
 `analyze.py::read_fds` accepts — which closes, for the bare-host case, the gap

@@ -18,6 +18,7 @@ Usage
             [--note "..."] [--port N] [--inference-url URL] \\
             [--seed-calibration FILE] [--job-cap S] [--settle S] \\
             [--hog-device N] [--hog-target gpu|mps|ram] [--min-free-mb 1024] \\
+            [--hog-event at=S,leave_free=MIB|hold=MIB|release ...] \\
             [--list] [--dry-run]
 
 `--list` prints the scenario table and exits; `--dry-run` resolves everything
@@ -128,7 +129,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -168,11 +169,31 @@ class HogEvent:
     #: exactly one of these
     hold_fraction: Optional[float] = None
     leave_free_fraction: Optional[float] = None
-    #: an absolute level, for a figure the protocol states in MiB rather than
-    #: as a share of the board: S4c's 2 GB is the defensive clamp's own
-    #: threshold, the same number on a 24 GB card as on a 96 GB one.
+    #: absolute levels, for a figure stated in MiB rather than as a share of
+    #: the board: S4c's 2 GB is the defensive clamp's own threshold, the same
+    #: number on a 24 GB card as on a 96 GB one, and `--hog-event` is in MiB.
     leave_free_mb: Optional[int] = None
+    hold_mb: Optional[int] = None
     label: str = ""
+
+
+def parse_hog_event(text: str) -> HogEvent:
+    """`at=S,leave_free=MIB`, `at=S,hold=MIB` or `at=S,release`: a hog change
+    S seconds after the job is posted, in MiB, neither scaled nor floored."""
+    fields = dict(part.partition("=")[::2] for part in text.split(","))
+    try:
+        at_s = float(fields.pop("at"))
+        if fields.keys() == {"leave_free"}:
+            return HogEvent(at_s, leave_free_mb=int(fields["leave_free"]),
+                            label=text)
+        if fields.keys() == {"hold"}:
+            return HogEvent(at_s, hold_mb=int(fields["hold"]), label=text)
+        if fields == {"release": ""}:
+            return HogEvent(at_s, hold_mb=0, label=text)
+    except (KeyError, ValueError):
+        pass
+    raise argparse.ArgumentTypeError(
+        f"{text!r}: want at=S,leave_free=MIB, at=S,hold=MIB or at=S,release")
 
 
 @dataclass(frozen=True)
@@ -1172,6 +1193,9 @@ class Leg:
             if event.leave_free_mb is not None:
                 row["leave_free_mb"] = event.leave_free_mb
                 row["fraction"] = None
+            elif event.hold_mb is not None:
+                row["mb"] = event.hold_mb
+                row["fraction"] = None
             elif event.leave_free_fraction is not None:
                 scaled = scale_mb(event.leave_free_fraction, self.total_mb)
                 row["leave_free_mb"] = max(self.args.min_free_mb, scaled)
@@ -1873,6 +1897,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "device `ram` is pressure on the same budget "
                              "by the other route, so a macOS pass runs "
                              "both")
+    parser.add_argument("--hog-event", action="append", default=[],
+                        type=parse_hog_event,
+                        metavar="at=S,leave_free=MIB|hold=MIB|release",
+                        help="a hog change S seconds after the job is posted, "
+                             "beside the scenario's own (repeatable); on a "
+                             "scenario without a hog, one starts holding 0 "
+                             "and keeps what each event solved for")
     parser.add_argument("--hog-port", type=int, default=6401)
     parser.add_argument("--seed-calibration",
                         help="calibration.toml copied into the fresh root "
@@ -1996,6 +2027,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             "the total the "
             "worker adopts -- on macOS that is the recommended-max "
             "`selftest.py` prints as device.gpu_total_mb, not hw.memsize")
+    if args.hog_event:
+        timed = tuple(sorted(scenario.events + tuple(args.hog_event),
+                             key=lambda event: event.at_s))
+        if wants_hog:
+            scenario = replace(scenario, events=timed)
+        else:
+            # Pinned, as S4a's: the job's own pool changing `free` after an
+            # event must not move the hog.
+            scenario = replace(scenario, events=timed, hog_hold_fraction=0.0,
+                               hog_reeval=999999)
 
     if args.dry_run:
         directory = Path(args.results) / (args.run_id or "<run-id>") / scenario.key
@@ -2064,6 +2105,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 else measured_source if measured_total_mb
                                 else "reference default"),
         "hog": ({"target": args.hog_target, "schedule": schedule,
+                 "reeval": scenario.hog_reeval,
                  **schedule_detail} if schedule else None),
         "hog_events": events,
         "floor_bound": leg.floor_notes,
