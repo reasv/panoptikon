@@ -141,7 +141,10 @@ impl VramLedger {
     /// The other devices sharing this one's host RAM, which would otherwise
     /// grant the same bytes twice: the CPU device, the MPS device and every
     /// APU are peers of each other. None for a GPU with its own memory.
-    fn ram_domain_peers<'a>(state: &'a LedgerState, gpu: &'a str) -> impl Iterator<Item = &'a str> {
+    pub(super) fn ram_domain_peers<'a>(
+        state: &'a LedgerState,
+        gpu: &'a str,
+    ) -> impl Iterator<Item = &'a str> {
         let shares_ram = |device: &GpuLedger| device.unified_ram_mb.is_some();
         let own = state.gpus.get(gpu).is_some_and(shares_ram);
         state

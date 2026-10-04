@@ -81,14 +81,17 @@ impl VramLedger {
         let pressure = self.memory_pressure();
         // Fold in neighbours' per-batch pool growth before pricing, or it reads
         // as external usage. Before the probe, which reads the same clock.
-        let (gpu, ram_side) = {
+        let (gpu, ram_side, shares_ram) = {
             let mut state = self.lock();
             Self::refresh_pools_locked(&mut state);
             let entry = state.workers.get(&worker)?;
-            (entry.gpu.clone(), entry.has_ram_side())
+            let shares_ram = entry.gpu != cpu::DEVICE_KEY
+                && Self::ram_domain_peers(&state, &entry.gpu).next().is_some();
+            (entry.gpu.clone(), entry.has_ram_side(), shares_ram)
         };
-        // While macOS pages, the worker's last reading may predate it.
-        if pressure.paging() {
+        // The worker's last reading may predate a RAM-domain peer's growth
+        // that its own grant has since settled, or macOS paging.
+        if shares_ram || pressure.paging() {
             self.refresh_host_ram_now(&gpu);
         }
         self.maybe_refresh_external(worker);

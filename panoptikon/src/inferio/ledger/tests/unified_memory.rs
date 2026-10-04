@@ -1551,6 +1551,42 @@ fn an_apus_ram_floor_is_taken_within_the_cgroup_limit() {
     assert_eq!(grant.grant().ram_reserve_mb, apu.reserve_mb);
 }
 
+/// An APU grant reads the RAM it shares first: the worker's last reading
+/// may predate memory a CPU replica kept after its own grant settled.
+#[test]
+fn an_apu_grant_reads_its_ram_first() {
+    const RAM: u64 = 128 * 1024 - APU_CARVEOUT_MB;
+    let inventory = GpuInventory::known_rocm(vec![apu_device(0)])
+        .with_cpu(RAM, crate::inferio::cpu::MemRoots::default());
+    let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
+    ledger.install_probe_stub(None);
+    let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
+    let admission = ledger
+        .register_worker("g/apu", item_cost(4), &handle, None)
+        .expect("admitted on the APU");
+    push_apu(&handle, 0, 60 * 1024, 40 * 1024, 0);
+    ledger.ingest_all_for_test();
+    let stale = ledger.headroom_mb(AMD_A);
+    let taken = 20 * 1024;
+    ledger.install_probe_stub(Some(vec![GpuMemory {
+        uuid: AMD_A.to_owned(),
+        total_mb: APU_TOTAL_MB,
+        free_mb: 40 * 1024 - taken,
+        gtt: Some(crate::inferio::gpu::GttBasis {
+            gtt_free_mb: 60 * 1024,
+            ram_available_mb: 40 * 1024 - taken,
+        }),
+    }]));
+    let charges = || device_of(&ledger.health(), AMD_A).charges_mb;
+    let before = charges();
+    let _grant = admission.request_grant(64, None, 1, 0).expect("granted");
+    assert_eq!(ledger.probe_calls(), 1);
+    assert_eq!(
+        ledger.headroom_mb(AMD_A) + (charges() - before),
+        stale - taken
+    );
+}
+
 /// An APU's memory in its carve-out is not in host RAM: a pool that fits in
 /// a 96 GiB carve-out leaves the CPU device's headroom as it was.
 #[test]

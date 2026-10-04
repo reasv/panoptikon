@@ -406,10 +406,10 @@ impl VramLedger {
     }
 
     /// Read `device`'s free memory now, for a grant that cannot be priced
-    /// from an older reading: host RAM another process may have taken since
-    /// the last grant, or any device of a Mac while it pages. Synchronous:
-    /// RAM statistics are a cheap read, unlike a GPU driver query. Only when
-    /// [`may_probe`].
+    /// from an older reading: host RAM another process or a RAM-domain peer
+    /// may have taken since the last grant, or any device of a Mac while it
+    /// pages. Synchronous: RAM statistics and amdgpu's sysfs counters are a
+    /// cheap read, unlike a GPU driver query. Only when [`may_probe`].
     pub(super) fn refresh_host_ram_now(&self, device: &str) {
         let due = self.lock().gpus.get(device).is_some_and(may_probe);
         if !due || !self.probes_the_host() {
