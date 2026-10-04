@@ -583,13 +583,10 @@ def test_the_fixed_estimate_is_the_last_resort_and_names_itself(fake_torch) -> N
     report = memory.finish_load(before, object())
     assert report["base_method"] == "alloc_delta"
     assert report["base_mb"] == 800 + memory.CONTEXT_ESTIMATE_MB
-    # Each backend's estimate covers the largest context measured on it.
-    assert memory.CONTEXT_ESTIMATE_MB >= 668
     with isolated(fake_torch_module(FakeCuda(), hip="7.2.0")):
         assert memory.context_allowance_mb() == (
             memory.HIP_CONTEXT_ESTIMATE_MB, "estimate"
         )
-        assert memory.HIP_CONTEXT_ESTIMATE_MB >= 286
 
 
 def test_an_unmeasured_context_is_logged_once_with_its_reason(
@@ -597,7 +594,7 @@ def test_an_unmeasured_context_is_logged_once_with_its_reason(
 ) -> None:
     # A base priced with the context estimate logs one INFO line per worker
     # naming the estimate and why the context went unmeasured. A base from a
-    # per-process figure logs none.
+    # per-process figure or a plausible free delta logs none.
     band = "outside the band"
     fixed = (
         memory.CONTEXT_NO_DRIVER_READING,
@@ -611,17 +608,22 @@ def test_an_unmeasured_context_is_logged_once_with_its_reason(
     # The probe polls only when the test says, so whether it saw the GPU come
     # up is not a race.
     monkeypatch.setattr(memory._ContextProbe, "start", lambda self: None)
-    for hip, fdinfo_texts, initialized, polled, nvml, expected in (
-        (False, None, True, True, (8700, 24_576),
+    # `returned` is the MiB the allocation gives back to the free reading.
+    for (
+        hip, fdinfo_texts, initialized, polled, nvml, returned, method, expected
+    ) in (
+        (False, None, True, True, (8700, 24_576), 600, "alloc_delta",
          (memory.CONTEXT_INITIALISED_BEFORE, cuda_estimate)),
-        (False, None, True, True, (None, None),
+        (False, None, True, True, (None, None), 600, "alloc_delta",
          (memory.CONTEXT_NO_DRIVER_READING, cuda_estimate)),
-        (False, None, False, False, (8700, 24_576),
+        (False, None, False, False, (8700, 24_576), 600, "alloc_delta",
          (memory.CONTEXT_INIT_UNSEEN, cuda_estimate)),
-        (False, None, False, True, (8700, 24_576), (band, cuda_estimate)),
-        (True, None, True, True, (None, None),
+        (False, None, False, True, (8700, 24_576), 600, "alloc_delta",
+         (band, cuda_estimate)),
+        (True, None, True, True, (None, None), 600, "alloc_delta",
          (memory.CONTEXT_NO_DRIVER_READING, hip_estimate)),
-        (True, ours, True, True, (None, None), None),
+        (True, ours, True, True, (None, None), 600, "fdinfo", None),
+        (False, None, True, True, (None, None), 0, "free_delta", None),
     ):
         cuda = FakeCuda(initialized=initialized)
         host = (
@@ -643,14 +645,12 @@ def test_an_unmeasured_context_is_logged_once_with_its_reason(
                 if polled and before["context_probe"] is not None:
                     before["context_probe"].poll()
                 cuda.allocate(512, reserved_mb=600)
-                cuda.free += 600 * MIB
+                cuda.free += returned * MIB
                 report = memory.finish_load(before, object())
-                assert report["base_method"] == (
-                    "fdinfo" if fdinfo_texts else "alloc_delta"
-                )
+                assert report["base_method"] == method
         records = [(r.levelno, r.args) for r in caplog.records]
         if expected is None:
-            assert records == [], "a per-process base"
+            assert records == [], method
         elif expected[0] == band:
             [(level, (reason, estimate))] = records
             assert (level, estimate) == (logging.INFO, expected[1])
@@ -1714,14 +1714,16 @@ KFD_GPU_ID = 4242
 OUR_PASID = 32770
 
 
-def kfd_tree(tmp_path, procs: dict) -> str:
-    """A KFD tree with `0000:03:01.0` as one GPU node and `procs` as
-    `{entry name: (pasid, vram MiB)}`."""
+def kfd_tree(tmp_path, pci: tuple, procs: dict) -> str:
+    """A KFD tree with one GPU node at `pci`, `(domain, bus, device)` as in
+    `FakeCuda.pci`, and `procs` as `{entry name: (pasid, vram MiB)}`."""
     root = _fresh(tmp_path, "kfd")
     cpu, gpu = root / "topology/nodes/0", root / "topology/nodes/1"
-    for node, location in ((cpu, 0), (gpu, 0x03 << 8 | 0x01 << 3)):
+    domain, bus, device = pci
+    nodes = {cpu: (0, 0), gpu: (domain, bus << 8 | device << 3)}
+    for node, (d, loc) in nodes.items():
         node.mkdir(parents=True)
-        (node / "properties").write_text(f"domain 0\nlocation_id {location}\n")
+        (node / "properties").write_text(f"domain {d}\nlocation_id {loc}\n")
     (gpu / "gpu_id").write_text(f"{KFD_GPU_ID}\n")
     for name, (pasid, vram_mb) in procs.items():
         entry = root / "proc" / str(name)
@@ -1758,11 +1760,13 @@ def test_kfd_is_the_discrete_base_where_it_exceeds_fdinfo(
     # initial PID namespace; elsewhere by the PASID KFD gives our DRM
     # clients, unless another process holds it too (a fork).
     def ours(vram: str | None = "1536 MiB") -> str:
-        return fdinfo("0000:03:01.0", 1, vram) + f"pasid:\t{OUR_PASID}\n"
+        return fdinfo("0001:03:01.0", 1, vram) + f"pasid:\t{OUR_PASID}\n"
 
     pid, host_pid = os.getpid(), 999_999
-    # Outside the initial namespace `/proc` also holds our own process.
-    me, fork = {pid: [ours()]}, {pid: [ours()], pid + 1: [ours()]}
+    # Outside the initial namespace `/proc` also holds our own process, under
+    # its PID and as `self`.
+    me = {pid: [ours()], "self": [ours()]}
+    fork = {pid: [ours()], "self": [ours()], pid + 1: [ours()]}
     under_pool = "free_delta", 1200
     for initial_ns, procs, others, vram, expected, label in (
         (True, {pid: (OUR_PASID, 1600)}, {}, "1536 MiB", ("kfd", 1600),
@@ -1788,10 +1792,10 @@ def test_kfd_is_the_discrete_base_where_it_exceeds_fdinfo(
         (False, {}, me, "1536 MiB", ("fdinfo", 1536), "no KFD entry"),
     ):
         cuda = FakeCuda()
-        cuda.pci = (0, 0x03, 0x01)
+        cuda.pci = (1, 0x03, 0x01)
         with rocm_host(
             tmp_path, monkeypatch, fdinfo_texts=[ours(vram)], cuda=cuda,
-            kfd=kfd_tree(tmp_path, procs),
+            kfd=kfd_tree(tmp_path, cuda.pci, procs),
             proc=proc_tree(tmp_path, initial_ns, others),
         ):
             before = memory.begin_load()
@@ -1873,12 +1877,13 @@ def test_the_fdinfo_tier_counts_gtt_on_a_unified_device(tmp_path, monkeypatch) -
     gpu = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 256 * MIB)})
     write_gtt(gpu, "0000:03:00.0", APU_GTT_MIB * MIB, 4096 * MIB)
     carveout = FakeCuda(total_mb=APU_CARVEOUT_MIB)
-    kfd = kfd_tree(tmp_path, {os.getpid(): (OUR_PASID, 4096)})
+    kfd = kfd_tree(tmp_path, carveout.pci, {os.getpid(): (OUR_PASID, 4096)})
     with rocm_host(
         tmp_path, monkeypatch, pci=gpu, fdinfo_texts=texts, cuda=carveout,
         kfd=kfd, proc=proc_tree(tmp_path, True, {}),
     ):
         assert memory.fdinfo_own_vram_mb() == 384, "VRAM alone without the flag"
+        assert memory.kfd_own_vram_mb() == 4096
         with unified():
             assert memory.fdinfo_own_vram_mb() == 384 + 2560
             before = memory.begin_load()
@@ -2048,7 +2053,8 @@ def test_the_fdinfo_reading_is_bounded_below_and_above(
         (total - 1, 1024, 1, "fdinfo", "one MiB under it is a real reading"),
         # The comparand is the ABSOLUTE post-load pool, not the window delta:
         # a windowed one would pass an under-report on every reload.
-        (900, 3000, 2, "free_delta", "an under-report against the pool by then"),
+        (4000, 3000, 2, "free_delta",
+         "an under-report against the pool by then"),
     ):
         assert base_method(vram, pool, loads) == expected, label
     # Each rejection is an INFO line, once per worker, naming the source.

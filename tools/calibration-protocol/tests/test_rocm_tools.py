@@ -526,6 +526,12 @@ def test_selftest_asks_every_base_tier_of_the_worker(monkeypatch):
     monkeypatch.setitem(memory._nvml_state, "module", None)
     rows = selftest.probe_base_tiers(memory, {}, 1024, 1024, 1024)
     assert [r["reason"] for r in rows if "raised" in (r["reason"] or "")] == []
+    # A KFD base is its own row and a direct per-process figure.
+    monkeypatch.setattr(memory, "_rocm_base", lambda *args: (1600, "kfd"))
+    rows = selftest.probe_base_tiers(memory, {}, 1024, 1024, 1024)
+    assert ("kfd", 1600) in [(r["tier"], r["value_at_probe_time_mb"]) for r in rows]
+    _, degraded = selftest.verdict_line({"base": {"base_method": "kfd"}})
+    assert [d for d in degraded if d.startswith("base:")] == []
 
 
 def test_newrun_records_the_gpu_nodes(tmp_path):

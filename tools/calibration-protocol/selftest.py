@@ -46,7 +46,7 @@ error):
 4. `base`      - `memory.begin_load()` / `finish_load()` around the real
    `impl.load()`: `base_mb`, `base_method`, `allocated_at_load_mb`,
    `reserved_at_load_mb`, and the same tier-by-tier table for the base chain
-   (`nvml` / `fdinfo` / `mps` / `rss` / `free_delta` / `alloc_delta`).
+   (`nvml` / `kfd` / `fdinfo` / `mps` / `rss` / `free_delta` / `alloc_delta`).
 5. `batch`     - one batch of `--batch` items priced by the worker's own
    `packing.price_inputs` / `batch_units`, measured with
    `memory.begin_batch()` / `measure_batch()`: `peak_allocated_mb`,
@@ -324,7 +324,7 @@ def probe_base_tiers(
         rocm = memory._rocm_base(reserved_mb, reserved_delta)
         row(rocm[1] if rocm else "fdinfo", rocm[0] if rocm else None,
             "no plausible KFD or DRM fdinfo VRAM figure for this process "
-            "(not a ROCm host)")
+            "(not a ROCm host, or every reading rejected; see the worker log)")
     except Exception as exc:  # pragma: no cover - defensive
         row("fdinfo", None, f"raised {type(exc).__name__}: {exc}"[:200])
     try:

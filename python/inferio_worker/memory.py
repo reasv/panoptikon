@@ -856,7 +856,6 @@ def kfd_own_vram_mb() -> int | None:
 def _rocm_base(
     reserved_mb: int | None,
     reserved_delta: int | None,
-    root: str | None = None,
 ) -> tuple[int, str] | None:
     """This process's VRAM and its source, ROCm only, if plausible: the
     larger of DRM fdinfo, which under-reads on some kernels, and KFD's
@@ -869,7 +868,7 @@ def _rocm_base(
     if not _is_hip(_torch()):
         return None
     unified = _unified_gpu()
-    candidates = [(fdinfo_own_vram_mb(root), "fdinfo")]
+    candidates = [(fdinfo_own_vram_mb(), "fdinfo")]
     if not unified:
         candidates.append((kfd_own_vram_mb(), "kfd"))
     # On a unified GPU HIP may report only the carve-out as `total_memory`,
