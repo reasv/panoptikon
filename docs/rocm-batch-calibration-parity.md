@@ -599,7 +599,7 @@ unchanged, behind the existing `is_initialized` gates.
   `torch.version.hip` is set — or, before any impl has imported torch, when
   `HIP_VISIBLE_DEVICES` is non-empty, which our own spawner writes on every
   pinned ROCm worker and on no other kind.
-- base (`_resolve_base`): **nvml → fdinfo → free_delta → alloc_delta**.
+- base (`_resolve_base`): **nvml → kfd or fdinfo → free_delta → alloc_delta**.
 - **The free-delta rung is structurally dead on a ROCm *first* load**, which
   is worth stating because the ladder above reads as though it were live.
   `begin_load` takes its "before" reading before anything has touched torch —
@@ -619,21 +619,22 @@ unchanged, behind the existing `is_initialized` gates.
   the HIP context size is promoted from "flagged" to the first number to
   measure on real hardware.
 - **Plausibility floor:** `FDINFO_UNDERREPORT_SLACK_MB = 256`, i.e. an
-  fdinfo reading below `reserved_mb - 256 MB` is rejected (one-shot debug
-  line) and the next tier answers. Rationale: the reading is *expected* above
-  the pool (HIP context + non-torch allocations ride on top), so only a
-  shortfall is suspicious, and the only innocent shortfalls are MiB
+  fdinfo reading below `reserved_mb - 256 MB` is rejected (one-shot INFO
+  line) and the next tier answers. Rationale: the reading is *expected*
+  above the pool (HIP context + non-torch allocations ride on top), so only
+  a shortfall is suspicious, and the only innocent shortfalls are MiB
   truncation on both sides and pages evicted since we committed them
   (`drm-resident-vram` counts *resident* pages). 256 covers those while
-  staying well under `CONTEXT_ESTIMATE_MB`, so a reading that missed a whole
-  HIP context can never pass as jitter. The comparand is the **absolute**
-  post-load pool, not the load window's `reserved_delta`: fdinfo reports
-  absolute whole-process VRAM, the two coincide only on a process's first
-  load, and the ledger explicitly anticipates repeat loads into one worker —
-  where a windowed comparand would wave an under-report through for no better
-  reason than that the second load was small. (`reserved_delta` stays as the
-  fallback for the case where the allocator could not be read after the load
-  at all.)
+  staying under `HIP_CONTEXT_ESTIMATE_MB`; a missed HIP context smaller than
+  256 MiB (199 MiB was measured on gfx1030) still passes, which KFD's
+  per-process counter covers on a discrete GPU. The comparand is the
+  **absolute** post-load pool, not the load window's `reserved_delta`:
+  fdinfo reports absolute whole-process VRAM, the two coincide only on a
+  process's first load, and the ledger explicitly anticipates repeat loads
+  into one worker — where a windowed comparand would wave an under-report
+  through for no better reason than that the second load was small.
+  (`reserved_delta` stays as the fallback for the case where the allocator
+  could not be read after the load at all.)
 - **Upper sanity bound:** a reading at or above the GPU's own
   `total_memory` is rejected too — the twin of the NVML sentinel guard that
   rejects a filled-in `-1`. A per-process figure that equals or exceeds the

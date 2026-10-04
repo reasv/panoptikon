@@ -70,6 +70,16 @@ _bdf_state: dict[str, Any] = {"bdf": None}
 # This process's DRM clients (Linux only).
 FDINFO_ROOT = "/proc/self/fdinfo"
 
+# KFD's tree: `proc/<pid>/vram_<gpu_id>` per process, `topology/nodes` per GPU.
+KFD_ROOT = "/sys/class/kfd/kfd"
+
+# Every process's `/proc/<pid>`.
+PROC_ROOT = "/proc"
+
+# `/proc/self/ns/pid` in the initial PID namespace, the only one where KFD's
+# `proc/<pid>` names are our PIDs.
+INIT_PID_NS = "pid:[4026531836]"
+
 # amdgpu per-GPU VRAM counters (`<root>/<bdf>/mem_info_vram_{total,used}`), the
 # same files the orchestrator reads.
 PCI_DEVICES_ROOT = "/sys/bus/pci/devices"
@@ -751,18 +761,116 @@ def fdinfo_own_vram_mb(root: str | None = None) -> int | None:
     return own_mb if own_mb else None
 
 
-def _fdinfo_base_mb(
+def _drm_pasids(texts: Iterable[str]) -> set[int]:
+    """The non-zero amdgpu `pasid:` of each DRM client in `texts`."""
+    pasids: set[int] = set()
+    for text in texts:
+        for line in text.splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() == "pasid" and value.strip().isdigit():
+                pasids.add(int(value))
+    pasids.discard(0)
+    return pasids
+
+
+def _in_initial_pid_ns() -> bool:
+    try:
+        link = os.readlink(os.path.join(PROC_ROOT, "self", "ns", "pid"))
+    except OSError:
+        return False
+    return link == INIT_PID_NS
+
+
+def _kfd_gpu_id(bdf: str) -> int | None:
+    """KFD's id for the GPU at `bdf`, from its topology node."""
+    nodes = os.path.join(KFD_ROOT, "topology", "nodes")
+    try:
+        names = os.listdir(nodes)
+    except OSError:
+        return None
+    for name in names:
+        path = os.path.join(nodes, name, "properties")
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                fields = [line.split() for line in handle.read().splitlines()]
+        except OSError:
+            continue
+        props = {pair[0]: pair[1] for pair in fields if len(pair) > 1}
+        try:
+            domain, location = int(props["domain"]), int(props["location_id"])
+        except (KeyError, ValueError):
+            continue
+        # `location_id` is bus << 8 | device << 3, as `rocm.rs` decodes it.
+        node_bdf = (
+            f"{domain:04x}:{(location >> 8) & 0xFF:02x}:"
+            f"{(location >> 3) & 0x1F:02x}.0"
+        )
+        if node_bdf == bdf:
+            return _sysfs_bytes(os.path.join(nodes, name, "gpu_id"))
+    return None
+
+
+def _kfd_own_dir() -> str | None:
+    """This process's entry under KFD's `proc`: by PID in the initial PID
+    namespace, elsewhere by the PASID KFD gives our DRM clients. None when
+    the entry is not ours alone: another process here holding the PASID is a
+    fork, and the counter covers both.
+    """
+    entries = os.path.join(KFD_ROOT, "proc")
+    if _in_initial_pid_ns():
+        own = os.path.join(entries, str(os.getpid()))
+        return own if os.path.isdir(own) else None
+    pasids = _drm_pasids(_fdinfo_texts(FDINFO_ROOT))
+    try:
+        matches = [
+            os.path.join(entries, name)
+            for name in os.listdir(entries)
+            if _sysfs_bytes(os.path.join(entries, name, "pasid")) in pasids
+        ]
+        others = [
+            os.path.join(PROC_ROOT, name, "fdinfo")
+            for name in os.listdir(PROC_ROOT)
+            if name.isdigit() and name != str(os.getpid())
+        ]
+    except OSError:
+        return None
+    if len(matches) != 1:
+        return None
+    pasid = _sysfs_bytes(os.path.join(matches[0], "pasid"))
+    if any(pasid in _drm_pasids(_fdinfo_texts(other)) for other in others):
+        return None
+    return matches[0]
+
+
+def kfd_own_vram_mb() -> int | None:
+    """This process's VRAM on its GPU per KFD's counter, in MiB, or None."""
+    bdf = _identity_bdf()
+    gpu_id = _kfd_gpu_id(bdf) if bdf is not None else None
+    own = _kfd_own_dir() if gpu_id is not None else None
+    if own is None:
+        return None
+    return _mb(_sysfs_bytes(os.path.join(own, f"vram_{gpu_id}"))) or None
+
+
+def _rocm_base(
     reserved_mb: int | None,
     reserved_delta: int | None,
     root: str | None = None,
-) -> int | None:
-    """`fdinfo_own_vram_mb` if plausible, ROCm only. Older kernels under-report
-    compute memory, so the reading must not fall below our own absolute
-    post-load allocator pool (`reserved_mb`).
+) -> tuple[int, str] | None:
+    """This process's VRAM and its source, ROCm only, if plausible: KFD's
+    per-process counter where it exceeds DRM fdinfo, which under-reads on
+    some kernels, else fdinfo. A unified GPU keeps fdinfo, whose figure
+    includes GTT; KFD's counts VRAM alone. Older kernels under-report compute
+    memory, so the reading must not fall below our own absolute post-load
+    allocator pool (`reserved_mb`).
     """
     if not _is_hip(_torch()):
         return None
-    own = fdinfo_own_vram_mb(root)
+    own, method = fdinfo_own_vram_mb(root), "fdinfo"
+    if not _unified_gpu():
+        kfd = kfd_own_vram_mb()
+        if kfd is not None and (own is None or kfd > own):
+            own, method = kfd, "kfd"
     if own is None:
         return None
     # On a unified GPU HIP may report only the carve-out as `total_memory`,
@@ -770,8 +878,9 @@ def _fdinfo_base_mb(
     total_mb = amdgpu_device_total_mb() if _unified_gpu() else gpu_total_mb()
     if total_mb is not None and total_mb > 0 and own >= total_mb:
         logger.debug(
-            "DRM fdinfo reports this process holding %d MiB of a %d MiB GPU; "
+            "%s reports this process holding %d MiB of a %d MiB GPU; "
             "rejecting the reading and falling back to the memory deltas",
+            method,
             own,
             total_mb,
         )
@@ -781,18 +890,19 @@ def _fdinfo_base_mb(
     if own < floor:
         if not _logged["fdinfo_under_reported"]:
             _logged["fdinfo_under_reported"] = True
-            logger.debug(
-                "DRM fdinfo reports this process holding %d MiB of VRAM while "
-                "our own allocator pool is %d MiB (-%d MiB tolerance); "
-                "rejecting the reading as an under-report (fdinfo memory stats "
-                "for compute allocations need a recent kernel) and falling "
-                "back to the memory deltas",
+            logger.info(
+                "%s reports this process holding %d MiB of VRAM while our own "
+                "allocator pool is %d MiB (-%d MiB tolerance); rejecting the "
+                "reading as an under-report (per-process memory stats for "
+                "compute allocations need a recent kernel) and falling back "
+                "to the memory deltas",
+                method,
                 own,
                 pool or 0,
                 FDINFO_UNDERREPORT_SLACK_MB,
             )
         return None
-    return own
+    return (own, method)
 
 
 # --- amdgpu sysfs (device-wide free/total for this worker's GPU) ---
@@ -2152,7 +2262,7 @@ def _resolve_base(
     """`(base_mb, base_method)`, or `(None, None)`.
 
     1. A process that did not allocate through torch reports nothing.
-    2. A per-process figure wins: NVML, fdinfo (ROCm), or MPS
+    2. A per-process figure wins: NVML, KFD or fdinfo (ROCm), or MPS
        `driver_allocated_memory()`.
     3. Otherwise the free-memory delta, if positive and not implausibly larger
        than the pool's growth (`reserved_delta`) plus the context and slack.
@@ -2166,9 +2276,9 @@ def _resolve_base(
     own = _nvml_own_process_mb(holding_mb=reserved_mb)
     if own is not None and own > 0:
         return (own, "nvml")
-    own = _fdinfo_base_mb(reserved_mb, reserved_delta)
-    if own is not None and own > 0:
-        return (own, "fdinfo")
+    rocm = _rocm_base(reserved_mb, reserved_delta)
+    if rocm is not None and rocm[0] > 0:
+        return rocm
     # On MPS each process owns its heap, so this is its whole footprint.
     own = _mb(_mps_call("driver_allocated_memory"))
     if own is not None and own > 0:

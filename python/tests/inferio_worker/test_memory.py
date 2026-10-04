@@ -1448,10 +1448,13 @@ def empty_dir(tmp_path, name: str) -> str:
 
 
 @contextmanager
-def rocm_host(tmp_path, monkeypatch, pci=None, fdinfo_texts=None, cuda=None):
-    """A ROCm worker whose two sysfs roots point at fixture trees. Both roots
-    are always redirected: the tiers read `/sys` and `/proc`, and what this
-    machine has there is not this suite's business."""
+def rocm_host(
+    tmp_path, monkeypatch, pci=None, fdinfo_texts=None, cuda=None, kfd=None,
+    proc=None,
+):
+    """A ROCm worker whose sysfs and procfs roots point at fixture trees. All
+    roots are always redirected: the tiers read `/sys` and `/proc`, and what
+    this machine has there is not this suite's business."""
     cuda = cuda if cuda is not None else FakeCuda()
     with isolated(fake_torch_module(cuda, hip="7.2.0")):
         monkeypatch.setattr(
@@ -1459,6 +1462,9 @@ def rocm_host(tmp_path, monkeypatch, pci=None, fdinfo_texts=None, cuda=None):
             "PCI_DEVICES_ROOT",
             pci if pci is not None else empty_dir(tmp_path, "no-pci"),
         )
+        for name, root in (("KFD_ROOT", kfd), ("PROC_ROOT", proc)):
+            root = root or empty_dir(tmp_path, name)
+            monkeypatch.setattr(memory, name, root)
         monkeypatch.setattr(
             memory,
             "FDINFO_ROOT",
@@ -1628,6 +1634,77 @@ def test_the_fdinfo_tier_works_off_the_dominant_client_identity(
     assert again["gpu_bdf"] == "0000:0c:00.0", "the wire field is the memoized identity"
 
 
+KFD_GPU_ID = 4242
+OUR_PASID = 32770
+
+
+def kfd_tree(tmp_path, procs: dict) -> str:
+    """A KFD tree with `0000:03:00.0` as one GPU node and `procs` as
+    `{entry name: (pasid, vram MiB)}`."""
+    root = _fresh(tmp_path, "kfd")
+    cpu, gpu = root / "topology/nodes/0", root / "topology/nodes/1"
+    for node, location in ((cpu, 0), (gpu, 0x03 << 8)):
+        node.mkdir(parents=True)
+        (node / "properties").write_text(f"domain 0\nlocation_id {location}\n")
+    (gpu / "gpu_id").write_text(f"{KFD_GPU_ID}\n")
+    for name, (pasid, vram_mb) in procs.items():
+        entry = root / "proc" / str(name)
+        entry.mkdir(parents=True)
+        (entry / "pasid").write_text(f"{pasid}\n")
+        (entry / f"vram_{KFD_GPU_ID}").write_text(f"{vram_mb * MIB}\n")
+    return str(root)
+
+
+def proc_tree(tmp_path, initial_ns: bool, others: dict) -> str:
+    """A `/proc` whose PID namespace is the initial one or not, holding
+    `others` as `{pid: [fdinfo text]}`."""
+    root = _fresh(tmp_path, "proc")
+    if initial_ns:
+        (root / "self/ns").mkdir(parents=True)
+        try:
+            os.symlink(memory.INIT_PID_NS, root / "self/ns/pid")
+        except OSError:
+            pytest.skip("this filesystem cannot hold a symlink")
+    for pid, texts in others.items():
+        (root / str(pid) / "fdinfo").mkdir(parents=True)
+        for fd, text in enumerate(texts):
+            (root / str(pid) / "fdinfo" / str(fd)).write_text(text)
+    return str(root)
+
+
+def test_kfd_is_the_discrete_base_where_it_exceeds_fdinfo(
+    tmp_path, monkeypatch
+) -> None:
+    # fdinfo can miss part of a process's compute memory that KFD's own
+    # per-process counter holds. The KFD entry is ours by PID only in the
+    # initial PID namespace; elsewhere by the PASID KFD gives our DRM
+    # clients, unless another process holds it too (a fork).
+    ours = fdinfo("0000:03:00.0", 1, "1536 MiB") + f"pasid:\t{OUR_PASID}\n"
+    pid, host_pid = os.getpid(), 999_999
+    fork = {pid + 1: [ours]}
+    for initial_ns, procs, others, expected, label in (
+        (True, {pid: (OUR_PASID, 1600)}, {}, ("kfd", 1600), "by PID"),
+        (True, {pid: (OUR_PASID, 1536)}, {}, ("fdinfo", 1536), "not above"),
+        (True, {host_pid: (OUR_PASID, 1600)}, {}, ("fdinfo", 1536),
+         "no entry by PID: a PASID join would find a forked parent"),
+        (False, {host_pid: (OUR_PASID, 1600)}, {}, ("kfd", 1600), "by PASID"),
+        (False, {pid: (1, 1600)}, {}, ("fdinfo", 1536),
+         "our PID names another process outside the initial namespace"),
+        (False, {host_pid: (OUR_PASID, 1600)}, fork, ("fdinfo", 1536),
+         "a PASID a fork holds too"),
+        (False, {}, {}, ("fdinfo", 1536), "no KFD entry"),
+    ):
+        with rocm_host(
+            tmp_path, monkeypatch, fdinfo_texts=[ours],
+            kfd=kfd_tree(tmp_path, procs),
+            proc=proc_tree(tmp_path, initial_ns, others),
+        ) as cuda:
+            before = memory.begin_load()
+            cuda.allocate(1024, reserved_mb=1200)
+            report = memory.finish_load(before, object())
+        assert (report["base_method"], report["base_mb"]) == expected, label
+
+
 # --- Unified GPUs: AMD APUs (docs/unified-memory-admission.md, backend B). ---
 
 # A BC-250/Strix-Halo-shaped GPU.
@@ -1688,7 +1765,8 @@ def test_the_amdgpu_tier_is_gtt_inclusive_on_a_unified_device(
 
 def test_the_fdinfo_tier_counts_gtt_on_a_unified_device(tmp_path, monkeypatch) -> None:
     # On an APU our own allocations are VRAM + GTT, and a VRAM-only figure
-    # would report a multi-gigabyte model as holding a few hundred MB.
+    # would report a multi-gigabyte model as holding a few hundred MB. KFD's
+    # counter is such a figure, so it is not read there.
     texts = [
         fdinfo("0000:03:00.0", 1, "256 MiB") + "drm-resident-gtt:\t2048 MiB\n",
         fdinfo("0000:03:00.0", 1, "256 MiB") + "drm-resident-gtt:\t2048 MiB\n",
@@ -1700,7 +1778,11 @@ def test_the_fdinfo_tier_counts_gtt_on_a_unified_device(tmp_path, monkeypatch) -
     gpu = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 256 * MIB)})
     write_gtt(gpu, "0000:03:00.0", APU_GTT_MIB * MIB, 4096 * MIB)
     carveout = FakeCuda(total_mb=APU_CARVEOUT_MIB)
-    with rocm_host(tmp_path, monkeypatch, pci=gpu, fdinfo_texts=texts, cuda=carveout):
+    kfd = kfd_tree(tmp_path, {os.getpid(): (OUR_PASID, 4096)})
+    with rocm_host(
+        tmp_path, monkeypatch, pci=gpu, fdinfo_texts=texts, cuda=carveout,
+        kfd=kfd, proc=proc_tree(tmp_path, True, {}),
+    ):
         assert memory.fdinfo_own_vram_mb() == 384, "VRAM alone without the flag"
         with unified():
             assert memory.fdinfo_own_vram_mb() == 384 + 2560
@@ -1845,7 +1927,7 @@ def test_nvml_is_refused_outright_on_a_rocm_worker(tmp_path, monkeypatch) -> Non
 
 
 def test_the_fdinfo_reading_is_bounded_below_and_above(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ) -> None:
     # fdinfo's KFD/compute figures are VM-walk-based and need a recent kernel,
     # so a reading materially below our own allocator pool is an under-report,
@@ -1874,6 +1956,11 @@ def test_the_fdinfo_reading_is_bounded_below_and_above(
         (900, 3000, 2, "free_delta", "an under-report against the pool by then"),
     ):
         assert base_method(vram, pool, loads) == expected, label
+    # The rejection is an INFO line, once per worker, naming the source.
+    with caplog.at_level(logging.INFO, logger="inferio_worker.memory"):
+        base_method(900, 3000, 2)
+    rejected = [r for r in caplog.records if r.args[:2] == ("fdinfo", 900)]
+    assert [r.levelno for r in rejected] == [logging.INFO]
     assert slack < memory.HIP_CONTEXT_ESTIMATE_MB, (
         "a missed context is never jitter"
     )
