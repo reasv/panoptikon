@@ -765,8 +765,8 @@ all-or-nothing VRAM rule therefore did **not** catch APUs; it admitted them
 and priced the host against the carve-out, which collapses every grant to
 batch-1 with nothing in the log to say why. APU nodes are now detected
 positively — KFD models an integrated part as a single node carrying both
-`simd_count > 0` and `cpu_cores_count > 0`, and that combination is the only
-signal there is — and any openable one makes the whole probe unknown with a
+`simd_count > 0` and `cpu_cores_count > 0` (since replaced by HIP's own
+test: unified-memory-admission.md "What counts as an APU") — and any openable one makes the whole probe unknown with a
 WARN naming the node and its gfx target (D1.4). The node is not *skipped*:
 HIP still enumerates it, so excluding one row would shift every later row's
 device index. So the outcome the design always promised — an APU host is
@@ -783,7 +783,7 @@ death-as-negative-sample (DP-2) and the worker's GTT-inclusive arithmetic
 (DP-5, `PANOPTIKON_UNIFIED_GPU=<the gpu's PCI address>`, which the worker
 only acts on when it is the address it resolved for itself). The positive KFD
 detection survived
-unchanged — it is the only signal an integrated part has — and so did the
+unchanged (since replaced: unified-memory-admission.md "What counts as an APU") — and so did the
 all-or-nothing rule: an APU node whose GTT total or whose `MemTotal` cannot be
 read still takes the whole probe unknown, because pricing such a GPU against
 its carve-out is precisely the batch-1 collapse the decline existed to
