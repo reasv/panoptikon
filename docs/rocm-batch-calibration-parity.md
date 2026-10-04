@@ -681,7 +681,8 @@ side.
 
 **Extended 2026-08-01 (backend B).** A GPU the probe flagged unified reads
 its GTT counters as well and clamps the unclaimed half by `MemAvailable`
-(less `SReclaimable`, on both sides, as the CPU device reads free RAM),
+(less `SReclaimable` and within the cgroup limit, on both sides, as the CPU
+device reads free RAM),
 because an APU's budget is carve-out + GTT and the pages behind unclaimed GTT
 have to come out of RAM that exists right now
 (docs/unified-memory-admission.md, backend B). Discrete rows read exactly the

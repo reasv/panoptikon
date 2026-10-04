@@ -5,7 +5,7 @@
 //! its `/dev/dri/renderD<minor>` opens read-write. amd-smi/rocm-smi are not
 //! used because they enumerate in PCI order, which is not HIP's. Live memory
 //! comes from amdgpu's `mem_info_vram_{total,used}` (plus `gtt` on an APU)
-//! and `/proc/meminfo`.
+//! and `/proc/meminfo`, bounded by the cgroup limit as for the CPU device.
 //!
 //! Identity is all-or-nothing per host: a row's index is the
 //! `HIP_VISIBLE_DEVICES` value a pin selects with, so it only means anything
@@ -19,6 +19,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use super::cpu;
 use super::gpu::{GpuInfo, GpuMemory};
 
 /// Every env var that can restrict which GPUs a HIP process sees.
@@ -54,6 +55,8 @@ pub(super) struct SysfsRoots {
     /// `MemTotal` for an APU's identity; `MemAvailable` and `SReclaimable`
     /// for its GTT clamp.
     pub meminfo: PathBuf,
+    /// The cgroup root whose limit also bounds an APU's GTT clamp.
+    pub cgroup: PathBuf,
     /// [`amdgpu_fusion`], read on each openable render node.
     pub fusion: fn(&fs::File) -> Option<bool>,
 }
@@ -66,7 +69,18 @@ impl Default for SysfsRoots {
             dev_dri: PathBuf::from("/dev/dri"),
             kfd: PathBuf::from("/dev/kfd"),
             meminfo: PathBuf::from("/proc/meminfo"),
+            cgroup: cpu::MemRoots::default().cgroup,
             fusion: amdgpu_fusion,
+        }
+    }
+}
+
+impl SysfsRoots {
+    /// The host RAM statistics an APU's GTT clamp reads.
+    pub(super) fn ram(&self) -> cpu::MemRoots {
+        cpu::MemRoots {
+            meminfo: self.meminfo.clone(),
+            cgroup: self.cgroup.clone(),
         }
     }
 }
@@ -210,12 +224,13 @@ pub(super) fn build(
 /// high; the ledger's margin covers that.
 ///
 /// A unified GPU's total is carve-out plus GTT, and its free is
-/// `(vram_total − vram_used) + min(gtt_total − gtt_used, deliverable RAM)`
-/// ([`ram_deliverable_mb`]), because unclaimed GTT is backed by RAM that may
-/// not be free.
+/// `(vram_total − vram_used) + min(gtt_total − gtt_used, deliverable RAM)`,
+/// because unclaimed GTT is backed by RAM that may not be free. Deliverable
+/// RAM is the CPU device's free reading ([`cpu::ram_available_mb`]): within
+/// the cgroup limit too.
 pub(super) fn query_memory(
     pci_devices: &Path,
-    meminfo: &Path,
+    ram: &cpu::MemRoots,
     gpus: &[GpuRef],
 ) -> Option<Vec<GpuMemory>> {
     if gpus.is_empty() {
@@ -240,7 +255,7 @@ pub(super) fn query_memory(
         let gtt_free_mb = gtt_total_mb.saturating_sub(read_mb(&dir.join("mem_info_gtt_used"))?);
         let available_mb = match ram_available_mb {
             Some(mb) => mb,
-            None => *ram_available_mb.insert(ram_deliverable_mb(meminfo)?),
+            None => *ram_available_mb.insert(cpu::ram_available_mb(ram)?),
         };
         out.push(GpuMemory {
             uuid: gpu.key.clone(),
@@ -846,6 +861,7 @@ mod tests {
                 dev_dri: dir.path().join("dri"),
                 kfd: dir.path().join("kfd/device"),
                 meminfo: dir.path().join("meminfo"),
+                cgroup: dir.path().join("cgroup"),
                 fusion: fixture_fusion,
             };
             for root in [&roots.kfd_nodes, &roots.pci_devices, &roots.dev_dri] {
@@ -1514,15 +1530,15 @@ mod tests {
     /// The staleness refresh reads the same files the worker's free/total
     /// tier does, keyed by the inventory's device key, and is all-or-nothing.
     /// On a **unified** GPU total is carve-out + GTT and free adds as much
-    /// GTT as RAM can deliver right now — that clamp is the whole reason
-    /// `/proc/meminfo` is read, and why a discrete host must not depend on
-    /// it.
+    /// GTT as RAM can deliver right now, within the cgroup limit — that
+    /// clamp is the whole reason `/proc/meminfo` is read, and why a discrete
+    /// host must not depend on it.
     #[test]
     fn the_refresh_reads_every_gpu_or_none_of_them() {
         let fixture = Fixture::new();
         fixture.pci(BDF_03, GB24, 4 * GIB).pci(BDF_0C, GB16, 0);
         let roots = &fixture.roots;
-        let read = |gpus: &[GpuRef]| query_memory(&roots.pci_devices, &roots.meminfo, gpus);
+        let read = |gpus: &[GpuRef]| query_memory(&roots.pci_devices, &roots.ram(), gpus);
         let tuple = |r: GpuMemory| (r.uuid, r.total_mb, r.free_mb);
         let seen = |gpus: &[GpuRef]| {
             read(gpus).map(|rows| rows.into_iter().map(tuple).collect::<Vec<_>>())
@@ -1548,7 +1564,7 @@ mod tests {
             unified,
         };
         let read_from = |f: &Fixture, gpu: GpuRef| {
-            query_memory(&f.roots.pci_devices, &f.roots.meminfo, &[gpu])
+            query_memory(&f.roots.pci_devices, &f.roots.ram(), &[gpu])
                 .map(|mut r| r.remove(0))
                 .map(|r| (r.total_mb, r.free_mb))
         };
@@ -1579,6 +1595,19 @@ mod tests {
         let roomy = host(100 * 1024 * 1024);
         let seen = read_from(&roomy, apu(true));
         assert_eq!(seen, Some((budget, 256 + 60 * 1024)));
+        // In a container limited to 16 GiB with 10 GiB used, 6 GiB is left.
+        fs::create_dir_all(&roomy.roots.cgroup).unwrap();
+        fs::write(
+            roomy.roots.cgroup.join("memory.max"),
+            format!("{}\n", 16 * GIB),
+        )
+        .unwrap();
+        fs::write(
+            roomy.roots.cgroup.join("memory.current"),
+            format!("{}\n", 10 * GIB),
+        )
+        .unwrap();
+        assert_eq!(read_from(&roomy, apu(true)), Some((budget, 256 + 6 * 1024)));
 
         // All-or-nothing extends to the new files, and only to unified rows.
         let no_gtt = Fixture::new();

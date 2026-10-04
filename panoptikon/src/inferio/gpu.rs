@@ -176,9 +176,9 @@ enum MemoryBackend {
     RocmSysfs {
         /// The PCI device root the probe read, reused by the refresh.
         pci_devices: PathBuf,
-        /// `/proc/meminfo`; read only for unified GPUs, which clamp unclaimed
-        /// GTT to `MemAvailable`.
-        meminfo: PathBuf,
+        /// Host RAM statistics; read only for unified GPUs, which clamp
+        /// unclaimed GTT to the RAM the OS could deliver.
+        ram: cpu::MemRoots,
         /// A HIP-layer visibility variable (`HIP_VISIBLE_DEVICES`,
         /// `CUDA_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL`) was set at probe
         /// time, so no pin of ours is written. `ROCR_VISIBLE_DEVICES` is not.
@@ -443,7 +443,7 @@ fn rocm_host(
             adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: roots.pci_devices.clone(),
-                meminfo: roots.meminfo.clone(),
+                ram: roots.ram(),
                 ambient_hip_restriction,
             },
             cpu_roots: None,
@@ -561,10 +561,10 @@ pub(super) enum MemoryQuery {
     /// One `nvidia-smi --query-gpu` call covering every visible GPU.
     NvidiaSmi,
     /// amdgpu's `mem_info_vram_{total,used}` per GPU, plus
-    /// `mem_info_gtt_{total,used}` and `MemAvailable` for a unified GPU.
+    /// `mem_info_gtt_{total,used}` and deliverable RAM for a unified GPU.
     RocmSysfs {
         pci_devices: PathBuf,
-        meminfo: PathBuf,
+        ram: cpu::MemRoots,
         /// Every GPU's key, address and unified flag, in inventory order.
         gpus: Arc<[rocm::GpuRef]>,
     },
@@ -594,9 +594,9 @@ impl MemoryQuery {
             Self::NvidiaSmi => query_memory_nvidia_smi(),
             Self::RocmSysfs {
                 pci_devices,
-                meminfo,
+                ram,
                 gpus,
-            } => rocm::query_memory(pci_devices, meminfo, gpus),
+            } => rocm::query_memory(pci_devices, ram, gpus),
             Self::Mps { key, ram_mb } => mps::query_memory(key, *ram_mb),
             Self::Cpu { key, ram_mb, roots } => cpu::query_memory(key, *ram_mb, roots),
             Self::Unavailable => None,
@@ -896,7 +896,7 @@ impl GpuInventory {
             adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: rocm::SysfsRoots::default().pci_devices,
-                meminfo: rocm::SysfsRoots::default().meminfo,
+                ram: rocm::SysfsRoots::default().ram(),
                 ambient_hip_restriction: false,
             },
             cpu_roots: None,
@@ -1067,9 +1067,7 @@ impl GpuInventory {
             };
         }
         let MemoryBackend::RocmSysfs {
-            pci_devices,
-            meminfo,
-            ..
+            pci_devices, ram, ..
         } = &self.backend
         else {
             return MemoryQuery::NvidiaSmi;
@@ -1098,7 +1096,7 @@ impl GpuInventory {
         }
         MemoryQuery::RocmSysfs {
             pci_devices: pci_devices.clone(),
-            meminfo: meminfo.clone(),
+            ram: ram.clone(),
             gpus: keyed.into(),
         }
     }
@@ -1644,13 +1642,13 @@ mod tests {
     }
 
     fn rocm_inventory(pci_devices: PathBuf, gpus: Vec<GpuInfo>) -> GpuInventory {
-        rocm_inventory_with(pci_devices, rocm::SysfsRoots::default().meminfo, gpus)
+        rocm_inventory_with(pci_devices, rocm::SysfsRoots::default().ram(), gpus)
     }
 
-    /// The same, with `/proc/meminfo` — only the unified refresh reads it.
+    /// The same, with host RAM statistics — only the unified refresh reads them.
     fn rocm_inventory_with(
         pci_devices: PathBuf,
-        meminfo: PathBuf,
+        ram: cpu::MemRoots,
         gpus: Vec<GpuInfo>,
     ) -> GpuInventory {
         GpuInventory {
@@ -1659,7 +1657,7 @@ mod tests {
             adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices,
-                meminfo,
+                ram,
                 // A knowable inventory is proof of no ambient restriction:
                 // the probe blanks it otherwise.
                 ambient_hip_restriction: false,
@@ -1705,7 +1703,7 @@ mod tests {
             adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: PathBuf::from("/sys/bus/pci/devices"),
-                meminfo: PathBuf::from("/proc/meminfo"),
+                ram: cpu::MemRoots::default(),
                 ambient_hip_restriction,
             },
             cpu_roots: None,
@@ -2112,7 +2110,7 @@ mod tests {
         assert_eq!(unknown.free_source(), "nvidia-smi", "nothing to refresh");
         let host = rocm_inventory_with(
             PathBuf::from("/sys/bus/pci/devices"),
-            PathBuf::from("/proc/meminfo"),
+            cpu::MemRoots::default(),
             vec![
                 amd_apu(0, "0000:03:00.0", 512, 64 * 1024, 128 * 1024),
                 amd_gpu(1, "0000:0c:00.0", 24_576),
@@ -2126,7 +2124,7 @@ mod tests {
              reporter must not inherit authority by string collision"
         );
         match query {
-            MemoryQuery::RocmSysfs { gpus, meminfo, .. } => {
+            MemoryQuery::RocmSysfs { gpus, ram, .. } => {
                 let rows: Vec<_> = gpus
                     .iter()
                     .map(|g| (g.key.as_str(), g.bdf.as_str(), g.unified))
@@ -2138,7 +2136,7 @@ mod tests {
                         ("GPU-BDF-0000:0c:00.0", "0000:0c:00.0", false),
                     ]
                 );
-                assert_eq!(meminfo, PathBuf::from("/proc/meminfo"));
+                assert_eq!(ram, cpu::MemRoots::default());
             }
             other => panic!("expected the sysfs query, got {other:?}"),
         }
@@ -2720,7 +2718,7 @@ mod tests {
             adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: PathBuf::from("/sys/bus/pci/devices"),
-                meminfo: PathBuf::from("/proc/meminfo"),
+                ram: cpu::MemRoots::default(),
                 ambient_hip_restriction: true,
             },
             cpu_roots: None,

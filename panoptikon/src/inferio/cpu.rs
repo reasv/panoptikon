@@ -185,7 +185,7 @@ fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
 /// counts it. On Linux that is [`super::rocm::ram_deliverable_mb`], bounded
 /// by the cgroup limit.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
+pub(super) fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let available = super::rocm::ram_deliverable_mb(&roots.meminfo)?;

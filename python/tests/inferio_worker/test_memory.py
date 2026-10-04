@@ -3083,6 +3083,17 @@ def test_the_cpu_device_is_bounded_by_the_cgroup_limit(tmp_path) -> None:
         assert memory.ram_free_total_mb() == (10 * 1024, 16 * 1024)
         assert memory.ram_gpu_name() == "CPU (16 GB)", "what /health must show"
 
+    # An APU clamps its unclaimed GTT (60 GiB) by the same bounded RAM.
+    pci = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 256 * MIB)})
+    write_gtt(pci, "0000:03:00.0", APU_GTT_MIB * MIB, 4096 * MIB)
+    hip = fake_torch_module(FakeCuda(), hip="7.2.0")
+    with cpu_host(machine(), hip, pinned=False, cgroup=str(v2)):
+        os.environ["PANOPTIKON_UNIFIED_GPU"] = "0000:03:00.0"
+        assert memory.amdgpu_free_total_mb(pci) == (
+            256 + 10 * 1024,
+            APU_CARVEOUT_MIB + APU_GTT_MIB,
+        )
+
     # cgroup v1, the same facts under the controller's own names.
     v1 = tmp_path / "v1" / "memory"
     v1.mkdir(parents=True)

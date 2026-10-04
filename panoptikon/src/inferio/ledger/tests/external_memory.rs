@@ -572,7 +572,7 @@ fn a_whole_gpu_reading_outranks_a_torch_one_on_every_backend() {
     assert_eq!(
         GpuMemoryQuery::RocmSysfs {
             pci_devices: std::path::PathBuf::from("/sys/bus/pci/devices"),
-            meminfo: std::path::PathBuf::from("/proc/meminfo"),
+            ram: crate::inferio::cpu::MemRoots::default(),
             gpus: Vec::new().into(),
         }
         .free_source(),
