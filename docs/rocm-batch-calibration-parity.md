@@ -173,9 +173,10 @@ Linux only:
    GPU is different: on ROCm 7.2, with that restriction emulated, ROCr
    enumerated no GPU at all, which the worker's pin check refuses. If *no*
    GPU node is openable, or `/dev/kfd` does not open read-write, the
-   inventory is known empty and models run on the CPU device. Accepted cost: briefly opening
-   every render node at startup can resume a runtime-suspended GPU, once
-   per boot.
+   inventory is known empty and models run on the CPU device. On a ROCm
+   host, opening `/dev/kfd` and every render node at startup can resume a
+   runtime-suspended GPU, and registers the gateway as a KFD process (0
+   VRAM) until it exits.
 4. From `/sys/bus/pci/devices/<bdf>/`: `mem_info_vram_total` → `total_mb`.
    The all-or-nothing rule (the CUDA parser's, for the same reason) covers
    the whole identity, not just that file. Any **one** of these on any
