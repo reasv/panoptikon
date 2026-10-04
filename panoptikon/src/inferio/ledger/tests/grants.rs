@@ -487,7 +487,7 @@ fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
         );
     }
 
-    // The CPU device keeps its RAM floor; a Mac's GPU, the fraction alone.
+    // The CPU device keeps its RAM floor.
     let host = VramLedger::for_test(
         &[
             (GPU, "TEST 9000", 24_576),
