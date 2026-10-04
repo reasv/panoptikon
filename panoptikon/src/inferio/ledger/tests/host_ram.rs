@@ -921,19 +921,39 @@ fn no_size_books_less_than_a_smaller_batch_measured() {
 }
 
 /// The booking never falls as the batch grows, past twice the largest batch
-/// as well, also where the fit's fixed part is negative and taken as 0.
+/// as well, also where the fit's fixed part is negative and taken as 0. Up
+/// to twice the largest, each unit books at most the costliest growth per
+/// unit among the batches near the largest, counted beyond the first
+/// batch's units when that batch kept memory (or the slope, if higher), with
+/// one unit for rounding: what the first batch kept is not priced per unit.
 #[test]
 fn the_booking_never_falls_as_the_batch_grows() {
-    for (pairs, first_units, startup) in [
+    for (pairs, first_units, kept) in [
         (&[(10, 100), (20, 300), (30, 450)][..], 0, 0),
         (&[(128, 7_206), (256, 16_077)], 2, 700),
         (&[(2, 303), (4, 383)], 1, 0),
+        // About 90 MiB per unit, after a first unit that kept 8 990 MiB or none.
+        (&[(2, 180), (4, 380), (8, 700)], 1, 8_990),
+        (&[(2, 200), (4, 340), (8, 740), (16, 1_420)], 1, 8_990),
+        (&[(2, 200), (4, 340), (8, 740), (16, 1_420)], 1, 0),
     ] {
-        let cost = ram_cost(&ram_samples(pairs), first_units, startup).expect("a cost");
+        let cost = ram_cost(&ram_samples(pairs), first_units, kept).expect("a cost");
         for units in 1..4 * cost.fitted_reach() {
             assert!(
                 cost.booking_mb(units) <= cost.booking_mb(units + 1),
                 "{pairs:?}: {units} units"
+            );
+        }
+        let beyond = if kept > 0 { first_units } else { 0 };
+        let costliest = pairs
+            .iter()
+            .filter(|&&(units, _)| units > first_units && 2 * units >= cost.measured_units)
+            .map(|&(units, delta)| delta as f64 / (units - beyond) as f64)
+            .fold(cost.slope_mb_per_unit, f64::max);
+        for units in cost.measured_units + 1..=cost.fitted_reach() {
+            assert!(
+                cost.booking_mb(units) as f64 <= costliest * (units + 1) as f64,
+                "{pairs:?}, kept {kept}: {units} units"
             );
         }
     }
