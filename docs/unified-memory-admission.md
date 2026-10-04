@@ -311,13 +311,16 @@ Single synthetic device:
     neighbour, a dip in the reading) lasts only as long as its cause.
   - **A paging episode leaves a cap** (`PressureCap`, per model and device, so
     a replica loaded afterwards runs what one that lived through it runs).
-    Each paging window that memory or the ramp sized, not the queue, sets the
-    cap to its unit budget. The first of an episode also sets how far the cap
-    may grow back while the level stays at warning: **half the unit budget in
-    force when the episode began**, and each later episode halves that bound
-    again (at least 1). A batch size that tipped the machine into paging is
-    therefore not returned to at warning, and a replica whose own batches
-    cause the paging settles within log2(size) episodes.
+    Each paging window that memory or the ramp sized sets the cap to its unit
+    budget; one the queue sized sets it only when memory cut the batch below
+    the queue. The first of an episode also sets how far the cap
+    may grow back while the level stays at warning: the batch size the ramp
+    admits, or the previous bound, **halved (at least 1) only when that
+    window was granted before the paging began and ran at that size**. A
+    batch size that tipped the machine into paging is therefore not returned
+    to at warning, a replica whose own batches cause the paging settles
+    within log2(size) episodes, and paging that began before the grant or
+    under a smaller batch leaves the bound alone.
   - **Growing back.** Each clean window that filled its budget doubles the
     cap: at warning up to that bound, at normal until it reaches what the
     ramp admits, where the cap lifts and the bound is forgotten. A warning

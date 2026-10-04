@@ -1131,9 +1131,9 @@ struct PressureCap {
     /// Caps the unit budget: the size the last paging window ran at, doubled
     /// by each clean full window since.
     units: u64,
-    /// How far `units` may grow back while the level is warning: half the
-    /// unit budget in force when the first episode began, halved again by
-    /// each later episode. Kept until the cap lifts.
+    /// How far `units` may grow back while the level is warning: the batch
+    /// size admitted when the first episode began, halved by each episode
+    /// that our batch, running at it, began. Kept until the cap lifts.
     regrow_to: u64,
     /// The last window was a paging one: the episode is still on.
     paging: bool,

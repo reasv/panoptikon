@@ -322,9 +322,12 @@ impl VramLedger {
     ///
     /// A paging window that memory or the batch size set (not the queue) sets the
     /// cap to its unit budget. The first one of an episode also sets how far
-    /// the cap may grow back at warning: half the budget in force before it,
-    /// or half the previous bound, at least 1. So a batch size that made the
-    /// Mac page is not returned to while the level stays at warning.
+    /// the cap may grow back at warning: the batch size admitted, or the
+    /// previous bound, halved (at least 1) when this window was granted
+    /// before the paging began and ran at that size. So a batch size that
+    /// made the Mac page is not returned to while the level stays at
+    /// warning, and paging that began under a smaller batch, or before the
+    /// grant, does not lower the bound.
     ///
     /// Otherwise a clean window that `filled` its budget doubles the cap: at
     /// warning up to that bound, at normal until it reaches the batch size
@@ -335,6 +338,7 @@ impl VramLedger {
         worker: WorkerId,
         charge: GrantCharge,
         filled: bool,
+        paged_at_grant: bool,
     ) {
         let Some(entry) = state.workers.get(&worker) else {
             return;
@@ -356,7 +360,15 @@ impl VramLedger {
             }
             let regrow_to = match cap {
                 Some(cap) if cap.paging => cap.regrow_to,
-                _ => (cap.map_or(admitted, |cap| cap.regrow_to) / 2).max(1),
+                _ => {
+                    let bound = cap.map_or(admitted, |cap| cap.regrow_to);
+                    let in_force = bound.min(admitted);
+                    if !paged_at_grant && charge.unit_budget >= in_force {
+                        (in_force / 2).max(1)
+                    } else {
+                        bound
+                    }
+                }
             };
             Some(PressureCap {
                 units: charge.unit_budget,

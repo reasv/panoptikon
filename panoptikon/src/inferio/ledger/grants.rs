@@ -458,7 +458,9 @@ impl VramLedger {
         // This window's requests leave the demand signal on every outcome.
         // The pressure at settle counts as well, and paging at warning or
         // above any time since the grant counts as paging.
-        let charge = entry.grants.remove(&grant_id).map(|charge| GrantCharge {
+        let granted = entry.grants.remove(&grant_id);
+        let paged_at_grant = granted.is_some_and(|charge| charge.pressure.paging());
+        let charge = granted.map(|charge| GrantCharge {
             pressure: charge.pressure.max(pressure.unwrap_or_default()),
             ..charge
         });
@@ -507,7 +509,7 @@ impl VramLedger {
             }
             if let Some(charge) = charge {
                 let filled = !negative && ingested.filled;
-                Self::note_pressure_size_locked(&mut state, worker, charge, filled);
+                Self::note_pressure_size_locked(&mut state, worker, charge, filled, paged_at_grant);
             }
         }
         let died = matches!(outcome, WindowOutcome::WorkerDied);
