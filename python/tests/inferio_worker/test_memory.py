@@ -982,6 +982,17 @@ def test_batch_measurement_is_per_call(fake_torch) -> None:
     assert measurement["allocated_before_mb"] == 500
     assert measurement["peak_allocated_mb"] == 550
 
+    # A pool emptied inside the batch and regrown smaller has no peak of its
+    # own: torch's is still the pool before the batch.
+    state = memory.begin_batch()
+    fake_torch.reserved = fake_torch.allocated
+    fake_torch.allocate(100)
+    emptied = memory.finish_batch(state, items=1)["measurements"][0]
+    assert (emptied["reserved_before_mb"], emptied["reserved_after_mb"]) == (
+        800, 650
+    )
+    assert emptied["peak_reserved_mb"] is None
+
 
 def test_alloc_retries_is_a_per_batch_delta(fake_torch) -> None:
     # A build with no counter reports nothing rather than a zero.

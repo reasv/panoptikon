@@ -2707,6 +2707,17 @@ def measure_batch(
         # Keep the rest of the measurement (an OOM, a live reading).
         logger.debug("batch measurement failed: %s", exc)
         reserved_after = peak_reserved = peak_allocated = None
+    # A pool emptied during the batch leaves the peak at the pre-batch pool
+    # the reset copied, which is not this batch's peak.
+    before = state.get("reserved_before_mb")
+    if (
+        peak_reserved is not None
+        and before is not None
+        and reserved_after is not None
+        and reserved_after < before
+        and peak_reserved <= before
+    ):
+        peak_reserved = None
     started = state.get("started")
     duration_ms = (
         round((time.perf_counter() - started) * 1000.0, 3)
