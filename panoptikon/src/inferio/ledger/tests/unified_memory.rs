@@ -1490,7 +1490,7 @@ fn apus_and_the_cpu_device_charge_each_others_grants() {
 
 /// An APU whose GTT window binds holds only its own memory in it: a CPU
 /// replica that fills RAM the window does not need leaves its headroom as
-/// it was.
+/// it was. Its grant still carries the RAM floor to the worker.
 #[test]
 fn a_cpu_replica_leaves_an_apus_gtt_window_alone() {
     const RAM: u64 = 128 * 1024 - APU_CARVEOUT_MB;
@@ -1500,7 +1500,7 @@ fn a_cpu_replica_leaves_an_apus_gtt_window_alone() {
     let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
     ledger.install_probe_stub(None);
     let apu_handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
-    let _on_apu = ledger
+    let on_apu = ledger
         .register_worker("g/apu", item_cost(4), &apu_handle, None)
         .expect("admitted on the APU");
     // 1 GiB of other usage; the APU's 1 000 MiB base fills its carve-out.
@@ -1523,6 +1523,12 @@ fn a_cpu_replica_leaves_an_apus_gtt_window_alone() {
         "RAM still has more room than the window"
     );
     assert_eq!(ledger.headroom_mb(AMD_A), alone);
+    // The window binds under the GPU's reserve; the worker still keeps the
+    // RAM floor out of the RAM term of its reading.
+    let grant = on_apu.request_grant(64, None, 1, 0).expect("granted");
+    let rule = device_of(&ledger.health(), AMD_A).reserve_rule.clone();
+    assert_eq!(rule, RESERVE_RULE_GPU_FLOOR);
+    assert_eq!(grant.grant().ram_reserve_mb, cpu::ram_reserve_mb(RAM));
 }
 
 /// In a container limited to 16 GiB on a 128 GB APU host, the APU's RAM
