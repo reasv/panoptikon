@@ -306,8 +306,8 @@ OOM_HOST_RAM_PREFIX = "INFERENCE_OOM_HOST_RAM:"
 class InferenceOOMError(RuntimeError):
     """Out of memory on a single input after cache-clearing retries.
 
-    str() starts with OOM_BATCH1_PREFIX, or OOM_HOST_RAM_PREFIX when host RAM
-    ran out: the worker's error frame carries only the message string, so the
+    str() starts with OOM_BATCH1_PREFIX, or OOM_HOST_RAM_PREFIX when only host
+    RAM ran out: the worker's error frame carries only the message string, so the
     prefix is what the orchestrator recognises the condition by.
     """
 
@@ -421,8 +421,8 @@ def run_with_oom_retry(
     the same position is retried at half the size — never re-grown within
     a call, since the dispatcher forms fresh full batches on the next
     request anyway. An OOM with a single item raises InferenceOOMError,
-    naming host RAM when that ran out; any other exception propagates
-    untouched.
+    with the host RAM prefix only when no device OOM preceded it in the
+    call; any other exception propagates untouched.
 
     An OOM is the CUDA/HIP exception type, `looks_like_host_ram`, or
     `looks_like_oom` text. A 32-bit index ceiling also halves but counts as an index-limit
@@ -437,6 +437,7 @@ def run_with_oom_retry(
     generation = _oom_retry_generation
     largest = 0
     halvings = 0
+    device_halvings = 0
     _last_oom_retry = (generation, largest, halvings)
     if oom_exceptions is None:
         import torch
@@ -479,11 +480,13 @@ def run_with_oom_retry(
                 continue
             clear_cache()
             if len(chunk) == 1:
-                prefix, what = (
-                    (OOM_HOST_RAM_PREFIX, "host RAM")
-                    if host_ram
-                    else (OOM_BATCH1_PREFIX, "GPU memory")
+                # A device OOM earlier in the call outranks host RAM here.
+                prefix = (
+                    OOM_HOST_RAM_PREFIX
+                    if host_ram and not device_halvings
+                    else OOM_BATCH1_PREFIX
                 )
+                what = "host RAM" if host_ram else "GPU memory"
                 raise InferenceOOMError(
                     f"{prefix} out of {what} on a single input: {err}"
                 ) from err
@@ -492,6 +495,8 @@ def run_with_oom_retry(
             _total_oom_halvings += 1
             if host_ram:
                 _total_host_ram_halvings += 1
+            else:
+                device_halvings += 1
             _last_oom_retry = (generation, largest, halvings)
             log.warning(
                 "out of %s on a chunk of %d inputs; retrying at %d.",

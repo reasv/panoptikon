@@ -83,21 +83,32 @@ def test_halves_on_oom_and_preserves_order():
 
 def test_batch1_oom_raises_classified_error():
     """At one item the error names what ran out: GPU memory, or host RAM for a
-    `MemoryError` or the CPU allocator, whose halvings are counted apart."""
+    `MemoryError` or the CPU allocator, whose halvings are counted apart. A
+    device OOM earlier in the call keeps the GPU prefix."""
     cpu_allocator = RuntimeError(
         "[enforce fail at alloc_cpu.cpp:114] data. DefaultCPUAllocator: not "
         "enough memory: you tried to allocate 8589934592 bytes."
     )
-    for failure, prefix in (
-        (FakeOOM("CUDA out of memory"), OOM_BATCH1_PREFIX),
-        (MemoryError(), OOM_HOST_RAM_PREFIX),
-        (cpu_allocator, OOM_HOST_RAM_PREFIX),
+    device = FakeOOM("CUDA out of memory")
+    for first, failure, prefix in (
+        (device, device, OOM_BATCH1_PREFIX),
+        (None, MemoryError(), OOM_HOST_RAM_PREFIX),
+        (None, cpu_allocator, OOM_HOST_RAM_PREFIX),
+        (None, RuntimeError(
+            "DefaultCPUAllocator: can't allocate memory: you tried to "
+            "allocate 8 bytes"), OOM_HOST_RAM_PREFIX),
+        (device, MemoryError(), OOM_BATCH1_PREFIX),
     ):
+        first = first or failure
+
+        def process(chunk):
+            raise first if len(chunk) > 1 else failure
+
         host_before = total_host_ram_halvings()
         with mock.patch("inferio.impl.utils.clear_cache") as cache:
             with pytest.raises(InferenceOOMError) as excinfo:
                 run_with_oom_retry(
-                    _raiser(failure), ["a", "b"], oom_exceptions=(FakeOOM,)
+                    process, ["a", "b"], oom_exceptions=(FakeOOM,)
                 )
         assert str(excinfo.value).startswith(prefix), failure
         assert excinfo.value.__cause__ is failure

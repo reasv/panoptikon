@@ -1408,6 +1408,9 @@ def test_the_oom_classifier_covers_the_non_cuda_backends(fake_torch):
             "[enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator: can't "
             "allocate memory: you tried to allocate 12884901888 bytes."
         ),
+        "cpu-allocator-bare": RuntimeError(
+            "DefaultCPUAllocator: can't allocate memory: you tried to allocate 8 bytes"
+        ),
         "memory-error": MemoryError(),
     }
     for name, failure in failures.items():
@@ -1425,6 +1428,8 @@ def test_the_oom_classifier_covers_the_non_cuda_backends(fake_torch):
         RuntimeError("DefaultCPUAllocator: can't allocate memory\nCUDA out of memory")
     )
     assert both["host_ram"] is False
+    prefixed = packing.classify_oom(RuntimeError("INFERENCE_OOM_HOST_RAM: x"))
+    assert prefixed["host_ram"] is True
 
     with pytest.raises(packing.WindowFailure) as caught:
         packing.run_window(
