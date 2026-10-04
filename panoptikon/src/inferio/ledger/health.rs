@@ -244,7 +244,7 @@ pub struct LedgerWorkerHealth {
     /// The GPU's margin, widened while the fit is unconfirmed or scattered.
     pub effective_margin: f64,
     /// A GPU replica's host RAM, booked on the CPU device: its resident set
-    /// (absent when its RAM is not booked), the MiB per unit its grants book
+    /// (absent when its RAM is not booked), the fitted host RAM per unit
     /// (absent until a batch measured it), what its outstanding grants hold
     /// booked, and whether host RAM capped its last grant.
     pub ram_resident_mb: Option<u64>,
