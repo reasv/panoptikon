@@ -980,8 +980,9 @@ def test_paging_during_a_long_batch_cuts_the_next_one():
     """Swap-outs 5 s into a 90 s batch and none for its last 85 s: the next
     batch's reading counts them, since they came after the reading the batch
     was sized from, so that batch fits the 2000 MiB pool held. The batch
-    after it saw no rise during the one before and is not cut, nor is the
-    first batch of a window after swap-outs in the idle time before it."""
+    after it saw no rise during the one before and is not cut. Once the
+    worker clears the instant after the reply, the first batch of the next
+    window is not cut by swap-outs in the idle time before it."""
     clock = [0.0]
 
     def counters():
@@ -1002,6 +1003,7 @@ def test_paging_during_a_long_batch_cuts_the_next_one():
         mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN),
     ):
         payload = packing.run_window(Slow(), items(16), grant(unit_budget=8, mb=4000))
+        memory.count_paging_from_last_reading(False)
         clock[0] = 400
         next_window = packing.run_window(Slow(), items(8), grant(unit_budget=8, mb=4000))
     first, cut, after = payload["measurements"]

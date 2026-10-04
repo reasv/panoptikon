@@ -369,6 +369,7 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
             # request, and what they occupied goes back to the OS.
             msg = inputs = None
             memory.return_freed_memory()
+            memory.count_paging_from_last_reading(False)
 
         elif mtype == "unload":
             # Valid in every state: a parked prewarmed worker with no

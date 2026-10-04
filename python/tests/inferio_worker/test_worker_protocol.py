@@ -783,8 +783,9 @@ def test_a_trim_that_released_nothing_leaves_the_shrink_state_alone() -> None:
 
 def test_the_worker_returns_freed_memory_after_each_predict_reply() -> None:
     """After every `predict` reply, ok or error, the worker trims the C heap
-    before it reads the next request. Driven in-process, noting which reply
-    frames were written when each trim ran."""
+    and stops counting paging from the window's last reading before it reads
+    the next request. Driven in-process, noting which reply frames were
+    written when each ran."""
     from unittest import mock
 
     from inferio_worker import __main__ as harness
@@ -814,19 +815,26 @@ def test_the_worker_returns_freed_memory_after_each_predict_reply() -> None:
         return frames
 
     trims: list[list[tuple[int, str]]] = []
+    clears: list[list[tuple[int, str]]] = []
     windows = mock.Mock(
         side_effect=[{"outputs": [{"echo": 1}]}, RuntimeError("the window failed")]
     )
     with (
         mock.patch.dict(sys.modules, {"torch": None}),
         mock.patch.object(memory, "return_freed_memory", lambda: trims.append(replies())),
+        mock.patch.object(
+            memory,
+            "count_paging_from_last_reading",
+            lambda counted: clears.append(replies()) if not counted else None,
+        ),
         mock.patch.object(packing, "run_grantless_window", windows),
     ):
         assert harness._serve(proto_in, proto_out) == 0
     # Trims also run at load end; those after a predict reply are the last
     # frame written being that reply.
-    after_predict = [frames[-1] for frames in trims if frames and frames[-1][0] >= 4]
-    assert after_predict == [(4, "ok"), (5, "error")], trims
+    for runs in (trims, clears):
+        last = [frames[-1] for frames in runs if frames and frames[-1][0] >= 4]
+        assert last == [(4, "ok"), (5, "error")], runs
 
 
 def test_the_worker_holds_no_request_input_while_it_waits() -> None:

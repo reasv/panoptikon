@@ -1002,8 +1002,8 @@ def count_paging_from_last_reading(counted: bool) -> None:
     """While `counted`, a swap-out rise after the latest reading is paging
     however long ago it was (`_mac_paging`). Set as each batch of a window
     starts, so the next batch's reading counts paging during this one, and
-    cleared as a window starts, so its first reading does not count paging
-    from the idle time before it."""
+    cleared after each predict reply, so no reading until the next window's
+    first batch counts paging from the idle time before it."""
     _swapouts["since"] = _swapouts["read_at"] if counted else None
 
 
