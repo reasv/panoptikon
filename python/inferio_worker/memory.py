@@ -1935,6 +1935,11 @@ _context_state: dict[str, Any] = {
     "unmeasured": None,
 }
 
+# Why the context went unmeasured; a reading outside the band names its figure.
+CONTEXT_NO_DRIVER_READING = "no driver free reading before the load"
+CONTEXT_INITIALISED_BEFORE = "GPU initialised before the load"
+CONTEXT_INIT_UNSEEN = "no reading across the GPU's initialisation"
+
 
 class _ContextProbe:
     """Measures the accelerator context as the free-memory delta across this
@@ -2057,34 +2062,29 @@ def _start_context_probe(
     """Start the context probe, or None when no measurement is possible: a
     RAM-priced process, a context already measured, no driver-level reading,
     or CUDA already initialised. A leftover probe is collected first."""
-    _collect_context_probe(announce=False)
+    _collect_context_probe()
     if _ram_currency() or _context_state["measured_mb"] is not None:
         return None
     if free_mb is None or free_source not in ("nvml", "amdgpu-sysfs"):
-        _context_state["unmeasured"] = "no driver free reading before the load"
+        _context_state["unmeasured"] = CONTEXT_NO_DRIVER_READING
         return None
     torch = _torch()
     if torch is not None:
         try:
             if torch.cuda.is_initialized():
-                _context_state["unmeasured"] = (
-                    "GPU initialised before the load"
-                )
+                _context_state["unmeasured"] = CONTEXT_INITIALISED_BEFORE
                 return None
         except Exception:
             return None
-    _context_state["unmeasured"] = "no reading across the GPU's initialisation"
+    _context_state["unmeasured"] = CONTEXT_INIT_UNSEEN
     probe = _ContextProbe(free_mb, free_source)
     probe.start()
     _context_state["probe"] = probe
     return probe
 
 
-def _collect_context_probe(
-    probe: "_ContextProbe | None" = None, announce: bool = True
-) -> None:
-    """Stop any running context probe and keep its result; with `announce`,
-    log which context figure a process with a live GPU context uses."""
+def _collect_context_probe(probe: "_ContextProbe | None" = None) -> None:
+    """Stop any running context probe and keep its result."""
     running = _context_state.get("probe")
     _context_state["probe"] = None
     seen: list[Any] = []
@@ -2099,8 +2099,6 @@ def _collect_context_probe(
             continue
         if measured is not None:
             _remember_context_mb(measured)
-    if announce and not _ram_currency() and _torch_cuda() is not None:
-        _remember_context_mb(None)
 
 
 def abort_load(before: dict[str, Any]) -> None:
@@ -2109,7 +2107,7 @@ def abort_load(before: dict[str, Any]) -> None:
     """
     try:
         probe = before.get("context_probe") if isinstance(before, dict) else None
-        _collect_context_probe(probe, announce=False)
+        _collect_context_probe(probe)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("post-failure memory cleanup failed: %s", exc)
 
@@ -2314,9 +2312,11 @@ def _resolve_base(
                 context_source,
                 IMPLAUSIBLE_SLACK_MB,
             )
-        return (floor + context_mb, alloc_method)
-    if free_delta >= floor:
+    elif free_delta >= floor:
         return (free_delta, "free_delta")
+    if context_source == "estimate":
+        # Log once which estimate priced this base.
+        _remember_context_mb(None)
     return (floor + context_mb, alloc_method)
 
 

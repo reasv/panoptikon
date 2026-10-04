@@ -595,32 +595,66 @@ def test_the_fixed_estimate_is_the_last_resort_and_names_itself(fake_torch) -> N
 def test_an_unmeasured_context_is_logged_once_with_its_reason(
     tmp_path, monkeypatch, caplog
 ) -> None:
-    # Two loads into one worker log one line, naming the figure and why it
-    # was not measured. A load that never brings up the GPU logs nothing.
-    monkeypatch.setattr(memory, "PCI_DEVICES_ROOT", empty_dir(tmp_path, "pci"))
-    for initialized, nvml in ((True, (8700, 24_576)), (False, (None, None))):
+    # A base priced with the context estimate logs one INFO line per worker
+    # naming the estimate and why the context went unmeasured. A base from a
+    # per-process figure logs none.
+    band = "outside the band"
+    fixed = (
+        memory.CONTEXT_NO_DRIVER_READING,
+        memory.CONTEXT_INITIALISED_BEFORE,
+        memory.CONTEXT_INIT_UNSEEN,
+    )
+    cuda_estimate, hip_estimate = (
+        memory.CONTEXT_ESTIMATE_MB, memory.HIP_CONTEXT_ESTIMATE_MB
+    )
+    ours = [fdinfo("0000:03:00.0", 1, "1536 MiB")]
+    # The probe polls only when the test says, so whether it saw the GPU come
+    # up is not a race.
+    monkeypatch.setattr(memory._ContextProbe, "start", lambda self: None)
+    for hip, fdinfo_texts, initialized, polled, nvml, expected in (
+        (False, None, True, True, (8700, 24_576),
+         (memory.CONTEXT_INITIALISED_BEFORE, cuda_estimate)),
+        (False, None, True, True, (None, None),
+         (memory.CONTEXT_NO_DRIVER_READING, cuda_estimate)),
+        (False, None, False, False, (8700, 24_576),
+         (memory.CONTEXT_INIT_UNSEEN, cuda_estimate)),
+        (False, None, False, True, (8700, 24_576), (band, cuda_estimate)),
+        (True, None, True, True, (None, None),
+         (memory.CONTEXT_NO_DRIVER_READING, hip_estimate)),
+        (True, ours, True, True, (None, None), None),
+    ):
         cuda = FakeCuda(initialized=initialized)
+        host = (
+            rocm_host(tmp_path, monkeypatch, fdinfo_texts=fdinfo_texts, cuda=cuda)
+            if hip
+            else isolated(fake_torch_module(cuda))
+        )
         with (
-            isolated(fake_torch_module(cuda)),
+            host,
             mock.patch.object(memory, "_nvml_memory", return_value=nvml),
             caplog.at_level(logging.INFO, logger="inferio_worker.memory"),
         ):
             caplog.clear()
-            cuda.initialized = False
-            idle = memory.begin_load()
-            memory.finish_load(idle, object())
-            assert caplog.records == [], "no GPU context, nothing to size"
-            cuda.initialized = initialized
             for _ in range(2):
                 before = memory.begin_load()
                 cuda.initialized = True
-                cuda.allocate(100)
-                memory.finish_load(before, object())
-            reason = memory._context_state["unmeasured"]
-        assert reason is not None, initialized
-        assert [r.args for r in caplog.records] == [
-            (reason, memory.CONTEXT_ESTIMATE_MB)
-        ], initialized
+                if polled and before["context_probe"] is not None:
+                    before["context_probe"].poll()
+                cuda.allocate(512, reserved_mb=600)
+                cuda.free += 600 * MIB
+                report = memory.finish_load(before, object())
+                assert report["base_method"] == (
+                    "fdinfo" if fdinfo_texts else "alloc_delta"
+                )
+        records = [(r.levelno, r.args) for r in caplog.records]
+        if expected is None:
+            assert records == [], "a per-process base"
+        elif expected[0] == band:
+            [(level, (reason, estimate))] = records
+            assert (level, estimate) == (logging.INFO, expected[1])
+            assert reason not in fixed, "the reading's own figure"
+        else:
+            assert records == [(logging.INFO, expected)], expected
 
 
 def test_a_measured_context_sharpens_the_plausibility_ceiling() -> None:
