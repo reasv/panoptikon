@@ -1,4 +1,5 @@
 //! Registration: which GPU a worker is admitted under, and when it is refused.
+use super::unified_memory::{APU_TOTAL_MB, apu_device, apu_ledger};
 use super::*;
 
 /// `none`-class models, workers with no GPU at all, and GPUs outside
@@ -182,10 +183,20 @@ fn a_rocm_wire_load_report_reaches_the_gpu_it_names() {
     assert_eq!(report.base_method.as_deref(), Some("fdinfo"));
     assert_eq!(report.gpu_integrated, Some(false));
 
-    // A worker whose HIP runtime calls the discrete GPU integrated is
-    // admitted all the same, and the disagreement is logged once per GPU.
-    for (integrated, logged) in [(true, 1), (false, 0)] {
-        let ledger = rocm_ledger();
+    // A worker whose HIP runtime disagrees with the host's discrete or
+    // unified call is admitted all the same, and that is logged once per GPU.
+    let apu_report = LoadReport {
+        gpu_bdf: Some("0000:03:00.0".to_owned()),
+        gpu_total_mb: Some(APU_TOTAL_MB),
+        ..report.clone()
+    };
+    let cases = [
+        (rocm_ledger(), &report, true, 1),
+        (rocm_ledger(), &report, false, 0),
+        (apu_ledger(vec![apu_device(0)]), &apu_report, false, 1),
+        (apu_ledger(vec![apu_device(0)]), &apu_report, true, 0),
+    ];
+    for (ledger, report, integrated, logged) in cases {
         let mut report = report.clone();
         report.gpu_integrated = Some(integrated);
         let mut telemetry = WorkerTelemetry::default();

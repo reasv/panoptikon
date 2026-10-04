@@ -410,10 +410,10 @@ fn the_published_inventory_carries_the_adopted_total() {
 /// The BIOS UMA carve-out amdgpu publishes as an APU's whole VRAM total.
 const APU_CARVEOUT_MB: u64 = 512;
 /// Carve-out + GTT: what admission actually budgets against.
-const APU_TOTAL_MB: u64 = APU_CARVEOUT_MB + 64 * 1024;
+pub(super) const APU_TOTAL_MB: u64 = APU_CARVEOUT_MB + 64 * 1024;
 
 /// An APU row as `rocm.rs` builds one, at `0000:03:00.0`.
-fn apu_device(index: u32) -> crate::inferio::gpu::GpuInfo {
+pub(super) fn apu_device(index: u32) -> crate::inferio::gpu::GpuInfo {
     crate::inferio::gpu::GpuInfo {
         index,
         uuid: AMD_A.to_owned(),
@@ -427,7 +427,7 @@ fn apu_device(index: u32) -> crate::inferio::gpu::GpuInfo {
     }
 }
 
-fn apu_ledger(gpus: Vec<crate::inferio::gpu::GpuInfo>) -> Arc<VramLedger> {
+pub(super) fn apu_ledger(gpus: Vec<crate::inferio::gpu::GpuInfo>) -> Arc<VramLedger> {
     VramLedger::new(
         &GpuInventory::known_rocm(gpus),
         VramBudget::default().into(),
