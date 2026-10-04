@@ -143,7 +143,7 @@ in
           exit 1
         ''
         else ''
-          # tauri-build refuses to compile unless bundle.resources paths exist.
+          # postInstall bundles the staged PDFium.
           # Same pinned wheel as scripts/stage-pdfium.py; the fetch is fixed-output.
           mkdir -p "$NIX_BUILD_TOP/pdfium-cache"
           cp ${pdfiumWheel} "$NIX_BUILD_TOP/pdfium-cache/${baseNameOf pdfiumSpec.url}"
