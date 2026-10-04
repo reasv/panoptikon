@@ -971,14 +971,17 @@ def test_a_gpu_worker_keeps_the_ram_reserve_free(fake_torch):
 def test_an_apu_keeps_the_ram_reserve_in_its_ram_term(tmp_path, monkeypatch):
     """An APU's reading is free VRAM plus the smaller of unclaimed GTT and
     free RAM. The grant's RAM reserve comes off the RAM term only: it bites
-    when RAM is short, and withholds nothing when the GTT window is."""
+    when RAM is short, withholds nothing when GTT is, and never takes free
+    VRAM."""
     bdf = "0000:03:00.0"
     root = pci_root(tmp_path, {bdf: (512 * MIB, 256 * MIB)})
     with rocm_host(tmp_path, monkeypatch, pci=root):
         write_gtt(root, bdf, 64 * 1024 * MIB, 4 * 1024 * MIB)
         with unified(ram_available_mb=8_000):
             ram_short = packing.clamp_to_live_memory(64, 4_000, 6_000)
-        write_gtt(root, bdf, 64 * 1024 * MIB, 60 * 1024 * MIB)
+        with unified(ram_available_mb=4_000):
+            below_reserve = packing.clamp_to_live_memory(64, 4_000, 6_000)
+        write_gtt(root, bdf, 64 * 1024 * MIB, 62 * 1024 * MIB)
         with unified(ram_available_mb=100 * 1024):
             gtt_short = packing.clamp_to_live_memory(64, 4_000, 6_000)
             window = packing.run_window(Recorder(), items(1), grant(unit_budget=1))
@@ -987,8 +990,13 @@ def test_an_apu_keeps_the_ram_reserve_in_its_ram_term(tmp_path, monkeypatch):
         "to_units": 36,
         "free_mb": 256 + 8_000,
     }, "256 + 2 000 above the reserve, of 4 000"
-    assert (gtt_short.units, gtt_short.clamped) == (64, None)
-    assert gtt_short.gtt_mb == (4 * 1024, 100 * 1024)
+    assert below_reserve.units == 4, "the 256 of free VRAM, of 4 000"
+    assert gtt_short.clamped == {
+        "from_units": 64,
+        "to_units": 37,
+        "free_mb": 256 + 2 * 1024,
+    }, "all of it, of 4 000"
+    assert gtt_short.gtt_mb == (2 * 1024, 100 * 1024)
     batch = window["measurements"][0]
     assert (batch["gtt_free_mb"], batch["ram_available_mb"]) == gtt_short.gtt_mb
 

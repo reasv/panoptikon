@@ -495,11 +495,11 @@ high-water and a freed page is already in the free reading; there the free
 reading counts only above `grant.ram_reserve_mb`
 (`spendable = free − reserve + pool`), so a batch cannot take the RAM the
 ledger left free. On an APU the reserve comes off the RAM term of its reading
-only (`spendable = VRAM free + min(GTT free, RAM − reserve) + pool`), so
-where the GTT window is short it withholds nothing. A discrete GPU worker's own free reading is the device's and
-has no reserve taken from it; its host RAM is checked separately against
-`grant.ram_mb`, and a batch that check shrank reports
-`clamped.reason = "host_ram"`. Uncredited, the
+only (`spendable = VRAM free + min(GTT free, max(RAM − reserve, 0)) + pool`),
+so where GTT is short it withholds nothing. A discrete GPU worker's own free
+reading is the device's and has no reserve taken from it; its host RAM is
+checked separately against `grant.ram_mb`, and a batch that check shrank
+reports `clamped.reason = "host_ram"`. Uncredited, the
 clamp shrank 120 of 123 batches per job on an M3 Max holding 20–47 GiB of
 pool, scattered the cost fit and cost 5.5–7.3 % of throughput; on a 24 GiB
 card an 84 MiB gap on a 23 557 MiB pre-fit grant floored a 2-unit budget to 1

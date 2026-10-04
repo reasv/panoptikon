@@ -878,7 +878,7 @@ def clamp_to_live_memory(
 
     Free host RAM counts only above `ram_reserve_mb`, which the orchestrator
     keeps free: in a RAM-priced worker's reading, in an APU's RAM term (its
-    free VRAM and GTT window do not shrink by it), and for a GPU worker whose
+    free VRAM and GTT do not shrink by it), and for a GPU worker whose
     grant books `ram_grant_mb` of host RAM, which is scaled the same way
     against free RAM and runs at the smaller of the two budgets.
     """

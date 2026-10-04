@@ -1828,16 +1828,17 @@ def unified(ram_available_mb: int | None = 8 * 1024, bdf: str = "0000:03:00.0"):
     `FakeCuda`'s PCI fields render to. psutil is stubbed rather than read: a
     test whose expected numbers came from the machine it runs on asserts
     nothing."""
-    real = memory._ram_available_bytes
-    memory._ram_available_bytes = (
-        lambda: None if ram_available_mb is None else ram_available_mb * MIB
+    real = memory._ram_bounds_bytes
+    memory._ram_bounds_bytes = lambda root=None: (
+        real(root)[0],
+        None if ram_available_mb is None else ram_available_mb * MIB,
     )
     os.environ["PANOPTIKON_UNIFIED_GPU"] = bdf
     try:
         yield
     finally:
         del os.environ["PANOPTIKON_UNIFIED_GPU"]
-        memory._ram_available_bytes = real
+        memory._ram_bounds_bytes = real
 
 
 def test_the_amdgpu_tier_is_gtt_inclusive_on_a_unified_device(
@@ -2879,7 +2880,7 @@ def test_linux_free_ram_leaves_out_reclaimable_slab(
         with mock.patch.object(sys, "platform", "win32"):
             assert memory._reclaimable_slab_bytes() == 0
         # A unified ROCm GPU clamps its GTT by the same figure.
-        assert memory._ram_available_bytes() == 24_605 * MIB
+        assert memory._ram_bounds_bytes()[1] == 24_605 * MIB
     # More slab than is available, a row in another unit, no row, no file.
     for text, free_mb in (
         ("SReclaimable:   99999999 kB\n", 0),

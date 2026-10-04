@@ -920,7 +920,8 @@ def _rocm_base(
 def amdgpu_free_total_mb(root: str | None = None) -> tuple[int | None, int | None]:
     """Device-wide `(free_mb, total_mb)` for this worker's GPU from amdgpu sysfs
     (the files the orchestrator reads), or `(None, None)`. On a unified-memory
-    device GTT is added, its free part clamped by `_ram_available_bytes`.
+    device GTT is added, its free part clamped by available RAM
+    (`_ram_bounds_bytes`, as `rocm.rs` reads it).
     """
     reading = _amdgpu_reading(root)
     return (reading.free_mb, reading.total_mb)
@@ -940,7 +941,7 @@ def _amdgpu_reading(root: str | None = None) -> FreeReading:
     if unified_gpu():
         gtt_total = _sysfs_bytes(os.path.join(device, "mem_info_gtt_total"))
         gtt_used = _sysfs_bytes(os.path.join(device, "mem_info_gtt_used"))
-        available = _ram_available_bytes()
+        available = _ram_bounds_bytes()[1]
         if gtt_total is None or gtt_used is None or available is None:
             return FreeReading(None, None, None)
         gtt_free = max(gtt_total - gtt_used, 0)
@@ -1257,12 +1258,6 @@ def _virtual_memory() -> Any | None:
         return psutil.virtual_memory()
     except Exception:
         return None
-
-
-def _ram_available_bytes() -> int | None:
-    """The RAM the OS could deliver now in bytes, as the CPU device reads it
-    (within the cgroup limit too), or None. `rocm.rs` clamps GTT by the same."""
-    return _ram_bounds_bytes()[1]
 
 
 def mps_gpu_name() -> str | None:
