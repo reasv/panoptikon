@@ -518,6 +518,13 @@ small: wd-vit at batch 128 on the M3 Max read **16 460 MiB post-batch against
 whose device total *is* host RAM and which must therefore never actually be
 filled.
 
+**ROCm**: where NVML has no GPU `N`, `--device N` is the HIP device index in
+KFD order (a single-index `HIP_VISIBLE_DEVICES` wins), pinned as the spawner
+pins a ROCm worker: `HIP_VISIBLE_DEVICES`, plus `PANOPTIKON_UNIFIED_GPU=<bdf>`
+on an APU. Free and total come from amdgpu sysfs and `nvml_own_mb`/`base_nvml_mb`
+from KFD's per-process counter or DRM fdinfo, as `rocm_sysfs.py` reads them for
+`vramrec.py`; `device.own_source` names which. The torch figures are HIP's.
+
 `--mode audio-npy` is required for the `whisper` and `clap` groups: those
 impls read their input with `deserialize_array`
 (`np.load(allow_pickle=False)`), so what a probe must hand them is the mono
@@ -553,7 +560,7 @@ the worker's post-load attention check, run at the same point: `patched`,
 | block | fields |
 |---|---|
 | `cost` | `unit`, `aggregation`, `seed_units`, `epoch`, `canvas_pixels`, `canvas_pixels_in_force`, `max_tokens`, `max_tokens_in_force` |
-| `device` | `index`, `uuid`, `name`, `total_mb`, `cuda_visible_devices`. On `--device mps`: `index` null, `uuid` the orchestrator's `GPU-MPS`, `total_mb` the recommended-max, `backend: "mps"` |
+| `device` | `index`, `uuid`, `name`, `total_mb`, `cuda_visible_devices`. On `--device mps`: `index` null, `uuid` the orchestrator's `GPU-MPS`, `total_mb` the recommended-max, `backend: "mps"`. On ROCm: `uuid` the orchestrator's device key, `bdf`, `unified`, `free_mb`, `hip_visible_devices`, `own_source`, `backend: "rocm"` |
 | `load` | `seconds`, `base_nvml_mb`, `base_free_delta_mb`, `reserved_at_load_mb`, `allocated_at_load_mb`, `free_before_mb`, `free_after_mb` |
 | `batches[]` | `batch`, `repeat`, `units`, `items`, `ok`, `oom`, `error`, `absorbed_halvings`, `index_limit_events`, `duration_ms`, `peak_reserved_mb`, `peak_allocated_mb`, `delta_mb`, `reserved_before_mb`, `reserved_after_mb`, `nvml_own_mb` (on MPS the `driver_allocated_memory()` own figure), `gpu_free_mb`, and `oom_class` (`source`, `exception`, `device`, `free_mb_at_failure`) or `null`; on MPS with the sampler on, also `sampled_peak_mb`, `sampled_samples`, `gc_bias_mb`, `gc_bias_pct` |
 | `fit` | `basis` (`peak_allocated_mb`; `peak_reserved_mb` on MPS, where there is no allocated peak to read), `slope_mb_per_unit`, `intercept_mb`, `residual_mb`, `samples` — or `null` |

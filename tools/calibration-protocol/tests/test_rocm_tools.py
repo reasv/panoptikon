@@ -3,7 +3,7 @@
 `rocm_sysfs.py` must index, key and total GPUs as `rocm.rs` does, or no
 reading here joins `/health`; its per-process figure must come from KFD only
 where KFD's PIDs are ours. The tools built on it (`vramrec.py`, `hog.py`,
-`legs.py`, `selftest.py`, `newrun.py`) and `analyze.py`'s checks of amdgpu
+`legs.py`, `selftest.py`, `newrun.py`, `ceiling_probe.py`) and `analyze.py`'s checks of amdgpu
 samples are exercised on the same trees.
 
 Run with the managed interpreter:
@@ -36,9 +36,10 @@ def _load(name):
     return module
 
 
-rocm_sysfs, vramrec, analyze, hog, legs, selftest, newrun = (
+rocm_sysfs, vramrec, analyze, hog, legs, selftest, newrun, probe = (
     _load(name) for name in
-    ("rocm_sysfs", "vramrec", "analyze", "hog", "legs", "selftest", "newrun"))
+    ("rocm_sysfs", "vramrec", "analyze", "hog", "legs", "selftest", "newrun",
+     "ceiling_probe"))
 
 
 class Host:
@@ -584,16 +585,49 @@ def test_legs_totals_a_rocm_gpu_from_sysfs(tmp_path, monkeypatch, capsys):
         16384, "amdgpu-sysfs")
 
 
-def test_selftest_pins_like_the_spawner(tmp_path):
-    host = Host(tmp_path).gpu(1, 0x0300).gpu(2, 0x0C00, gtt=(GIB, 0))
-    assert selftest.rocm_pin(0, {}, host.roots) == {
-        "HIP_VISIBLE_DEVICES": "0", "PANOPTIKON_DEVICE_PIN": "0"}
+def test_the_tools_pin_like_the_spawner(tmp_path, monkeypatch, capsys):
+    """selftest and ceiling_probe pin HIP device N in KFD order, an unopenable
+    node taking no index; the probe takes that GPU when NVML has none, and
+    reads it from sysfs and its own usage from KFD."""
+    host = Host(tmp_path).gpu(1, 0x0300, used=2 * GIB).gpu(2, 0x0800,
+                                                           openable=False)
+    host.gpu(3, 0x0C00, used=128 * MIB, gtt=(GIB, 0))
+
+    def pin(device, environ=None):
+        gpu = rocm_sysfs.pinned_gpu(device, environ or {}, host.roots)
+        return gpu and rocm_sysfs.pin_env(gpu)
+
+    assert pin(0) == {"HIP_VISIBLE_DEVICES": "0", "PANOPTIKON_DEVICE_PIN": "0"}
     unified = {"HIP_VISIBLE_DEVICES": "1", "PANOPTIKON_DEVICE_PIN": "1",
                "PANOPTIKON_UNIFIED_GPU": BDF_0C}
-    assert selftest.rocm_pin(1, {}, host.roots) == unified
-    assert selftest.rocm_pin(0, {"HIP_VISIBLE_DEVICES": "1"}, host.roots) == unified
-    assert selftest.rocm_pin(0, {"ROCR_VISIBLE_DEVICES": "1"}, host.roots) == {}
-    assert selftest.rocm_pin(5, {}, host.roots) == {}
+    assert pin(1) == unified
+    assert pin(0, {"HIP_VISIBLE_DEVICES": "1"}) == unified
+    assert pin(0, {"ROCR_VISIBLE_DEVICES": "1"}) is None
+    assert pin(5) is None
+
+    host.kfd(os.getpid(), 1, 300 * MIB)
+    rocm = probe.Rocm.pinned(0, {}, host.roots)
+    assert rocm.env() == pin(0)
+    assert rocm.row() == {
+        "index": 0, "uuid": f"GPU-BDF-{BDF_03}", "name": None,
+        "total_mb": 24576, "free_mb": 22528, "bdf": BDF_03, "unified": False,
+        "backend": "rocm"}
+    assert (rocm.free_mb(), rocm.own_mb(), rocm.own_source) == (22528, 300, "kfd")
+    apu = probe.Rocm.pinned(1, {}, host.roots)
+    assert apu.env() == unified
+    assert (apu.row()["total_mb"], apu.free_mb()) == (512 + 1024, 384 + 1024)
+    assert probe.Rocm.pinned(0, {"CUDA_VISIBLE_DEVICES": "0"}, host.roots) is None
+
+    pinned = probe.Rocm.pinned
+    monkeypatch.setattr(probe, "Nvml", lambda: types.SimpleNamespace(
+        gpus=lambda: [], error="NVMLError_LibraryNotFound"))
+    monkeypatch.setattr(probe.Rocm, "pinned", lambda device, environ: pinned(
+        device, environ, host.roots))
+    assert probe.main(["--model", "tags/wd-vit-tagger-v3", "--device", "1",
+                       "--dry-run"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["backend"] == "rocm"
+    assert plan["device"] == apu.row()
 
 
 def test_selftest_reasons_name_what_is_missing(tmp_path, monkeypatch):

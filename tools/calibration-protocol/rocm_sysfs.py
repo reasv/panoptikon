@@ -119,6 +119,30 @@ def inventory(roots: Roots = Roots()) -> List[Gpu]:
             else row for row in rows]
 
 
+def pinned_gpu(device: int, environ: Dict[str, str],
+               roots: Roots = Roots()) -> Optional[Gpu]:
+    """The GPU a process pinned to HIP device `device` uses. A single index
+    already in `HIP_VISIBLE_DEVICES` is kept and names the device; any other
+    visibility variable leaves the process unpinned (None)."""
+    hip = (environ.get("HIP_VISIBLE_DEVICES") or "").strip()
+    others = ("ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL")
+    if any((environ.get(name) or "").strip() for name in others) or (
+            hip and not hip.isdigit()):
+        return None
+    return next((gpu for gpu in inventory(roots)
+                 if gpu.index == (int(hip) if hip else device)), None)
+
+
+def pin_env(gpu: Gpu) -> Dict[str, str]:
+    """The variables the spawner gives a worker on `gpu`: `HIP_VISIBLE_DEVICES`
+    and, on a unified GPU, `PANOPTIKON_UNIFIED_GPU`."""
+    out = {"HIP_VISIBLE_DEVICES": str(gpu.index),
+           "PANOPTIKON_DEVICE_PIN": str(gpu.index)}
+    if gpu.unified:
+        out["PANOPTIKON_UNIFIED_GPU"] = gpu.bdf
+    return out
+
+
 def meminfo_mb(roots: Roots, key: str) -> Optional[int]:
     """One `/proc/meminfo` row in MiB (`rocm.rs::meminfo_mb`)."""
     for line in (_read(os.path.join(roots.proc, "meminfo")) or "").splitlines():

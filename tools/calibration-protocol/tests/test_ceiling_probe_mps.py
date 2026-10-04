@@ -99,7 +99,7 @@ def test_a_device_that_is_neither_an_index_nor_mps_is_refused():
          "--dry-run", "--device", "gpu0"],
         capture_output=True, text=True, timeout=180)
     assert out.returncode != 0
-    assert "NVML index or `mps`" in out.stderr
+    assert "HIP index or `mps`" in out.stderr
 
 
 # --- the in-batch peak sampler ---------------------------------------------

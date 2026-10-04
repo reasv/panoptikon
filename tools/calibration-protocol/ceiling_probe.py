@@ -18,7 +18,11 @@ Usage
 
 Options are in `--help`. `--device N` is an NVML index, translated to
 `CUDA_VISIBLE_DEVICES=GPU-<uuid>` as the orchestrator pins a worker
-(`gpu.rs: resolve_pin`). See tools/calibration-protocol/README.md
+(`gpu.rs: resolve_pin`). Without NVML it is the HIP device index in KFD
+order, pinned as the spawner pins a ROCm worker (`HIP_VISIBLE_DEVICES`, plus
+`PANOPTIKON_UNIFIED_GPU=<bdf>` on an APU); free and total then come from
+amdgpu sysfs and the process's own usage from KFD or DRM fdinfo
+(`rocm_sysfs.py`). See tools/calibration-protocol/README.md
 "`ceiling_probe.py` - ground truth".
 
 Apple Silicon: `--device mps`
@@ -118,6 +122,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import corpus as corpus_files  # noqa: E402
+import rocm_sysfs  # noqa: E402
 
 MIB = 1024 * 1024
 
@@ -400,6 +405,49 @@ class Nvml:
                 continue
             return None
         return None
+
+
+# --- ROCm (amdgpu sysfs and KFD, as the other tools read them) -------------
+
+
+class Rocm:
+    """One amdgpu GPU in HIP device order: its row, free and total from
+    amdgpu sysfs, and this process's own usage from KFD or DRM fdinfo."""
+
+    def __init__(self, gpu: rocm_sysfs.Gpu,
+                 roots: rocm_sysfs.Roots = rocm_sysfs.Roots()) -> None:
+        self.gpu = gpu
+        self.roots = roots
+        self.own_source: Optional[str] = None  # "kfd" or "fdinfo"
+
+    @classmethod
+    def pinned(cls, device: int, environ: Dict[str, str],
+               roots: rocm_sysfs.Roots = rocm_sysfs.Roots()) -> Optional["Rocm"]:
+        gpu = rocm_sysfs.pinned_gpu(device, environ, roots)
+        return None if gpu is None else cls(gpu, roots)
+
+    def env(self) -> Dict[str, str]:
+        return rocm_sysfs.pin_env(self.gpu)
+
+    def row(self) -> Dict[str, Any]:
+        """The `device` block, keyed on the orchestrator's device key."""
+        memory = rocm_sysfs.memory_mb(self.roots, self.gpu)
+        return {"index": self.gpu.index, "uuid": self.gpu.key, "name": None,
+                "total_mb": None if memory is None else memory[0],
+                "free_mb": None if memory is None else memory[1],
+                "bdf": self.gpu.bdf, "unified": self.gpu.unified,
+                "backend": "rocm"}
+
+    def free_mb(self) -> Optional[int]:
+        memory = rocm_sysfs.memory_mb(self.roots, self.gpu)
+        return None if memory is None else memory[1]
+
+    def own_mb(self) -> Optional[int]:
+        pid = os.getpid()
+        reading = rocm_sysfs.process_vram_mb(
+            self.roots, [self.gpu], [pid])[self.gpu.key]
+        self.own_source = reading.source
+        return reading.held.get(pid)
 
 
 # --- MPS: no NVML, no peak API, so the peak has to be sampled -------------
@@ -720,8 +768,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--data", default="{}",
                         help="JSON merged into every input's data dict")
     parser.add_argument("--device", default="0",
-                        help="NVML GPU index, or `mps` for the unified device "
-                             "on Apple Silicon (no NVML, no CUDA pin)")
+                        help="NVML GPU index; without NVML, the HIP device "
+                             "index (KFD order, a single-index "
+                             "HIP_VISIBLE_DEVICES wins); or `mps` for the "
+                             "unified device on Apple Silicon")
     parser.add_argument("--sample-ms", type=float, default=20.0,
                         help="MPS only: interval of the in-batch peak sampler. "
                              "torch.mps has no peak API, so the post-batch "
@@ -780,6 +830,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # is the normal state.
     nvml = Nvml() if not mps else None
     gpus = nvml.gpus() if nvml is not None else []
+    rocm: Optional[Rocm] = None
     if mps:
         gpu: Optional[Dict[str, Any]] = mps_device_row()
         device_index = None
@@ -788,10 +839,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             device_index = int(args.device)
         except ValueError:
             raise SystemExit(
-                f"ceiling_probe: --device takes an NVML index or `mps`, "
-                f"not {args.device!r}")
+                f"ceiling_probe: --device takes an NVML index, a HIP index "
+                f"or `mps`, not {args.device!r}")
         gpu = next((entry for entry in gpus
                     if entry["index"] == device_index), None)
+        if gpu is None:
+            rocm = Rocm.pinned(device_index, dict(os.environ))
+            gpu = None if rocm is None else rocm.row()
+    backend = "mps" if mps else "rocm" if rocm is not None else "cuda"
 
     plan = {
         "schema": "ceiling_probe/1",
@@ -809,7 +864,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "device": gpu,
         "gpus": gpus,
         "nvml_error": None if nvml is None else nvml.error,
-        "backend": "mps" if mps else "cuda",
+        "backend": backend,
         "python": sys.version.split()[0],
     }
     if mps:
@@ -830,8 +885,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         hint = ("  On Apple Silicon there is no NVML: use `--device mps`."
                 if sys.platform == "darwin" else "")
         raise SystemExit(
-            f"ceiling_probe: NVML has no GPU with index {device_index} "
-            f"(nvml error: {None if nvml is None else nvml.error})" + hint
+            f"ceiling_probe: neither NVML nor KFD has a GPU with index "
+            f"{device_index} (nvml error: "
+            f"{None if nvml is None else nvml.error}; a ROCm GPU also needs no "
+            f"visibility variable but a single-index HIP_VISIBLE_DEVICES)"
+            + hint
         )
     if not items:
         raise SystemExit("ceiling_probe: --corpus is required for a real run")
@@ -844,13 +902,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.mps_watermark:
             for name in MPS_WATERMARK_ENV:
                 os.environ[name] = args.mps_watermark
+    elif rocm is not None:
+        # The spawner's ROCm pin, BEFORE torch is imported.
+        os.environ.update(rocm.env())
     else:
         # Pin exactly as the orchestrator does, BEFORE torch is imported.
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu["uuid"]
         os.environ.setdefault("PANOPTIKON_DEVICE_PIN", gpu["uuid"])
     sys.path.insert(0, str(repo / "python"))
 
-    handle = None if mps else nvml.handle_for_uuid(gpu["uuid"])
+    handle = None if backend != "cuda" else nvml.handle_for_uuid(gpu["uuid"])
     from inferio_worker.discovery import find_impl_class
     from inferio_worker import packing
     from inferio_worker import memory as worker_memory
@@ -878,6 +939,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     def device_free_mb() -> Optional[int]:
         if mps:
             return worker_memory.mps_free_total_mb()[0]
+        if rocm is not None:
+            return rocm.free_mb()
         return nvml.free_mb(handle)
 
     def device_own_mb() -> Optional[int]:
@@ -885,6 +948,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             # `driver_allocated_memory()`: the worker's tier-1 `mps` base
             # method, per-process by construction.
             return worker_memory.mps_pool_mb()[0]
+        if rocm is not None:
+            return rocm.own_mb()
         return nvml.own_mb(handle)
 
     def synchronize() -> None:
@@ -1076,7 +1141,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"batch {count:5d} units {record['units']:9d} "
                 f"peak_reserved {record['peak_reserved_mb']:6d} MiB "
                 f"delta {record['delta_mb']:6d} MiB "
-                f"{'own' if mps else 'nvml'} {record['nvml_own_mb']} "
+                f"{'nvml' if backend == 'cuda' else 'own'} "
+                f"{record['nvml_own_mb']} "
                 + (f"sampled {record['sampled_peak_mb']} MiB "
                    if record.get("sampled_peak_mb") is not None else "")
                 + f"{record['duration_ms']:.0f} ms"
@@ -1185,6 +1251,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         bisect["low_items"] = low
         bisect["high_items"] = high
 
+    if mps:
+        device = {**gpu, "name": worker_memory.mps_gpu_name(),
+                  "total_mb": worker_memory.mps_free_total_mb()[1],
+                  "cuda_visible_devices": None}
+    elif rocm is not None:
+        device = {**gpu, "name": torch.cuda.get_device_name(0),
+                  "hip_visible_devices": os.environ["HIP_VISIBLE_DEVICES"],
+                  "own_source": rocm.own_source}
+    else:
+        device = {**gpu,
+                  "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]}
     result = {
         **plan,
         # `plan` has the declared caps; these are the ones that priced every
@@ -1194,11 +1271,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                  "max_tokens_in_force": tokens_in_force},
         "torch": torch.__version__,
         **load_facts,
-        "device": ({**gpu, "name": worker_memory.mps_gpu_name(),
-                    "total_mb": worker_memory.mps_free_total_mb()[1],
-                    "cuda_visible_devices": None} if mps else
-                   {**gpu,
-                    "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]}),
+        "device": device,
         "load": load,
         "batches": records,
         "fit": fit,

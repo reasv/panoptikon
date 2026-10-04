@@ -178,28 +178,6 @@ def load_probe(here: Path) -> Any:
     return module
 
 
-def rocm_pin(device: int, environ: Dict[str, str],
-             roots: rocm_sysfs.Roots = rocm_sysfs.Roots()) -> Dict[str, str]:
-    """The variables the spawner would give a worker on HIP device `device`:
-    `HIP_VISIBLE_DEVICES` and, on a unified GPU, `PANOPTIKON_UNIFIED_GPU`.
-    A single index already in `HIP_VISIBLE_DEVICES` is kept and names the
-    device; any other visibility variable leaves the process unpinned."""
-    hip = (environ.get("HIP_VISIBLE_DEVICES") or "").strip()
-    others = ("ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL")
-    if any((environ.get(name) or "").strip() for name in others) or (
-            hip and not hip.isdigit()):
-        return {}
-    gpu = next((gpu for gpu in rocm_sysfs.inventory(roots)
-                if gpu.index == (int(hip) if hip else device)), None)
-    if gpu is None:
-        return {}
-    out = {"HIP_VISIBLE_DEVICES": str(gpu.index),
-           "PANOPTIKON_DEVICE_PIN": str(gpu.index)}
-    if gpu.unified:
-        out["PANOPTIKON_UNIFIED_GPU"] = gpu.bdf
-    return out
-
-
 def synth_items(count: int, pixels: int, out_dir: Path) -> List[Dict[str, Any]]:
     """`count` distinct JPEGs of `pixels`x`pixels`, written under `out_dir`.
 
@@ -942,7 +920,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         os.environ["CUDA_VISIBLE_DEVICES"] = pin
         os.environ.setdefault("PANOPTIKON_DEVICE_PIN", pin)
     else:
-        hip_env = rocm_pin(args.device, dict(os.environ))
+        hip_gpu = rocm_sysfs.pinned_gpu(args.device, dict(os.environ))
+        hip_env = rocm_sysfs.pin_env(hip_gpu) if hip_gpu else {}
         pin = hip_env.get("HIP_VISIBLE_DEVICES")
         for name, value in hip_env.items():
             os.environ.setdefault(name, value)
