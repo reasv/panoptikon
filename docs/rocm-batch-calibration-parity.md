@@ -563,11 +563,11 @@ unchanged, behind the existing `is_initialized` gates.
 - `free_source_is_authoritative` (ledger) adds `"amdgpu-sysfs"` to
   `"nvml" | "nvidia-smi"`. `"torch"` stays non-authoritative — on HIP
   doubly so given the historical process-local `hipMemGetInfo`.
-- `CONTEXT_ESTIMATE_MB = 500` stays as the HIP placeholder for the
-  alloc-delta tier: no published HIP figure exists; with the fdinfo tier
-  available the constant is rarely load-bearing, `IMPLAUSIBLE_SLACK_MB`
-  absorbs the error band, and the value is flagged as a
-  field-calibration item.
+- The alloc-delta tier charges a per-backend context estimate, each at
+  least the largest context measured on that backend:
+  `HIP_CONTEXT_ESTIMATE_MB = 300` (measured 199 MiB on gfx1030, 286 MiB on
+  gfx908) and `CONTEXT_ESTIMATE_MB = 700` for CUDA and any other backend
+  (measured 666–668 MiB).
 
 **As implemented (2026-07-31).** `inferio_worker/memory.py` gained
 `amdgpu_free_total_mb`, `fdinfo_own_vram_mb`, `_fdinfo_base_mb`,
@@ -612,12 +612,12 @@ unchanged, behind the existing `is_initialized` gates.
   CUDA at all: it answers pre-load without a context, from the UUID pin. The
   real ROCm first-load ladder is therefore **fdinfo → alloc_delta**, and the
   free delta only ever appears on a *second* load into a worker that already
-  has a device. Consequence for the field pass: `CONTEXT_ESTIMATE_MB` is
+  has a device. Consequence for the field pass: `HIP_CONTEXT_ESTIMATE_MB` is
   materially more load-bearing on ROCm than the D4 text above implies —
   whenever fdinfo is unavailable (an older kernel's VM-walk stats), every
-  first load falls straight to `alloc_delta + CONTEXT_ESTIMATE_MB`, so the
-  HIP context size is promoted from "flagged" to the first number to measure
-  on real hardware.
+  first load falls straight to `alloc_delta + HIP_CONTEXT_ESTIMATE_MB`, so
+  the HIP context size is promoted from "flagged" to the first number to
+  measure on real hardware.
 - **Plausibility floor:** `FDINFO_UNDERREPORT_SLACK_MB = 256`, i.e. an
   fdinfo reading below `reserved_mb - 256 MB` is rejected (one-shot debug
   line) and the next tier answers. Rationale: the reading is *expected* above

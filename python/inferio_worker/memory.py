@@ -27,8 +27,11 @@ logger = logging.getLogger("inferio_worker.memory")
 
 _MIB = 1024 * 1024
 
-# Accelerator-context allowance when this process could not measure its own.
-CONTEXT_ESTIMATE_MB = 500
+# Accelerator-context allowance when this process could not measure its own,
+# at least the largest context measured on each backend (CUDA 668 MiB, HIP
+# 286 MiB). CUDA's figure also covers any other backend.
+CONTEXT_ESTIMATE_MB = 700
+HIP_CONTEXT_ESTIMATE_MB = 300
 
 # Plausible band (MiB) for a measured context; outside it the estimate is used.
 CONTEXT_MIN_MB = 64
@@ -1991,6 +1994,8 @@ def context_allowance_mb() -> tuple[int, str]:
     measured = _context_state["measured_mb"]
     if measured is not None:
         return (int(measured), "measured")
+    if _is_hip(_torch()):
+        return (HIP_CONTEXT_ESTIMATE_MB, "estimate")
     return (CONTEXT_ESTIMATE_MB, "estimate")
 
 
@@ -2005,15 +2010,14 @@ def _remember_context_mb(measured: int | None) -> None:
     if source == "measured":
         logger.info(
             "measured this process's accelerator context at %d MiB across its "
-            "first CUDA initialisation; using it instead of the %d MiB estimate",
+            "first CUDA initialisation; using it instead of the estimate",
             allowance,
-            CONTEXT_ESTIMATE_MB,
         )
     else:
         logger.info(
             "could not measure this process's accelerator context; using the "
             "%d MiB estimate",
-            CONTEXT_ESTIMATE_MB,
+            allowance,
         )
 
 

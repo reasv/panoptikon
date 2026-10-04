@@ -578,20 +578,34 @@ def test_the_fixed_estimate_is_the_last_resort_and_names_itself(fake_torch) -> N
     report = memory.finish_load(before, object())
     assert report["base_method"] == "alloc_delta"
     assert report["base_mb"] == 800 + memory.CONTEXT_ESTIMATE_MB
+    # Each backend's estimate covers the largest context measured on it.
+    assert memory.CONTEXT_ESTIMATE_MB >= 668
+    with isolated(fake_torch_module(FakeCuda(), hip="7.2.0")):
+        assert memory.context_allowance_mb() == (
+            memory.HIP_CONTEXT_ESTIMATE_MB, "estimate"
+        )
+        assert memory.HIP_CONTEXT_ESTIMATE_MB >= 286
 
 
 def test_a_measured_context_sharpens_the_plausibility_ceiling() -> None:
     # The ceiling is `reserved_delta + context + slack`, and it is not
-    # circular.
-    for measured, method in ((700, "free_delta"), (None, "alloc_delta")):
+    # circular. The free delta is 100 MiB over the estimate's ceiling.
+    estimate = memory.CONTEXT_ESTIMATE_MB
+    after = 8700 - (100 + estimate + memory.IMPLAUSIBLE_SLACK_MB + 100)
+    for measured, method in (
+        (estimate + 200, "free_delta"),
+        (None, "alloc_delta"),
+    ):
         cuda = FakeCuda(initialized=True)
         with isolated(fake_torch_module(cuda)):
             memory._context_state["measured_mb"] = measured
-            answers = [(8700, 24_576), (5900, 24_576)]
+            answers = [(8700, 24_576), (after, 24_576)]
             with mock.patch.object(
                 memory,
                 "_nvml_memory",
-                side_effect=lambda: answers.pop(0) if answers else (5900, 24_576),
+                side_effect=lambda: (
+                    answers.pop(0) if answers else (after, 24_576)
+                ),
             ):
                 before = memory.begin_load()
                 cuda.allocate(100, reserved_mb=100)
@@ -1824,7 +1838,9 @@ def test_the_fdinfo_reading_is_bounded_below_and_above(
         (900, 3000, 2, "free_delta", "an under-report against the pool by then"),
     ):
         assert base_method(vram, pool, loads) == expected, label
-    assert slack < memory.CONTEXT_ESTIMATE_MB, "a missed context is never jitter"
+    assert slack < memory.HIP_CONTEXT_ESTIMATE_MB, (
+        "a missed context is never jitter"
+    )
 
 
 def test_the_amdgpu_tiers_never_initialize_cuda_and_never_raise(

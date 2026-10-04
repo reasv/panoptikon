@@ -84,7 +84,7 @@ base_method       = "nvml"             # nvml | fdinfo | mps | rss | free_delta 
                                        # formulas: the measured one charges the
                                        # context this process measured across
                                        # its first CUDA init, the other the
-                                       # fixed 500 MiB estimate
+                                       # backend's fixed estimate
 base_platform     = "linux"            # optional: the platform base_mb was
                                        # measured on, when that is not this
                                        # row's own `platform`. Present only on
