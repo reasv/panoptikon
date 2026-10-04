@@ -54,8 +54,11 @@ ROCR_TORCH_MIN = (2, 6)
 def rocr_torch_problem() -> str | None:
     """Why this interpreter's torch would fail at its first GPU use under the
     inherited `ROCR_VISIBLE_DEVICES`, or None. An empty `HIP_VISIBLE_DEVICES`
-    or `CUDA_VISIBLE_DEVICES` is set. Read from the package metadata, before
-    anything imports torch."""
+    or `CUDA_VISIBLE_DEVICES` is set. A replica on the CPU device
+    (`INFERIO_DEVICE=cpu`) never uses the GPU. Read from the package
+    metadata, before anything imports torch."""
+    if os.environ.get("INFERIO_DEVICE") == "cpu":
+        return None
     if not os.environ.get("ROCR_VISIBLE_DEVICES"):
         return None
     if {"HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"} & os.environ.keys():

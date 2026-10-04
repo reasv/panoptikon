@@ -910,21 +910,24 @@ def test_a_rocm_torch_before_2_6_fails_the_handshake_under_rocr(
     from inferio_worker import __main__ as worker_main
     from inferio_worker import protocol
 
-    for version, rocr, hip, cuda, fails in (
-        ("2.5.1+rocm6.2", "0", None, None, True),
-        ("2.5.1+rocm6.2", "0", "0", None, False),
-        ("2.5.1+rocm6.2", "0", "", None, False),
-        ("2.5.1+rocm6.2", "0", None, "0", False),
-        ("2.5.1+rocm6.2", None, None, None, False),
-        ("2.6.0+rocm6.2", "0", None, None, False),
-        ("2.10.0+rocm7.2", "0", None, None, False),
-        ("2.5.1+cu124", "0", None, None, False),
+    for version, rocr, hip, cuda, device, fails in (
+        ("2.5.1+rocm6.2", "0", None, None, None, True),
+        ("2.5.1+rocm6.2", "0", "0", None, None, False),
+        ("2.5.1+rocm6.2", "0", "", None, None, False),
+        ("2.5.1+rocm6.2", "0", None, "0", None, False),
+        ("2.5.1+rocm6.2", "0", None, "", None, False),
+        ("2.5.1+rocm6.2", "0", None, None, "cpu", False),
+        ("2.5.1+rocm6.2", None, None, None, None, False),
+        ("2.6.0+rocm6.2", "0", None, None, None, False),
+        ("2.10.0+rocm7.2", "0", None, None, None, False),
+        ("2.5.1+cu124", "0", None, None, None, False),
     ):
         monkeypatch.setattr(importlib.metadata, "version", lambda _: version)
         for name, value in (
             ("ROCR_VISIBLE_DEVICES", rocr),
             ("HIP_VISIBLE_DEVICES", hip),
             ("CUDA_VISIBLE_DEVICES", cuda),
+            ("INFERIO_DEVICE", device),
         ):
             if value is None:
                 monkeypatch.delenv(name, raising=False)
@@ -936,7 +939,7 @@ def test_a_rocm_torch_before_2_6_fails_the_handshake_under_rocr(
         impl_cls, _ = worker_main._handshake(request, reply)
         reply.seek(0)
         frame = protocol.read_frame(reply)
-        assert (impl_cls is None) == fails, (version, rocr, hip, cuda)
+        assert (impl_cls is None) == fails, (version, rocr, hip, cuda, device)
         if fails:
             assert frame["type"] == "error"
             assert version in frame["message"]
