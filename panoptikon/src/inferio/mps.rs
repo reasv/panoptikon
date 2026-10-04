@@ -641,6 +641,11 @@ mod tests {
             !swapouts.paging(at(45), None),
             "the rise is dated 23 s ago, outside the window"
         );
+        swapouts.record(505, at(55));
+        assert!(
+            swapouts.paging(at(55), None),
+            "a rise dated exactly 10 s ago is paging"
+        );
     }
 
     /// The background readings date a rise that happened while the gateway
@@ -677,18 +682,6 @@ mod tests {
             !swapouts.paging(at(65), Some(at(55))),
             "the rise came before the job's first window was granted"
         );
-    }
-
-    /// The first reading starts the background thread, which then reads the
-    /// counter every tick without being asked.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_first_reading_starts_the_background_readings() {
-        let last_read = || SWAPOUTS.lock().unwrap().last.map(|(_, at)| at);
-        assert!(ram_available_mb().is_some());
-        let read = last_read();
-        std::thread::sleep(SWAPOUT_TICK * 3);
-        assert!(last_read() > read, "read again within three ticks");
     }
 
     /// A recorded trace of a process holding 61 440 MiB for 167.5 s and

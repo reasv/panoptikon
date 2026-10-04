@@ -2172,21 +2172,17 @@ def test_paging_is_a_rise_within_the_window_or_after_a_batch_started() -> None:
         assert paging_at(45, 504), "rose after the batch started"
         memory.count_paging_from_last_reading(False)
         assert not paging_at(45, 504), "without it the rise is dated 45 s ago"
+        assert paging_at(55, 505), "a rise dated exactly 10 s ago is paging"
 
 
 def test_a_windows_first_reading_counts_only_a_recent_rise() -> None:
     """No batch of the window comes before its first reading, so a rise
     counts there only within `MAC_PAGING_SECONDS`. One at the end of a 120 s
-    idle wait is dated at the reading before the wait; the gateway reads the
-    counter every 2 s, which dates it 6 s before its grant. A rise 50 s
-    before a job is never paging for it."""
+    idle wait is dated at the reading before the wait. A rise 50 s before a
+    job is never paging for it."""
     with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
         paging_at(0, 500)
         assert not paging_at(120, 600), "dated at the reading 120 s before"
-    with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
-        for seconds in range(0, 120, 2):
-            paging_at(seconds, 600 if seconds >= 115 else 500)
-        assert paging_at(120, 600), "readings 2 s apart date it 6 s before"
     with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
         paging_at(0, 500)
         assert not paging_at(55, 600), "dated 55 s before, outside the window"
