@@ -3685,6 +3685,11 @@ mod tests {
             (frame.gtt_free_mb, frame.ram_available_mb),
             (Some(61440), Some(8192))
         );
+        assert_eq!(
+            MemorySample::parse(apu.as_array().and_then(|frames| frames.first()))
+                .map(|sample| (sample.gtt_free_mb, sample.ram_available_mb)),
+            Some((Some(61440), Some(8192)))
+        );
     }
 
     /// The two clamps, including a shape ceiling that arrives without a free
