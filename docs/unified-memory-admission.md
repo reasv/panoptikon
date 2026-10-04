@@ -319,7 +319,8 @@ Single synthetic device:
     the queue. The first of an episode also sets how far the cap
     may grow back while the level stays at warning: the batch size the ramp
     admits, or the previous bound, **halved (at least 1) only when that
-    window was granted before the paging began and ran at that size**. A
+    window was granted before the paging began and ran at that size, or at
+    the size its grant asked if smaller**. A
     batch size that tipped the machine into paging is therefore not returned
     to at warning, a replica whose own batches cause the paging settles
     within log2(size) episodes, and paging that began before the grant or

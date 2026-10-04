@@ -1960,6 +1960,31 @@ fn only_an_episode_our_batch_began_at_the_bound_halves_it() {
     assert_eq!(pressure_cap(&ledger), None, "back at what the ramp admits");
 }
 
+/// At warning a replica that normal pressure would let double its working
+/// size, memory having granted nothing above it, runs the working size. Paging
+/// that a window began at that size halves the bound.
+#[test]
+fn at_warning_paging_our_batch_began_at_the_working_size_halves_the_bound() {
+    use mps::MemoryPressure::{Paging, Warning};
+    let (ledger, handle, admission) = ramped_mac_replica();
+    {
+        let mut state = ledger.lock();
+        let cal = state
+            .calibration
+            .get_mut(&("g/a".to_owned(), MPS_GPU.to_owned()))
+            .expect("calibrated");
+        cal.trial = None;
+        cal.room_cut = true;
+    }
+    assert_eq!(ramp_figures(&ledger).3, 128, "twice the working size");
+    ledger.set_memory_pressure_for_test(Warning);
+    assert_eq!(ramp_window(&handle, &admission, &MINILM_M3_MAX), 64);
+    assert_eq!(window_that_began_paging(&ledger, &handle, &admission), 64);
+    paging_windows(&ledger, &handle, &admission, Paging, 1);
+    ledger.set_memory_pressure_for_test(Warning);
+    assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 32]);
+}
+
 /// The bound is at least one unit, or a batch already at one unit would be
 /// capped at none and never grow back.
 #[test]

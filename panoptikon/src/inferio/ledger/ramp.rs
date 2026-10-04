@@ -324,10 +324,10 @@ impl VramLedger {
     /// cap to its unit budget. The first one of an episode also sets how far
     /// the cap may grow back at warning: the batch size admitted, or the
     /// previous bound, halved (at least 1) when this window was granted
-    /// before the paging began and ran at that size. So a batch size that
-    /// made the Mac page is not returned to while the level stays at
-    /// warning, and paging that began under a smaller batch, or before the
-    /// grant, does not lower the bound.
+    /// before the paging began and ran at that size or at the size its grant
+    /// asked, if smaller. So a batch size that made the Mac page is not
+    /// returned to while the level stays at warning, and paging that began
+    /// under a smaller batch, or before the grant, does not lower the bound.
     ///
     /// Otherwise a clean window that `filled` its budget doubles the cap: at
     /// warning up to that bound, at normal until it reaches the batch size
@@ -343,12 +343,11 @@ impl VramLedger {
         let Some(entry) = state.workers.get(&worker) else {
             return;
         };
-        let admitted = admitted_units(
-            entry,
-            Self::size_locked(state, entry, mps::MemoryPressure::Normal),
-            Self::anchor_locked(state, entry),
-            Self::batch_ceiling_locked(state, entry),
-        );
+        let anchor = Self::anchor_locked(state, entry);
+        let ceiling = Self::batch_ceiling_locked(state, entry);
+        let size = Self::size_locked(state, entry, mps::MemoryPressure::Normal);
+        let admitted = admitted_units(entry, size, anchor, ceiling);
+        let asked = admitted_units(entry, charge.size_asked, anchor, ceiling);
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let Some(cal) = state.calibration.get_mut(&key) else {
             return;
@@ -362,7 +361,7 @@ impl VramLedger {
                 Some(cap) if cap.paging => cap.regrow_to,
                 _ => {
                     let bound = cap.map_or(admitted, |cap| cap.regrow_to);
-                    let in_force = bound.min(admitted);
+                    let in_force = bound.min(asked);
                     if !paged_at_grant && charge.unit_budget >= in_force {
                         (in_force / 2).max(1)
                     } else {
