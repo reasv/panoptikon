@@ -146,9 +146,9 @@ pub const EXTERNAL_SAMPLE_MAX_AGE: Duration = Duration::from_secs(10);
 /// Consecutive clean windows that repay one level of deflation.
 pub const CLEAN_WINDOWS_TO_RESTORE: u32 = 3;
 
-/// Consecutive one-item out-of-memory windows, with less room than one item,
-/// or one-unit windows whose batch spilled to system RAM right after a pool
-/// release, after which a replica is declared unable to run on this GPU.
+/// Consecutive one-item windows that ran out of memory, or spilled to system
+/// RAM right after a pool release, with less room than one item, after which
+/// a replica is declared unable to run on this GPU.
 pub const OOM_WINDOWS_AT_FLOOR: u32 = CLEAN_WINDOWS_TO_RESTORE;
 
 /// How long a verdict reached by worker deaths refuses the model's loads; the

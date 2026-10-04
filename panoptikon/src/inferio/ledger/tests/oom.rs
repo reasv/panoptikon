@@ -591,49 +591,47 @@ fn a_one_item_oom_with_room_to_spare_condemns_nothing() {
 }
 
 /// Where a full GPU spills to system RAM, a model too big for it never runs
-/// out of memory: one-unit windows whose one-item batch spilled right after a
-/// pool release condemn it, whatever room the ledger saw. A spill with no
-/// release before it is no strike.
+/// out of memory: a one-item window whose batch spilled right after a pool
+/// release is a strike as a one-item out-of-memory window is, with less room
+/// than one item costs and not with room to spare. A spill with no release
+/// before it is no strike.
 #[test]
-fn one_item_windows_that_spill_condemn_the_replica() {
-    let ledger = ledger(24_576, no_margin());
-    let handle = loaded(Some(20_000), Some(0));
-    let admission = ledger
-        .register_worker("g/too-big", item_cost(4), &handle, None)
-        .expect("registers");
-    push_memory(&handle, 4_000, 0);
-    ledger.ingest_all_for_test();
-    let window = |units, spilled, regrow_after: Option<&str>| {
-        let token = admission.request_grant(units, None, 1, 0).expect("granted");
-        let unit_budget = token.grant().unit_budget;
-        handle
-            .lock()
-            .unwrap()
-            .record_measurements(vec![BatchMeasurement {
-                spilled,
-                items: Some(1),
-                regrow_after: regrow_after.map(str::to_owned),
-                ..warm_batch(1, 1.0)
-            }]);
-        (
-            unit_budget,
-            token.finish(WindowOutcome::Responded { oom: None }),
-        )
-    };
-    let spill = Some("spill");
-    assert!(window(1, false, None).1.is_none(), "a clean window");
-    let (unit_budget, verdict) = window(4, true, spill);
-    assert!(
-        unit_budget > 1 && verdict.is_none(),
-        "a grant of {unit_budget}"
-    );
-    assert!(window(1, true, None).1.is_none(), "no release before it");
-    for _ in 1..OOM_WINDOWS_AT_FLOOR {
-        assert!(window(1, true, spill).1.is_none());
+fn one_item_windows_that_spill_with_no_room_for_one_condemn_the_replica() {
+    for (total_mb, base_mb, free_mb, condemned) in
+        [(32_607, 31_150, 456, true), (100_000, 1_000, 90_000, false)]
+    {
+        let ledger = ledger(total_mb, no_margin());
+        let handle = loaded(Some(base_mb), Some(0));
+        let admission = ledger
+            .register_worker("g/too-big", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, free_mb, 0);
+        ledger.ingest_all_for_test();
+        let window = |regrow_after: Option<&str>| {
+            let token = admission.request_grant(1, None, 1, 0).expect("granted");
+            assert_eq!(token.grant().unit_budget, 1);
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![BatchMeasurement {
+                    spilled: true,
+                    items: Some(1),
+                    regrow_after: regrow_after.map(str::to_owned),
+                    ..warm_batch(1, 1.0)
+                }]);
+            token.finish(WindowOutcome::Responded { oom: None })
+        };
+        assert!(window(None).is_none(), "no release before it");
+        for _ in 1..OOM_WINDOWS_AT_FLOOR {
+            assert!(window(Some("spill")).is_none());
+        }
+        let verdict = window(Some("spill"));
+        assert_eq!(verdict.is_some(), condemned, "{total_mb} MiB card");
+        if let Some(verdict) = verdict {
+            assert_eq!(verdict.base_mb, base_mb);
+            assert!(verdict.needs_mb > verdict.room_mb, "{verdict}");
+        }
     }
-    let verdict = window(1, true, spill).1.expect("three one-item spills");
-    assert_eq!(verdict.base_mb, 20_000);
-    assert!(verdict.needs_mb > verdict.room_mb, "{verdict}");
 }
 
 /// The Windows sysmem fallback, whose 304 MiB of growth had 297 MiB of card

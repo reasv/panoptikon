@@ -1255,8 +1255,8 @@ impl's own kernels have said they cannot execute at this corpus's shapes.
   one-item out-of-memory with room to spare stays the backstop's
   ordinary business. Where the driver spills instead of failing (WDDM's
   sysmem fallback), a one-unit window whose batch spilled right after a pool
-  release is a strike whatever the room: that spill is live memory that does
-  not fit. Unpriced (`none`) models have no admission, are outside this rule
+  release is live memory that does not fit, and counts as such an
+  out-of-memory window does, against the same room. Unpriced (`none`) models have no admission, are outside this rule
   and still run, releasing the pool once per window.
 
   **The pre-fit price of one item.** With no slope there is no measured

@@ -64,7 +64,7 @@ pub(super) struct OomEvidence {
 }
 
 impl VramLedger {
-    /// Count consecutive out-of-memory windows that carried one item into less
+    /// Count consecutive `failed` windows that carried one item into less
     /// room than one item costs ([`Self::one_unit_appetite_mb_locked`]); at
     /// [`OOM_WINDOWS_AT_FLOOR`] the replica is unrunnable. A clean window
     /// clears the count; an aborted one neither counts nor clears, nor does
@@ -74,21 +74,16 @@ impl VramLedger {
     /// A worker that `died` running one unit counts whatever room the ledger
     /// saw, where a death may be a host RAM kill ([`death_may_be_ram`]): the
     /// batch cannot shrink further. The count passes to the next replica.
-    /// A one-unit window whose batch `spilled` to system RAM right after a
-    /// pool release counts whatever the room: that spill is live memory that
-    /// does not fit.
     ///
     /// Condemning remembers the model's working set on this GPU: the next load
     /// is refused while the refusal room ([`Self::refusal_room_locked`],
     /// reserve not deducted) is below it.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn note_floor_oom_locked(
         &self,
         state: &mut LedgerState,
         worker: WorkerId,
         charge: Option<GrantCharge>,
         failed: bool,
-        spilled: bool,
         died: bool,
         clean: bool,
     ) -> Option<UnrunnableReplica> {
@@ -99,10 +94,9 @@ impl VramLedger {
             .filter(|charge| !charge.pressure.paging())
             .is_some_and(|charge| {
                 charge.unit_budget <= 1
-                    && (spilled
-                        || failed
-                            && ((charge.room as f64) < one_unit
-                                || (died && death_may_be_ram(state, &key.1, &charge))))
+                    && failed
+                    && ((charge.room as f64) < one_unit
+                        || (died && death_may_be_ram(state, &key.1, &charge)))
             });
         let entry = state.workers.get_mut(&worker)?;
         if clean {
