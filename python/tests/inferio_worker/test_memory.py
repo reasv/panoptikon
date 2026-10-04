@@ -1650,11 +1650,11 @@ OUR_PASID = 32770
 
 
 def kfd_tree(tmp_path, procs: dict) -> str:
-    """A KFD tree with `0000:03:00.0` as one GPU node and `procs` as
+    """A KFD tree with `0000:03:01.0` as one GPU node and `procs` as
     `{entry name: (pasid, vram MiB)}`."""
     root = _fresh(tmp_path, "kfd")
     cpu, gpu = root / "topology/nodes/0", root / "topology/nodes/1"
-    for node, location in ((cpu, 0), (gpu, 0x03 << 8)):
+    for node, location in ((cpu, 0), (gpu, 0x03 << 8 | 0x01 << 3)):
         node.mkdir(parents=True)
         (node / "properties").write_text(f"domain 0\nlocation_id {location}\n")
     (gpu / "gpu_id").write_text(f"{KFD_GPU_ID}\n")
@@ -1670,12 +1670,14 @@ def proc_tree(tmp_path, initial_ns: bool, others: dict) -> str:
     """A `/proc` whose PID namespace is the initial one or not, holding
     `others` as `{pid: [fdinfo text]}`."""
     root = _fresh(tmp_path, "proc")
-    if initial_ns:
-        (root / "self/ns").mkdir(parents=True)
-        try:
-            os.symlink(memory.INIT_PID_NS, root / "self/ns/pid")
-        except OSError:
-            pytest.skip("this filesystem cannot hold a symlink")
+    (root / "self/ns").mkdir(parents=True)
+    try:
+        os.symlink(
+            memory.INIT_PID_NS if initial_ns else "pid:[4026532001]",
+            root / "self/ns/pid",
+        )
+    except OSError:
+        pytest.skip("this filesystem cannot hold a symlink")
     for pid, texts in others.items():
         (root / str(pid) / "fdinfo").mkdir(parents=True)
         for fd, text in enumerate(texts):
@@ -1690,26 +1692,42 @@ def test_kfd_is_the_discrete_base_where_it_exceeds_fdinfo(
     # per-process counter holds. The KFD entry is ours by PID only in the
     # initial PID namespace; elsewhere by the PASID KFD gives our DRM
     # clients, unless another process holds it too (a fork).
-    ours = fdinfo("0000:03:00.0", 1, "1536 MiB") + f"pasid:\t{OUR_PASID}\n"
+    def ours(vram: str | None = "1536 MiB") -> str:
+        return fdinfo("0000:03:01.0", 1, vram) + f"pasid:\t{OUR_PASID}\n"
+
     pid, host_pid = os.getpid(), 999_999
-    fork = {pid + 1: [ours]}
-    for initial_ns, procs, others, expected, label in (
-        (True, {pid: (OUR_PASID, 1600)}, {}, ("kfd", 1600), "by PID"),
-        (True, {pid: (OUR_PASID, 1536)}, {}, ("fdinfo", 1536), "not above"),
-        (True, {host_pid: (OUR_PASID, 1600)}, {}, ("fdinfo", 1536),
+    # Outside the initial namespace `/proc` also holds our own process.
+    me, fork = {pid: [ours()]}, {pid: [ours()], pid + 1: [ours()]}
+    under_pool = "free_delta", 1200
+    for initial_ns, procs, others, vram, expected, label in (
+        (True, {pid: (OUR_PASID, 1600)}, {}, "1536 MiB", ("kfd", 1600), "by PID"),
+        (True, {pid: (OUR_PASID, 1536)}, {}, "1536 MiB", ("fdinfo", 1536),
+         "not above"),
+        (True, {host_pid: (OUR_PASID, 1600)}, {}, "1536 MiB", ("fdinfo", 1536),
          "no entry by PID: a PASID join would find a forked parent"),
-        (False, {host_pid: (OUR_PASID, 1600)}, {}, ("kfd", 1600), "by PASID"),
-        (False, {pid: (1, 1600)}, {}, ("fdinfo", 1536),
-         "our PID names another process outside the initial namespace"),
-        (False, {host_pid: (OUR_PASID, 1600)}, fork, ("fdinfo", 1536),
-         "a PASID a fork holds too"),
-        (False, {}, {}, ("fdinfo", 1536), "no KFD entry"),
+        (True, {pid: (OUR_PASID, 1600)}, {}, None, ("kfd", 1600),
+         "no fdinfo VRAM reading"),
+        (True, {pid: (OUR_PASID, 8192)}, {}, "1536 MiB", ("fdinfo", 1536),
+         "KFD at the GPU's total"),
+        (True, {pid: (OUR_PASID, 900)}, {}, "800 MiB", under_pool,
+         "both below the pool"),
+        (False, {host_pid: (OUR_PASID, 1600)}, me, "1536 MiB", ("kfd", 1600),
+         "by PASID"),
+        (False, {pid: (1, 1600)}, me, "1536 MiB", ("fdinfo", 1536),
+         "a PID-named entry outside the initial namespace"),
+        (False, {host_pid: (OUR_PASID, 1600)}, fork, "1536 MiB",
+         ("fdinfo", 1536), "a PASID a fork holds too"),
+        (False, {host_pid: (OUR_PASID, 1600), host_pid + 1: (OUR_PASID, 1600)},
+         me, "1536 MiB", ("fdinfo", 1536), "two entries with our PASID"),
+        (False, {}, me, "1536 MiB", ("fdinfo", 1536), "no KFD entry"),
     ):
+        cuda = FakeCuda()
+        cuda.pci = (0, 0x03, 0x01)
         with rocm_host(
-            tmp_path, monkeypatch, fdinfo_texts=[ours],
+            tmp_path, monkeypatch, fdinfo_texts=[ours(vram)], cuda=cuda,
             kfd=kfd_tree(tmp_path, procs),
             proc=proc_tree(tmp_path, initial_ns, others),
-        ) as cuda:
+        ):
             before = memory.begin_load()
             cuda.allocate(1024, reserved_mb=1200)
             report = memory.finish_load(before, object())
@@ -1967,11 +1985,14 @@ def test_the_fdinfo_reading_is_bounded_below_and_above(
         (900, 3000, 2, "free_delta", "an under-report against the pool by then"),
     ):
         assert base_method(vram, pool, loads) == expected, label
-    # The rejection is an INFO line, once per worker, naming the source.
+    # Each rejection is an INFO line, once per worker, naming the source.
     with caplog.at_level(logging.INFO, logger="inferio_worker.memory"):
         base_method(900, 3000, 2)
-    rejected = [r for r in caplog.records if r.args[:2] == ("fdinfo", 900)]
-    assert [r.levelno for r in rejected] == [logging.INFO]
+        base_method(total, 1024, 2)
+    rejected = [
+        r for r in caplog.records if r.args[:2] in (("fdinfo", 900), ("fdinfo", total))
+    ]
+    assert [r.levelno for r in rejected] == [logging.INFO, logging.INFO]
     assert slack < memory.HIP_CONTEXT_ESTIMATE_MB, (
         "a missed context is never jitter"
     )

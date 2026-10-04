@@ -62,6 +62,7 @@ _logged: dict[str, bool] = {
     "hip_uuid_suppressed": False,
     "fdinfo_identity": False,
     "fdinfo_under_reported": False,
+    "per_process_over_total": False,
 }
 
 # This worker's GPU PCI address, memoized on success only.
@@ -857,34 +858,43 @@ def _rocm_base(
     reserved_delta: int | None,
     root: str | None = None,
 ) -> tuple[int, str] | None:
-    """This process's VRAM and its source, ROCm only, if plausible: KFD's
-    per-process counter where it exceeds DRM fdinfo, which under-reads on
-    some kernels, else fdinfo. A unified GPU keeps fdinfo, whose figure
-    includes GTT; KFD's counts VRAM alone. Older kernels under-report compute
-    memory, so the reading must not fall below our own absolute post-load
-    allocator pool (`reserved_mb`).
+    """This process's VRAM and its source, ROCm only, if plausible: the
+    larger of DRM fdinfo, which under-reads on some kernels, and KFD's
+    per-process counter, once any reading at or above the GPU's total is
+    dropped. A unified GPU keeps fdinfo, whose figure includes GTT; KFD's
+    counts VRAM alone. Older kernels under-report compute memory, so the
+    reading must not fall below our own absolute post-load allocator pool
+    (`reserved_mb`).
     """
     if not _is_hip(_torch()):
         return None
-    own, method = fdinfo_own_vram_mb(root), "fdinfo"
-    if not _unified_gpu():
-        kfd = kfd_own_vram_mb()
-        if kfd is not None and (own is None or kfd > own):
-            own, method = kfd, "kfd"
-    if own is None:
-        return None
+    unified = _unified_gpu()
+    candidates = [(fdinfo_own_vram_mb(root), "fdinfo")]
+    if not unified:
+        candidates.append((kfd_own_vram_mb(), "kfd"))
     # On a unified GPU HIP may report only the carve-out as `total_memory`,
     # while the reading includes GTT.
-    total_mb = amdgpu_device_total_mb() if _unified_gpu() else gpu_total_mb()
-    if total_mb is not None and total_mb > 0 and own >= total_mb:
-        logger.debug(
-            "%s reports this process holding %d MiB of a %d MiB GPU; "
-            "rejecting the reading and falling back to the memory deltas",
-            method,
-            own,
-            total_mb,
-        )
+    total_mb = amdgpu_device_total_mb() if unified else gpu_total_mb()
+    plausible: list[tuple[int, str]] = []
+    for own, method in candidates:
+        if own is None:
+            continue
+        if total_mb is not None and total_mb > 0 and own >= total_mb:
+            if not _logged["per_process_over_total"]:
+                _logged["per_process_over_total"] = True
+                logger.info(
+                    "%s reports this process holding %d MiB of a %d MiB GPU; "
+                    "rejecting the reading",
+                    method,
+                    own,
+                    total_mb,
+                )
+            continue
+        plausible.append((own, method))
+    if not plausible:
         return None
+    # The first of equals: KFD only where it exceeds fdinfo.
+    own, method = max(plausible, key=lambda candidate: candidate[0])
     pool = reserved_mb if reserved_mb is not None else reserved_delta
     floor = (pool or 0) - FDINFO_UNDERREPORT_SLACK_MB
     if own < floor:
