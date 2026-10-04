@@ -113,7 +113,8 @@ impl VramLedger {
         };
         #[cfg(not(test))]
         let pressure = mps::memory_pressure();
-        if pressure == mps::MemoryPressure::Normal {
+        // Only macOS reports pressure: elsewhere no episode is ever open.
+        if cfg!(any(test, target_os = "macos")) && pressure == mps::MemoryPressure::Normal {
             self.lock().pressure_warned.clear();
         }
         pressure
