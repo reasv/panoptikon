@@ -1955,22 +1955,26 @@ mod tests {
             items: usize::MAX,
             bytes: MAX_WINDOW_BYTES,
         };
+        let request = |input| {
+            let (reply, _answer) = oneshot::channel();
+            DispatchRequest {
+                inputs: vec![input],
+                max_batch: None,
+                reply,
+            }
+        };
         let queued = |units: u64| -> VecDeque<Queued> {
             json_inputs(units)
                 .into_iter()
-                .map(|input| {
-                    let (reply, _answer) = oneshot::channel();
-                    let request = DispatchRequest {
-                        inputs: vec![input],
-                        max_batch: None,
-                        reply,
-                    };
-                    enqueue(request, &cost)
-                })
+                .map(|input| enqueue(request(input), &cost))
                 .collect()
         };
-        let run = async |mut queue: VecDeque<Queued>, deadline| {
-            let (_tx, mut rx) = mpsc::unbounded_channel();
+        let run = async |mut queue: VecDeque<Queued>, refills: u64, deadline| {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            for input in json_inputs(refills) {
+                tx.send(DispatchMsg::Predict(request(input)))
+                    .expect("receiver alive");
+            }
             let mut free = Vec::new();
             let mut in_flight = JoinSet::new();
             let started = tokio::time::Instant::now();
@@ -1989,7 +1993,7 @@ mod tests {
         };
 
         let now = tokio::time::Instant::now;
-        let full = run(queued(16), now() + WINDOW_SETTLE_MAX).await;
+        let full = run(queued(16), 0, now() + WINDOW_SETTLE_MAX).await;
         assert_eq!(
             full,
             Duration::ZERO,
@@ -1997,12 +2001,24 @@ mod tests {
         );
         // A deadline in the past is a model nothing has answered recently:
         // a lone request arriving at a quiet model pays nothing at all.
-        let idle = run(queued(1), now()).await;
+        let idle = run(queued(1), 0, now()).await;
         assert_eq!(idle, Duration::ZERO, "an idle model must not wait");
-        let short = run(queued(1), now() + WINDOW_SETTLE_MAX).await;
+        let short = run(queued(1), 0, now() + WINDOW_SETTLE_MAX).await;
         assert_eq!(
             short, WINDOW_SETTLE_QUIET,
             "a short window right after a reply waits for one quiet gap, not for the deadline"
+        );
+        let near = run(queued(1), 0, now() + WINDOW_SETTLE_QUIET / 2).await;
+        assert_eq!(
+            near,
+            WINDOW_SETTLE_QUIET / 2,
+            "the settle never outlasts its deadline"
+        );
+        let filled = run(queued(1), 15, now() + WINDOW_SETTLE_MAX).await;
+        assert_eq!(
+            filled,
+            Duration::ZERO,
+            "refills that fill the window end the wait at once"
         );
     }
 
