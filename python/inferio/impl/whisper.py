@@ -37,6 +37,7 @@ class FasterWhisperModel(InferenceModel):
         return "faster_whisper"
 
     def load(self) -> None:
+        import torch
         from faster_whisper import WhisperModel
 
         if self._model_loaded:
@@ -47,12 +48,14 @@ class FasterWhisperModel(InferenceModel):
             self.devices[0]
         ]  # Disable multi-GPU due to https://github.com/SYSTRAN/faster-whisper/issues/149
         # The resolved device decides, not CTranslate2's probe. CT2 has only
-        # CUDA and CPU backends.
-        kind = "cuda" if self.devices[0].type == "cuda" else "cpu"
+        # CUDA and CPU backends, so a ROCm torch's `cuda` device runs on the
+        # CPU.
+        cuda = self.devices[0].type == "cuda" and not torch.version.hip
+        kind = "cuda" if cuda else "cpu"
         self.model = WhisperModel(
             model_size_or_path=self.model_name,
-            # `auto` for CUDA: torch calls ROCm `cuda` too, and `auto` falls
-            # back to the CPU where an explicit `cuda` would raise.
+            # `auto` for CUDA: it falls back to the CPU on a CT2 build without
+            # CUDA, where an explicit `cuda` would raise.
             device="auto" if kind == "cuda" else "cpu",
             # device_index=[i for i in range(len(self.devices))],
             compute_type=select_ct2_compute_type(
