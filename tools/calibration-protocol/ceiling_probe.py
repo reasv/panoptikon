@@ -61,10 +61,11 @@ pixel canvas and token window that priced the run (`null` = uncapped), because
 a slope fitted under a cap is in a different denomination from one fitted
 without.
 
-Output (JSON): `schema`, `model`, `impl_class`, `config`, `torch`, `dtype`,
-`python`, and the blocks `cost`, `device`, `load`, `batches[]`, `fit`,
-`fit_reserved` and `bisect` (the last three nullable). The field lists are in
-tools/calibration-protocol/README.md "The probe's output".
+Output (JSON): `schema`, `model`, `impl_class`, `config`, `torch`,
+`transformers`, `dtype`, `dtype_method`, `gqa_check`, `python`, and the blocks
+`cost`, `device`, `load`, `batches[]`, `fit`, `fit_reserved` and `bisect` (the
+last three nullable). The field lists are in tools/calibration-protocol/README.md
+"The probe's output".
 
 Each batch record also carries `ran_whole_batch` (the `ok`/`oom`/index-limit
 verdict, materialised so a reader need not recompute it) and `items_per_s`.
@@ -670,6 +671,34 @@ def _boundary_key(record: Dict[str, Any]) -> str:
     )
 
 
+def load_instance(impl_cls: Any, config: Dict[str, Any], synchronize: Any,
+                  readings: Any) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
+    """Construct and load the impl in the worker's order: `load()`, the load's
+    `readings()`, then the worker's post-load GQA check, whose test call is
+    not part of the load. Returns the instance, the `load` block and the
+    worker's facts about the load: `dtype`/`dtype_method`, the check's
+    decision (`gqa_check`) and the installed transformers version."""
+    from importlib import metadata
+
+    from inferio_worker import memory, sdpa
+
+    started = time.monotonic()
+    instance = impl_cls(**config)
+    instance.load()
+    synchronize()
+    load = {"seconds": round(time.monotonic() - started, 3), **readings()}
+    dtype, dtype_method = memory.resolved_dtype(instance)
+    try:
+        transformers = metadata.version("transformers")
+    except metadata.PackageNotFoundError:
+        transformers = None
+    return instance, load, {
+        "dtype": dtype, "dtype_method": dtype_method,
+        "gqa_check": sdpa.expand_kv_heads_without_fused_gqa(),
+        "transformers": transformers,
+    }
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     here = Path(__file__).resolve()
     parser = argparse.ArgumentParser(
@@ -887,23 +916,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     def empty_cache() -> None:
         (torch.mps if mps else torch.cuda).empty_cache()
 
-    free_before = device_free_mb()
-    load_started = time.monotonic()
-    instance = impl_cls(**resolved["config"])
-    instance.load()
     if not mps:
         import torch
 
-    synchronize()
-    load_seconds = time.monotonic() - load_started
-    free_after = device_free_mb()
-    reserved_at_load = reserved_mb()
-    allocated_at_load = allocated_mb()
-    base_nvml = device_own_mb()
-    # The worker's attention check, at the same point: after the load.
-    from inferio_worker import sdpa
+    free_before = device_free_mb()
 
-    sdpa.expand_kv_heads_without_fused_gqa()
+    def load_readings() -> Dict[str, Any]:
+        free_after = device_free_mb()
+        return {
+            "base_nvml_mb": device_own_mb(),
+            "base_free_delta_mb": (
+                None if free_before is None or free_after is None
+                else max(0, free_before - free_after)
+            ),
+            "reserved_at_load_mb": reserved_mb(),
+            "allocated_at_load_mb": allocated_mb(),
+            "free_before_mb": free_before,
+            "free_after_mb": free_after,
+        }
+
+    instance, load, load_facts = load_instance(
+        impl_cls, resolved["config"], synchronize, load_readings)
+    reserved_at_load = load["reserved_at_load_mb"]
+    base_nvml = load["base_nvml_mb"]
 
     try:
         from inferio.impl import utils as impl_utils
@@ -1158,24 +1193,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         "cost": {**resolved["cost"], "canvas_pixels_in_force": canvas_in_force,
                  "max_tokens_in_force": tokens_in_force},
         "torch": torch.__version__,
-        "dtype": _resolve_dtype(instance),
+        **load_facts,
         "device": ({**gpu, "name": worker_memory.mps_gpu_name(),
                     "total_mb": worker_memory.mps_free_total_mb()[1],
                     "cuda_visible_devices": None} if mps else
                    {**gpu,
                     "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]}),
-        "load": {
-            "seconds": round(load_seconds, 3),
-            "base_nvml_mb": base_nvml,
-            "base_free_delta_mb": (
-                None if free_before is None or free_after is None
-                else max(0, free_before - free_after)
-            ),
-            "reserved_at_load_mb": reserved_at_load,
-            "allocated_at_load_mb": allocated_at_load,
-            "free_before_mb": free_before,
-            "free_after_mb": free_after,
-        },
+        "load": load,
         "batches": records,
         "fit": fit,
         "fit_reserved": fit_reserved,
@@ -1238,21 +1262,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             file=sys.stderr,
         )
     return 0
-
-
-def _resolve_dtype(instance: Any) -> Optional[str]:
-    for attribute in ("dtype", "torch_dtype", "_dtype"):
-        value = getattr(instance, attribute, None)
-        if value is not None:
-            return str(value)
-    model = getattr(instance, "model", None)
-    parameters = getattr(model, "parameters", None)
-    if callable(parameters):
-        try:
-            return str(next(parameters()).dtype)
-        except Exception:
-            return None
-    return None
 
 
 if __name__ == "__main__":
