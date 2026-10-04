@@ -1071,23 +1071,52 @@ mod tests {
     fn local_inference_follows_the_server_config() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("desktop.toml");
+        // The settings view reports the same value as local_inference_enabled.
+        let enabled = || {
+            let view = load(root.path(), &config).unwrap();
+            let checked = local_inference_enabled(root.path(), &config).unwrap();
+            assert_eq!(view.performance.gpu_memory.local_inference, checked);
+            checked
+        };
         fs::write(&config, fixture()).unwrap();
-        assert!(local_inference_enabled(root.path(), &config).unwrap());
+        assert!(enabled());
         fs::write(
             &config,
             fixture().replace("[inference_local]\nenabled = true", "[inference_local]"),
         )
         .unwrap();
-        assert!(!local_inference_enabled(root.path(), &config).unwrap());
+        assert!(!enabled());
         fs::write(&config, "[inference_local]\nenabled = false\n").unwrap();
-        assert!(!local_inference_enabled(root.path(), &config).unwrap());
+        assert!(!enabled());
+        fs::write(
+            root.path().join(".env"),
+            "PANOPTIKON_DESKTOP_TEST_LOCAL_INFERENCE=true\n",
+        )
+        .unwrap();
+        fs::write(
+            &config,
+            "[inference_local]\nenabled = \"${PANOPTIKON_DESKTOP_TEST_LOCAL_INFERENCE:-false}\"\n",
+        )
+        .unwrap();
+        assert!(enabled());
+        fs::write(&config, "[inference_local]\nenabled = \"yes\"\n").unwrap();
+        assert!(local_inference_enabled(root.path(), &config).is_err());
+        let view = load(root.path(), &config).unwrap();
+        assert!(!view.performance.gpu_memory.local_inference);
     }
 
     #[test]
     fn gpu_margin_round_trips_and_leaves_other_gpus_alone() {
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join("desktop.toml");
-        let gpu = "[inference_local.vram.gpu.\"GPU-1\"]\nmargin = 0.3\n";
+        fs::write(&config, fixture()).unwrap();
+        let memory = load(root.path(), &config).unwrap().performance.gpu_memory;
+        assert_eq!(memory.custom_gpus, 0);
+        // Only GPUs with their own margin count as custom.
+        let gpu = "[inference_local.vram.gpu.\"GPU-1\"]\nmargin = 0.3\n\n\
+                   [inference_local.vram.gpu.\"GPU-2\"]\ncap_fraction = 0.5\n\n\
+                   [inference_local.vram.gpu.\"GPU-3\"]\nknee_max_bucket_dispersion = 0.2\n\n\
+                   [inference_local.vram.gpu.\"GPU-4\"]\ncap_fraction = 0.5\nknee_max_bucket_dispersion = 0.2\n";
         let source = format!("{}\n{gpu}", fixture());
         fs::write(&config, &source).unwrap();
         let current = load(root.path(), &config).unwrap();
