@@ -815,7 +815,7 @@ def _kfd_own_dir() -> str | None:
     """This process's entry under KFD's `proc`: by PID in the initial PID
     namespace, elsewhere by the PASID KFD gives our DRM clients. None when
     the entry is not ours alone: another process here holding the PASID is a
-    fork, and the counter covers both.
+    fork, and the entry could be either's.
     """
     entries = os.path.join(KFD_ROOT, "proc")
     if _in_initial_pid_ns():
@@ -892,7 +892,7 @@ def _rocm_base(
         plausible.append((own, method))
     if not plausible:
         return None
-    # The first of equals: KFD only where it exceeds fdinfo.
+    # max() keeps fdinfo on a tie: KFD only where it is larger.
     own, method = max(plausible, key=lambda candidate: candidate[0])
     pool = reserved_mb if reserved_mb is not None else reserved_delta
     floor = (pool or 0) - FDINFO_UNDERREPORT_SLACK_MB

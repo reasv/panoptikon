@@ -1687,8 +1687,9 @@ The orchestrator sets for every worker:
     then the variable is simply not written and the worker inherits the
     environment. `CUDA_VISIBLE_DEVICES` is deliberately *not* also set there:
     it is a HIP alias, and setting both is documented unintended-behaviour
-    territory. `ROCR_VISIBLE_DEVICES` is never set — torch < 2.6 crashes at
-    init when it is.
+    territory. `ROCR_VISIBLE_DEVICES` is never set: torch < 2.6 fails at its
+    first GPU use when it is set without `HIP_VISIBLE_DEVICES` or
+    `CUDA_VISIBLE_DEVICES` (pytorch#140318).
 
   Exactly one is written, and only when a pin resolved; a worker is never
   handed both. **MPS and CPU hosts get neither**, in any vocabulary: there is

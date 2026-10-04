@@ -1711,25 +1711,32 @@ def test_the_fdinfo_tier_works_off_the_dominant_client_identity(
 
 
 KFD_GPU_ID = 4242
+OTHER_GPU_ID = 4343
 OUR_PASID = 32770
 
 
 def kfd_tree(tmp_path, pci: tuple, procs: dict) -> str:
-    """A KFD tree with one GPU node at `pci`, `(domain, bus, device)` as in
-    `FakeCuda.pci`, and `procs` as `{entry name: (pasid, vram MiB)}`."""
+    """A KFD tree with one GPU node at `pci`, another GPU and the CPU node as
+    a real host has them. `pci` is `(domain, bus, device)` as in
+    `FakeCuda.pci`, and `procs` is `{entry name: (pasid, vram MiB)}`."""
     root = _fresh(tmp_path, "kfd")
-    cpu, gpu = root / "topology/nodes/0", root / "topology/nodes/1"
     domain, bus, device = pci
-    nodes = {cpu: (0, 0), gpu: (domain, bus << 8 | device << 3)}
-    for node, (d, loc) in nodes.items():
+    nodes = {
+        "0": (0, 0, 0),
+        "1": (domain, bus << 8 | device << 3, KFD_GPU_ID),
+        "2": (domain, (bus + 1) << 8 | device << 3, OTHER_GPU_ID),
+    }
+    for name, (d, loc, gpu_id) in nodes.items():
+        node = root / "topology/nodes" / name
         node.mkdir(parents=True)
         (node / "properties").write_text(f"domain {d}\nlocation_id {loc}\n")
-    (gpu / "gpu_id").write_text(f"{KFD_GPU_ID}\n")
+        (node / "gpu_id").write_text(f"{gpu_id}\n")
     for name, (pasid, vram_mb) in procs.items():
         entry = root / "proc" / str(name)
         entry.mkdir(parents=True)
         (entry / "pasid").write_text(f"{pasid}\n")
         (entry / f"vram_{KFD_GPU_ID}").write_text(f"{vram_mb * MIB}\n")
+        (entry / f"vram_{OTHER_GPU_ID}").write_text(f"{4000 * MIB}\n")
     return str(root)
 
 
@@ -1781,6 +1788,8 @@ def test_kfd_is_the_discrete_base_where_it_exceeds_fdinfo(
          "KFD at the GPU's total"),
         (True, {pid: (OUR_PASID, 900)}, {}, "800 MiB", under_pool,
          "both below the pool"),
+        (True, {pid: (OUR_PASID, 1600)}, {}, "800 MiB", ("kfd", 1600),
+         "fdinfo under the pool"),
         (False, {host_pid: (OUR_PASID, 1600)}, me, "1536 MiB", ("kfd", 1600),
          "by PASID"),
         (False, {pid: (1, 1600)}, me, "1536 MiB", ("fdinfo", 1536),
