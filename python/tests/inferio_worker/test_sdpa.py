@@ -20,8 +20,7 @@ transformers_sdpa = pytest.importorskip(sdpa.SDPA_MODULE)
 
 def _fake_torch(initialized: bool = True, reserved: tuple = (0, 4096)):
     """A torch whose CUDA side is initialised or not and whose allocator holds
-    `reserved[i]` bytes on device i; `cuda.current` tracks `cuda.device`.
-    Its dtypes are their names."""
+    `reserved[i]` bytes on device i; `cuda.current` tracks `cuda.device`."""
     cuda = types.SimpleNamespace(current=0)
 
     @contextlib.contextmanager
@@ -40,23 +39,24 @@ def _fake_torch(initialized: bool = True, reserved: tuple = (0, 4096)):
         __version__="2.7.1",
         device=lambda kind, index: f"{kind}:{index}",
         cuda=cuda,
-        **{name: name for name in sdpa.TEST_DTYPES},
+        **{name: getattr(torch, name) for name in sdpa.TEST_DTYPES},
     )
 
 
-def _key(dtype: str) -> types.SimpleNamespace:
-    return types.SimpleNamespace(dtype=dtype)
+def _key(name: str) -> types.SimpleNamespace:
+    return types.SimpleNamespace(dtype=getattr(torch, name))
 
 
 @pytest.fixture
 def fake_worker(monkeypatch: pytest.MonkeyPatch):
     """Fresh check state, a stand-in transformers module whose own answer is
-    "GQA when unmasked", a fake torch with the model's memory on cuda:1, and a
-    GQA test call that records the device it was given, the current device and
-    the dtype, and answers `answers[dtype]` (True when absent)."""
+    "GQA when unmasked, except in float64", a fake torch with the model's
+    memory on cuda:1, and a GQA test call that records the device it was
+    given, the current device and the dtype's name, and answers
+    `answers[name]` (True when absent)."""
 
     def original(attention_mask, key):
-        return attention_mask is None
+        return attention_mask is None and key.dtype is not torch.float64
 
     module = types.SimpleNamespace(use_gqa_in_sdpa=original)
     fake = _fake_torch()
@@ -65,8 +65,9 @@ def fake_worker(monkeypatch: pytest.MonkeyPatch):
     )
 
     def test_call(torch_module, device, dtype):
-        state.calls.append((device, torch_module.cuda.current, dtype))
-        return state.answers.get(dtype, True)
+        name = str(dtype).removeprefix("torch.")
+        state.calls.append((device, torch_module.cuda.current, name))
+        return state.answers.get(name, True)
 
     monkeypatch.setattr(sdpa, "_fused_gqa", {})
     monkeypatch.setattr(sdpa, "_transformers_use_gqa", None)
@@ -79,8 +80,8 @@ def fake_worker(monkeypatch: pytest.MonkeyPatch):
 def test_only_a_dtype_without_a_fused_gqa_kernel_expands_the_kv_heads(
     fake_worker,
 ) -> None:
-    """fp32 has no fused GQA kernel: its keys are expanded; fp16 and bf16 keep
-    transformers' own answer, masked calls included."""
+    """fp32 has no fused GQA kernel: its keys are expanded; fp16, bf16 and
+    float64 keep transformers' own answer, masked calls included."""
     fake_worker.answers = {"float32": False}
     sdpa.expand_kv_heads_without_fused_gqa()
     use_gqa = fake_worker.module.use_gqa_in_sdpa
@@ -89,6 +90,16 @@ def test_only_a_dtype_without_a_fused_gqa_kernel_expands_the_kv_heads(
     assert use_gqa(None, _key("float16")) is True
     assert use_gqa(None, _key("bfloat16")) is True
     assert use_gqa("mask", _key("float16")) is False
+    assert use_gqa(None, _key("float64")) is False
+
+
+def test_every_dtype_without_a_fused_gqa_kernel_expands_the_kv_heads(
+    fake_worker,
+) -> None:
+    fake_worker.answers = dict.fromkeys(sdpa.TEST_DTYPES, False)
+    sdpa.expand_kv_heads_without_fused_gqa()
+    use_gqa = fake_worker.module.use_gqa_in_sdpa
+    assert [use_gqa(None, _key(name)) for name in sdpa.TEST_DTYPES] == [False] * 3
 
 
 def test_a_fused_gqa_kernel_in_every_dtype_leaves_transformers_untouched(

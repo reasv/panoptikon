@@ -878,10 +878,10 @@ def test_the_worker_holds_no_request_input_while_it_waits() -> None:
 
 
 def test_every_load_runs_the_attention_check_after_it_is_priced() -> None:
-    """The GQA check runs once per load, after `finish_load`: it looks at
-    where the load put memory, its own allocation is no part of the load's
-    footprint, and a dtype it left undecided is tested again at the next
-    load."""
+    """The GQA check runs once per load, after `finish_load` and before the
+    reply: it looks at where the load put memory, its own allocation is no
+    part of the load's footprint, and a dtype it left undecided is tested
+    again at the next load."""
     from unittest import mock
 
     from inferio_worker import __main__ as harness
@@ -914,9 +914,11 @@ def test_every_load_runs_the_attention_check_after_it_is_priced() -> None:
         mock.patch.object(
             sdpa, "expand_kv_heads_without_fused_gqa", spy("check", lambda: None)
         ),
+        mock.patch.object(harness, "_send_ok", spy("reply", harness._send_ok)),
     ):
         assert harness._serve(proto_in, io.BytesIO()) == 0
-    assert calls == ["begin", "finish", "check"] * 2
+    load = ["begin", "finish", "check", "reply"]
+    assert calls == ["reply", "reply", *load, *load, "reply"]
 
 
 def test_the_batch_memory_frames_capability_is_read_off_the_handshake() -> None:
