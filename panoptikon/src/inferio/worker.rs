@@ -3296,10 +3296,12 @@ mod tests {
 
     /// Both directions of the skew, and the two frames that must stay fatal.
     ///
-    /// A worker predating the capability sends nothing and is served exactly
-    /// as before. A `memory` frame for another id is a desynchronized stream,
-    /// and so is any other unexpected type for the id in flight — neither
-    /// reading changed when the reader learned to loop.
+    /// A worker predating the capability sends nothing and is served as
+    /// before, except that without the acknowledgement every death during a
+    /// predict reads as idle (no cap, no strike). A `memory` frame for another
+    /// id is a desynchronized stream, and so is any other unexpected type for
+    /// the id in flight — neither reading changed when the reader learned to
+    /// loop.
     #[tokio::test]
     async fn only_a_memory_frame_for_the_id_in_flight_is_tolerated() {
         let mut silent = frame_harness("silent", Vec::new())

@@ -172,7 +172,7 @@ Normal spawn flow: `handshake` → `configure` → `load`. Pooled flow:
 |---|---|---|
 | `ok` | request-specific payload (below) | Success for the echoed `id`. |
 | `error` | `message` (str), `traceback` (str, may be empty) | Failure for the echoed `id`. The worker stays alive and serviceable after an `error` (a failed predict/load must not require a respawn) — except a failed `handshake`, after which it exits non-zero. |
-| `memory` | `memory` (a memory sample map, optional), `units` (int, optional) | **Not a response.** Telemetry for the request whose `id` it echoes, written *before* that request's `ok`/`error` — the only frame that may precede a terminal reply. Sent only from inside a `predict` (its receipt, then one per batch of a granted one), and only when the orchestrator set `batch_memory_frames` in the handshake. Host tolerance is wider than worker behaviour: the reference orchestrator accepts such a frame for the id in flight on **any** request type, not only `predict`, so an impl that emits one elsewhere is absorbed rather than killed — but the frame is still specified as `predict`-only and nothing in tree sends one otherwise. See "Per-batch memory frames". |
+| `memory` | `memory` (a memory sample map, optional), `units` (int, optional) | **Not a response.** Telemetry for the request whose `id` it echoes, written *before* that request's `ok`/`error` — the only frame that may precede a terminal reply. Sent only from inside a `predict` (its acknowledgement, then one per batch of a granted one), and only when the orchestrator set `batch_memory_frames` in the handshake. Host tolerance is wider than worker behaviour: the reference orchestrator accepts such a frame for the id in flight on **any** request type, not only `predict`, so an impl that emits one elsewhere is absorbed rather than killed — but the frame is still specified as `predict`-only and nothing in tree sends one otherwise. See "Per-batch memory frames". |
 
 ### Memory grants (optional `predict` request fields)
 
@@ -1086,7 +1086,7 @@ A measurement map describes one GPU batch the worker actually ran:
 | `exception` | the failing exception's type name, qualified when the type is not a builtin (`"torch.OutOfMemoryError"`, `"RuntimeError"`, `"MemoryError"`). The literal string `"run_with_oom_retry"` when the classification came from the halving counter rather than from an exception — a batch that *succeeded* after the impl absorbed an out-of-memory condition internally has no exception to name |
 | `free_mb_at_failure` | what the **allocator** had left at the moment of the failure, read then. `null` when nothing could be read. This is the corroboration a `message_pattern` classification needs before the orchestrator deflates on it: an out-of-memory claim made while the allocator had tens of GB to give is a wording, not a condition. On CUDA, ROCm and CPU it is the device's free memory. On **MPS** it is the allocator's own headroom — `recommended_max_memory()` scaled by `PYTORCH_MPS_HIGH_WATERMARK_RATIO`, minus `driver_allocated_memory()` — because what refuses an MPS allocation is that ceiling and not RAM: a 5.38 GiB ceiling failing on a Mac with 103 918 MiB of its 110 100 free reported "free" as 103 918 and had every MPS out-of-memory report contradicted |
 | `device` | which device the two memory figures describe, as `"<backend>"` or `"<backend>:<gpu uuid>"` (`"cuda:GPU-1234…"`, `"rocm"`, `"mps"`, `"cpu"`, `"unknown"`). It exists so a reading can never be attributed to the wrong GPU on a multi-GPU host |
-| `host_ram` | `true` when the allocation that failed was host RAM's: `MemoryError`, the CPU allocator's two wordings, the `INFERENCE_OOM_HOST_RAM:` marker (`run_with_oom_retry` at one item, and a packed batch the harness wraps), or halvings the impl's loop made for those alone. A device's wording in the same text, or a GPU halving in the same batch, outranks it. The worker states it on every device; the orchestrator decides what it means. On the CPU device, MPS and a unified-memory APU host RAM is the device's memory and the window is a negative as before. On a GPU with its own memory it is no negative of the GPU: no deflation, anchor, pool-margin change or one-item strike, and the settle line says `outcome=host_ram_oom` |
+| `host_ram` | `true` when the allocation that failed was host RAM's: `MemoryError`, the CPU allocator's two wordings, the `INFERENCE_OOM_HOST_RAM:` marker (`run_with_oom_retry` at one item, and a packed batch the harness wraps), or halvings the impl's loop made for those alone. A device's wording in the same text, or a GPU halving in the same batch, outranks it. The worker states it on every device; the orchestrator decides what it means |
 
 **What the orchestrator does with the three batch measurement fields**
 (`panoptikon/src/inferio/ledger.rs`; the worker's side of each is above and
@@ -1340,9 +1340,9 @@ frames of the form:
 {"type": "memory", "id": <the request now in flight>, "units": <the batch about to run>, "memory": <a memory sample>}
 ```
 
-The first is the **receipt**, written as soon as the worker has read the
-request, before it decodes the inputs. A worker that dies before its receipt
-did not die running the request: the window settles as an abort (an idle
+The first is the **acknowledgement**, written as soon as the worker has read
+the request, before it decodes the inputs. A worker that dies before its
+acknowledgement did not die running the request: the window settles as an abort (an idle
 death), however long the operating system takes to report the exit. A death
 after it is a death holding the window. A granted window then writes one frame
 before each batch, stating that batch's `units` (in the grant's cost unit)
@@ -1356,8 +1356,9 @@ consumer rule is by capture instant. The rules:
 - **Opt-in, one-way.** The frame is written only when the handshake request
   carried `batch_memory_frames: true`. An orchestrator that predates the
   capability never sets the key and so receives nothing; a worker that
-  predates it ignores the key like any other unknown one and sends nothing.
-  Neither side needs the other's answer, which is why the version stays 2 —
+  predates it ignores the key like any other unknown one and sends nothing;
+  without the acknowledgement the gateway reads every death during a predict
+  as idle (no cap, no strike). Neither side needs the other's answer, which is why the version stays 2 —
   it is exact-equality on both sides, and bumping it would break every stale
   environment over an additive key.
 - **The id is the request in flight**, never a fresh one. A `memory` frame
@@ -1368,7 +1369,7 @@ consumer rule is by capture instant. The rules:
 - **Only from inside the window.** A frame written after a request's terminal
   reply desynchronizes the stream permanently, so a worker emits them only
   while handling the request, bound to its id. The grantless `predict` path
-  emits only the receipt (it has no batch boundaries).
+  emits only the acknowledgement (it has no batch boundaries).
 - **The sample is taken whole, at the frame.** Both halves — the pool figure
   and the free reading — come from one instant. Reusing the defensive clamp's
   free reading beside a later pool figure would understate

@@ -894,8 +894,8 @@ def test_the_batch_memory_frames_capability_is_read_off_the_handshake() -> None:
 def test_a_predict_is_acknowledged_and_states_each_batch(
     worker: WorkerProcess,
 ) -> None:
-    """A granted window on a host with no accelerator: the receipt, then one
-    frame per batch with its units and no sample, then the `ok`."""
+    """A granted window on a host with no accelerator: the acknowledgement,
+    then one frame per batch with its units and no sample, then the `ok`."""
     worker.send({**handshake_msg(req_id=1), "batch_memory_frames": True})
     assert worker.recv()["type"] == "ok"
     worker.send(configure_msg(req_id=2))

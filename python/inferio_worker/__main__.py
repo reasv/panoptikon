@@ -101,7 +101,8 @@ def _memory_frame_emitter(
 ) -> Callable[..., None] | None:
     """The `memory` frame writer for one in-flight `predict`, or None when not
     wanted. Only valid until that request's reply is sent. `units` is the
-    batch about to run; a frame with neither it nor a sample is the receipt.
+    batch about to run; a frame with neither it nor a sample is the
+    acknowledgement.
     """
     if not wanted:
         return None
@@ -299,8 +300,8 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
         elif mtype == "predict":
             emit = _memory_frame_emitter(proto_out, req_id, batch_memory_frames)
             if emit is not None:
-                # The receipt, before anything that takes time: a death before
-                # it did not run this request.
+                # The acknowledgement, before anything that takes time: a
+                # death before it did not run this request.
                 emit()
             if instance is None:
                 _send_error(
