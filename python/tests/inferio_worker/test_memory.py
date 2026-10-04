@@ -100,6 +100,7 @@ class FakeCuda:
         # (feature suffixes and all, as amdgpu renders it) on ROCm.
         self.capability = (12, 0)
         self.gcn_arch = "gfx1100:sramecc+:xnack-"
+        self.integrated = 0
 
     def is_available(self):
         return True
@@ -127,7 +128,10 @@ class FakeCuda:
 
     def get_device_properties(self, index):
         assert index == 0, "a pinned worker only ever has device 0"
-        props = SimpleNamespace(uuid=self.uuid, name=self.name, total_memory=self.total)
+        props = SimpleNamespace(
+            uuid=self.uuid, name=self.name, total_memory=self.total,
+            is_integrated=self.integrated,
+        )
         if self.pci is not None:
             keys = ("pci_domain_id", "pci_bus_id", "pci_device_id")
             props.__dict__.update(dict(zip(keys, self.pci)))
@@ -1085,13 +1089,17 @@ def test_hip_suppresses_the_uuid_but_keeps_the_address() -> None:
         before = memory.begin_load()
         cuda.allocate(1024)
         report = memory.finish_load(before, object())
+        cuda.integrated = 1
+        assert memory.gpu_integrated() is True
     assert "gpu_uuid" not in report, report
     assert (report["gpu_bdf"], report["gpu_total_mb"]) == ("0000:03:00.0", 8192)
     assert report["torch_version"] == "2.11.0+rocm7.2"
+    assert report["gpu_integrated"] is False, "HIP's integrated, for the host to check"
     # The same GPU on a CUDA build reports the UUID, and the address rides
     # along additively (registration keys on the UUID first there).
     with isolated(fake_torch_module(FakeCuda())):
         assert memory.device_identity()[0] == "GPU-1a2b3c4d-0000-0000-0000-000000000000"
+        assert memory.gpu_integrated() is None, "ROCm only"
 
 
 def test_a_raising_props_getter_degrades_one_field_not_the_whole_report() -> None:

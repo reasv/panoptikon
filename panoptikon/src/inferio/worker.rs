@@ -271,6 +271,9 @@ pub struct LoadReport {
     pub gpu_bdf: Option<String>,
     /// Total VRAM per torch, to cross-check a PCI-address match.
     pub gpu_total_mb: Option<u64>,
+    /// HIP's `integrated` for this GPU, checked against the host's unified
+    /// verdict. ROCm only.
+    pub gpu_integrated: Option<bool>,
     /// `torch.__version__`, part of the profile key.
     pub torch_version: Option<String>,
     /// Where torch put the model (`cpu`, `cuda`, `rocm`, `mps`); decides the
@@ -1781,6 +1784,10 @@ impl LoadReport {
             gpu_arch: field_string(payload, "gpu_arch"),
             gpu_bdf: field_string(payload, "gpu_bdf"),
             gpu_total_mb: field_u64(payload, "gpu_total_mb"),
+            gpu_integrated: match map_get(payload, "gpu_integrated") {
+                Some(Value::Boolean(integrated)) => Some(*integrated),
+                _ => None,
+            },
             torch_version: field_string(payload, "torch_version"),
             device_kind: field_string(payload, "device_kind"),
             rss_at_load_mb: field_u64(payload, "rss_at_load_mb"),

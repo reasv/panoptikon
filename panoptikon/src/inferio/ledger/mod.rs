@@ -1438,6 +1438,8 @@ struct LedgerState {
     free_total_mismatch_logged: HashSet<(String, String)>,
     /// Once-per-card guard on the architecture mismatch WARN.
     arch_mismatch_logged: HashSet<String>,
+    /// Once-per-card guard on the integrated-GPU mismatch WARN.
+    integrated_mismatch_logged: HashSet<String>,
     /// Once-per-card guard on the unpriced-dispatch WARN.
     unpriced_warned: HashSet<String>,
     /// (model, device) pairs whose load logged the memory pressure WARN in

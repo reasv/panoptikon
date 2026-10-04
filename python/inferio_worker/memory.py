@@ -585,6 +585,16 @@ def _props_bdf(props: Any) -> str | None:
     return f"{domain:04x}:{bus:02x}:{device:02x}.0"
 
 
+def gpu_integrated() -> bool | None:
+    """HIP's `integrated` for this worker's GPU (torch's `is_integrated`), or
+    None off ROCm; the host checks it against its own APU verdict.
+    """
+    if _ram_currency() or not _is_hip(_torch()):
+        return None
+    integrated = _prop(_device_props(), "is_integrated")
+    return None if integrated is None else bool(integrated)
+
+
 def gpu_total_mb() -> int | None:
     """Total device memory in MiB per torch, or None; the orchestrator
     cross-checks it against the driver. On MPS it is `recommended_max_memory()`.
@@ -2098,6 +2108,9 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     total_mb = gpu_total_mb()
     if total_mb is not None:
         payload["gpu_total_mb"] = total_mb
+    integrated = gpu_integrated()
+    if integrated is not None:
+        payload["gpu_integrated"] = integrated
     version = torch_version()
     if version is not None:
         payload["torch_version"] = version

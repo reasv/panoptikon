@@ -160,6 +160,7 @@ fn a_rocm_wire_load_report_reaches_the_gpu_it_names() {
         (Value::from("dtype"), Value::from("fp16")),
         (Value::from("gpu_bdf"), Value::from("0000:0c:00.0")),
         (Value::from("gpu_total_mb"), Value::from(24_560u64)),
+        (Value::from("gpu_integrated"), Value::from(false)),
         (
             Value::from("gpu_name"),
             Value::from("AMD Radeon RX 7900 XTX"),
@@ -179,6 +180,24 @@ fn a_rocm_wire_load_report_reaches_the_gpu_it_names() {
     let report = LoadReport::parse(&payload).expect("a ROCm load report");
     assert_eq!(report.gpu_uuid, None, "suppressed on HIP");
     assert_eq!(report.base_method.as_deref(), Some("fdinfo"));
+    assert_eq!(report.gpu_integrated, Some(false));
+
+    // A worker whose HIP runtime calls the discrete GPU integrated is
+    // admitted all the same, and the disagreement is logged once per GPU.
+    for (integrated, logged) in [(true, 1), (false, 0)] {
+        let ledger = rocm_ledger();
+        let mut report = report.clone();
+        report.gpu_integrated = Some(integrated);
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(report));
+        let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
+        for model in ["g/a", "g/b"] {
+            ledger
+                .register_worker(model, item_cost(4), &handle, None)
+                .expect("admitted");
+        }
+        assert_eq!(ledger.lock().integrated_mismatch_logged.len(), logged);
+    }
 
     let ledger = rocm_ledger();
     let mut telemetry = WorkerTelemetry::default();
