@@ -626,7 +626,8 @@ fn extra_accelerator(extra: &str) -> Option<Accelerator> {
 /// the decision itself is a pure function (tested against the full table).
 struct DetectionProbes {
     os: &'static str,
-    /// `std::env::consts::ARCH`, read on macOS only (MPS needs Apple Silicon).
+    /// `std::env::consts::ARCH`: MPS needs Apple Silicon, and the ROCm wheels
+    /// are x86_64 only.
     arch: &'static str,
     /// `nvidia-smi` on PATH (any platform).
     nvidia_smi_on_path: bool,
@@ -673,8 +674,9 @@ impl DetectionProbes {
 
 /// The auto-detection decision table: macOS always takes the default PyPI
 /// wheels (labelled `mps` on Apple Silicon, `cpu` on Intel), NVIDIA evidence
-/// beats ROCm, ROCm is Linux-only, a GPU the kernel driver lists counts only
-/// if the ROCm wheel has its gfx target, and no evidence means CPU.
+/// beats ROCm, ROCm is x86_64 Linux only, a GPU the kernel driver lists
+/// counts only if the ROCm wheel has its gfx target, and no evidence means
+/// CPU.
 fn decide_accelerator(probes: &DetectionProbes) -> (Accelerator, String) {
     if probes.os == "macos" {
         return (
@@ -693,7 +695,7 @@ fn decide_accelerator(probes: &DetectionProbes) -> (Accelerator, String) {
     if let Some((_, evidence)) = nvidia.iter().find(|(hit, _)| *hit) {
         return (Accelerator::Cuda, (*evidence).into());
     }
-    if probes.os == "linux" {
+    if probes.os == "linux" && probes.arch == "x86_64" {
         let rocm = [
             (probes.rocm_dir, "/opt/rocm exists"),
             (probes.rocm_smi_on_path, "rocm-smi on PATH"),
@@ -1292,9 +1294,9 @@ mod tests {
     fn probes(os: &'static str) -> DetectionProbes {
         DetectionProbes {
             os,
-            // The platform every release builds for; the Intel-Mac arm is
+            // Apple Silicon on macOS, x86_64 elsewhere; the other arm is
             // exercised explicitly where it matters.
-            arch: "aarch64",
+            arch: if os == "macos" { "aarch64" } else { "x86_64" },
             nvidia_smi_on_path: false,
             system32_nvidia_smi: false,
             proc_driver_nvidia: false,
@@ -1306,7 +1308,7 @@ mod tests {
 
     /// The auto-detection decision table: macOS is always the PyPI/MPS path
     /// (even with stray GPU evidence), any NVIDIA probe wins CUDA, ROCm
-    /// evidence only counts on Linux, and no evidence means CPU.
+    /// evidence only counts on x86_64 Linux, and no evidence means CPU.
     #[test]
     fn accelerator_decision_table() {
         // macOS: always PyPI wheels, which on Apple Silicon carry Metal.
@@ -1360,6 +1362,11 @@ mod tests {
         let (accelerator, evidence) = decide_accelerator(&linux);
         assert_eq!(accelerator, Accelerator::Cpu);
         assert!(evidence.contains("gfx1036"), "{evidence}");
+        // The ROCm wheels are x86_64 only.
+        let mut arm = probes("linux");
+        arm.arch = "aarch64";
+        arm.kfd_gpus = vec!["gfx1100".into()];
+        assert_eq!(decide_accelerator(&arm).0, Accelerator::Cpu);
     }
 
     /// A re-sync of an existing venv keeps the accelerator that venv was
