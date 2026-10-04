@@ -1131,17 +1131,15 @@ struct Ingested {
 /// windows during which macOS was swapping pages out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PressureCap {
-    /// Caps the unit budget: the size the last paging window ran at, doubled
-    /// by each clean full window since.
+    /// Caps the unit budget: the size the last paging window ran at, at most
+    /// `regrow_to`, doubled by each clean full window since.
     units: u64,
     /// How far `units` may grow back while the level is warning: the batch
     /// size the grant asked when the first episode began, halved by each
-    /// episode that our batch, running at it, began. Kept until the cap lifts.
+    /// paging window our batch began at it. Kept until the cap lifts.
     regrow_to: u64,
-    /// The last window was a paging one: the episode is still on.
-    paging: bool,
-    /// A window of this episode halved `regrow_to`.
-    halved: bool,
+    /// When the window that last halved `regrow_to` settled.
+    halved_at: Option<Instant>,
 }
 
 /// What the local store holds of a (model, GPU), as far as the write policy

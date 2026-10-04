@@ -517,8 +517,14 @@ impl VramLedger {
                 }
             }
             if let Some(charge) = charge {
-                let filled = !negative && ingested.filled;
-                Self::note_pressure_size_locked(&mut state, worker, charge, filled, paged_at_grant);
+                Self::note_pressure_size_locked(
+                    &mut state,
+                    worker,
+                    charge,
+                    ingested.filled,
+                    negative,
+                    paged_at_grant,
+                );
             }
         }
         let died = matches!(outcome, WindowOutcome::WorkerDied);

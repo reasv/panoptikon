@@ -493,8 +493,7 @@ fn a_capped_replica_is_priced_at_the_capped_batch() {
                 cal.pressure_cap = Some(PressureCap {
                     units: 2,
                     regrow_to: 2,
-                    paging: false,
-                    halved: false,
+                    halved_at: None,
                 });
             }
         }

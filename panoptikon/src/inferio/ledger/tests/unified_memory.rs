@@ -1989,12 +1989,17 @@ fn only_an_episode_our_batch_began_at_the_bound_halves_it() {
     assert_eq!(pressure_cap(&ledger), None, "back at what the ramp admits");
 }
 
-/// A window granted before the paging began that ran at what its grant asked
-/// halves the bound, whatever its settle changed, whichever window of the
-/// episode settles first, and only once an episode. Rows: at warning, a
-/// replica that normal pressure would let double its working size, memory
-/// having granted nothing above it; a deflation the window's settle repaid;
-/// an out-of-memory failure; a second replica granted after the paging began.
+/// A window granted before the paging began that ran a batch at what its
+/// grant asked halves the smaller of the bound and that size, whatever its
+/// settle changed and whichever window settles first; a window granted before
+/// that halving does not halve it again, one granted after it does. Rows: at
+/// warning, a replica that normal pressure would let double its working size,
+/// memory having granted nothing above it; a deflation the window's settle
+/// repaid; an out-of-memory failure; a second replica granted after the
+/// paging began, beside a window granted before the halving that settles
+/// after it; a window right after a halving, which runs the halved size; a
+/// window whose batches ran below its budget; a deflation that puts the size
+/// asked below the bound.
 #[test]
 fn paging_our_batch_began_at_what_its_grant_asked_halves_the_bound() {
     use mps::MemoryPressure::{Paging, Warning};
@@ -2044,8 +2049,12 @@ fn paging_our_batch_began_at_what_its_grant_asked_halves_the_bound() {
         let early = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
+        let before_halving = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
         ledger.set_paging_rise_for_test(ledger.pressure_read_at_for_test());
         assert_eq!(early.grant().unit_budget, 64);
+        assert_eq!(before_halving.grant().unit_budget, 64);
         ledger.set_memory_pressure_for_test(Paging);
         push_ram(&late, MAC_TOTAL_MB, 0, 180, 0);
         let token = late_admission
@@ -2055,21 +2064,47 @@ fn paging_our_batch_began_at_what_its_grant_asked_halves_the_bound() {
             .unwrap()
             .record_measurements(vec![measurement(8, 0, 180)]);
         token.finish(WindowOutcome::Responded { oom: None });
+        for token in [early, before_halving] {
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![measurement(64, 0, 740)]);
+            token.finish(WindowOutcome::Responded { oom: None });
+        }
+    };
+    let halved_again: Setup = |ledger, handle, admission| {
+        ledger.set_memory_pressure_for_test(Warning);
+        assert_eq!(window_that_began_paging(ledger, handle, admission), 64);
+        assert_eq!(window_that_began_paging(ledger, handle, admission), 32);
+    };
+    let below_budget: Setup = |ledger, handle, admission| {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        ledger.set_paging_rise_for_test(ledger.pressure_read_at_for_test());
+        assert_eq!(token.grant().unit_budget, 128);
         handle
             .lock()
             .unwrap()
             .record_measurements(vec![measurement(64, 0, 740)]);
-        early.finish(WindowOutcome::Responded { oom: None });
-        // Another window of the same episode, at the bound it had.
-        ledger.set_memory_pressure_for_test(Warning);
-        push_ram(handle, MAC_TOTAL_MB, 90_000, 740, 0);
-        assert_eq!(window_that_began_paging(ledger, handle, admission), 64);
+        token.finish(WindowOutcome::Responded { oom: None });
+    };
+    let smaller_asked: Setup = |ledger, handle, admission| {
+        assert_eq!(window_that_began_paging(ledger, handle, admission), 128);
+        for entry in ledger.lock().workers.values_mut() {
+            entry.deflation = 1;
+            entry.clean_windows = 0;
+        }
+        assert_eq!(window_that_began_paging(ledger, handle, admission), 32);
     };
     for (setup, regrow_to, regrowth) in [
         (room_cut, 32, [8, 16, 32, 32, 32]),
         (deflated, 32, [8, 16, 32, 32, 32]),
         (out_of_memory, 64, [8, 16, 32, 64, 64]),
         (two_replicas, 32, [8, 16, 32, 32, 32]),
+        (halved_again, 16, [8, 16, 16, 16, 16]),
+        (below_budget, 128, [8, 16, 32, 64, 64]),
+        (smaller_asked, 16, [8, 16, 16, 16, 16]),
     ] {
         let (ledger, handle, admission) = ramped_mac_replica();
         setup(&ledger, &handle, &admission);
@@ -2083,8 +2118,8 @@ fn paging_our_batch_began_at_what_its_grant_asked_halves_the_bound() {
     }
 }
 
-/// The bound is at least one unit, or a batch already at one unit would be
-/// capped at none and never grow back.
+/// Halving the bound leaves at least one unit, or a one-unit batch that
+/// began the paging would be capped at none and never grow back.
 #[test]
 fn the_bound_of_a_one_unit_batch_is_one_unit() {
     let ledger = mps_ledger();
@@ -2092,25 +2127,22 @@ fn the_bound_of_a_one_unit_batch_is_one_unit() {
     let admission = ledger
         .register_worker("g/a", item_cost(1), &handle, None)
         .expect("registers");
-    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
     push_ram(&handle, MAC_TOTAL_MB, 0, 0, 0);
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
+    ledger.set_paging_rise_for_test(ledger.pressure_read_at_for_test());
     assert_eq!(token.grant().unit_budget, 1);
     handle
         .lock()
         .unwrap()
         .record_measurements(vec![measurement(1, 0, 10)]);
     token.finish(WindowOutcome::Responded { oom: None });
+    let cap = pressure_cap(&ledger).expect("a cap");
     assert_eq!(
-        pressure_cap(&ledger),
-        Some(PressureCap {
-            units: 1,
-            regrow_to: 1,
-            paging: true,
-            halved: false,
-        })
+        (cap.units, cap.regrow_to, cap.halved_at.is_some()),
+        (1, 1, true)
     );
 }
 
@@ -2139,10 +2171,7 @@ fn paging_that_began_at_the_grants_own_reading_counts_at_settle() {
             .unwrap()
             .record_measurements(vec![measurement(1, 0, 10)]);
         token.finish(WindowOutcome::Responded { oom: None });
-        assert_eq!(
-            pressure_cap(&ledger).is_some_and(|cap| cap.paging),
-            !before_grant
-        );
+        assert_eq!(pressure_cap(&ledger).is_some(), !before_grant);
     }
 }
 

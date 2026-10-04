@@ -316,17 +316,17 @@ Single synthetic device:
   - **A paging episode leaves a cap** (`PressureCap`, per model and device, so
     a replica loaded afterwards runs what one that lived through it runs).
     Each paging window that memory or the ramp sized sets the cap to its unit
-    budget; one the queue sized sets it only when memory cut the batch below
-    the queue. The first of an episode also sets how far the cap
-    may grow back while the level stays at warning: the batch size its grant
-    asked, or the previous bound, **halved (at least 1), once per episode,
-    only when a window was granted before the paging began and ran at that
-    bound, or at the size its grant asked if smaller**. The size asked is
-    read at the grant, so a deflation the settle repays or adds does not
-    change it. A batch size that tipped the machine into paging is therefore
-    not returned to at warning, a replica whose own batches cause the paging
-    settles within log2(size) episodes, and paging that began before the
-    grant or under a smaller batch leaves the bound alone.
+    budget, at most the bound; one the queue sized sets it only when memory
+    cut the batch below the queue. The first one also sets the bound, how far
+    the cap may grow back while the level stays at warning: the batch size
+    its grant asked. **A window granted before the paging began that ran a
+    batch at its budget, that budget at least the smaller of the bound and
+    the size its grant asked, halves that smaller size (at least 1); a window
+    granted before an earlier window halved the bound does not halve it
+    again.** The size asked is read at the grant, so a deflation the settle
+    repays or adds does not change it. A batch size that tipped the machine
+    into paging is therefore not returned to at warning, and paging that
+    began before the grant or under a smaller batch leaves the bound alone.
   - **Growing back.** Each clean window that filled its budget doubles the
     cap: at warning up to that bound, at normal until it reaches what the
     ramp admits, where the cap lifts and the bound is forgotten. A warning
