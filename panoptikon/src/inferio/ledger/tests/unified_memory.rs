@@ -1647,17 +1647,9 @@ fn ramp_figures(ledger: &Arc<VramLedger>) -> (Option<u64>, u32, usize, u64) {
     )
 }
 
-/// What paging left of the replica's batch size, if anything, as `/health`
-/// also shows it.
+/// What paging left of the replica's batch size, if anything.
 fn pressure_cap(ledger: &Arc<VramLedger>) -> Option<PressureCap> {
-    let cap = ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].pressure_cap;
-    for worker in &ledger.health()[0].workers {
-        assert_eq!(
-            (worker.pressure_cap_units, worker.pressure_regrow_to_units),
-            (cap.map(|cap| cap.units), cap.map(|cap| cap.regrow_to))
-        );
-    }
-    cap
+    ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].pressure_cap
 }
 
 /// `windows` windows while macOS pages at `pressure`: the worker holds
@@ -1768,6 +1760,15 @@ fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
         let (ledger, handle, admission) = ramped_mac_replica();
         let (_, _, samples, budget) = ramp_figures(&ledger);
         assert_eq!(budget, 128, "the trial's next size");
+        // A pool that holds the 128 units: the working size all the same.
+        ledger.set_memory_pressure_for_test(pressure);
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: MPS_GPU.to_owned(),
+            total_mb: MAC_RAM_MB,
+            free_mb: 0,
+        }]));
+        push_ram(&handle, MAC_TOTAL_MB, 90_000, 1_400, 0);
+        assert_eq!(ramp_window(&handle, &admission, &MINILM_M3_MAX), 64);
         paging_windows(&ledger, &handle, &admission, pressure, 3);
         let (size_during, deflation, samples_during, _) = ramp_figures(&ledger);
         assert_eq!(
@@ -1913,8 +1914,13 @@ fn a_load_under_memory_pressure_warns_once_per_model_and_episode() {
 fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() {
     use mps::MemoryPressure::{Normal, Paging, Warning};
     let (ledger, handle, admission) = ramped_mac_replica();
+    let shown = |ledger: &Arc<VramLedger>| {
+        let worker = ledger.health().swap_remove(0).workers.swap_remove(0);
+        (worker.pressure_cap_units, worker.pressure_regrow_to_units)
+    };
     assert_eq!(window_that_began_paging(&ledger, &handle, &admission), 128);
     paging_windows(&ledger, &handle, &admission, Paging, 2);
+    assert_eq!(shown(&ledger), (Some(8), Some(64)));
     ledger.set_memory_pressure_for_test(Warning);
     assert_eq!(
         ramp_windows(&handle, &admission, 5),
@@ -1934,6 +1940,7 @@ fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() 
     ledger.set_memory_pressure_for_test(Normal);
     assert_eq!(ramp_windows(&handle, &admission, 4), [32, 64, 64, 64]);
     assert_eq!(pressure_cap(&ledger), None);
+    assert_eq!(shown(&ledger), (None, None));
 }
 
 /// Only an episode our batch began, granted before the paging and running
@@ -2185,8 +2192,13 @@ fn at_warning_without_paging_the_batch_size_is_held() {
         .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
         .collect();
     assert_eq!(held, [64, 64, 64], "the trial under way is put off");
-    let (size_during, _, samples_during, _) = ramp_figures(&ledger);
+    let (size_during, _, samples_during, budget_during) = ramp_figures(&ledger);
     assert_eq!(size_during, Some(64), "what the trial had measured");
+    assert_eq!(budget_during, 64);
+    assert_eq!(
+        ledger.window_target_units(admission.worker_id()),
+        64 * WINDOW_DEPTH_MULTIPLIER
+    );
     assert!(samples_during <= samples);
     assert_eq!(
         ledger.trial_for_test("g/a", MPS_GPU),

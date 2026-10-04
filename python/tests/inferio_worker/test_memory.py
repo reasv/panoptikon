@@ -2134,6 +2134,7 @@ def test_nothing_is_available_while_the_mac_pages_under_pressure() -> None:
         (1, True, 9_963),
         (2, False, 963),
         (2, True, 0),
+        (3, False, 963),
         (3, True, 0),
         (4, False, 0),
         (4, True, 0),
@@ -2244,7 +2245,8 @@ def test_an_unreadable_pressure_level_counts_as_normal() -> None:
 def test_while_the_mac_pages_an_mps_batch_fits_the_pool_it_holds() -> None:
     """Nothing is free beyond this process's own pool, so the live clamp cuts
     a batch to what that pool can hold. At warning without paging the reading
-    stands and the batch keeps its size."""
+    stands, as the fake host has no file cache, and the batch keeps its
+    size."""
     with mps_host(available_mb=40 * 1024, pressure=2, paging=True) as mps:
         mps.allocate(1000, driver_mb=3000)
         reading = memory.free_total_reading()
