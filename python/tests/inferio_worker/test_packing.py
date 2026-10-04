@@ -1420,6 +1420,11 @@ def test_the_oom_classifier_covers_the_non_cuda_backends(fake_torch):
         assert oom_class["host_ram"] is host_ram, name
         prefix = packing.OOM_HOST_RAM_PREFIX if host_ram else packing.OOM_WINDOW_PREFIX
         assert str(caught.value).startswith(prefix), name
+    # A device's wording outranks the CPU allocator's.
+    both = packing.classify_oom(
+        RuntimeError("DefaultCPUAllocator: can't allocate memory\nCUDA out of memory")
+    )
+    assert both["host_ram"] is False
 
     with pytest.raises(packing.WindowFailure) as caught:
         packing.run_window(
@@ -1634,23 +1639,38 @@ def test_an_internally_absorbed_oom_carries_the_marker_class(
     fake_torch, fake_oom_retry
 ):
     class Halving:
-        host_ram = False
+        """One halving per entry of `host_ram`, then `raises` if set."""
+
+        host_ram = (False,)
+        raises = None
 
         def predict(self, inputs):
-            fake_oom_retry.record(
-                largest=len(inputs), halvings=1, host_ram=self.host_ram
-            )
+            for host_ram in self.host_ram:
+                fake_oom_retry.record(
+                    largest=len(inputs), halvings=1, host_ram=host_ram
+                )
+            if self.raises is not None:
+                raise self.raises
             return [None] * len(inputs)
 
     impl = Halving()
     for host_ram in (False, True):
-        impl.host_ram = host_ram
+        impl.host_ram = (host_ram,)
         payload = packing.run_window(impl, items(2), grant(unit_budget=2))
         measurement = payload["measurements"][0]
         assert measurement["oom"] is True
         assert measurement["oom_class"]["source"] == packing.OOM_SOURCE_MARKER
         assert measurement["oom_class"]["exception"] == packing.OOM_HALVING_WITNESS
         assert measurement["oom_class"]["host_ram"] is host_ram
+
+    # A GPU halving outranks a host RAM one, and a host RAM failure after it.
+    impl.host_ram = (False, True)
+    payload = packing.run_window(impl, items(2), grant(unit_budget=2))
+    assert payload["measurements"][0]["oom_class"]["host_ram"] is False
+    impl.raises = MemoryError()
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(impl, items(2), grant(unit_budget=2))
+    assert caught.value.measurements[0]["oom_class"]["host_ram"] is False
 
 
 def test_the_classifier_never_raises(fake_torch):
@@ -2503,6 +2523,16 @@ def test_a_granted_window_states_each_batch_before_it_runs(fake_torch):
         assert sample["free_source"] == "torch"
         assert sample["free_mb"] is not None
         assert sample["total_mb"] is not None
+
+    # A pixel grant states each batch's priced units, not its items.
+    emitted.clear()
+    packing.run_window(
+        Recorder(),
+        [PredictionInput(file=png_bytes(20, 10)) for _ in range(3)],
+        grant(unit_budget=400, unit="pixel", aggregation="sum"),
+        lambda units, sample: emitted.append((units, sample)),
+    )
+    assert [units for units, _ in emitted] == [400, 200]
 
 
 def test_a_window_runs_identically_with_and_without_the_emitter(fake_torch):

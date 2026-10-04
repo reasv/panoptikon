@@ -363,7 +363,7 @@ def looks_like_oom(exc: BaseException) -> bool:
         lowered = text.lower()
         if "out of memory" in lowered or "INFERENCE_OOM" in text:
             return True
-    return looks_like_host_ram(exc)
+    return False
 
 
 def looks_like_host_ram(exc: BaseException) -> bool:
@@ -424,8 +424,8 @@ def run_with_oom_retry(
     naming host RAM when that ran out; any other exception propagates
     untouched.
 
-    An OOM is the CUDA/HIP exception type, `MemoryError`, or `looks_like_oom`
-    text. A 32-bit index ceiling also halves but counts as an index-limit
+    An OOM is the CUDA/HIP exception type, `looks_like_host_ram`, or
+    `looks_like_oom` text. A 32-bit index ceiling also halves but counts as an index-limit
     event, not an OOM, and propagates at one item.
     `oom_exceptions` overrides the caught types (used by torch-free tests).
     """

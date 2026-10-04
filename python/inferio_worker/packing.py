@@ -985,27 +985,34 @@ def _host_ram_text(lowered: str) -> bool:
     )
 
 
+def _device_text(lowered: str) -> bool:
+    """Whether lower-cased text is a device allocator's failure."""
+    return any(pattern in lowered for pattern in OOM_MESSAGE_PATTERNS) or bool(
+        OOM_DEVICE_PHRASE in lowered and OOM_DEVICE_TOKENS.search(lowered)
+    )
+
+
 def _pattern_oom(error: BaseException) -> str | None:
     """The exception's name when its text matches an allocation failure. A
     bare `out of memory` is not a match.
     """
     lowered = str(error).lower()
-    if any(pattern in lowered for pattern in OOM_MESSAGE_PATTERNS) or _host_ram_text(
-        lowered
-    ):
-        return _qualified_name(type(error))
-    if OOM_DEVICE_PHRASE in lowered and OOM_DEVICE_TOKENS.search(lowered):
+    if _device_text(lowered) or _host_ram_text(lowered):
         return _qualified_name(type(error))
     return None
 
 
 def _host_ram(error: BaseException) -> bool:
     """Whether the failure that classified a batch was a host RAM
-    allocation's: `MemoryError`, our host RAM prefix or the CPU allocator."""
+    allocation's: `MemoryError`, our host RAM prefix or the CPU allocator. A
+    device's wording in the same text outranks the CPU allocator's."""
     if isinstance(error, MemoryError):
         return True
     text = str(error)
-    return OOM_HOST_RAM_PREFIX in text or _host_ram_text(text.lower())
+    if OOM_HOST_RAM_PREFIX in text:
+        return True
+    lowered = text.lower()
+    return _host_ram_text(lowered) and not _device_text(lowered)
 
 
 def _chain(exc: BaseException | None) -> tuple[BaseException, ...]:
@@ -1033,8 +1040,8 @@ def classify_oom(
 
     Each tier (typed, marker, pattern) is tried over the whole chain before the
     next. `absorbed` classifies a batch whose OOMs the impl's halving loop
-    absorbed, host RAM's when all `absorbed_host_ram` were. `host_ram` says
-    the allocation that failed was host RAM's. Never raises. See
+    absorbed. `host_ram` says the allocation that failed was host RAM's, and
+    every absorbed one too: a device OOM outranks host RAM. Never raises. See
     docs/inferio-worker-protocol.md "Memory sensing".
     """
     try:
@@ -1048,7 +1055,11 @@ def classify_oom(
             for error in chain:
                 name = probe(error)
                 if name is not None:
-                    found = (source, name, _host_ram(error))
+                    found = (
+                        source,
+                        name,
+                        _host_ram(error) and absorbed_host_ram >= absorbed,
+                    )
                     break
             if found is not None:
                 break
