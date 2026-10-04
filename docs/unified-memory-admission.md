@@ -122,9 +122,9 @@ device subtracts `SReclaimable` on both sides. No new crates. The two
 producers must sum the **same terms** — on macOS RAM less wired,
 compressed and anonymous pages, on Windows the smaller of `ullAvailPhys`
 and `ullAvailPageFile`; counting anything more on the orchestrator side
-(purgeable, compressed) would make its refresh the looser of the two and
-systematically understate external pressure, the one error direction the
-ledger cannot absorb.
+(counting purgeable pages as available) would make its refresh the looser of
+the two and systematically understate external pressure, the one error
+direction the ledger cannot absorb.
 
 Everything else is inherited:
 

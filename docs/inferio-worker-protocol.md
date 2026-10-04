@@ -901,16 +901,15 @@ falls with the process's own allocation.
 **`"ram"` is the CPU-priced host's reading** (docs/unified-memory-admission.md,
 backend C), and it is the degenerate case of the unified model: there is no
 accelerator pool to intersect with, so `total_mb` is physical RAM and
-`free_mb` is the per-platform available RAM listed below, bounded by it. On
-Linux that is `MemAvailable` less `SReclaimable` (`/proc/meminfo`):
-`MemAvailable` counts reclaimable slab, but the kernel may not free it before
-it kills a process. It is authoritative — whole-machine by construction, and
-the only reading such a host has — and the orchestrator's own refresh reads
-the same sources under the same label (`MemTotal` and
-`MemAvailable − SReclaimable` on Linux, `GlobalMemoryStatusEx` on Windows (the
-smaller of `ullAvailPhys` and `ullAvailPageFile`, on both sides), and on macOS
-the kernel-counter formula above, psutil's `available` being disqualified
-there for the reasons just given).
+`free_mb` is the per-platform available RAM, bounded by it: on Linux
+`MemAvailable` less `SReclaimable` (`/proc/meminfo`), because `MemAvailable`
+counts reclaimable slab that the kernel may not free before it kills a
+process; on Windows the smaller of `ullAvailPhys` and `ullAvailPageFile`
+(`GlobalMemoryStatusEx`); on macOS the kernel-counter formula above, since
+psutil's `available` is disqualified there for the reasons just given. It is
+authoritative (whole-machine by construction, and the only reading such a
+host has), and the orchestrator's own refresh reads the same figures under
+the same label.
 
 **The tier is gated on the spawner's `INFERIO_DEVICE=cpu`, not on the absence
 of an accelerator**, and is checked *before* every other tier rather than

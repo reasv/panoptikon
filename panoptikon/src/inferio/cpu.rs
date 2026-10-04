@@ -241,8 +241,9 @@ mod sys {
         status().map(|status| available_bytes(&status) / MIB)
     }
 
-    /// Free physical memory, bounded by the commit left before Windows must
-    /// grow the pagefile.
+    /// Free physical memory, bounded by the commit left at the pagefile's
+    /// current size: beyond it Windows refuses the allocation or grows the
+    /// pagefile.
     fn available_bytes(status: &MEMORYSTATUSEX) -> u64 {
         status.ullAvailPhys.min(status.ullAvailPageFile)
     }

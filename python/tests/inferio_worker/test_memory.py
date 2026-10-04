@@ -2911,7 +2911,7 @@ def test_linux_free_ram_leaves_out_reclaimable_slab(
 
 
 def test_windows_free_ram_is_bounded_by_available_commit() -> None:
-    with cpu_host(FakeRam(total_mb=64 * 1024, available_mb=40 * 1024)):
+    with cpu_host(FakeRam(total_mb=64 * 1024, available_mb=8 * 1024)):
         for phys_mb, commit_mb, free_mb in (
             (12_288, 3_072, 3_072),
             (12_288, 40_960, 12_288),
