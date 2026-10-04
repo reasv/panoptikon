@@ -186,8 +186,11 @@ def parse_hog_event(text: str) -> HogEvent:
     """`at=S,leave_free=MIB`, `at=S,hold=MIB` or `at=S,release`: a hog change
     S seconds after the job is posted, in MiB, not scaled. S and MIB are
     finite and not negative."""
-    fields = dict(part.partition("=")[::2] for part in text.split(","))
+    pairs = [part.partition("=")[::2] for part in text.split(",")]
+    fields = dict(pairs)
     try:
+        if len(fields) != len(pairs):
+            raise ValueError("a key is repeated")
         at_s = float(fields.pop("at"))
         if fields == {"release": ""}:
             fields = {"hold": "0"}
@@ -2052,7 +2055,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit(
             "legs.py: --inference-url with a hog: the hog would pressure this "
             "host, not the inference server's")
-    if wants_hog and not args.gpu_total_mb and measured_total_mb is None:
+    if ((wants_hog or args.hog_event) and not args.gpu_total_mb
+            and measured_total_mb is None):
         # Scaling a fraction against another machine's board is not a
         # degraded measurement, it is a different experiment.
         raise SystemExit(

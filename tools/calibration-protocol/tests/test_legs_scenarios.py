@@ -51,10 +51,12 @@ def test_plain_s14_still_runs_one_model_on_the_smoke_tier():
     assert (scenario.corpus, scenario.models) == ("smoke", ())
 
 
-def test_a_hog_event_squeezes_during_the_job_on_any_hog_target(capsys):
+def test_a_hog_event_squeezes_during_the_job_on_any_hog_target(capsys,
+                                                              monkeypatch):
     """`--hog-event` adds timed changes in MiB to a scenario with no hog of
     its own, through the same driver, on host RAM as on a GPU. Its figures
-    are bounded by `--min-free-mb` as scaled ones are."""
+    are bounded by `--min-free-mb` as scaled ones are, and need the device
+    total as a scenario's own hog does."""
     assert legs.main(["--scenario", "S2", "--hog-target", "ram",
                       "--gpu-total-mb", "24564", "--no-dotenv", "--dry-run",
                       "--hog-event", "at=60,leave_free=4096",
@@ -85,6 +87,13 @@ def test_a_hog_event_squeezes_during_the_job_on_any_hog_target(capsys):
 
     for bad in ("at=5,leave_free=1,hold=2", "leave_free=1", "at=5,hold=x",
                 "at=5,release=x", "at=-1,release", "at=nan,release",
-                "at=inf,release", "at=5,hold=-1"):
+                "at=inf,release", "at=5,hold=-1", "at=1,at=90,hold=5"):
         with pytest.raises(SystemExit):
-            legs.main(["--scenario", "S2", "--dry-run", "--hog-event", bad])
+            legs.main(["--scenario", "S2", "--gpu-total-mb", "24564",
+                       "--dry-run", "--hog-event", bad])
+
+    monkeypatch.setattr(legs, "board_total_mb", lambda device: None)
+    monkeypatch.setattr(legs.rocm_sysfs, "inventory", lambda *roots: [])
+    with pytest.raises(SystemExit):
+        legs.main(["--scenario", "S2", "--no-dotenv", "--dry-run",
+                   "--hog-event", "at=5,leave_free=4096"])
