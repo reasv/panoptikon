@@ -3605,12 +3605,12 @@ transcode_presets = ["playback"]
         )
     }
 
-    /// Waits for one job to publish its artifact. Bounded rather than
-    /// unbounded: 4 s is far past a 16 s flat-colour encode, and a regression
-    /// fails here instead of hanging the suite.
+    /// Waits for one job to publish its artifact, so a hung job fails here
+    /// instead of hanging the suite.
     async fn settle(id: Uuid) -> ArtifactRef {
         use crate::media_tools::transcode::pool::TranscodeJobEvent;
-        for _ in 0..400 {
+        let deadline = std::time::Instant::now() + crate::test_utils::FFMPEG_HANG_DEADLINE;
+        while std::time::Instant::now() < deadline {
             match pool::job_snapshot(id).await.unwrap().map(|snap| snap.event) {
                 Some(TranscodeJobEvent::Done { artifact }) => return artifact,
                 Some(TranscodeJobEvent::Failed { error, .. }) => {
@@ -3694,8 +3694,6 @@ transcode_presets = ["playback"]
         assert_eq!(json["outcome"], "created");
         let id = parse_job_id(json["job"]["id"].as_str().expect("a job id")).unwrap();
 
-        // Bounded rather than unbounded: 4 s is far past a 16 s flat-colour
-        // encode, and a regression fails here instead of hanging the suite.
         let artifact = settle(id).await;
         assert_eq!(artifact.mime_type, "video/mp4");
 

@@ -97,6 +97,11 @@ pub(crate) fn absent_path(name: &str) -> String {
     format!("{}{}{name}", absent_root(), std::path::MAIN_SEPARATOR)
 }
 
+/// How long a test waits on a real ffmpeg run before calling it hung. A hang
+/// detector, not a speed bound: a fixture encode that takes 0.4 s on a quiet
+/// host has taken over a minute on a loaded one.
+pub(crate) const FFMPEG_HANG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// A port nothing in this process can be listening on. Binding and dropping
 /// an *ephemeral* port is not sound: it goes straight back to the pool this
 /// binary's other tests bind from, so the "closed" port is occasionally a
