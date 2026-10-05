@@ -52,8 +52,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 SCHEMA = 3
 # What a measurement may have been taken on, as (platform, backend).
 MEASURED_ON = (("linux", "cuda"), ("linux", "rocm"))
-# The backend whose rows are copied to other platforms.
-COPIED_BACKEND = "cuda"
 # Platforms a CUDA row may be copied to. macOS is not one: a cuda-keyed row
 # can never answer an mps lookup.
 COPYABLE_TO = ("windows",)
@@ -178,7 +176,7 @@ def generate(
 
     out = list(measured)
     for row in measured:
-        if row["backend"] != COPIED_BACKEND:
+        if row["backend"] != "cuda":
             continue
         for platform in allowlist.get(row["inference_id"], ()):
             copy = dict(row)

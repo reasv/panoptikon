@@ -135,7 +135,8 @@ def pinned_gpu(device: int, environ: Dict[str, str],
 
 def pin_env(gpu: Gpu) -> Dict[str, str]:
     """The variables the spawner gives a worker on `gpu`: `HIP_VISIBLE_DEVICES`
-    and, on a unified GPU, `PANOPTIKON_UNIFIED_GPU`."""
+    and `PANOPTIKON_DEVICE_PIN`, plus `PANOPTIKON_UNIFIED_GPU` on a unified
+    GPU."""
     out = {"HIP_VISIBLE_DEVICES": str(gpu.index),
            "PANOPTIKON_DEVICE_PIN": str(gpu.index)}
     if gpu.unified:
