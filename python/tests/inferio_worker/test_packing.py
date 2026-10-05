@@ -2310,9 +2310,10 @@ def test_a_clean_pool_of_the_same_size_is_still_released(fake_torch):
 def test_after_a_release_that_returned_nothing_the_slack_must_grow_first():
     """Metal keeps part of the pool through `empty_cache()` and publishes no
     counter for it, so slack can be claimed that a release does not return.
-    After a release that left at least 256 MiB of its slack in the pool, the
-    rule waits for the slack to grow 256 MiB past what it left, instead of
-    releasing it again every other window."""
+    After a release that left at least 256 MiB of its slack in the pool, or
+    more than it returned, the rule waits up to 30 s for the slack to grow
+    256 MiB past what it left, instead of releasing it again every other
+    window. A release that returned under 256 MiB keeps the comparator."""
 
     class FragmentedMps(FakeMpsAllocator):
         kept = 0
@@ -2332,7 +2333,9 @@ def test_after_a_release_that_returned_nothing_the_slack_must_grow_first():
     with mps_host(available_mb=40 * 1024, mps=mps):
         mps.allocate(3000, driver_mb=5000)
         mps.kept = 1000 * MIB
+        packing._last_growth = (8, 100.0)
         assert windows(6) == 1, "the release left 1000 MiB of 2000"
+        assert packing._last_growth is None, "it returned 1000 MiB"
         assert windows(6, grow_mb=1) == 1, "the slack grew 6 MiB"
         mps.driver += 250 * MIB
         assert windows(2) == 2, "the slack grew 256 MiB past what was left"
@@ -2359,6 +2362,18 @@ def test_after_a_release_that_returned_nothing_the_slack_must_grow_first():
         mps.driver += 1000 * MIB
         assert windows(2) == 10
         assert windows(2) == 10, "a release that left 256 MiB is waited on"
+        packing.release_pool()
+        assert windows(2) == 12, "another release forgets what was left"
+        packing.note_trimmed()
+        mps.driver = mps.allocated + 200 * MIB
+        mps.kept = 200 * MIB
+        packing._last_growth = (8, 100.0)
+        assert windows(2) == 13
+        assert packing._last_growth == (8, 100.0), "it returned nothing"
+        assert windows(4) == 13, "a release that returned less than it left"
+        later = packing.time.monotonic() + packing.SHRINK_RESIDUAL_HOLD_S
+        with mock.patch.object(packing.time, "monotonic", return_value=later):
+            assert windows(2) == 14, "the wait ends after 30 s"
 
 
 def test_the_clamp_credits_a_split_pool_the_release_decision_refuses(fake_torch):

@@ -146,11 +146,16 @@ _spill_persists = False
 _under_grant_windows = 0
 # Set by a release the blind rule caused; a grant with memory clears it.
 _blind_released = False
-# The slack left in the pool by a release that left at least
-# `SHRINK_BLIND_SLACK_MB` of its slack there (the pool is fragmented where no
-# counter says so, as on MPS); no shrink release runs until the slack grows
-# that much past it.
-_unreleased_slack_mb: int | None = None
+# How long the slack a shrink release left holds the rule off: the host's
+# `TRIM_DEBOUNCE`.
+SHRINK_RESIDUAL_HOLD_S = 30.0
+
+# `(slack_mb, monotonic time)` a shrink release left in the pool, when it left
+# at least `SHRINK_BLIND_SLACK_MB` or more than it returned (the pool is
+# fragmented where no counter says so, as on MPS). For
+# `SHRINK_RESIDUAL_HOLD_S` no shrink release runs unless the slack grows
+# `SHRINK_BLIND_SLACK_MB` past it.
+_unreleased_slack: tuple[int, float] | None = None
 
 
 class WindowFailure(Exception):
@@ -169,7 +174,7 @@ class WindowFailure(Exception):
 
 
 def reset_comparator() -> None:
-    """Forget the throughput comparator; called on every pool release, since a
+    """Forget the throughput comparator; called on a pool release, since a
     regrowing pool is not comparable to a warm one."""
     global _last_growth, _non_comparable_streak
     _last_growth = None
@@ -178,10 +183,10 @@ def reset_comparator() -> None:
 
 def reset_shrink_state() -> None:
     """Forget the reactive-shrink hysteresis."""
-    global _under_grant_windows, _blind_released, _unreleased_slack_mb
+    global _under_grant_windows, _blind_released, _unreleased_slack
     _under_grant_windows = 0
     _blind_released = False
-    _unreleased_slack_mb = None
+    _unreleased_slack = None
 
 
 def note_trimmed() -> None:
@@ -192,11 +197,14 @@ def note_trimmed() -> None:
 
 def release_pool() -> bool:
     """Release the pool for `inferio.impl.utils.clear_cache()` (the OOM-retry
-    loop); returns whether it ran. Resets only the throughput comparator.
+    loop); returns whether it ran. Resets the throughput comparator and
+    forgets the slack a shrink release left.
     """
+    global _unreleased_slack
     if not memory.empty_cache(memory.IMPL_RELEASE, arm=False):
         return False
     reset_comparator()
+    _unreleased_slack = None
     return True
 
 
@@ -212,10 +220,11 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     itself filled the device is released. It counts only above
     `SHRINK_BLIND_SLACK_MB`, and only until the first release it causes, so a
     busy shared device does not release on every other window. After a release
-    that left at least 256 MiB of its slack in the pool, neither rule counts
-    until the slack grows 256 MiB past what it left.
+    that left at least 256 MiB of its slack in the pool, or more than it
+    returned, neither rule counts for 30 s unless the slack grows 256 MiB past
+    what it left.
     """
-    global _under_grant_windows, _blind_released, _unreleased_slack_mb
+    global _under_grant_windows, _blind_released, _unreleased_slack
     if grant_mb is None or grant_mb < 0:
         _under_grant_windows = 0
         return False
@@ -228,12 +237,13 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     split_mb = memory.unreturnable_split_mb() or 0
     slack_mb = max(0, reserved_mb - allocated_mb - split_mb)
     if slack_mb <= 0 or (
-        _unreleased_slack_mb is not None
-        and slack_mb < _unreleased_slack_mb + SHRINK_BLIND_SLACK_MB
+        _unreleased_slack is not None
+        and slack_mb < _unreleased_slack[0] + SHRINK_BLIND_SLACK_MB
+        and time.monotonic() - _unreleased_slack[1] < SHRINK_RESIDUAL_HOLD_S
     ):
         _under_grant_windows = 0
         return False
-    _unreleased_slack_mb = None
+    _unreleased_slack = None
     if grant_mb == 0:
         if _blind_released or slack_mb < SHRINK_BLIND_SLACK_MB:
             _under_grant_windows = 0
@@ -267,11 +277,17 @@ def maybe_shrink(grant_mb: int | None) -> bool:
         reserved_mb,
         _under_grant_windows,
     )
-    note_trimmed()
-    _blind_released = grant_mb == 0
     released = memory.last_release()[0]
-    if released is not None and slack_mb - released >= SHRINK_BLIND_SLACK_MB:
-        _unreleased_slack_mb = slack_mb - released
+    # A release that returned less than `SHRINK_BLIND_SLACK_MB` left the pool
+    # as it was: its rates stay comparable.
+    if released is None or released >= SHRINK_BLIND_SLACK_MB:
+        reset_comparator()
+    reset_shrink_state()
+    _blind_released = grant_mb == 0
+    if released is not None:
+        left = slack_mb - released
+        if left >= SHRINK_BLIND_SLACK_MB or released < left:
+            _unreleased_slack = (left, time.monotonic())
     return True
 
 
