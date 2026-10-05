@@ -403,24 +403,27 @@ def test_the_denominator_never_exceeds_the_probe_boundary():
 
 
 def test_the_denominator_is_bounded_by_the_room_a_hog_leaves():
-    """Room = probe boundary - (least hog held + context) / reserved slope,
-    while the model ran, on its GPU."""
+    """Room = probe boundary - (least hog held + context + least grant
+    reserve) / reserved slope, while the model ran, on its GPU."""
     probe = {**_bisect_probe(512),
              "fit": {"basis": "peak_allocated_mb", "slope_mb_per_unit": 10.0},
              "fit_reserved": {"basis": "delta_mb", "slope_mb_per_unit": 20.0}}
 
     def utilization(target="gpu", held=3800, gpus=(GPU, GPU), unified=False,
                     hog_gpu=GPU, fit=None, states=None, logged=True,
-                    extra_gpus=(), trial=False):
+                    extra_gpus=(), trial=False, budget=100, reserves=()):
         states = states or [(10.0, 0), (50.0, held + 400), (110.0, held),
                             (150.0, 0)]
         hog = [{"kind": "header", "target": target, "gpu_uuid": hog_gpu,
                 "context_mb": 200}] + [
             {"kind": "state", "t_wall": t_wall, "held_mb": held_mb}
             for t_wall, held_mb in states]
-        log = [{**_budget_grant(100), "t_wall": t_wall,
-                "fields": {**_budget_grant(100)["fields"], "gpu": gpu}}
-               for t_wall, gpu in zip((100.0, 120.0), gpus)]
+        log = [{**_budget_grant(budget), "t_wall": t_wall,
+                "fields": {**_budget_grant(budget)["fields"], "gpu": gpu,
+                           **reserve}}
+               for t_wall, gpu, reserve in zip(
+                   (100.0, 120.0), gpus,
+                   [{"reserve_mb": mb} for mb in reserves] or [{}, {}])]
         log += [_trial_over(3)] if trial else []
         healthrec = [_worker_health(100)]
         if not logged:
@@ -439,6 +442,9 @@ def test_the_denominator_is_bounded_by_the_room_a_hog_leaves():
     mps = analyze.MPS_DEVICE_KEY
     assert utilization() == ("PASS", 312)
     assert utilization(trial=True) == ("PASS", 64)
+    # The least grant reserve comes off too: 512 - (3800 + 200 + 1024) / 20.
+    assert utilization(budget=70) == ("FAIL", 312)
+    assert utilization(budget=70, reserves=(1100, 1024)) == ("PASS", 260)
     assert utilization(gpus=(GPU, "GPU-1111")) == ("FAIL", 512)
     assert utilization(hog_gpu="GPU-1111") == ("FAIL", 512)
     assert utilization(target="ram") == ("FAIL", 512)

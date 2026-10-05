@@ -1856,8 +1856,9 @@ def check_utilization(ctx: Context) -> Verdict:
 
     **A hog leaves less room than the probe had.** The probe boundary is
     measured on a GPU with nothing else on it; the denominator is never above
-    that boundary less the least the hog held while the model ran, divided by
-    the probe's reserved slope (both are physical memory). A room under one
+    that boundary less the least the hog held while the model ran and the
+    least reserve the model's grants carried, divided by the probe's reserved
+    slope (all physical memory). A room under one
     unit, or a hog with no reserved slope to price it, is not decidable, and
     the row says so.
 
@@ -1879,12 +1880,17 @@ def check_utilization(ctx: Context) -> Verdict:
                 (sample["t_wall"], worker.get("gpu_uuid")))
     issued: Dict[str, int] = {}
     issued_at: Dict[str, List[Tuple[float, Any]]] = {}
+    reserves: Dict[str, int] = {}
     for event in ctx.log_events("issued a memory grant"):
         fields = event["fields"]
         model, budget = fields.get("model"), fields.get("unit_budget")
         if model is None or not isinstance(budget, (int, float)):
             continue
         issued[str(model)] = max(issued.get(str(model), 0), int(budget))
+        reserve = fields.get("reserve_mb")
+        if isinstance(reserve, (int, float)):
+            reserves[str(model)] = int(min(reserves.get(str(model), reserve),
+                                           reserve))
         issued_at.setdefault(str(model), []).append(
             (event["t_wall"], fields.get("gpu")))
     peak = {model: issued.get(model, value)
@@ -1932,7 +1938,9 @@ def check_utilization(ctx: Context) -> Verdict:
         allowed = (knee["rung"] or knee["knee"]) if knee else 0
         held = _hog_least_held_mb(
             ctx, issued_at.get(model) or published_at.get(model, []))
-        room = (int(boundary - held / slopes[model])
+        # The ledger also withholds its reserve: the least on the model's
+        # grant lines.
+        room = (int(boundary - (held + reserves.get(model, 0)) / slopes[model])
                 if held and model in slopes else None)
         if held and (room is None or room < 1):
             rows.append({**row, "boundary_units": boundary,
