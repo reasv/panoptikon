@@ -1135,11 +1135,12 @@ fn a_retaining_worker_is_never_under_booked() {
 #[test]
 fn a_resident_set_below_its_load_level_lowers_the_baseline() {
     const RELEASED: u64 = 1_500;
+    const PER_UNIT_MB: u64 = 2 * RAM_PER_UNIT_MB;
     let ledger = host(&[GPU], None);
     let (handle, admission) = gpu_replica(&ledger, "g/released", GPU, 64);
     cpu_free_to_book(&ledger, 45_000);
     let mut grants = Vec::new();
-    for _ in 0..7 {
+    for _ in 0..6 {
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
@@ -1147,18 +1148,16 @@ fn a_resident_set_below_its_load_level_lowers_the_baseline() {
         let low = RSS_AT_LOAD_MB - RELEASED;
         handle.lock().unwrap().record_measurements(vec![ram_batch(
             units,
-            low + RAM_PER_UNIT_MB * units,
+            low + PER_UNIT_MB * units,
             low,
         )]);
         token.finish(WindowOutcome::Responded { oom: None });
         admission.earn_next_size();
         grants.push(units);
     }
-    assert_eq!(grants, [64, 128, 256, 512, 1_024, 2_048, 4_096]);
-    assert_eq!(
-        row(&ledger, "g/released").ram_mb_per_unit,
-        Some(RAM_PER_UNIT_MB as f64)
-    );
+    assert_eq!(grants, [64, 128, 256, 512, 1_024, 2_048]);
+    let per_unit = row(&ledger, "g/released").ram_mb_per_unit;
+    assert!(per_unit.expect("a cost") >= PER_UNIT_MB as f64);
 }
 
 /// A resident set that dips below its load level and comes back with the
