@@ -1002,7 +1002,7 @@ fn a_sole_claimants_grant_keeps_the_charge_invariant_in_both_branches() {
     // (a) grants below pool growth: 1000 base + 8500 pool, free 0.
     // external = 10000 - 0 - 9500 = 500; limit = 9500; bonus reserve
     // ceil(500*0.15) = 75; limit_eff = 9425; headroom = 9425 - 9500 = -75;
-    // credit = 8500 - 0; own_room = 8425.
+    // credit = 8500; own_room = 8425.
     let ledger = ledger(10_000, no_margin());
     let handle = loaded(Some(1000), Some(0));
     let admission = ledger

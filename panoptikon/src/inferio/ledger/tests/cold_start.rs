@@ -128,7 +128,7 @@ impl Cold {
     }
 
     /// The frame a Mac worker sends after its window: its pool, and the RAM
-    /// the replicas' bases and `pools_mb`, every pool kept, leave available.
+    /// left after every replica's base and kept pool (`pools_mb`).
     fn report_memory(&self, pools_mb: u64) {
         let Some((device_mb, ram_mb, available_mb)) = self.mac_ram else {
             return;

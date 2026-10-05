@@ -558,7 +558,7 @@ fn ram_kept_after_a_window_is_not_booked_again() {
 /// is moved by the window's whole change, so it never counts less than the
 /// window kept.
 #[test]
-fn a_reading_newer_than_the_window_is_not_moved() {
+fn a_reading_never_counts_less_than_the_window_kept() {
     const OTHERS: u64 = 50_000;
     let ledger = host(&[GPU], None);
     let (handle, admission) = gpu_replica(&ledger, "g/newer", GPU, 256);
@@ -594,7 +594,10 @@ fn a_reading_newer_than_the_window_is_not_moved() {
     reply(RSS_AT_LOAD_MB + 3_000);
     token.finish(WindowOutcome::Responded { oom: None });
     let external = cpu_row(&ledger).external_mb;
-    assert!(external >= OTHERS, "{external} MiB counted, {OTHERS} used");
+    assert!(
+        (OTHERS..=OTHERS + 1_000).contains(&external),
+        "{external} MiB counted, {OTHERS} used"
+    );
 }
 
 /// Batches of one reply may carry one capture time (a coarse clock): the
