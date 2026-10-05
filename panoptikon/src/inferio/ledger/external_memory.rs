@@ -103,7 +103,8 @@ impl VramLedger {
     /// macOS's memory pressure level now; `Normal` on every other OS. On a
     /// Mac every device's memory is its RAM, so the level applies to all of
     /// them. Read without the ledger lock held. A reading at normal ends the
-    /// pressure episode ([`LedgerState::pressure_warned`]).
+    /// pressure episode ([`LedgerState::pressure_warned`],
+    /// [`LedgerState::paging_cut_warned`]).
     pub(super) fn memory_pressure(&self) -> mps::MemoryPressure {
         #[cfg(test)]
         let pressure = {
@@ -115,7 +116,9 @@ impl VramLedger {
         let pressure = mps::memory_pressure();
         // Only macOS reports pressure: elsewhere no episode is ever open.
         if cfg!(any(test, target_os = "macos")) && pressure == mps::MemoryPressure::Normal {
-            self.lock().pressure_warned.clear();
+            let mut state = self.lock();
+            state.pressure_warned.clear();
+            state.paging_cut_warned.clear();
         }
         pressure
     }

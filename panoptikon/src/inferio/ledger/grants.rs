@@ -320,6 +320,12 @@ impl VramLedger {
                 Self::pricing_fit_locked(&state, entry).is_none(),
             )
         });
+        // Once per model, device and paging episode.
+        let paging_cut = pressure.paging()
+            && unit_budget < wanted
+            && issued.as_ref().is_some_and(|(model, ..)| {
+                state.paging_cut_warned.insert((model.clone(), gpu.clone()))
+            });
         drop(state);
         if let Some((model, working_units, deflation, pre_fit)) = issued {
             let canvas = canvas_log_field(canvas_pixels);
@@ -355,6 +361,16 @@ impl VramLedger {
                     ram_mb,
                     ram_mb_per_unit = ?ram_mb_per_unit,
                     "host RAM capped this window below what the GPU could hold"
+                );
+            }
+            if paging_cut {
+                tracing::warn!(
+                    model = %model,
+                    gpu = %gpu,
+                    unit_budget,
+                    asked_units = wanted,
+                    "macOS is paging: this model's batches are cut to the \
+                     memory it holds until the pressure eases"
                 );
             }
         }

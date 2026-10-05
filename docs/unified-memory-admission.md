@@ -358,8 +358,10 @@ Single synthetic device:
   not refused under pressure: refusal on a unified device is judged against
   capacity. A load that starts above normal logs one WARN per model and
   device per episode (until a reading at normal), naming the level and what
-  it does; it does not also log the VRAM-headroom WARN, whose headroom then
-  counts only free pages (none while paging).
+  it does; while paging it does not also log the VRAM-headroom WARN, whose
+  headroom then reads 0. A grant that paging cuts logs its own WARN once
+  per model, device and episode, naming the size it was cut to, so a model
+  already running when the paging begins is named too.
 - **External usage is summed in the RAM domain.** `free` above is
   clipped to a `total` that is `recommended_max_memory()`, so the shipped
   `external = total − free − Σ ours` is arithmetic in two currencies and loses

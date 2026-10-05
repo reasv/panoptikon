@@ -2317,9 +2317,9 @@ async fn while_the_mac_pages_a_load_is_priced_from_a_fresh_reading() {
 }
 
 /// A load under memory pressure warns once per model and device per
-/// episode, at any level; it does not also warn that it needs more VRAM than
-/// the headroom, which counts only free pages then. A reading at normal ends
-/// the episode.
+/// episode, at any level; while macOS pages it does not also warn that it
+/// needs more VRAM than the headroom, which reads 0 then. A reading at
+/// normal ends the episode.
 #[test]
 fn a_load_under_memory_pressure_warns_once_per_model_and_episode() {
     use mps::MemoryPressure::{Normal, Paging, Warning};
@@ -2371,10 +2371,56 @@ fn a_load_under_memory_pressure_warns_once_per_model_and_episode() {
         "over the headroom"
     );
     assert_eq!(
-        warnings(Warning, 500, MPS_GPU, &["g/a", "g/a", "g/a"]),
+        warnings(Warning, 90_000, MPS_GPU, &["g/a", "g/a", "g/a"]),
         1,
-        "a new episode, short of free pages"
+        "a new episode"
     );
+    assert_eq!(
+        warnings(Warning, 0, MPS_GPU, &["g/a"]),
+        1,
+        "over the headroom at warning"
+    );
+}
+
+/// While macOS pages, a grant that paging cuts warns once per model and
+/// device per episode, though its load logged the warning-level line in the
+/// same episode. A reading at normal ends the episode.
+#[test]
+fn a_grant_paging_cuts_warns_once_per_model_and_episode() {
+    use mps::MemoryPressure::{Normal, Paging, Warning};
+    let (ledger, handle, admission) = ramped_mac_replica();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let warnings = |body: &dyn Fn()| {
+        captured_logs(body)
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .count()
+    };
+    ledger.set_memory_pressure_for_test(Warning);
+    let load = || {
+        let load = ledger.reserve_load_signalling_for_test("g/a", item_cost(4), MPS_GPU, None);
+        runtime.block_on(load).expect("a reservation");
+    };
+    assert_eq!(warnings(&load), 1, "the load");
+    // Cut to the 180 MiB pool, then to a 100 MiB one.
+    let cut_twice = || {
+        paging_windows(&ledger, &handle, &admission, Paging, 1);
+        push_ram(&handle, MAC_TOTAL_MB, 90_000, 100, 0);
+        clean_window(&admission);
+    };
+    assert_eq!(warnings(&cut_twice), 1);
+    ledger
+        .lock()
+        .calibration
+        .get_mut(&("g/a".to_owned(), MPS_GPU.to_owned()))
+        .expect("calibrated")
+        .pressure_cap = None;
+    ledger.set_memory_pressure_for_test(Normal);
+    ledger.health();
+    assert_eq!(warnings(&cut_twice), 1, "a new episode");
 }
 
 /// At warning, once the paging has stopped, the batch grows back by doubling

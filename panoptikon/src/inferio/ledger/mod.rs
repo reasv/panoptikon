@@ -1473,6 +1473,9 @@ struct LedgerState {
     /// (model, device) pairs whose load logged the memory pressure WARN in
     /// this pressure episode; a reading at normal ends the episode.
     pressure_warned: HashSet<(String, String)>,
+    /// (model, device) pairs whose grant logged the paging cut WARN in this
+    /// pressure episode.
+    paging_cut_warned: HashSet<(String, String)>,
     /// Once-per-reason guard on the calibration-store skip DEBUG lines.
     profile_skip_logged: HashSet<(String, String, &'static str)>,
     next_id: u64,

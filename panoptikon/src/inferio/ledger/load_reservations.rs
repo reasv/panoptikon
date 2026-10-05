@@ -188,8 +188,8 @@ impl VramLedger {
                  smaller batches until the pressure eases"
             } else {
                 "loading while macOS reports memory pressure: this model \
-                 tries no larger batch size until the pressure is back to \
-                 normal"
+                 runs no batch above its working size until the pressure is \
+                 back to normal"
             };
             tracing::warn!(
                 model = %inference_id,
@@ -210,10 +210,9 @@ impl VramLedger {
             );
         }
         let exceeds_headroom = expected > headroom;
-        // Under memory pressure the headroom counts free pages only (none
-        // while macOS pages), not a VRAM shortage; the pressure line above
-        // says what happens.
-        if exceeds_headroom && pressure == mps::MemoryPressure::Normal {
+        // While macOS pages the headroom reads 0, not a VRAM shortage; the
+        // pressure line above says what happens.
+        if exceeds_headroom && !pressure.paging() {
             tracing::warn!(
                 model = %inference_id,
                 gpu = %gpu,
