@@ -9,16 +9,6 @@ pub(super) fn persistable_anchor(cal: &ModelCalibration) -> u64 {
     cal.max_units_measured_here
 }
 
-/// The trial cadence as it is stored: the trials in a row that left the
-/// working size in place, and the wait for the next rounded down to whole
-/// [`RETEST_WINDOWS`], so a wait is written once per that many windows.
-fn stored_cadence(cal: &ModelCalibration) -> (u32, u32) {
-    (
-        cal.failed_trials,
-        cal.retest_after / RETEST_WINDOWS * RETEST_WINDOWS,
-    )
-}
-
 impl VramLedger {
     /// Prime a (model, GPU)'s calibration from a matched profile. A profile
     /// confers the fit always; the anchor (as a seeded claim) and the working
@@ -59,18 +49,27 @@ impl VramLedger {
         cal.seeded = true;
         // Never overwrite a working size this machine measured. Like the
         // anchor, a stored one is ignored without a fit: it is the size the
-        // run opens at, and nothing could price it. A local one was left in
-        // place by a trial here, and the wait for the next trial carries on.
+        // run opens at, and nothing could price it. The evidence behind a
+        // local one, and the wait for the next probe, carry on under the same
+        // build.
         if !cal.knee_is_local {
             cal.knee_units = seed.knee_units.filter(|_| seed.slope_mb_per_unit > 0.0);
-            if let Some(knee) = cal.knee_units.filter(|_| seed.local) {
-                cal.knee_is_local = true;
-                cal.failed_trials = seed.knee_trials.failed;
-                cal.retest_after = seed.knee_trials.retest_after;
-                // No larger size was ever measured here: memory, or the end
-                // of the run, cut the climb at this one.
-                cal.room_cut = seed.max_units_measured as f64 * SAME_SIZE_RATIO <= knee as f64;
+            cal.knee_is_local = cal.knee_units.is_some() && seed.local;
+            cal.failed_trials = seed.knee_trials.failed;
+            cal.retest_after = seed.knee_trials.retest_after;
+            for size in &seed.sizes {
+                cal.evidence.insert(size.units, *size);
             }
+        }
+        if cal.ram_samples.is_empty() && !seed.ram_ring.is_empty() {
+            cal.ram_samples = seed.ram_ring.iter().copied().collect();
+            cal.ram_startup_mb = seed.ram_startup_mb;
+            cal.ram_first_units = seed.ram_first_units;
+            cal.ram_cost = measurements::ram_cost(
+                cal.ram_samples.make_contiguous(),
+                cal.ram_first_units,
+                cal.ram_startup_mb,
+            );
         }
         if adopt_fit {
             cal.fit = Some(FitSnapshot {
@@ -92,7 +91,6 @@ impl VramLedger {
             cal.anchor_measured_here = false;
         }
         if seed.local {
-            cal.unfinished = seed.knee_rates;
             for sample in seed.ring {
                 cal.samples.push_back(sample);
                 while cal.samples.len() > FIT_RING {
@@ -107,7 +105,6 @@ impl VramLedger {
                 anchor: persistable_anchor(cal),
                 fit_version: cal.fit.map(|fit| fit.version).unwrap_or(0),
                 knee: cal.knee_units.filter(|_| cal.knee_is_local),
-                cadence: stored_cadence(cal),
             });
         }
         tracing::debug!(
@@ -127,7 +124,7 @@ impl VramLedger {
 
     /// The write policy, once per settled window and when the queue runs dry:
     /// an update when the anchor advanced, or the fit, the working size, the
-    /// trial cadence or an unfinished trial's observations changed.
+    /// evidence per size or the wait for the next probe changed.
     /// Requires known `arch`, `torch`, `dtype` and `base_mb`, and
     /// `local_samples > 0`. The fit fields are empty until a local fit exists.
     pub(super) fn pending_update_locked(
@@ -181,18 +178,16 @@ impl VramLedger {
         }
         let before = cal.persisted;
         let fit_version = cal.fit.map(|fit| fit.version).unwrap_or(0);
-        // Only a working size a trial here measured is written; `None` leaves
-        // the stored one as it is.
+        // Only a working size measured here is written; `None` leaves the
+        // stored one as it is.
         let knee = cal.knee_units.filter(|_| cal.knee_is_local);
-        let cadence = stored_cadence(cal);
         let anchor = persistable_anchor(cal);
-        let unfinished = std::mem::take(&mut cal.store_due);
+        let due = std::mem::take(&mut cal.store_due);
         if before.is_some_and(|before| {
             before.fit_version == fit_version
                 && before.anchor >= anchor
                 && (knee.is_none() || before.knee == knee)
-                && before.cadence == cadence
-        }) && !unfinished
+        }) && !due
         {
             return None;
         }
@@ -202,14 +197,12 @@ impl VramLedger {
             anchor: max_units_measured,
             fit_version,
             knee,
-            cadence,
         });
         let fit = cal.fit.filter(|_| cal.fit_is_local);
         let reason = match before {
             Some(before) if before.fit_version != fit_version => "fit_changed",
             Some(before) if knee.is_some() && before.knee != knee => "knee_changed",
-            Some(before) if before.cadence != cadence => "trial_cadence",
-            Some(before) if before.anchor >= anchor => "trial_unfinished",
+            Some(before) if before.anchor >= anchor => "evidence",
             Some(_) => "anchor_advanced",
             None if fit_version > 0 => "fit_changed",
             None => "anchor_advanced",
@@ -239,10 +232,13 @@ impl VramLedger {
             samples: fit.map(|fit| fit.samples).unwrap_or(0),
             knee_units: knee,
             knee_trials: TrialCadence {
-                failed: cadence.0,
-                retest_after: cadence.1,
+                failed: cal.failed_trials,
+                retest_after: cal.retest_after,
             },
-            knee_rates: cal.unfinished.clone(),
+            sizes: cal.evidence.values().copied().collect(),
+            ram_ring: cal.ram_samples.iter().copied().collect(),
+            ram_startup_mb: cal.ram_startup_mb,
+            ram_first_units: cal.ram_first_units,
             max_units_measured,
             local_samples: cal.local_samples,
             ring: cal.samples.iter().copied().collect(),

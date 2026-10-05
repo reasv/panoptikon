@@ -7863,6 +7863,7 @@
           "grants_mb",
           "grants_outstanding",
           "margin",
+          "sizing",
           "workers"
         ],
         "properties": {
@@ -7965,6 +7966,10 @@
           "reserve_rule": {
             "type": "string",
             "description": "`\"user_margin\"` (configured, uncapped), `\"capped_default\"` (default\nfraction, clamped), `\"gpu_floor\"` (3 % of the card, at most 1 GiB,\nwhere the default fraction gives less; not on Apple Silicon),\n`\"flat_default\"` (the cap itself, on a CUDA GPU that spills to system\nRAM) or `\"ram_floor\"` (the CPU device's minimum: a tenth of RAM, at\nmost 16 GiB, at least 2 GiB or a quarter of RAM)."
+          },
+          "sizing": {
+            "type": "string",
+            "description": "How the batch size trades memory for speed: `balanced` or `throughput`."
           },
           "total_mb": {
             "type": "integer",
@@ -9031,7 +9036,7 @@
           },
           "knee_is_local": {
             "type": "boolean",
-            "description": "A trial on this machine measured the sizes next to `knee_units` and\nmoved to it or left it in place, in this run or the one that stored\nit. `false` for a size seeded from a shipped profile and one this\nreplica opened at."
+            "description": "`knee_units` was opened or moved on this machine, in this run or the\none that stored it. `false` for a size seeded from a shipped profile."
           },
           "knee_units": {
             "type": [
@@ -9039,7 +9044,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The working batch size: the smallest whose rate measured within 5 %\nof the best, or the size this replica opened at until a trial has\nmeasured the sizes next to it.",
+            "description": "The working batch size: where the evidence per size put it, or the\nsize this replica opened at.",
             "minimum": 0
           },
           "last_regrow_batch_ms": {
@@ -9143,7 +9148,7 @@
           "retest_after_windows": {
             "type": "integer",
             "format": "int32",
-            "description": "Full windows at `knee_units` still to run before the next trial.",
+            "description": "Windows at `knee_units` still to run before the next probe.",
             "minimum": 0
           },
           "seed_units": {
@@ -9162,7 +9167,7 @@
           },
           "throughput_samples": {
             "type": "integer",
-            "description": "Throughput observations held (all occupancies); runtime-only.",
+            "description": "Windows counted in the evidence per batch size, over every run.",
             "minimum": 0
           },
           "trial_units": {
@@ -9171,7 +9176,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The batch size the trial in progress runs next; absent between trials.",
+            "description": "The batch size the probe in progress runs next; absent between probes.",
             "minimum": 0
           },
           "unit_budget": {

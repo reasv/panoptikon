@@ -894,14 +894,14 @@ fn a_configured_ceiling_overrides_the_cpu_default() {
         VramBudgets::uniform(VramBudget {
             margin: Some(0.0),
             cap_fraction: None,
-            knee_max_bucket_dispersion: None,
+            sizing: None,
         })
         .with_gpu(
             "CPU",
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: Some(0.5),
-                knee_max_bucket_dispersion: None,
+                sizing: None,
             },
         ),
     );
@@ -910,7 +910,7 @@ fn a_configured_ceiling_overrides_the_cpu_default() {
     let section_wide = cpu_ledger(VramBudget {
         margin: Some(0.0),
         cap_fraction: Some(1.0),
-        knee_max_bucket_dispersion: None,
+        sizing: None,
     });
     assert_eq!(section_wide.health()[0].cap_fraction, Some(1.0));
     assert_eq!(
@@ -1439,11 +1439,13 @@ async fn a_load_on_the_cpu_device_of_a_mac_counts_on_the_mps_device() {
 }
 
 /// With MPS sampled peaks, no batch reads warm off `peak_reserved`. Read off
-/// the **post-batch** pool, the ring's warm batches are told from the ones
-/// that grew it: wd-vit's rate is no better at 128 units than at 64, nor at
-/// 256, and within 5 % of its best down to 4 units, where the job ends.
+/// the **post-batch** pool, windows are told apart by whether they grew it:
+/// wd-vit's rate is no better at 128 units than at 64, and the size steps
+/// down while a doubling falls short of its bar, to 16. There doubling to 16
+/// gains nothing and adds a tenth to the batch's memory, whose bar of 0.5 %
+/// the pairs cannot tell from nothing, so it stays.
 #[test]
-fn a_long_job_of_sampled_mps_windows_ends_at_the_smallest_size_near_its_best_rate() {
+fn a_long_job_of_sampled_mps_windows_ends_where_a_doubling_stops_paying() {
     let (ledger, handle, admission) = ramping_from_seed(64);
     let mut budgets = Vec::new();
     for _ in 0..1_200 {
@@ -1454,14 +1456,13 @@ fn a_long_job_of_sampled_mps_windows_ends_at_the_smallest_size_near_its_best_rat
         worker.throughput_samples > 0,
         "the sampler's peak does not disqualify every batch"
     );
-    assert_eq!(worker.knee_units, Some(4));
+    assert_eq!(worker.knee_units, Some(16));
     assert_eq!(
-        (budgets[0], budgets[2], budgets.iter().copied().max()),
-        (64, 128, Some(256)),
-        "one size above was tried, one doubling past it, and no more: {:?}",
+        (budgets[0], budgets.iter().copied().max()),
+        (64, Some(128)),
+        "one size above was tried, and no more: {:?}",
         &budgets[..12]
     );
-    assert_eq!(*budgets.last().expect("windows"), 4);
 }
 
 /// Three warm windows ahead of the same job change nothing.
@@ -1476,9 +1477,8 @@ fn three_warm_windows_do_not_decide_the_budget_for_the_whole_job() {
         budgets.push(mps_sampled_window(&handle, &admission, &WDVIT_M3_MAX));
     }
     let worker = &ledger.health()[0].workers[0];
-    assert_eq!(worker.knee_units, Some(4));
-    assert_eq!(*budgets.last().expect("windows"), 4);
-    assert!(budgets.iter().all(|units| *units <= 256));
+    assert_eq!(worker.knee_units, Some(16));
+    assert!(budgets.iter().all(|units| *units <= 128));
 }
 /// The **ceiling** half of `limit = min(recommended_max, memsize - external -
 /// reserve)`, swept: wherever more RAM is free than Metal will hand out, the
@@ -1617,7 +1617,8 @@ fn the_pool_is_in_the_room_and_in_the_charge_so_only_free_ram_is_admitted() {
     token.finish(WindowOutcome::Responded { oom: None });
 }
 
-/// A Mac replica ramped 4 → 64 on an idle machine, its next budget 128.
+/// A Mac replica ramped 4 → 64 on an idle machine, a probe of 128 its next
+/// window.
 fn ramped_mac_replica() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
     let ledger = mps_ledger();
     let handle = loaded_mps(Some(MAC_TOTAL_MB));
@@ -1625,10 +1626,11 @@ fn ramped_mac_replica() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("registers");
     push_ram(&handle, MAC_TOTAL_MB, 90_000, 0, 0);
-    let ramped: Vec<u64> = (0..6)
+    let ramped: Vec<u64> = (0..200)
         .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
+        .take_while(|_| ledger.trial_for_test("g/a", MPS_GPU).0 != Some(128))
         .collect();
-    assert_eq!(ramped, [4, 4, 8, 16, 32, 64]);
+    assert_eq!(ramp_figures(&ledger).0, Some(64), "{ramped:?}");
     (ledger, handle, admission)
 }
 
@@ -1907,14 +1909,14 @@ fn at_warning_without_paging_the_batch_size_is_held() {
     let held: Vec<u64> = (0..3)
         .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
         .collect();
-    assert_eq!(held, [128, 64, 64], "the trial under way is put off");
+    assert_eq!(held, [128, 64, 64], "the probe under way is put off");
     let (size_during, _, samples_during, _) = ramp_figures(&ledger);
-    assert_eq!(size_during, Some(64), "what the trial had measured");
+    assert_eq!(size_during, Some(64), "what the probes had measured");
     assert!(samples_during <= samples);
     assert_eq!(
         ledger.trial_for_test("g/a", MPS_GPU),
         (None, RETEST_WINDOWS, 0),
-        "put off, not counted as a trial that left the size in place"
+        "put off, not counted as a probe that left the size in place"
     );
     let reached =
         ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].max_units_measured_here;
@@ -1939,7 +1941,11 @@ fn at_warning_without_paging_the_batch_size_is_held() {
         after[..RETEST_WINDOWS as usize],
         [64; RETEST_WINDOWS as usize]
     );
-    assert_eq!(after[RETEST_WINDOWS as usize..], [128, 256, 256]);
+    assert_eq!(
+        after[RETEST_WINDOWS as usize..],
+        [64, 64, 128],
+        "the probe again"
+    );
 }
 
 /// Pressure at either end of a window marks it: at the grant only, or at the
@@ -1956,7 +1962,7 @@ fn a_window_under_pressure_at_either_end_earns_no_step() {
         ledger.set_memory_pressure_for_test(at_settle);
         let rate = ladder_rate(&MINILM_M3_MAX, 128);
         let mut batches = vec![BatchMeasurement {
-            duration_ms: Some(128.0 * 1000.0 / rate),
+            duration_ms: Some(batch_ms(128, rate)),
             ..measurement(128, 0, 10 * 128 + 100)
         }];
         batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| warm_batch(128, rate)));

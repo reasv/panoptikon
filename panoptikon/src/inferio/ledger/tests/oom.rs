@@ -1031,6 +1031,7 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
         byte_bound: false,
         ram_mb: 0,
         ram_bound: false,
+        ram_held: false,
         pressure: mps::MemoryPressure::Normal,
         item_cap: None,
     };
@@ -1125,6 +1126,7 @@ fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
         byte_bound: false,
         ram_mb: 0,
         ram_bound: false,
+        ram_held: false,
         pressure: mps::MemoryPressure::Normal,
         item_cap: None,
     };

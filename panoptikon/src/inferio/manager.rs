@@ -2742,7 +2742,10 @@ metadata.cost.seed_units = 1000000
             samples: 3,
             knee_units: None,
             knee_trials: Default::default(),
-            knee_rates: Vec::new(),
+            sizes: Vec::new(),
+            ram_ring: Vec::new(),
+            ram_startup_mb: 0,
+            ram_first_units: 0,
             max_units_measured: 16,
             local_samples: 3,
             ring: vec![FitSample {

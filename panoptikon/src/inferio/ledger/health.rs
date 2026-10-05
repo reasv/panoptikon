@@ -61,9 +61,14 @@ impl VramLedger {
                             shape_ceiling_units: shape_ceiling,
                             death_cap_units: cal.and_then(|cal| cal.death_cap_units),
                             knee_is_local: cal.is_some_and(|cal| cal.knee_is_local),
-                            trial_units: cal.and_then(|cal| cal.trial).map(|trial| trial.run),
+                            trial_units: cal.and_then(|cal| cal.probe).map(|probe| probe.run),
                             retest_after_windows: cal.map_or(0, |cal| cal.retest_after),
-                            throughput_samples: cal.map(|cal| cal.throughput.len()).unwrap_or(0),
+                            throughput_samples: cal.map_or(0, |cal| {
+                                cal.evidence
+                                    .values()
+                                    .map(|size| size.windows as usize)
+                                    .sum()
+                            }),
                             local_samples: cal.map(|cal| cal.local_samples).unwrap_or(0),
                             effective_margin: self.effective_margin_locked(state, entry),
                             ram_resident_mb: entry.has_ram_side().then(|| entry.ram_resident_mb()),
@@ -110,6 +115,13 @@ impl VramLedger {
                         .sum(),
                     margin: self.budgets.for_gpu(uuid).margin_in_force(),
                     cap_fraction: self.budgets.for_gpu(uuid).cap_fraction,
+                    sizing: self
+                        .budgets
+                        .for_gpu(uuid)
+                        .sizing
+                        .unwrap_or_default()
+                        .as_str()
+                        .to_owned(),
                     workers,
                 }
             })
@@ -164,6 +176,8 @@ pub struct GpuBudgetHealth {
     pub grants_outstanding: usize,
     pub margin: f64,
     pub cap_fraction: Option<f64>,
+    /// How the batch size trades memory for speed: `balanced` or `throughput`.
+    pub sizing: String,
     pub workers: Vec<LedgerWorkerHealth>,
 }
 
@@ -217,25 +231,22 @@ pub struct LedgerWorkerHealth {
     pub unit_budget: u64,
     /// Ratchet anchor: largest locally measured clean priced batch.
     pub max_units_measured: u64,
-    /// The working batch size: the smallest whose rate measured within 5 %
-    /// of the best, or the size this replica opened at until a trial has
-    /// measured the sizes next to it.
+    /// The working batch size: where the evidence per size put it, or the
+    /// size this replica opened at.
     pub knee_units: Option<u64>,
-    /// A trial on this machine measured the sizes next to `knee_units` and
-    /// moved to it or left it in place, in this run or the one that stored
-    /// it. `false` for a size seeded from a shipped profile and one this
-    /// replica opened at.
+    /// `knee_units` was opened or moved on this machine, in this run or the
+    /// one that stored it. `false` for a size seeded from a shipped profile.
     pub knee_is_local: bool,
-    /// The batch size the trial in progress runs next; absent between trials.
+    /// The batch size the probe in progress runs next; absent between probes.
     pub trial_units: Option<u64>,
-    /// Full windows at `knee_units` still to run before the next trial.
+    /// Windows at `knee_units` still to run before the next probe.
     pub retest_after_windows: u32,
     /// Shape ceiling from `index_limit` clamps: caps `unit_budget`; runtime-only.
     pub shape_ceiling_units: Option<u64>,
     /// Half the batch a replica of this model was running here when its
     /// process died mid-window: caps `unit_budget` until the server restarts.
     pub death_cap_units: Option<u64>,
-    /// Throughput observations held (all occupancies); runtime-only.
+    /// Windows counted in the evidence per batch size, over every run.
     pub throughput_samples: usize,
     /// Local fit samples, including restored ones; the margin widens below
     /// `LOCAL_CONFIRMATION_SAMPLES`.

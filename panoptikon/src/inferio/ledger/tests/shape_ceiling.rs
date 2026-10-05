@@ -234,28 +234,27 @@ fn a_batch_that_ran_wider_uncut_retires_the_shape_ceiling() {
 #[test]
 fn no_size_is_earned_past_the_shape_ceiling() {
     let rising = |units: u64| units as f64;
-    // Control: no ceiling, and a rate that rises earns a size per window.
+    // Control: no ceiling, and a rate that rises earns a size per probe.
     let (ledger, handle, admission) = clippable(4);
-    let budgets: Vec<u64> = (0..7)
-        .map(|_| window_at_the_rate(&handle, &admission, rising))
-        .collect();
-    assert_eq!(budgets, [4, 4, 8, 16, 32, 64, 128]);
-    assert_eq!(ledger.health()[0].workers[0].trial_units, Some(256));
+    for _ in 0..40 {
+        window_at_the_rate(&handle, &admission, rising);
+    }
+    assert!(ledger.health()[0].workers[0].knee_units > Some(16));
     drop(admission);
 
     // The same windows under a ceiling of 16: the size climbs *to* it, 4,
     // 8, 16, and stops.
     let (ledger, handle, admission) = clippable(4);
     clipped_window(&handle, &admission, 16);
-    for _ in 0..7 {
+    for _ in 0..40 {
         let granted = window_at_the_rate(&handle, &admission, rising);
         assert!(granted <= 16, "granted {granted}");
     }
     let worker = &ledger.health()[0].workers[0];
     assert_eq!(
-        (worker.knee_units, worker.trial_units),
-        (Some(16), None),
-        "the trial of 32 never ran, so 32 was never earned"
+        worker.knee_units,
+        Some(16),
+        "the probe of 32 never ran, so 32 was never earned"
     );
     assert_eq!(worker.unit_budget, 16);
 
@@ -411,7 +410,10 @@ fn a_shape_ceiling_never_survives_a_restart() {
             samples: last.samples,
             knee_units: last.knee_units,
             knee_trials: last.knee_trials,
-            knee_rates: Vec::new(),
+            sizes: Vec::new(),
+            ram_ring: Vec::new(),
+            ram_startup_mb: 0,
+            ram_first_units: 0,
             local: true,
             fit_is_local: true,
             exact_torch: true,

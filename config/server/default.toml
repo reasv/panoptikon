@@ -103,18 +103,19 @@ auto_setup = "${PANOPTIKON_AUTO_SETUP:-true}"
 # Hard ceiling as a fraction of the GPU's total VRAM, for sharing one card
 # between services. Default: off.
 # cap_fraction = 0.90
-# How far throughput measurements in one batch-size bucket may disagree
-# (relative MAD) before the batch-size knee is not fitted. Default 0.20 on a
-# GPU, 0.35 on the CPU; a value here applies to both, so to change a single
-# device use its override table below.
-# knee_max_bucket_dispersion = 0.20
+# How the batch size trades memory for speed. "balanced" (default) doubles a
+# batch only for a measured speed-up of 5 % per doubling of its memory on a
+# GPU, 15 % on the CPU or unified memory; "throughput" for any clear one (2 %)
+# on every device, still inside the reserve.
+# sizing = "balanced"
 
 # Per-device overrides, keyed by GPU UUID (`nvidia-smi -L`) or "CPU"; absent
 # keys inherit the section above. Uncomment a header together with its keys.
 # [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
 # margin = 0.25
+# sizing = "throughput"
 # [inference_local.vram.gpu."CPU"]
-# knee_max_bucket_dispersion = 0.35
+# cap_fraction = 0.50
 
 [search]
 # Size of the in-process embedding cache used by search preprocessing.

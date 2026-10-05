@@ -616,7 +616,8 @@ pub(crate) async fn run_dispatcher(
                 },
             };
             replica.last_grant = plan.grant.as_ref().map(|token| *token.grant());
-            let share = match window_target {
+            let in_flight_target = replica.admission.as_ref().map(Admission::in_flight_units);
+            let share = match in_flight_target {
                 // Clamp the target, not `bounds.units`, which already carries
                 // the previous clamp and would never unsqueeze.
                 Some(target) => desired_in_flight_items(
@@ -1886,7 +1887,7 @@ mod tests {
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
-                knee_max_bucket_dispersion: None,
+                sizing: None,
             },
         );
         let replica = priced_replica(&ledger, TEST_GPU, impl_class, cost, refuses_trim).await;
@@ -2087,7 +2088,7 @@ mod tests {
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
-                knee_max_bucket_dispersion: None,
+                sizing: None,
             },
         );
         let cost = item_cost(8);
@@ -2250,7 +2251,7 @@ mod tests {
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
-                knee_max_bucket_dispersion: None,
+                sizing: None,
             },
         );
         let replica = priced_replica(&ledger, TEST_GPU, "batchsize_test", cost, false).await;

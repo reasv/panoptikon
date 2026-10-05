@@ -294,17 +294,17 @@ fn vram_budgets(
     let mut budgets = super::ledger::VramBudgets::uniform(super::ledger::VramBudget {
         margin: config.margin,
         cap_fraction: config.cap_fraction,
-        knee_max_bucket_dispersion: config.knee_max_bucket_dispersion,
+        sizing: config.sizing,
     });
     budgets.spills_to_ram = spills_to_ram;
     for uuid in config.gpu.keys() {
-        let (margin, cap_fraction, knee_max_bucket_dispersion) = config.for_gpu(uuid);
+        let (margin, cap_fraction, sizing) = config.for_gpu(uuid);
         budgets = budgets.with_gpu(
             uuid.clone(),
             super::ledger::VramBudget {
                 margin,
                 cap_fraction,
-                knee_max_bucket_dispersion,
+                sizing,
             },
         );
     }
@@ -2343,7 +2343,10 @@ metadata.cost.unit = "none"
             samples: 38,
             knee_units: Some(512),
             knee_trials: Default::default(),
-            knee_rates: Vec::new(),
+            sizes: Vec::new(),
+            ram_ring: Vec::new(),
+            ram_startup_mb: 0,
+            ram_first_units: 0,
             max_units_measured: 1024,
             local_samples: 12,
             ring: Vec::new(),

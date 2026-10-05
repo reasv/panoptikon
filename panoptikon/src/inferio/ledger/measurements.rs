@@ -353,7 +353,9 @@ impl VramLedger {
         let mut ram_samples: Vec<FitSample> = Vec::new();
         let mut ram_after: Option<(u64, Instant)> = None;
         let mut margin_samples: Vec<(u64, f64)> = Vec::new();
-        let mut throughput: Vec<ThroughputSample> = Vec::new();
+        // The window's rate: units and seconds of the batches that count.
+        let (mut rate_units, mut rate_secs, mut rate_warmup) = (0u64, 0.0, false);
+        let mut throughput_samples = 0usize;
         let mut anchor = 0u64;
         // "Ran at its budget", for the gain rule and the throughput ring:
         // [`FULL_BATCH_RATIO`] of the admitted (post-squeeze) unit budget, or
@@ -624,13 +626,10 @@ impl VramLedger {
                 && duration_ms > 0.0
                 && (units >= full_batch || measurement.next_over_budget)
             {
-                throughput.push(ThroughputSample {
-                    units,
-                    units_per_sec: units as f64 * 1000.0 / (duration_ms * wall_ratio),
-                    occupants,
-                    grew_pool,
-                    warmup: warmup_window || ran_batches <= KNEE_WARMUP_BATCHES,
-                });
+                throughput_samples += 1;
+                rate_units = rate_units.saturating_add(units);
+                rate_secs += duration_ms * wall_ratio / 1000.0;
+                rate_warmup |= warmup_window || ran_batches <= KNEE_WARMUP_BATCHES;
             }
             // Every clean priced batch is a fit sample of the envelope
             // `peak_allocated − allocated_at_load`, which is what a grant reserves.
@@ -796,7 +795,6 @@ impl VramLedger {
             }
         }
         let fit_sample_count = fit_samples.len();
-        let throughput_samples = throughput.len();
         let ceiling_identity = key.clone();
         let cal = state.calibration.entry(key).or_default();
         // The shape ceiling first.
@@ -880,12 +878,6 @@ impl VramLedger {
         {
             cal.max_units_measured_here = anchor;
         }
-        for sample in throughput {
-            cal.throughput.push_back(sample);
-            while cal.throughput.len() > KNEE_RING {
-                cal.throughput.pop_front();
-            }
-        }
         // Local samples ingested, not ring entries, for the confirmation gate.
         cal.local_samples = cal
             .local_samples
@@ -893,6 +885,12 @@ impl VramLedger {
         Ingested {
             negative,
             fit_samples: fit_sample_count,
+            rate: (throughput_samples > 0).then_some(WindowRate {
+                units: rate_units,
+                secs: rate_secs,
+                contended: !sole_occupancy,
+                warmup: rate_warmup,
+            }),
             at_budget: !queue_bound && !pressure && ran_full,
             filled: !queue_bound && !ram_bound && ran_full,
             throughput_samples,
@@ -971,6 +969,19 @@ impl VramLedger {
 /// median pairwise slope, intercept the median of `y − slope·x`, residual the
 /// median absolute deviation. `None` with fewer than [`MIN_FIT_SAMPLES`]
 /// samples, no two distinct unit counts, or a non-positive slope.
+pub(super) fn median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    Some(if values.len().is_multiple_of(2) {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    })
+}
+
 pub(super) fn robust_fit(samples: &[FitSample]) -> Option<FitSnapshot> {
     if samples.len() < MIN_FIT_SAMPLES {
         return None;

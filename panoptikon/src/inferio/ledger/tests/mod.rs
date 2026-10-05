@@ -17,7 +17,6 @@ use super::oom::{
     OOM_SOURCE_ERROR_FRAME, OOM_SOURCE_MARKER, OOM_SOURCE_MESSAGE_PATTERN, OOM_SOURCE_TYPED,
     OOM_SOURCE_UNCLASSIFIED, OomTrust,
 };
-use super::ramp::{faster, placed, quiet_rate, relative_mad};
 use super::test_hooks::CalibrationState;
 
 const GPU: &str = "GPU-aaaa";
@@ -151,7 +150,7 @@ fn user_margin(margin: f64) -> VramBudget {
     VramBudget {
         margin: Some(margin),
         cap_fraction: None,
-        knee_max_bucket_dispersion: None,
+        sizing: None,
     }
 }
 
@@ -236,7 +235,10 @@ fn seeded_anchor(anchor: u64, local: bool) -> ProfileSeed {
         samples: 20,
         knee_units: Some(anchor),
         knee_trials: Default::default(),
-        knee_rates: Vec::new(),
+        sizes: Vec::new(),
+        ram_ring: Vec::new(),
+        ram_startup_mb: 0,
+        ram_first_units: 0,
         local,
         fit_is_local: local,
         exact_torch: true,
@@ -518,27 +520,11 @@ fn loaded_on_cpu(total_mb: Option<u64>) -> TelemetryHandle {
     Arc::new(StdMutex::new(telemetry))
 }
 
-/// `count` observations of one batch size running at `units_per_sec`.
-fn rate(units: u64, units_per_sec: f64, count: usize) -> Vec<ThroughputSample> {
-    vec![
-        ThroughputSample {
-            units,
-            units_per_sec,
-            occupants: 0,
-            grew_pool: Some(false),
-            warmup: false,
-        };
-        count
-    ]
-}
-
-/// The rate the ring holds for batch size `size`, from the observations
-/// comparable with its newest one.
-fn ring_rate(ring: &VecDeque<ThroughputSample>, size: u64, band: f64) -> Option<f64> {
-    quiet_rate(
-        &super::ramp::rates_at(&super::ramp::comparable(ring), size, size / 2),
-        band,
-    )
+/// Milliseconds a batch of `units` takes at `units_per_sec`, a thousand
+/// times slowed: the real time a test spends between a grant and its settle,
+/// which a window's time includes, stays far below its batches'.
+fn batch_ms(units: u64, units_per_sec: f64) -> f64 {
+    units as f64 * 1_000_000.0 / units_per_sec
 }
 
 /// A **warm-pool** batch carrying no allocator reading: it reaches the
@@ -549,28 +535,9 @@ fn warm_batch(units: u64, units_per_sec: f64) -> BatchMeasurement {
         units: Some(units),
         reserved_before_mb: Some(1000),
         peak_reserved_mb: Some(1000),
-        duration_ms: Some(units as f64 * 1000.0 / units_per_sec),
+        duration_ms: Some(batch_ms(units, units_per_sec)),
         ..BatchMeasurement::default()
     }
-}
-
-/// One observation as the ledger recorded it: `(units, units/sec, the
-/// replica's window index)`.
-type Recorded = (u64, f64, u64);
-
-/// A recorded series as the ring holds it, with the replica's first window
-/// marked warm-up.
-fn recorded(series: &[Recorded]) -> VecDeque<ThroughputSample> {
-    series
-        .iter()
-        .map(|(units, rate_, window)| ThroughputSample {
-            units: *units,
-            units_per_sec: *rate_,
-            occupants: 0,
-            grew_pool: Some(false),
-            warmup: *window == 0,
-        })
-        .collect()
 }
 
 /// A ledger whose models are all pre-seeded with a 1 MiB/unit fit, so two
@@ -585,7 +552,10 @@ fn priced_ledger(total_mb: u64) -> Arc<VramLedger> {
             samples: 20,
             knee_units: None,
             knee_trials: Default::default(),
-            knee_rates: Vec::new(),
+            sizes: Vec::new(),
+            ram_ring: Vec::new(),
+            ram_startup_mb: 0,
+            ram_first_units: 0,
             local: false,
             fit_is_local: false,
             exact_torch: true,
@@ -643,17 +613,6 @@ fn ladder_rate(ladder: &[(u64, f64)], units: u64) -> f64 {
     }
     last.1
 }
-
-/// CLIP on an M3 Max: 125.5 items/s at 16 units against 118.7 at 512, for
-/// 11.2x the memory.
-const CLIP_M3_MAX: [(u64, f64); 6] = [
-    (1, 27.9),
-    (8, 113.4),
-    (16, 125.5),
-    (64, 122.9),
-    (256, 119.1),
-    (512, 118.7),
-];
 
 /// wd-vit on the same host and the same probe: the model whose bottom is
 /// nearly flat — 26.7 at 1 unit against 29.9 at 8 — while still climbing.
@@ -713,7 +672,7 @@ fn queued_window_at_the_rate(
     let granted = token.grant().unit_budget;
     let rate_ = rate_at(granted);
     let mut batches = vec![BatchMeasurement {
-        duration_ms: Some(granted as f64 * 1000.0 / rate_),
+        duration_ms: Some(batch_ms(granted, rate_)),
         ..measurement(granted, 0, 10 * granted + 100)
     }];
     batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| warm_batch(granted, rate_)));
@@ -737,7 +696,7 @@ fn mps_sampled_window(
     let rate = ladder_rate(ladder, granted);
     let batches = (0..WINDOW_DEPTH_MULTIPLIER)
         .map(|_| BatchMeasurement {
-            duration_ms: Some(granted as f64 * 1000.0 / rate),
+            duration_ms: Some(batch_ms(granted, rate)),
             reserved_after_mb: Some(1_000),
             ..measurement(granted, 1_000, 10 * granted + 1_000)
         })

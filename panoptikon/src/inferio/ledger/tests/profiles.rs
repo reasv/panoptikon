@@ -15,7 +15,10 @@ fn a_shipped_profiles_anchor_caps_growth_and_does_not_open_the_run() {
             samples: 20,
             knee_units: None,
             knee_trials: Default::default(),
-            knee_rates: Vec::new(),
+            sizes: Vec::new(),
+            ram_ring: Vec::new(),
+            ram_startup_mb: 0,
+            ram_first_units: 0,
             local: false,
             fit_is_local: false,
             exact_torch: true,
@@ -79,7 +82,10 @@ fn a_seeded_anchor_is_never_written_back_as_this_machines_own() {
             samples: 20,
             knee_units: Some(512),
             knee_trials: Default::default(),
-            knee_rates: Vec::new(),
+            sizes: Vec::new(),
+            ram_ring: Vec::new(),
+            ram_startup_mb: 0,
+            ram_first_units: 0,
             local: false,
             fit_is_local: false,
             exact_torch: true,
@@ -222,7 +228,10 @@ fn an_oom_halves_a_seeded_anchor_but_not_a_measured_one() {
                 samples: 20,
                 knee_units: None,
                 knee_trials: Default::default(),
-                knee_rates: Vec::new(),
+                sizes: Vec::new(),
+                ram_ring: Vec::new(),
+                ram_startup_mb: 0,
+                ram_first_units: 0,
                 local: true,
                 fit_is_local: true,
                 exact_torch: true,
@@ -504,7 +513,10 @@ fn a_profile_from_another_sku_of_this_architecture_prices_and_opens_it() {
             samples: 20,
             knee_units: Some(4096),
             knee_trials: Default::default(),
-            knee_rates: Vec::new(),
+            sizes: Vec::new(),
+            ram_ring: Vec::new(),
+            ram_startup_mb: 0,
+            ram_first_units: 0,
             // Measured on a 32 GB card of this architecture; this host's
             // card holds 12 GB. Not local: it is not this machine's own.
             local: false,
@@ -602,7 +614,10 @@ fn a_local_profile_resumes_the_measured_range() {
             samples: 6,
             knee_units: Some(64),
             knee_trials: Default::default(),
-            knee_rates: Vec::new(),
+            sizes: Vec::new(),
+            ram_ring: Vec::new(),
+            ram_startup_mb: 0,
+            ram_first_units: 0,
             local: true,
             fit_is_local: true,
             exact_torch: true,
@@ -647,7 +662,10 @@ fn seeding_happens_once_per_model_and_gpu() {
             samples: 6,
             knee_units: None,
             knee_trials: Default::default(),
-            knee_rates: Vec::new(),
+            sizes: Vec::new(),
+            ram_ring: Vec::new(),
+            ram_startup_mb: 0,
+            ram_first_units: 0,
             local: true,
             fit_is_local: true,
             exact_torch: true,
@@ -726,7 +744,10 @@ fn the_write_policy_fires_on_evidence_not_per_window() {
         "the ring rides along so a restart refits"
     );
 
-    // More clean windows that measure nothing again change nothing.
+    // More clean windows that measure nothing again change nothing, once the
+    // size the last window moved to is written.
+    clean_window(&admission);
+    let written = profiles.updates.lock().unwrap().len();
     for _ in 0..5 {
         clean_window(&admission);
     }
@@ -758,7 +779,10 @@ fn a_fallback_matched_local_profile_confers_growth_but_not_confirmation() {
             samples: 6,
             knee_units: None,
             knee_trials: Default::default(),
-            knee_rates: Vec::new(),
+            sizes: Vec::new(),
+            ram_ring: Vec::new(),
+            ram_startup_mb: 0,
+            ram_first_units: 0,
             local: true,
             fit_is_local: true,
             // The store fell back across torch builds to find this.
@@ -873,7 +897,10 @@ fn a_seeded_fit_is_never_laundered_into_local_provenance() {
             samples: 20,
             knee_units: None,
             knee_trials: Default::default(),
-            knee_rates: Vec::new(),
+            sizes: Vec::new(),
+            ram_ring: Vec::new(),
+            ram_startup_mb: 0,
+            ram_first_units: 0,
             // A shipped baseline: pricing, nothing else.
             local: false,
             fit_is_local: false,

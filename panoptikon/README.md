@@ -461,7 +461,7 @@ enabled = true
 # [inference_local.vram]  # per-GPU admission budget (see below)
 # margin = 0.10           # headroom over OTHER processes' VRAM usage
 # cap_fraction = 0.90     # hard ceiling as a fraction of total VRAM (off by default)
-# knee_max_bucket_dispersion = 0.20   # how noisy a batch-size bucket may be and still knee
+# sizing = "balanced"    # "balanced" | "throughput": what a larger batch must gain
 
 # [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
 # margin = 0.25           # per-gpu override; absent keys inherit
@@ -494,14 +494,14 @@ set, the admission budget is the smaller:
   running the machine out of RAM is an OS process kill rather than a catchable
   allocation failure. Setting it — here or under
   `[inference_local.vram.gpu."CPU"]` — replaces that default.
-- **`knee_max_bucket_dispersion`** (default `0.20`, or `0.35` on the `CPU`
-  device) — how far the throughput measurements inside one batch-size bucket
-  may disagree, as a relative median absolute deviation, before the
-  batch-size knee refuses to read the curve at all. The default was derived
-  from quiet GPU series at 0.003 and 0.052; a quiet CPU host measures
-  0.13–0.20 in the buckets the ramp lives in, which is why that device ships
-  its own. Raise it on a host whose CPU inference never settles on a knee;
-  lower it to make the knee harder to fit.
+- **`sizing`** (default `"balanced"`) — what a larger batch must gain before
+  it is used. Balanced doubles a batch only for a measured speed-up of 5 %
+  per doubling of its memory on a GPU, 15 % on the `CPU` device and on
+  unified memory (Apple Silicon, APUs), where memory is shared with
+  everything else. `"throughput"` takes any clear gain (2 %) on every device,
+  for a dedicated server where memory costs nothing; the reserve and the
+  pressure rules still apply. Set it per device under
+  `[inference_local.vram.gpu."<id>"]`.
 
 A model on a GPU is sized against host RAM as well. The RAM its batches use
 for decoded inputs, preprocessing and outputs is booked against the `CPU`

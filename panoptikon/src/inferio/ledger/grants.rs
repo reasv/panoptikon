@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 
 use super::*;
 use crate::log_throttle::LogThrottle;
+use ramp::admitted_units;
 
 /// The settle line's `clamped` field: `none`, or each clamp reason in
 /// first-seen order joined by `+` (a clamp naming no reason is `memory`).
@@ -43,6 +44,28 @@ impl VramLedger {
         Self::budget_locked(&state, entry)
             .saturating_mul(WINDOW_DEPTH_MULTIPLIER)
             .max(1)
+    }
+
+    /// Units the caller should keep in flight, as one window's target: that
+    /// of the larger size while a probe is on, so the caller already holds
+    /// enough for it when the probe turns to it.
+    pub(super) fn in_flight_units(&self, worker: WorkerId) -> u64 {
+        let state = self.lock();
+        let Some(entry) = state.workers.get(&worker) else {
+            return 1;
+        };
+        let probe = cal_locked(&state, entry).and_then(|cal| cal.probe);
+        let size = probe.map_or(Self::size_locked(&state, entry), |probe| {
+            probe.lo.saturating_mul(2)
+        });
+        let admitted = admitted_units(
+            entry,
+            size,
+            Self::anchor_locked(&state, entry),
+            Self::batch_ceiling_locked(&state, entry),
+        );
+        let budget = Self::budget_locked(&state, entry).max(admitted);
+        budget.saturating_mul(WINDOW_DEPTH_MULTIPLIER).max(1)
     }
 
     /// Items the dispatcher may put in one window. Under an item cap
@@ -130,6 +153,7 @@ impl VramLedger {
             queue_bound,
             ram_mb,
             ram_bound,
+            ram_held,
             ram_mb_per_unit,
             fixed_mb,
         ) = {
@@ -175,16 +199,21 @@ impl VramLedger {
             // would; the GPU side above is unchanged.
             let ram = self.ram_ceiling_locked(&state, entry);
             let ram_bound = ram.is_some_and(|ram| ram.units < units);
+            // The room set it, at a cost fitted up to that size.
+            let ram_held = ram.filter(|_| ram_bound).is_some_and(|ram| {
+                ram.cost
+                    .is_some_and(|cost| cost.fitted && ram.units <= cost.fitted_reach())
+            });
             if let Some(ram) = ram.filter(|_| ram_bound) {
                 units = ram.units;
                 if let Some(price) = price {
                     mb = price.cost_mb(units);
                 }
             }
-            // A trial's look-ahead is run in full or not at all.
+            // A probe's size above the working size is run in full or not at all.
             if units < wanted
                 && (squeezed || ram_bound)
-                && let Some(working) = Self::look_ahead_from_locked(&state, entry)
+                && let Some(working) = Self::probe_floor_locked(&state, entry)
                 && working < units
             {
                 units = working;
@@ -207,6 +236,7 @@ impl VramLedger {
                 wanted < capped,
                 ram_mb,
                 ram_bound,
+                ram_held,
                 ram_mb_per_unit,
                 price.map_or(0, |price| price.fixed_mb as u64),
             )
@@ -257,6 +287,7 @@ impl VramLedger {
                     byte_bound,
                     ram_mb,
                     ram_bound,
+                    ram_held,
                     pressure,
                     item_cap,
                 },
@@ -497,7 +528,14 @@ impl VramLedger {
             .flatten();
         if !matches!(outcome, WindowOutcome::Aborted) {
             let failed = responded_negative || died;
-            self.note_gain_locked(&mut state, worker, charge, ingested.at_budget, failed);
+            self.note_gain_locked(
+                &mut state,
+                worker,
+                charge,
+                ingested.rate,
+                ingested.at_budget,
+                failed,
+            );
         }
         // Any OOM or death lowers a seeded anchor, unless the unified-memory
         // death path already halved it.

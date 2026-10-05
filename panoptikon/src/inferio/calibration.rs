@@ -110,19 +110,62 @@ pub struct CalibrationProfile {
     pub knee_trials_failed: u32,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub knee_retest_after: u32,
-    /// What a batch size trial had measured when its run ended, as parallel
-    /// arrays: a batch of `knee_rate_units[i]` units ran at `knee_rates[i]`
-    /// units a second. The next start goes on from them.
+    /// What the windows at each batch size have shown on this machine, under
+    /// the panoptikon build in `generator` and the torch in `torch`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub knee_rate_units: Vec<u64>,
+    pub sizes: Vec<SizeEvidence>,
+    /// A GPU replica's host RAM samples as parallel arrays (`ram_units[i]`
+    /// units grew the resident set `ram_delta_mb[i]` MiB), with what a
+    /// replica's first batch kept and that batch's units.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub knee_rates: Vec<f64>,
+    pub ram_units: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ram_delta_mb: Vec<u64>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub ram_startup_mb: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub ram_first_units: u64,
     /// The fit sample ring as parallel arrays: `sample_units[i]` units
     /// allocated `sample_delta_mb[i]` MiB over `allocated_at_load`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sample_units: Vec<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sample_delta_mb: Vec<u64>,
+}
+
+/// What the windows at one batch size have shown on this machine
+/// (`VramLedger::note_gain_locked`): its rate as totals, and the pairs that
+/// compare it with twice its size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SizeEvidence {
+    pub units: u64,
+    /// Windows at this size that ran at their budget, the units they ran and
+    /// their seconds from grant to settle.
+    pub windows: u32,
+    pub unit_total: f64,
+    pub secs: f64,
+    /// Pairs of adjacent windows at this size and twice it, as a weight, with
+    /// the sum and the sum of squares of the log of the larger size's rate
+    /// over this size's.
+    pub pairs: f64,
+    pub gain: f64,
+    pub gain_sq: f64,
+}
+
+impl SizeEvidence {
+    /// Rounded as the store keeps it: a millisecond, a millionth of a pair
+    /// or of a log gain.
+    fn rounded(self) -> Self {
+        let round = |value: f64, scale: f64| (value * scale).round() / scale;
+        Self {
+            unit_total: self.unit_total.round(),
+            secs: round(self.secs, 1e3),
+            pairs: round(self.pairs, 1e6),
+            gain: round(self.gain, 1e6),
+            gain_sq: round(self.gain_sq, 1e6),
+            ..self
+        }
+    }
 }
 
 fn default_epoch() -> u32 {
@@ -173,8 +216,11 @@ impl CalibrationProfile {
         self.local_samples = 0;
         self.knee_trials_failed = 0;
         self.knee_retest_after = 0;
-        self.knee_rate_units.clear();
-        self.knee_rates.clear();
+        self.sizes.clear();
+        self.ram_units.clear();
+        self.ram_delta_mb.clear();
+        self.ram_startup_mb = 0;
+        self.ram_first_units = 0;
         self.sample_units.clear();
         self.sample_delta_mb.clear();
     }
@@ -301,11 +347,16 @@ pub struct ProfileSeed {
     pub samples: usize,
     /// The working batch size, when the matched entry carries one.
     pub knee_units: Option<u64>,
-    /// Zero unless `local`.
+    /// Zero unless `same_build`: a local entry written by this panoptikon
+    /// build under this exact torch.
     pub knee_trials: TrialCadence,
-    /// An unfinished trial's observations, `(units, units/sec)`. Empty
-    /// unless `local`.
-    pub knee_rates: Vec<(u64, f64)>,
+    /// The evidence per batch size. Empty unless `same_build`.
+    pub sizes: Vec<SizeEvidence>,
+    /// Host RAM samples, the first batch's kept MiB and units. Empty unless
+    /// `same_build`.
+    pub ram_ring: Vec<FitSample>,
+    pub ram_startup_mb: u64,
+    pub ram_first_units: u64,
     /// True only for an entry from the local store.
     pub local: bool,
     /// Whether the fit fields came from a local entry; differs from `local`
@@ -343,9 +394,11 @@ pub struct ProfileUpdate {
     /// `None` leaves the stored working size as it is.
     pub knee_units: Option<u64>,
     pub knee_trials: TrialCadence,
-    /// An unfinished trial's observations, `(units, units/sec)`; replaces
-    /// the stored ones.
-    pub knee_rates: Vec<(u64, f64)>,
+    /// Replace the stored ones.
+    pub sizes: Vec<SizeEvidence>,
+    pub ram_ring: Vec<FitSample>,
+    pub ram_startup_mb: u64,
+    pub ram_first_units: u64,
     pub max_units_measured: u64,
     pub local_samples: u32,
     pub ring: Vec<FitSample>,
@@ -660,8 +713,15 @@ impl CalibrationStore {
                 knee_units: update.knee_units,
                 knee_trials_failed: update.knee_trials.failed,
                 knee_retest_after: update.knee_trials.retest_after,
-                knee_rate_units: update.knee_rates.iter().map(|(units, _)| *units).collect(),
-                knee_rates: update.knee_rates.iter().map(|(_, rate)| *rate).collect(),
+                sizes: update.sizes.iter().map(|size| size.rounded()).collect(),
+                ram_units: update.ram_ring.iter().map(|sample| sample.units).collect(),
+                ram_delta_mb: update
+                    .ram_ring
+                    .iter()
+                    .map(|sample| sample.delta_mb)
+                    .collect(),
+                ram_startup_mb: update.ram_startup_mb,
+                ram_first_units: update.ram_first_units,
                 samples: update.samples.min(u32::MAX as usize) as u32,
                 residual_mb: update.residual_mb,
                 measured_at: now_rfc3339(),
@@ -857,6 +917,9 @@ impl CalibrationProfiles for CalibrationStore {
         self.refresh_locked(&mut state);
         let candidates = self.candidates_locked(&state, query);
         let best = candidates.first()?;
+        // What was measured under another build or torch starts over.
+        let same_build =
+            best.local && best.exact_torch && best.profile.generator == self.env.generator;
         // A winner without a fit borrows it from the best candidate with one
         // (design doc, "Layering and lifecycle").
         let donor = if best.profile.slope_mb_per_unit > 0.0 {
@@ -875,7 +938,7 @@ impl CalibrationProfiles for CalibrationStore {
                 .profile
                 .knee_units
                 .or_else(|| donor.and_then(|donor| donor.profile.knee_units)),
-            knee_trials: if best.local {
+            knee_trials: if same_build {
                 TrialCadence {
                     failed: best.profile.knee_trials_failed,
                     retest_after: best.profile.knee_retest_after,
@@ -883,10 +946,33 @@ impl CalibrationProfiles for CalibrationStore {
             } else {
                 TrialCadence::default()
             },
-            knee_rates: {
-                let profile = &best.profile;
-                let rates = profile.knee_rates.iter().copied();
-                profile.knee_rate_units.iter().copied().zip(rates).collect()
+            sizes: if same_build {
+                best.profile.sizes.clone()
+            } else {
+                Vec::new()
+            },
+            ram_ring: if same_build {
+                let deltas = best.profile.ram_delta_mb.iter();
+                let units = best.profile.ram_units.iter();
+                units
+                    .zip(deltas)
+                    .map(|(units, delta_mb)| FitSample {
+                        units: *units,
+                        delta_mb: *delta_mb,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            ram_startup_mb: if same_build {
+                best.profile.ram_startup_mb
+            } else {
+                0
+            },
+            ram_first_units: if same_build {
+                best.profile.ram_first_units
+            } else {
+                0
             },
             local: best.local,
             fit_is_local: donor.is_some_and(|donor| donor.local),
@@ -1229,7 +1315,10 @@ mod tests {
             samples: 38,
             knee_units: None,
             knee_trials: Default::default(),
-            knee_rates: Vec::new(),
+            sizes: Vec::new(),
+            ram_ring: Vec::new(),
+            ram_startup_mb: 0,
+            ram_first_units: 0,
             max_units_measured: 1024,
             local_samples: 12,
             ring: (1..=4).map(|k| sample(k * 8)).collect(),
@@ -2313,27 +2402,59 @@ sample_delta_mb = [80, 160]
 
     /// The working size is read back by the next run and, like the anchor,
     /// travels when the same file is imported as a shipped baseline. The wait
-    /// for the next trial and an unfinished trial's observations are read
-    /// back too, and stay local.
+    /// for the next probe, the evidence per size (rounded) and the host RAM
+    /// samples are read back only under the same build, and stay local.
     #[test]
-    fn the_working_size_round_trips_and_travels_into_a_baseline() {
+    fn the_working_size_round_trips_and_its_evidence_only_under_one_build() {
         let root = tempfile::tempdir().unwrap();
         let store = store(root.path());
         let knee_trials = TrialCadence {
             failed: 3,
             retest_after: 84,
         };
-        let knee_rates = vec![(15, 41.5), (30, 43.25), (15, 40.0)];
+        let size = SizeEvidence {
+            units: 15,
+            windows: 7,
+            unit_total: 315.0,
+            secs: 7.123_456_7,
+            pairs: 3.0,
+            gain: 0.123_456_789,
+            gain_sq: 0.006,
+        };
+        let ram_ring = vec![sample(8), sample(16)];
         store.record(ProfileUpdate {
             knee_units: Some(15),
             knee_trials,
-            knee_rates: knee_rates.clone(),
+            sizes: vec![size],
+            ram_ring: ram_ring.clone(),
+            ram_startup_mb: 900,
+            ram_first_units: 1,
             ..update("clip/vit", "fp16", 0.79)
         });
         let seed = lookup(&store, "clip/vit").expect("the entry matches its own key");
         assert!(seed.local);
         assert_eq!((seed.knee_units, seed.knee_trials), (Some(15), knee_trials));
-        assert_eq!(seed.knee_rates, knee_rates);
+        let rounded = SizeEvidence {
+            secs: 7.123,
+            gain: 0.123_457,
+            ..size
+        };
+        assert_eq!(seed.sizes, vec![rounded]);
+        assert_eq!((seed.ram_ring, seed.ram_startup_mb), (ram_ring, 900));
+
+        // Another panoptikon build reads the working size and nothing else.
+        store.flush();
+        let other = store_with_env(
+            root.path(),
+            StoreEnv {
+                generator: "panoptikon other".to_owned(),
+                ..env()
+            },
+        );
+        let seed = lookup(&other, "clip/vit").expect("the same key");
+        assert_eq!(seed.knee_units, Some(15));
+        assert_eq!(seed.knee_trials, TrialCadence::default());
+        assert!(seed.sizes.is_empty() && seed.ram_ring.is_empty());
 
         let mut profile = store.local_entries().remove(0);
         profile.strip_local_authority();
@@ -2342,15 +2463,7 @@ sample_delta_mb = [80, 160]
             (profile.knee_trials_failed, profile.knee_retest_after),
             (0, 0)
         );
-        assert!(profile.knee_rate_units.is_empty() && profile.knee_rates.is_empty());
-
-        // The next update replaces the trial's observations: none are left.
-        store.record(ProfileUpdate {
-            knee_units: Some(15),
-            ..update("clip/vit", "fp16", 0.79)
-        });
-        let seed = lookup(&store, "clip/vit").expect("still there");
-        assert!(seed.knee_rates.is_empty());
+        assert!(profile.sizes.is_empty() && profile.ram_units.is_empty());
         assert_eq!(profile.max_units_measured, 1024, "the anchor travels too");
     }
 

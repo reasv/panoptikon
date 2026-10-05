@@ -1327,32 +1327,6 @@ async fn a_cuda_probe_before_the_first_worker_prices_as_before() {
     assert!(!exceeds);
 }
 
-/// A frame with `reserved_after_mb` absent falls back to the peak for both
-/// the resident's charge and `grew_pool`.
-#[test]
-fn a_frame_without_a_post_batch_pool_falls_back_to_the_peak() {
-    let (ledger, handle, admission) = ramping_from_seed(1);
-    let token = admission
-        .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
-    let units = token.grant().unit_budget;
-    // peak above `before`: pool-growing.
-    handle
-        .lock()
-        .unwrap()
-        .record_measurements(vec![measurement(units, 0, 10 * units + 100)]);
-    token.finish(WindowOutcome::Responded { oom: None });
-    let sample = ledger.lock().calibration[&("g/a".to_owned(), GPU.to_owned())]
-        .throughput
-        .back()
-        .copied();
-    assert_eq!(
-        sample.and_then(|sample| sample.grew_pool),
-        Some(true),
-        "a peak above the pre-batch pool is still `grew_pool = true`"
-    );
-}
-
 /// A RAM basis on a CUDA batch frame changes nothing: the RAM branch is gated
 /// on `metal_allocator` and on the frame's own pair.
 #[test]

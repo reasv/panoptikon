@@ -5,6 +5,7 @@ use serde::de::{self, SeqAccess, Visitor};
 use std::sync::OnceLock;
 use std::{collections::BTreeMap, env, fmt, path::PathBuf};
 
+use crate::inferio::ledger::SizingMode;
 use crate::media_tools::transcode::presets::TranscodeProfileConfig;
 
 pub const MAX_DB_NAME_LEN: usize = 64;
@@ -306,10 +307,11 @@ pub struct VramConfig {
     /// Hard ceiling as a fraction of total VRAM; off by default.
     #[serde(default)]
     pub cap_fraction: Option<f64>,
-    /// The throughput knee's bucket-dispersion band; absent takes the default
-    /// for the device kind.
+    /// How the batch size trades memory for speed: `balanced` (absent) grows
+    /// a batch only for a speed-up worth its memory, `throughput` for any
+    /// clear one.
     #[serde(default)]
-    pub knee_max_bucket_dispersion: Option<f64>,
+    pub sizing: Option<SizingMode>,
     /// Per-GPU overrides keyed by GPU UUID; absent keys inherit. A server-wide
     /// `cap_fraction` cannot be turned off for one GPU (TOML has no `null`).
     #[serde(default)]
@@ -324,13 +326,13 @@ pub struct VramOverride {
     #[serde(default)]
     pub cap_fraction: Option<f64>,
     #[serde(default)]
-    pub knee_max_bucket_dispersion: Option<f64>,
+    pub sizing: Option<SizingMode>,
 }
 
 impl VramConfig {
-    /// The `(margin, cap_fraction, knee_max_bucket_dispersion)` for one GPU.
-    /// UUID matching ignores case but is otherwise exact.
-    pub fn for_gpu(&self, uuid: &str) -> (Option<f64>, Option<f64>, Option<f64>) {
+    /// The `(margin, cap_fraction, sizing)` for one GPU. UUID matching ignores
+    /// case but is otherwise exact.
+    pub fn for_gpu(&self, uuid: &str) -> (Option<f64>, Option<f64>, Option<SizingMode>) {
         let over = self.gpu.get(uuid).or_else(|| {
             self.gpu
                 .iter()
@@ -341,14 +343,9 @@ impl VramConfig {
             Some(over) => (
                 over.margin.or(self.margin),
                 over.cap_fraction.or(self.cap_fraction),
-                over.knee_max_bucket_dispersion
-                    .or(self.knee_max_bucket_dispersion),
+                over.sizing.or(self.sizing),
             ),
-            None => (
-                self.margin,
-                self.cap_fraction,
-                self.knee_max_bucket_dispersion,
-            ),
+            None => (self.margin, self.cap_fraction, self.sizing),
         }
     }
 }
@@ -1430,11 +1427,7 @@ impl Settings {
     /// rejected; a too-wide margin is clamped by [`clamp_vram_margins`].
     fn validate_inference_vram(&self) -> Result<()> {
         let vram = &self.inference_local.vram;
-        let check = |where_: &str,
-                     margin: Option<f64>,
-                     cap: Option<f64>,
-                     band: Option<f64>|
-         -> Result<()> {
+        let check = |where_: &str, margin: Option<f64>, cap: Option<f64>| -> Result<()> {
             if let Some(margin) = margin
                 && (!margin.is_finite() || margin < 0.0)
             {
@@ -1451,23 +1444,9 @@ impl Settings {
                          it is a fraction of the GPU's total VRAM, e.g. 0.90 for 90%"
                 );
             }
-            if let Some(band) = band
-                && (!band.is_finite() || band <= 0.0 || band > 1.0)
-            {
-                anyhow::bail!(
-                    "{where_} knee_max_bucket_dispersion must be a finite number in (0, 1] \
-                     (got {band}); it is a relative median absolute deviation of the \
-                     throughput inside one batch-size bucket, e.g. 0.20 for 20%"
-                );
-            }
             Ok(())
         };
-        check(
-            "inference_local.vram",
-            vram.margin,
-            vram.cap_fraction,
-            vram.knee_max_bucket_dispersion,
-        )?;
+        check("inference_local.vram", vram.margin, vram.cap_fraction)?;
         // Case-duplicate keys: see `reject_case_duplicate_gpu_keys`.
         for (uuid, over) in &vram.gpu {
             if uuid.trim().is_empty() {
@@ -1482,8 +1461,6 @@ impl Settings {
                 &format!("inference_local.vram.gpu.\"{uuid}\""),
                 over.margin.or(vram.margin),
                 over.cap_fraction.or(vram.cap_fraction),
-                over.knee_max_bucket_dispersion
-                    .or(vram.knee_max_bucket_dispersion),
             )?;
         }
         Ok(())
@@ -2381,7 +2358,7 @@ base_url = "http://127.0.0.1:6342"
                  \n[inference_local.vram.gpu.\"GPU-aaaa\"]\nmargin = 0.5\n\
                  \n[inference_local.vram.gpu.\"GPU-bbbb\"]\ncap_fraction = 0.5\n\
                  \n[inference_local.vram.gpu.\"GPU-dddd\"]\n\
-                 knee_max_bucket_dispersion = 0.35\n"
+                 sizing = \"throughput\"\n"
             ),
         )
         .unwrap();
@@ -2412,8 +2389,8 @@ base_url = "http://127.0.0.1:6342"
         );
         assert_eq!(
             vram.for_gpu("GPU-dddd"),
-            (Some(0.25), Some(0.90), Some(0.35)),
-            "the knee band overrides and inherits on the same rule as the rest"
+            (Some(0.25), Some(0.90), Some(SizingMode::Throughput)),
+            "the sizing mode overrides and inherits on the same rule as the rest"
         );
 
         // margin = 0 is a legitimate setting (a headless box, or a card the
@@ -2453,10 +2430,6 @@ base_url = "http://127.0.0.1:6342"
             "[inference_local.vram]\ncap_fraction = inf\n",
             "[inference_local.vram.gpu.\"GPU-aaaa\"]\nmargin = -1.0\n",
             "[inference_local.vram.gpu.\"GPU-aaaa\"]\ncap_fraction = 2.0\n",
-            "[inference_local.vram]\nknee_max_bucket_dispersion = 0.0\n",
-            "[inference_local.vram]\nknee_max_bucket_dispersion = 1.5\n",
-            "[inference_local.vram]\nknee_max_bucket_dispersion = nan\n",
-            "[inference_local.vram.gpu.\"GPU-aaaa\"]\nknee_max_bucket_dispersion = -0.2\n",
         ] {
             std::fs::write(&path, format!("{base}\n{bad}")).unwrap();
             let err =
@@ -2467,6 +2440,13 @@ base_url = "http://127.0.0.1:6342"
                 "the error must name the offending key: {message}"
             );
         }
+        std::fs::write(
+            &path,
+            format!("{base}\n[inference_local.vram]\nsizing = \"fast\"\n"),
+        )
+        .unwrap();
+        let err = Settings::load(Some(path.clone())).expect_err("an unknown sizing mode");
+        assert!(format!("{err:#}").contains("fast"), "{err:#}");
         // Both boundaries are legal: "all of it", and "withhold as much again
         // as the other processes are using".
         std::fs::write(
@@ -2608,9 +2588,9 @@ base_url = "http://127.0.0.1:6342"
             );
             assert_eq!(shipped.cap_fraction, None, "{name}.toml: cap is off");
             assert_eq!(
-                shipped.knee_max_bucket_dispersion, None,
-                "{name}.toml states no knee band, so the shipped per-device-kind \
-                 one applies and can be changed centrally"
+                shipped.sizing, None,
+                "{name}.toml states no sizing mode, so the default applies and \
+                 can be changed centrally"
             );
             assert!(shipped.gpu.is_empty(), "{name}.toml ships no GPU override");
 
@@ -2636,7 +2616,7 @@ base_url = "http://127.0.0.1:6342"
                     };
                     let example = rest.starts_with("margin = ")
                         || rest.starts_with("cap_fraction = ")
-                        || rest.starts_with("knee_max_bucket_dispersion = ")
+                        || rest.starts_with("sizing = ")
                         || rest.starts_with("[inference_local.vram.gpu.");
                     if in_block && example {
                         rest.to_owned()
@@ -2653,9 +2633,9 @@ base_url = "http://127.0.0.1:6342"
                 "{name}.toml: the cap_fraction example"
             );
             assert_eq!(
-                vram.knee_max_bucket_dispersion,
-                Some(0.20),
-                "{name}.toml: the knee band example"
+                vram.sizing,
+                Some(SizingMode::Balanced),
+                "{name}.toml: the sizing example"
             );
             assert_eq!(
                 vram.gpu.len(),
@@ -2675,16 +2655,13 @@ base_url = "http://127.0.0.1:6342"
             );
             assert_eq!(
                 vram.for_gpu(uuid),
-                (Some(0.25), Some(0.90), Some(0.20)),
+                (Some(0.25), Some(0.90), Some(SizingMode::Throughput)),
                 "{name}.toml: the override inherits the section's cap_fraction"
             );
-            // The CPU example is the one a CPU-only host needs: it widens that
-            // device's band alone, where the section key above would have
-            // narrowed it to the accelerator's 0.20.
             assert_eq!(
                 vram.for_gpu("CPU"),
-                (Some(0.10), Some(0.90), Some(0.35)),
-                "{name}.toml: the CPU example moves the band on that device only"
+                (Some(0.10), Some(0.50), Some(SizingMode::Balanced)),
+                "{name}.toml: the CPU example moves the cap on that device only"
             );
         }
     }

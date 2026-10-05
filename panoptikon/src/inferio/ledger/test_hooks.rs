@@ -159,7 +159,7 @@ impl VramLedger {
         }
     }
 
-    /// Set or read a replica's pending release after a batch size trial
+    /// Set or read a replica's pending release after a batch size probe
     /// ([`Admission::take_trial_trim`]).
     #[cfg(test)]
     pub(in crate::inferio) fn trial_trim_for_test(&self, worker: u64, set: Option<bool>) -> bool {
@@ -179,21 +179,6 @@ impl VramLedger {
         self.lock().workers.get(&worker)?.last_trim_at
     }
 
-    /// The throughput ring as `(units, units/sec)`.
-    #[cfg(test)]
-    pub(super) fn throughput_for_test(&self, inference_id: &str, gpu: &str) -> Vec<(u64, f64)> {
-        self.lock()
-            .calibration
-            .get(&(inference_id.to_owned(), gpu.to_owned()))
-            .map(|cal| {
-                cal.throughput
-                    .iter()
-                    .map(|sample| (sample.units, sample.units_per_sec))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     /// Install a working size as measured here.
     #[cfg(test)]
     pub(super) fn set_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {
@@ -204,25 +189,11 @@ impl VramLedger {
             .or_default();
         cal.knee_units = Some(knee);
         cal.knee_is_local = true;
-        cal.trial = None;
+        cal.probe = None;
     }
 
-    /// Observations in the ring that may decide a batch size.
-    #[cfg(test)]
-    pub(super) fn deciding_samples_for_test(&self, inference_id: &str, gpu: &str) -> usize {
-        self.lock()
-            .calibration
-            .get(&(inference_id.to_owned(), gpu.to_owned()))
-            .map_or(0, |cal| {
-                cal.throughput
-                    .iter()
-                    .filter(|sample| sample.decides())
-                    .count()
-            })
-    }
-
-    /// The gain rule's state: `(the size a trial runs next, windows before
-    /// the next trial, trials in a row that left the working size in place)`.
+    /// The gain rule's state: `(the size a probe runs next, windows before
+    /// the next probe, probes in a row that left the working size in place)`.
     #[cfg(test)]
     pub(super) fn trial_for_test(&self, inference_id: &str, gpu: &str) -> (Option<u64>, u32, u32) {
         self.lock()
@@ -230,7 +201,7 @@ impl VramLedger {
             .get(&(inference_id.to_owned(), gpu.to_owned()))
             .map(|cal| {
                 (
-                    cal.trial.map(|trial| trial.run),
+                    cal.probe.map(|probe| probe.run),
                     cal.retest_after,
                     cal.failed_trials,
                 )

@@ -774,6 +774,7 @@ impl VramLedger {
                 ram_bound: false,
                 ram_started: false,
                 item_cap: ram_at_load_mb.map(|_| 1),
+                remaining_items: None,
             },
         );
         drop(state);
@@ -881,7 +882,7 @@ impl Admission {
             .map(|entry| entry.gpu.clone())
     }
 
-    /// Whether a batch size trial left this replica's pool to release; the
+    /// Whether a batch size probe left this replica's pool to release; the
     /// answer is given once.
     pub fn take_trial_trim(&self) -> bool {
         let mut state = self.ledger.lock();
@@ -902,9 +903,25 @@ impl Admission {
         self.ledger.note_trim_declined(self.worker);
     }
 
+    /// The items this replica's job has left to send, `None` when unknown: a
+    /// batch size probe starts only in a job long enough to repay it
+    /// ([`PROBE_PAYBACK_WINDOWS`]). No caller reports it yet.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn note_remaining_items(&self, items: Option<u64>) {
+        let mut state = self.ledger.lock();
+        if let Some(entry) = state.workers.get_mut(&self.worker) {
+            entry.remaining_items = items;
+        }
+    }
+
     /// Units to aim for in the next window (see [`WINDOW_DEPTH_MULTIPLIER`]).
     pub fn window_target_units(&self) -> u64 {
         self.ledger.window_target_units(self.worker)
+    }
+
+    /// Units the caller should keep in flight ([`VramLedger::in_flight_units`]).
+    pub fn in_flight_units(&self) -> u64 {
+        self.ledger.in_flight_units(self.worker)
     }
 
     /// Items the next window may hold ([`VramLedger::window_item_bound`]).
@@ -922,7 +939,7 @@ impl Admission {
 
     /// Stand in for a rate that rises with every doubling: the working size
     /// becomes twice the largest batch measured (at least the seed), as
-    /// trials that each earned their size would leave it.
+    /// probes that each earned their size would leave it.
     #[cfg(test)]
     pub(super) fn earn_next_size(&self) {
         let mut state = self.ledger.lock();
@@ -935,7 +952,7 @@ impl Admission {
         );
         let cal = state.calibration.entry(key).or_default();
         cal.knee_units = Some(seed.max(cal.max_units_measured.saturating_mul(RATCHET_FACTOR)));
-        cal.trial = None;
+        cal.probe = None;
     }
 
     /// [`Self::request_grant_byte_bound`] with `byte_bound = false`.
@@ -983,7 +1000,7 @@ impl Admission {
     }
 
     /// Update the demand signal of this replica, which is free: 0 when the
-    /// queue drained, which a batch size trial is told
+    /// queue drained, which a batch size probe is told
     /// ([`VramLedger::note_queue_dry_locked`]).
     pub fn note_demand(&self, pending: usize) {
         let update = {

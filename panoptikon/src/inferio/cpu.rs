@@ -32,11 +32,6 @@ pub(super) fn ram_reserve_mb(total_mb: u64) -> u64 {
 const RAM_RESERVE_MIN_MB: u64 = 2 * 1024;
 const RAM_RESERVE_MAX_MB: u64 = 16 * 1024;
 
-/// Default knee bucket-dispersion band on the CPU device, wider than
-/// [`super::ledger::KNEE_MAX_BUCKET_DISPERSION`] because a quiet CPU host's
-/// buckets already reach about 0.2. A config value overrides it.
-pub(super) const DEFAULT_KNEE_MAX_BUCKET_DISPERSION: f64 = 0.35;
-
 /// Where this host's RAM statistics are read from (injectable for tests).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MemRoots {

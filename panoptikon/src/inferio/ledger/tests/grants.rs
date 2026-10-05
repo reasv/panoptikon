@@ -86,7 +86,7 @@ fn cap_fraction_composes_with_margin() {
         VramBudget {
             margin: Some(DEFAULT_MARGIN),
             cap_fraction: Some(0.5),
-            knee_max_bucket_dispersion: None,
+            sizing: None,
         },
     );
     let handle = loaded(Some(1000), Some(0));
@@ -102,7 +102,7 @@ fn cap_fraction_composes_with_margin() {
         VramBudget {
             margin: Some(0.0),
             cap_fraction: Some(0.5),
-            knee_max_bucket_dispersion: None,
+            sizing: None,
         },
     );
     let handle = loaded(Some(1000), Some(0));
@@ -316,7 +316,10 @@ fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
                 samples: 0,
                 knee_units: None,
                 knee_trials: Default::default(),
-                knee_rates: Vec::new(),
+                sizes: Vec::new(),
+                ram_ring: Vec::new(),
+                ram_startup_mb: 0,
+                ram_first_units: 0,
                 local: true,
                 fit_is_local: false,
                 exact_torch: true,
@@ -700,7 +703,7 @@ fn margin_widening_is_additive_and_never_clamps_the_configured_margin() {
         VramBudget {
             margin: Some(0.9),
             cap_fraction: None,
-            knee_max_bucket_dispersion: None,
+            sizing: None,
         },
     );
     let handle = loaded(Some(1000), Some(0));
@@ -849,14 +852,14 @@ fn budgets_resolve_per_gpu() {
     let budgets = VramBudgets::uniform(VramBudget {
         margin: Some(0.0),
         cap_fraction: None,
-        knee_max_bucket_dispersion: None,
+        sizing: None,
     })
     .with_gpu(
         B,
         VramBudget {
             margin: Some(0.0),
             cap_fraction: Some(0.5),
-            knee_max_bucket_dispersion: None,
+            sizing: None,
         },
     );
     let ledger = VramLedger::for_test(
@@ -896,14 +899,14 @@ fn per_gpu_margins_reach_the_effective_margin() {
     let budgets = VramBudgets::uniform(VramBudget {
         margin: Some(0.0),
         cap_fraction: None,
-        knee_max_bucket_dispersion: None,
+        sizing: None,
     })
     .with_gpu(
         B,
         VramBudget {
             margin: Some(0.5),
             cap_fraction: None,
-            knee_max_bucket_dispersion: None,
+            sizing: None,
         },
     );
     let ledger = VramLedger::for_test(
