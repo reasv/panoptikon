@@ -318,7 +318,7 @@ async fn acquire_read_conn(
             // A pool whose connections are all busy times out the same way;
             // only a database that cannot be opened drops it.
             let paths = db_paths_unchecked(&names.index_db, &names.user_data_db);
-            if probe_read_conn(&paths, attach_user_data).await.is_err() {
+            if build_read_pool(&paths, attach_user_data).await.is_err() {
                 let mut pools = read_pools().lock().expect("read pool registry poisoned");
                 pools.remove(&key);
             }
@@ -327,45 +327,26 @@ async fn acquire_read_conn(
     }
 }
 
-/// The pool's connect options, storage path and user-data attach path.
-fn read_conn_parts(
-    paths: &DbPaths,
-    attach_user_data: bool,
-) -> (SqliteConnectOptions, String, Option<String>) {
+async fn build_read_pool(paths: &DbPaths, attach_user_data: bool) -> Result<SqlitePool, ApiError> {
+    ensure_sqlite_extensions()?;
     let options = SqliteConnectOptions::new()
         .filename(&paths.index_db_file)
         .read_only(true);
     let storage_path = paths.storage_db_file.to_string_lossy().to_string();
     let user_data_path = attach_user_data.then(|| user_data_attach_path(&paths.user_db_file, true));
-    (options, storage_path, user_data_path)
-}
 
-/// Opens one read connection as the pool does. The pool retries a failing
-/// connection setup until its acquire timeout (30 s), so this is what tells
-/// at once that a database cannot be opened.
-async fn probe_read_conn(paths: &DbPaths, attach_user_data: bool) -> Result<(), ApiError> {
-    let (options, storage_path, user_data_path) = read_conn_parts(paths, attach_user_data);
+    // The pool retries a failing connection setup until its acquire timeout
+    // (30 s), so a database that cannot be opened is refused here, at once.
     let opened = async {
         let mut conn = SqliteConnection::connect_with(&options).await?;
-        setup_read_conn(&mut conn, storage_path, user_data_path).await
+        setup_read_conn(&mut conn, storage_path.clone(), user_data_path.clone()).await
     };
-    match opened.await {
-        Ok(()) => {
-            log_open_success(paths, attach_user_data);
-            Ok(())
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "failed to open read connection");
-            log_open_problem(paths, attach_user_data);
-            Err(ApiError::internal("Failed to open database"))
-        }
+    if let Err(err) = opened.await {
+        tracing::error!(error = %err, "failed to open read connection");
+        log_open_problem(paths, attach_user_data, false);
+        return Err(ApiError::internal("Failed to open database"));
     }
-}
-
-async fn build_read_pool(paths: &DbPaths, attach_user_data: bool) -> Result<SqlitePool, ApiError> {
-    ensure_sqlite_extensions()?;
-    probe_read_conn(paths, attach_user_data).await?;
-    let (options, storage_path, user_data_path) = read_conn_parts(paths, attach_user_data);
+    log_open_success(paths, attach_user_data, false);
     let pool = SqlitePoolOptions::new()
         .max_connections(READ_POOL_MAX_CONNECTIONS)
         .min_connections(0)
@@ -672,16 +653,18 @@ async fn connect_db(
     attach_user_data: bool,
 ) -> Result<SqliteConnection, ApiError> {
     let conn = open_db(paths, write_lock, user_data_wl, attach_user_data).await;
+    let write = write_lock || user_data_wl;
     match conn {
-        Ok(_) => log_open_success(paths, attach_user_data),
-        Err(_) => log_open_problem(paths, attach_user_data),
+        Ok(_) => log_open_success(paths, attach_user_data, write),
+        Err(_) => log_open_problem(paths, attach_user_data, write),
     }
     conn
 }
 
-/// The database files whose open problem was logged and that have not been
-/// opened since.
-static OPEN_PROBLEMS: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+/// The database files, each with whether the open asked for a write lock,
+/// whose open problem was logged and that have not been opened the same way
+/// since.
+static OPEN_PROBLEMS: Mutex<BTreeSet<(PathBuf, bool)>> = Mutex::new(BTreeSet::new());
 
 /// The files an open of `paths` opens: the user-data file only when attached.
 fn opened_files(paths: &DbPaths, attach_user_data: bool) -> impl Iterator<Item = &PathBuf> {
@@ -695,9 +678,9 @@ fn opened_files(paths: &DbPaths, attach_user_data: bool) -> impl Iterator<Item =
 }
 
 /// Logs why a database in `paths` cannot be written: another user owns it or
-/// its filesystem is read-only. Logged once per database file until an open
-/// of it succeeds.
-fn log_open_problem(paths: &DbPaths, attach_user_data: bool) {
+/// its filesystem is read-only. Logged once per database file and kind of
+/// open (read or write) until an open of the same kind succeeds.
+fn log_open_problem(paths: &DbPaths, attach_user_data: bool, write: bool) {
     let Some((file, reason)) = opened_files(paths, attach_user_data).find_map(|file| {
         let name = file.file_name()?.to_str()?;
         Some((
@@ -708,17 +691,17 @@ fn log_open_problem(paths: &DbPaths, attach_user_data: bool) {
         return;
     };
     let mut logged = OPEN_PROBLEMS.lock().unwrap_or_else(|err| err.into_inner());
-    if logged.insert(file.clone()) {
+    if logged.insert((file.clone(), write)) {
         tracing::warn!(reason, "cannot open a database");
     }
 }
 
-/// After an open of `paths` succeeds, a problem with its files is logged
-/// again.
-fn log_open_success(paths: &DbPaths, attach_user_data: bool) {
+/// After an open of `paths` succeeds, a problem with its files in an open of
+/// the same kind is logged again.
+fn log_open_success(paths: &DbPaths, attach_user_data: bool, write: bool) {
     let mut logged = OPEN_PROBLEMS.lock().unwrap_or_else(|err| err.into_inner());
     for file in opened_files(paths, attach_user_data) {
-        logged.remove(file);
+        logged.remove(&(file.clone(), write));
     }
 }
 
@@ -964,8 +947,9 @@ mod tests {
     }
 
     /// A database that cannot be opened fails a request at once, and each
-    /// folder another user owns is logged once until an open of it succeeds,
-    /// naming the folder and its owner. A cached read pool for it is dropped.
+    /// folder another user owns is logged once until an open of the same kind
+    /// succeeds, naming the folder and its owner. A cached read pool for it is
+    /// dropped.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_database_that_cannot_be_opened_fails_at_once_and_names_the_owner() {
@@ -1006,30 +990,41 @@ mod tests {
             index_db: None,
             user_data_db: None,
         };
-        let read = acquire_read_conn(&no_names, &names("foreign_read"), false).await;
+        let read_names = names("foreign_read");
+        let read = || acquire_read_conn(&no_names, &read_names, false);
         let open = || open_index_db_write_no_user_data("foreign_owned");
-        let mut failed = vec![read.is_err(), open().await.is_err(), open().await.is_err()];
-        let opened = |opens: bool| {
-            if opens {
-                fs::remove_file(&link).unwrap();
-                fs::create_dir(&link).unwrap();
+        let mut failed = vec![read().await.is_err(), open().await.is_err()];
+        failed.push(open().await.is_err());
+        let make_openable = |link: &Path, openable: bool| {
+            if openable {
+                fs::remove_file(link).unwrap();
+                fs::create_dir(link).unwrap();
                 for db in ["index.db", "storage.db"] {
                     fs::write(link.join(db), "").unwrap();
                 }
             } else {
-                fs::remove_dir_all(&link).unwrap();
-                symlink(foreign, &link).unwrap();
+                fs::remove_dir_all(link).unwrap();
+                symlink(foreign, link).unwrap();
             }
         };
-        opened(true);
+        make_openable(&link, true);
         let pooled = acquire_read_conn(&no_names, &names("foreign_owned"), false).await;
         drop(pooled.unwrap());
-        opened(false);
+        make_openable(&link, false);
         failed.push(open().await.is_err());
-        opened(true);
+        make_openable(&link, true);
         assert!(open().await.is_ok());
-        opened(false);
+        make_openable(&link, false);
         failed.push(open().await.is_err());
+        failed.push(read().await.is_err());
+        make_openable(&read_link, true);
+        drop(read().await.unwrap());
+        read_pools()
+            .lock()
+            .unwrap()
+            .remove(&("foreign_read".to_owned(), String::new(), false));
+        make_openable(&read_link, false);
+        failed.push(read().await.is_err());
 
         let key = ("foreign_pool".to_owned(), String::new(), false);
         let pool = SqlitePoolOptions::new()
@@ -1049,7 +1044,7 @@ mod tests {
         assert!(failed.iter().all(|failed| *failed) && dropped, "{failed:?}");
         let [read, write, pool] = [&read_link, &link, &pool_link]
             .map(|link| Some(owned_by_another_user(link, owner, foreign)));
-        let expected = [read, write.clone(), write.clone(), write, pool];
+        let expected = [read.clone(), write.clone(), write, read, pool];
         assert_eq!(*reasons.lock().unwrap(), expected);
     }
 
