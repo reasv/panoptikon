@@ -1744,14 +1744,15 @@ def note_batch_units(size: int, record: str = "largest_units") -> None:
 def _note_release(
     released_mb: int | None, elapsed_ms: float, trigger: str, arm: bool = True
 ) -> None:
-    """Record a completed release and arm the next batch's re-grow report,
-    unless it returned nothing."""
+    """Record a completed release. Unless it returned nothing, arm the next
+    batch's re-grow report and forget the batch sizes that ran before it."""
     armed = arm and released_mb != 0
     _release_state["armed"] = armed
     _release_state["released_mb"] = released_mb
     _release_state["release_ms"] = round(elapsed_ms, 3)
     _release_state["trigger"] = trigger
-    _release_state["largest_units"] = _release_state["grantless_size"] = None
+    if released_mb != 0:
+        _release_state["largest_units"] = _release_state["grantless_size"] = None
     logger.debug(
         "released the allocator pool (%s): handed back %s MiB in %.1f ms%s",
         trigger,

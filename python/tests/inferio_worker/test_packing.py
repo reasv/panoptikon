@@ -3182,6 +3182,9 @@ def test_a_spill_that_outlives_its_release_releases_nothing_until_one_fits(
     impl = SimpleNamespace(predict=predict)
     with caplog.at_level(logging.DEBUG, logger="inferio_worker.packing"):
         first = packing.run_window(impl, items(8), grant(unit_budget=4, mb=0))
+        assert memory._release_state["largest_units"] == 4, (
+            "a release that returned nothing keeps the largest batch"
+        )
         second = packing.run_window(impl, items(2), grant(unit_budget=1, mb=0))
         packing.run_grantless_window(impl, items(1))
         live_mb[0] = 100
