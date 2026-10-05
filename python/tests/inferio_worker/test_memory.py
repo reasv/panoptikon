@@ -2413,8 +2413,7 @@ NO_SWAPOUTS_SEEN = dict.fromkeys(("count", "read_at", "rose_after", "since"))
 
 def paging_at(seconds: float, swapouts: int) -> bool:
     """`_mac_paging` read `seconds` into a fake clock."""
-    with mock.patch("time.monotonic", return_value=1000.0 + seconds):
-        return memory._mac_paging(swapouts)
+    return memory._mac_paging(swapouts, 1000.0 + seconds)
 
 
 def test_paging_is_a_rise_within_the_window_or_after_a_batch_started() -> None:

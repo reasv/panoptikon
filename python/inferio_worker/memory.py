@@ -1082,10 +1082,11 @@ def _mps_free_with_basis() -> tuple[int | None, int | None, int | None, int | No
     `recommended_max_memory()`; `free` is `min(total, ram_available)`.
     """
     total = _mps_call("recommended_max_memory")
+    read_at = time.monotonic()
     facts = _mac_memory_counters()
     if not total or facts is None:
         return (None, None, None, None)
-    available = _mac_available(facts)
+    available = _mac_available(facts, read_at)
     return (_mb(min(total, available)), _mb(total), _mb(facts[0]), _mb(available))
 
 
@@ -1105,13 +1106,14 @@ def mac_available_bytes() -> int | None:
     """RAM a new allocation could get on macOS, or None off it
     (`_mac_available`). psutil's `available` does not track MPS allocations.
     """
+    read_at = time.monotonic()
     facts = _mac_memory_counters()
     if facts is None:
         return None
-    return _mac_available(facts)
+    return _mac_available(facts, read_at)
 
 
-def _mac_available(facts: tuple[int, ...]) -> int:
+def _mac_available(facts: tuple[int, ...], read_at: float) -> int:
     """Total RAM minus wired, compressed and anonymous pages, and at warning
     the file cache too: macOS then makes room by compressing and swapping
     other memory, not only by dropping it. 0 at critical memory pressure, and
@@ -1119,7 +1121,7 @@ def _mac_available(facts: tuple[int, ...]) -> int:
     `mps.rs::available_bytes`.
     """
     ram, wired, compressed, anonymous, pressure, swapouts, file_backed = facts
-    paging = _mac_paging(swapouts)
+    paging = _mac_paging(swapouts, read_at)
     if pressure >= MAC_PRESSURE_CRITICAL:
         return 0
     if pressure >= MAC_PRESSURE_WARNING and paging:
@@ -1130,19 +1132,19 @@ def _mac_available(facts: tuple[int, ...]) -> int:
     return max(0, ram - taken)
 
 
-def _mac_paging(swapouts: int) -> bool:
+def _mac_paging(swapouts: int, read_at: float) -> bool:
     """Whether macOS swapped pages out within `MAC_PAGING_SECONDS` before
-    now, or after `_swapouts["since"]` (`count_paging_from_last_reading`).
-    A rise is dated by the earlier reading of the pair that saw it: it
-    happened after that reading. Same as `mps.rs::Swapouts`.
+    `read_at`, the monotonic time taken before reading `swapouts`, or after
+    `_swapouts["since"]` (`count_paging_from_last_reading`). A rise is dated
+    by the earlier reading of the pair that saw it: it happened after that
+    reading. Same as `mps.rs::Swapouts`.
     """
-    now = time.monotonic()
     if _swapouts["count"] is not None and swapouts > _swapouts["count"]:
         _swapouts["rose_after"] = _swapouts["read_at"]
-    _swapouts["count"], _swapouts["read_at"] = swapouts, now
+    _swapouts["count"], _swapouts["read_at"] = swapouts, read_at
     rose_after, since = _swapouts["rose_after"], _swapouts["since"]
     return rose_after is not None and (
-        now - rose_after <= MAC_PAGING_SECONDS
+        read_at - rose_after <= MAC_PAGING_SECONDS
         or (since is not None and rose_after >= since)
     )
 
