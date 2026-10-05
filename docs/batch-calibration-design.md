@@ -857,9 +857,7 @@ booked centrally on the CPU device. It is never a throughput signal.
   No sample is taken from a batch that peaked no higher than the resident
   set before it: that batch ran in memory an earlier one kept (the worker
   trims the C heap after every batch, but partly used pages stay), so its
-  own cost is unknown. Nor from a batch smaller than one the replica ran
-  before: it may run in heap the larger one left (below) and peak higher
-  than it would alone. What a replica's first batch after load keeps is
+  own cost is unknown. What a replica's first batch after load keeps is
   start-up (libraries, kernels, allocator set-up): it is added to the load
   level and gives no sample, since priced per unit it would hold a small
   host at one unit.
@@ -1015,9 +1013,8 @@ booked centrally on the CPU device. It is never a throughput signal.
   resident set falls back to about its load level between batches; what
   little it still keeps (partly used pages) reads as resident growth, which
   the replica may reuse for its next batch but no one else may book. It keeps
-  glibc's dynamic mmap threshold, which rises with the largest block freed
-  and never falls, so a batch smaller than one run before can peak up to
-  about twice as high as it would alone; it gives no RAM sample.
+  glibc's dynamic mmap threshold, so a batch after a larger one can peak
+  higher than it would alone: its RAM samples over-read on a shrinking ramp.
 
 ## Dispatcher windows and the batch cap
 

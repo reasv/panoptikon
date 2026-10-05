@@ -773,7 +773,6 @@ impl VramLedger {
                 ram_mb: None,
                 ram_bound: false,
                 ram_started: false,
-                ram_largest_units: 0,
                 item_cap: ram_at_load_mb.map(|_| 1),
             },
         );

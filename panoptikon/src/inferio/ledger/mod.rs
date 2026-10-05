@@ -836,10 +836,6 @@ struct WorkerEntry {
     ram_bound: bool,
     /// Its first batch ran; what that batch kept is in its load level.
     ram_started: bool,
-    /// The largest batch it ran. A smaller batch may run in heap the larger
-    /// one left (glibc's mmap threshold only rises), so it gives no RAM
-    /// sample.
-    ram_largest_units: u64,
     /// Items per batch until its host RAM cost is measured at two sizes
     /// ([`VramLedger::item_cap_locked`]): 1 at load with a RAM side, doubled
     /// after an item-capped window whose batch filled it, `None` once that

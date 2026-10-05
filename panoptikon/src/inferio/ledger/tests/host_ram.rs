@@ -1251,25 +1251,6 @@ fn the_costliest_batch_at_a_size_is_kept() {
     );
 }
 
-/// A batch smaller than one its replica ran before may run in heap the
-/// larger one left and peak higher than alone: it gives no RAM sample, so
-/// after a batch twice the size the working size books what it measured.
-#[test]
-fn a_batch_after_a_larger_one_leaves_the_booking() {
-    let ledger = host(&[GPU], None);
-    let (handle, admission) = gpu_replica(&ledger, "g/down", GPU, 64);
-    cpu_free_to_book(&ledger, 45_000);
-    let booked_at_64 = || {
-        let token = admission.request_grant(64, None, 1, 0).expect("granted");
-        assert_eq!(token.grant().unit_budget, 64);
-        row(&ledger, "g/down").ram_booked_mb
-    };
-    growth_window(&handle, &admission, &[(64, 640)]);
-    let measured = booked_at_64();
-    growth_window(&handle, &admission, &[(128, 1_280), (64, 1_216)]);
-    assert_eq!(booked_at_64(), measured);
-}
-
 /// A failed host read is not retried at every grant: it backs off like the
 /// probe.
 #[test]
