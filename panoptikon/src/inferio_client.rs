@@ -2511,7 +2511,8 @@ pub(crate) mod tests {
     /// a cold burst. When the front speaks only HTTP/1.1, an admitted request
     /// is one socket and no more, so the fixed gate
     /// (`both_transports_take_a_concurrency_permit`) is the bound; a burst past
-    /// the gate would cost this process a thousand descriptors.
+    /// the gate would cost this process a thousand descriptors. Health checks
+    /// do not start: each dials its own connection through the front.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_tls_front_costs_the_sockets_the_cleartext_path_does() {
@@ -2528,7 +2529,7 @@ pub(crate) mod tests {
             let backend =
                 spawn_blocking_stub(Arc::clone(&probe), crate::MAX_CONCURRENT_STREAMS).await;
             let (base_url, accepted) = spawn_tls_front(&backend, alpn).await;
-            let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+            let client = checked_client(&base_url, NO_HEALTH_CHECKS);
             assert_eq!(client.transport().await, transport, "{label}: ALPN decides");
             let before = accepted.load(SeqCst);
 
@@ -2542,7 +2543,7 @@ pub(crate) mod tests {
                         .expect("the stub answers");
                 });
             }
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + crate::test_utils::HANG_DEADLINE;
             while probe.in_flight.load(SeqCst) < burst && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -2669,17 +2670,24 @@ pub(crate) mod tests {
         timeout: Duration::from_secs(1),
     };
 
+    /// Health checks no request in a test waits long enough to start.
+    const NO_HEALTH_CHECKS: HealthCheckTiming = HealthCheckTiming {
+        after: Duration::from_secs(24 * 3600),
+        timeout: Duration::from_secs(10),
+    };
+
+    /// A client for `base_url` whose endpoint checks its server on `timing`.
+    fn checked_client(base_url: &str, timing: HealthCheckTiming) -> InferenceApiClient {
+        endpoint_runtime(&normalize_base_url(base_url.to_owned()), timing).unwrap();
+        InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap()
+    }
+
     /// A client for `base_url` with [`SHORT_HEALTH_CHECKS`], on `transport`.
     pub(crate) async fn health_checked_client(
         base_url: &str,
         transport: Transport,
     ) -> InferenceApiClient {
-        endpoint_runtime(
-            &normalize_base_url(base_url.to_owned()),
-            SHORT_HEALTH_CHECKS,
-        )
-        .unwrap();
-        let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+        let client = checked_client(base_url, SHORT_HEALTH_CHECKS);
         *client.endpoint.transport.write().await = Some(Remembered {
             transport,
             expires: None,
