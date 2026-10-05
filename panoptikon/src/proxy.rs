@@ -649,6 +649,7 @@ fn append_forwarded_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inferio_client::HEALTH_CHECK_MISSES;
     use axum::routing::any;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -1456,7 +1457,7 @@ allow = "*"
         // The missed deadline started the checks, which find the server frozen.
         let frozen = format!("Could not reach the inference server at {url}: {PeerFrozen}");
         let mut polled = None;
-        for _ in 0..10 {
+        for _ in 0..HEALTH_CHECK_MISSES + 3 {
             let report = get_health().await;
             if report.1["detail"] == frozen.as_str() {
                 polled = Some(report);
@@ -1502,7 +1503,7 @@ allow = "*"
         let (_, outer) = spawn_inference_gateway(&inner).await;
 
         let frozen = format!("Could not reach the inference server at {inner}: {PeerFrozen}");
-        for _ in 0..10 {
+        for _ in 0..HEALTH_CHECK_MISSES + 3 {
             let response = reqwest::get(format!("http://{outer}/api/inference/health"))
                 .await
                 .unwrap();

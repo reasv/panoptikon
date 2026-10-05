@@ -1022,7 +1022,7 @@ const HEALTH_CHECKS: HealthCheckTiming = HealthCheckTiming {
     timeout: Duration::from_secs(10),
 };
 /// Checks in a row without an answer that declare the server frozen.
-const HEALTH_CHECK_MISSES: u32 = 2;
+pub(crate) const HEALTH_CHECK_MISSES: u32 = 2;
 
 impl InferenceApiClient {
     pub fn new_with_metadata_cache(
@@ -2766,9 +2766,14 @@ pub(crate) mod tests {
     }
 
     async fn checks_ended(client: &InferenceApiClient) {
-        while client.endpoint.health_checks.lock().running {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let ended = async {
+            while client.endpoint.health_checks.lock().running {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(4 * client.health_check_timeout(), ended)
+            .await
+            .expect("the check task ends");
     }
 
     async fn predict_one(client: InferenceApiClient) -> Result<PredictResponse> {
@@ -2838,12 +2843,28 @@ pub(crate) mod tests {
             assert!(now.frozen_since.is_none(), "{now:?}");
         }
         responding.abort();
+        // A proxy's 502, 503 and 504 are no answer.
+        let proxy_errors = tokio::spawn({
+            let client = client.clone();
+            async move {
+                for status in [502, 503, 504].into_iter().cycle() {
+                    let response = axum::http::Response::builder()
+                        .status(status)
+                        .body("")
+                        .unwrap();
+                    let response = Ok::<_, reqwest::Error>(reqwest::Response::from(response));
+                    let _ = client.until_answered(std::future::ready(response)).await;
+                    tokio::time::sleep(SHORT_HEALTH_CHECKS.timeout / 4).await;
+                }
+            }
+        });
         let frozen = verdict.wait_for(|now| now.frozen_since.is_some());
         tokio::time::timeout(10 * SHORT_HEALTH_CHECKS.timeout, frozen)
             .await
             .expect("declared frozen")
             .unwrap();
         request.await.unwrap().expect_err("cut off");
+        proxy_errors.abort();
         probe.health.send_replace(Some(StatusCode::OK));
         probe.release(true);
         checks_ended(&client).await;
@@ -3048,31 +3069,35 @@ pub(crate) mod tests {
                 .build()
                 .unwrap()
         };
-        // Never accepts: its connections wait in the backlog, so checks miss.
-        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", silent.local_addr().unwrap());
-        let first = runtime();
-        let client = first.block_on(async {
-            let client = health_checked_client(&url, Transport::Http11).await;
-            assert!(client.start_health_checks());
-            // The task is between two checks.
-            tokio::time::sleep(SHORT_HEALTH_CHECKS.timeout / 4).await;
-            client
-        });
-        drop(first);
-        runtime().block_on(async {
-            let mut verdict = client.endpoint.health_checks.verdict.subscribe();
-            let seen = verdict.borrow_and_update().checks;
-            let stalled = spawn_unanswered(&client);
-            tokio::time::timeout(
-                4 * SHORT_HEALTH_CHECKS.timeout,
-                verdict.wait_for(|now| now.checks > seen),
-            )
-            .await
-            .expect("the stall starts a check")
-            .unwrap();
-            stalled.abort();
-        });
+        for polled in [false, true] {
+            // Never accepts: its connections wait in the backlog, so checks miss.
+            let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", silent.local_addr().unwrap());
+            let first = runtime();
+            let client = first.block_on(async {
+                let client = health_checked_client(&url, Transport::Http11).await;
+                assert!(client.start_health_checks());
+                if polled {
+                    // The task is in its first check.
+                    tokio::time::sleep(SHORT_HEALTH_CHECKS.timeout / 4).await;
+                }
+                client
+            });
+            drop(first);
+            runtime().block_on(async {
+                let mut verdict = client.endpoint.health_checks.verdict.subscribe();
+                let seen = verdict.borrow_and_update().checks;
+                let stalled = spawn_unanswered(&client);
+                tokio::time::timeout(
+                    4 * SHORT_HEALTH_CHECKS.timeout,
+                    verdict.wait_for(|now| now.checks > seen),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("polled {polled}: the stall starts a check"))
+                .unwrap();
+                stalled.abort();
+            });
+        }
     }
 
     /// A miss is not forgotten when the requests that started the checks end
@@ -3093,6 +3118,7 @@ pub(crate) mod tests {
         assert!(resent.await.unwrap().is_err(), "cut off by the verdict");
         let bound = HEALTH_CHECKS.after + (HEALTH_CHECK_MISSES + 1) * HEALTH_CHECKS.timeout;
         assert!(started.elapsed() <= bound, "{:?}", started.elapsed());
+        checks_ended(&client).await;
     }
 
     /// A request with no answer is reported each time its wait doubles and
@@ -3782,6 +3808,7 @@ pub(crate) mod tests {
         client.observe_desired_in_flight(1_632);
         assert_eq!(permits(), 1_632);
         let h1_ceiling = http1_gate_ceiling(crate::rlimit::soft_nofile_limit());
+        assert_eq!(runtime.h1_gate.ceiling, h1_ceiling);
         assert_eq!(h1_permits(), 1_632.min(h1_ceiling));
         client.observe_desired_in_flight(u64::MAX);
         assert_eq!(permits(), INFERENCE_MAX_CONCURRENT_STREAMS);
