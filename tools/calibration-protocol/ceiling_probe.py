@@ -18,9 +18,9 @@ Usage
 
 Options are in `--help`. `--device N` is an NVML index, translated to
 `CUDA_VISIBLE_DEVICES=GPU-<uuid>` as the orchestrator pins a worker
-(`gpu.rs: resolve_pin`). Without NVML it is the HIP device index in KFD
-order, pinned as the spawner pins a ROCm worker (`HIP_VISIBLE_DEVICES`, plus
-`PANOPTIKON_UNIFIED_GPU=<bdf>` on an APU); free and total then come from
+(`gpu.rs: resolve_pin`). Where NVML has no GPU N, it is the HIP device index
+in KFD order, pinned as the spawner pins a ROCm worker (`HIP_VISIBLE_DEVICES`,
+plus `PANOPTIKON_UNIFIED_GPU=<bdf>` on an APU); free and total then come from
 amdgpu sysfs and the process's own usage from KFD or DRM fdinfo
 (`rocm_sysfs.py`). See tools/calibration-protocol/README.md
 "`ceiling_probe.py` - ground truth".
@@ -750,9 +750,8 @@ def load_instance(impl_cls: Any, config: Dict[str, Any], synchronize: Any,
     (`memory.after_load`) with the load priced by `synchronize()` and
     `readings()`. Returns the instance, the `load` block and the worker's
     facts about the load: `dtype`/`dtype_method`, the GQA check's decision
-    (`gqa_check`) and the installed transformers version."""
-    from importlib import metadata
-
+    (`gqa_check`) and the version of the transformers module the load
+    imported (None when it imported none)."""
     from inferio_worker import memory
 
     started = time.monotonic()
@@ -765,10 +764,7 @@ def load_instance(impl_cls: Any, config: Dict[str, Any], synchronize: Any,
 
     load, gqa_check = memory.after_load(price)
     dtype, dtype_method = memory.resolved_dtype(instance)
-    try:
-        transformers = metadata.version("transformers")
-    except metadata.PackageNotFoundError:
-        transformers = None
+    transformers = getattr(sys.modules.get("transformers"), "__version__", None)
     return instance, load, {
         "dtype": dtype, "dtype_method": dtype_method,
         "gqa_check": gqa_check, "transformers": transformers,
@@ -909,6 +905,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if gpu is None:
         nvml_error = None if nvml is None else nvml.error
+        nodes = rocm_sysfs.gpu_nodes()
+        if nodes and not any(node["openable"] for node in nodes):
+            raise SystemExit("ceiling_probe: KFD lists a GPU but this process "
+                             "cannot open its render node")
         if os.path.isdir(rocm_sysfs.Roots().kfd):
             raise SystemExit(
                 f"ceiling_probe: neither NVML nor KFD has a GPU with index "

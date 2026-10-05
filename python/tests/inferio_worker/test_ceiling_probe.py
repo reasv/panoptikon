@@ -19,7 +19,6 @@ from __future__ import annotations
 import importlib.util
 import io
 import sys
-from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -200,8 +199,8 @@ def test_the_probe_records_the_workers_dtype_and_the_transformers_version(
 ):
     """The probe loads in the worker's order (load, pin check, priced load,
     GQA check). The dtype is the worker's own, here from a module two levels
-    inside the impl; the GQA check's decision and the installed transformers
-    version are recorded beside it."""
+    inside the impl; the GQA check's decision and the imported transformers
+    module's version are recorded beside it."""
     torch = pytest.importorskip("torch")
     events: list[str] = []
 
@@ -224,7 +223,9 @@ def test_the_probe_records_the_workers_dtype_and_the_transformers_version(
         "expand_kv_heads_without_fused_gqa",
         lambda: events.append("gqa") or sdpa.PATCHED,
     )
-    monkeypatch.setattr(metadata, "version", lambda name: "4.99.0")
+    monkeypatch.setitem(
+        sys.modules, "transformers", SimpleNamespace(__version__="4.99.0")
+    )
     monkeypatch.delitem(sys.modules, "inferio.impl.utils", raising=False)
     _, load, facts = probe.load_instance(
         Impl, {}, lambda: events.append("synchronize"), readings
