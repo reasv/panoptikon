@@ -1742,8 +1742,10 @@ def note_batch_units(size: int, record: str = "largest_units") -> None:
 def _note_release(
     released_mb: int | None, elapsed_ms: float, trigger: str, arm: bool = True
 ) -> None:
-    """Record a completed release and arm the next batch's re-grow report."""
-    _release_state["armed"] = arm
+    """Record a completed release and arm the next batch's re-grow report,
+    unless it returned nothing."""
+    armed = arm and released_mb != 0
+    _release_state["armed"] = armed
     _release_state["released_mb"] = released_mb
     _release_state["release_ms"] = round(elapsed_ms, 3)
     _release_state["trigger"] = trigger
@@ -1753,7 +1755,7 @@ def _note_release(
         trigger,
         "?" if released_mb is None else released_mb,
         elapsed_ms,
-        "; the next batch pays the re-grow" if arm else "",
+        "; the next batch pays the re-grow" if armed else "",
     )
 
 

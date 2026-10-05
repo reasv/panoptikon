@@ -778,7 +778,8 @@ def test_a_trim_that_released_nothing_leaves_the_shrink_state_alone() -> None:
             "nor reset the hysteresis that is counting towards a real release"
         )
     finally:
-        packing.note_trimmed()
+        packing.reset_comparator()
+        packing.reset_shrink_state()
 
 
 def test_the_worker_returns_freed_memory_after_each_predict_reply() -> None:

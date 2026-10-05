@@ -190,8 +190,12 @@ def reset_shrink_state() -> None:
 
 
 def note_trimmed() -> None:
-    """Reset everything a completed `empty_cache()` invalidates."""
-    reset_comparator()
+    """Reset everything a completed `empty_cache()` invalidates; the throughput
+    comparator is kept when the release returned less than
+    `SHRINK_BLIND_SLACK_MB`, which left the pool as it was."""
+    released = memory.last_release()[0]
+    if released is None or released >= SHRINK_BLIND_SLACK_MB:
+        reset_comparator()
     reset_shrink_state()
 
 
@@ -214,7 +218,8 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     Called once per granted window, before its first batch. Slack is what
     `empty_cache()` would return (`reserved - allocated` minus unreturnable
     split blocks); the grant must stay below `SHRINK_RATIO` of it for
-    `SHRINK_WINDOWS` consecutive windows. Returns whether `empty_cache()` ran.
+    `SHRINK_WINDOWS` consecutive windows. Returns whether a release changed
+    the pool.
 
     A memory-blind window (`mb == 0`) counts as a squeeze, so a pool that
     itself filled the device is released. It counts only above
@@ -268,6 +273,23 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     if not memory.empty_cache(memory.SHRINK_RELEASE):
         _under_grant_windows = 0
         return False
+    windows = _under_grant_windows
+    released = memory.last_release()[0]
+    note_trimmed()
+    _blind_released = grant_mb == 0
+    if released is not None:
+        left = slack_mb - released
+        if left >= SHRINK_BLIND_SLACK_MB or released < left:
+            _unreleased_slack = (left, time.monotonic())
+    if released is not None and released < SHRINK_BLIND_SLACK_MB:
+        logger.debug(
+            "released the %d MiB allocator pool against %d MiB of releasable "
+            "slack; it returned %d MiB, so the pool is unchanged",
+            reserved_mb,
+            slack_mb,
+            released,
+        )
+        return False
     logger.info(
         "grant fell to %d MiB against %d MiB of releasable slack (a %d MiB "
         "allocator pool) for %d consecutive windows; released the pool "
@@ -275,19 +297,8 @@ def maybe_shrink(grant_mb: int | None) -> bool:
         grant_mb,
         slack_mb,
         reserved_mb,
-        _under_grant_windows,
+        windows,
     )
-    released = memory.last_release()[0]
-    # A release that returned less than `SHRINK_BLIND_SLACK_MB` left the pool
-    # as it was: its rates stay comparable.
-    if released is None or released >= SHRINK_BLIND_SLACK_MB:
-        reset_comparator()
-    reset_shrink_state()
-    _blind_released = grant_mb == 0
-    if released is not None:
-        left = slack_mb - released
-        if left >= SHRINK_BLIND_SLACK_MB or released < left:
-            _unreleased_slack = (left, time.monotonic())
     return True
 
 

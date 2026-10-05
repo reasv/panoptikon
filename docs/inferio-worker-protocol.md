@@ -1093,7 +1093,7 @@ A measurement map describes one GPU batch the worker actually ran:
 | `throughput_collapse` | `true` when this *pool-growing* batch was an upward-or-equal step in `units` against the previous pool-growing batch **and** its units/sec fell below the collapse ratio times that batch's. On Windows' WDDM the driver's sysmem fallback turns over-admission into a silent throughput collapse rather than an OOM, so this is the synthetic negative sample that stands in for the missing exception. A smaller (e.g. tail) batch or a non-growing one is not comparable and is never flagged; a flagged batch does not become the new comparator, so a persistent spill cannot normalise itself. **A candidate, not a negative**: the host deflates on it only where the same batch's pool grew past the device's free reading (design doc, "The worker's verdict is a candidate") |
 | `spilled` | `true` when, after this batch, the worker's pool exceeded NVML's used memory on the GPU by more than 512 MiB, both from one sample: part of the pool is in system memory. Only on CUDA under the Windows display driver (native Windows, WSL2, Docker Desktop). A negative sample the host deflates on without further corroboration; the batch's outputs are valid. The worker then releases the pool and runs the rest of the window at half this batch's size, never above the grant; once a spill outlives its release, it releases nothing until a batch does not spill, and still halves. On the grantless path it halves nothing, since the window is one call (design doc, "Windows display driver: the pool outgrows the card") |
 | `next_over_budget` | `true` when the next item in packing order would have pushed this batch past the grant's `unit_budget`, as the harness priced it, and the batch carries at least half of that budget: it is as full as whole items allow. Never on a window's last batch, nor on a batch the shape ceiling, the memory clamp or `user_cap_items` stopped while the next item still fit. The orchestrator counts such a batch as having run at its budget even below `FULL_BATCH_RATIO` of it. Absent/false otherwise |
-| `regrow_mb` | **new**: pool MiB the **first** batch after a release grew back, `peak_reserved_mb − reserved_before_mb`. Absent on every other batch. The `cudaMalloc`s happen inside `predict`, so this batch's `duration_ms` *contains* the re-grow and is not a measurement of it |
+| `regrow_mb` | **new**: pool MiB the **first** batch after a release grew back, `peak_reserved_mb − reserved_before_mb`. Absent on every other batch, and after a release that returned nothing. The `cudaMalloc`s happen inside `predict`, so this batch's `duration_ms` *contains* the re-grow and is not a measurement of it |
 | `regrow_after` | **new**: which release the re-grow followed — `"trim"` (the orchestrator asked), `"shrink"` (this worker's own reactive rule), or on a host whose driver spills to system memory `"growth"` (released before a batch larger than every batch since the last release) or `"spill"` (released after a `spilled` batch). Present with `regrow_mb`. Each is a different population with a different remedy; the orchestrator reports only `"trim"` |
 | `trimmed` | `true` on the **first** measurement of a window the worker's reactive shrink released the allocator pool before (see "Reactive shrink and trim"). Advisory: it explains why this batch grew the pool from (near) nothing and why its throughput is not comparable to the previous window's. Absent/false normally |
 | `oom_class` | **new 2026-09-04**: present exactly when `oom` is `true`, as `{source, exception, free_mb_at_failure, device}` — *why* the harness called this an out-of-memory condition, so the orchestrator can trust a structural signal and corroborate a textual one instead of guessing from a message it never sees. Absent when `oom` is absent, and **absent means the worker saw no out-of-memory condition**, including on a batch that failed for some other reason: the orchestrator must not deflate on such a failure |
@@ -1459,14 +1459,15 @@ residents"):
   least 256 MiB of its slack in the pool, or more than it returned, the rule
   does not count again for 30 s (the orchestrator's trim interval) unless the
   slack grows 256 MiB past what it left. Another release, a trim or the
-  OOM-retry loop's, ends that wait. A release that returned less than 256 MiB
-  keeps the throughput comparator. A **memory-blind** window (`grant.mb` is
-  `0`: the GPU had nothing left to price it against) is the strongest squeeze
-  there is and counts as one of the two, provided the slack is worth
-  returning (256 MiB) — without that clause a pool that has itself consumed
-  the card's headroom pins the card behind the zero-MB grants its own size
-  produced, and no later window is ever priced again. This only ever fires in
-  a worker that is *receiving* windows.
+  OOM-retry loop's, ends that wait. A shrink or trim release that returned
+  less than 256 MiB left the pool as it was: it keeps the throughput
+  comparator, and a shrink's does not flag `trimmed`. A **memory-blind**
+  window (`grant.mb` is `0`: the GPU had nothing left to price it against) is
+  the strongest squeeze there is and counts as one of the two, provided the
+  slack is worth returning (256 MiB) — without that clause a pool that has
+  itself consumed the card's headroom pins the card behind the zero-MB grants
+  its own size produced, and no later window is ever priced again. This only
+  ever fires in a worker that is *receiving* windows.
 - **Trim** is the orchestrator's, for a resident that is receiving none. An
   idle worker's retained pool squeezes its neighbours indefinitely and it will
   never notice, so the orchestrator sends it a `trim` request. It is a message

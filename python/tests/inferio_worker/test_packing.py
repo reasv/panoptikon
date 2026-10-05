@@ -104,9 +104,11 @@ class FakeCuda:
 def clean_state():
     """Every test starts with no cross-window throughput comparator and no
     accumulated reactive-shrink hysteresis."""
-    packing.note_trimmed()
+    packing.reset_comparator()
+    packing.reset_shrink_state()
     yield
-    packing.note_trimmed()
+    packing.reset_comparator()
+    packing.reset_shrink_state()
 
 
 class FakeOomRetryUtils:
@@ -2369,11 +2371,21 @@ def test_after_a_release_that_returned_nothing_the_slack_must_grow_first():
         mps.kept = 200 * MIB
         packing._last_growth = (8, 100.0)
         assert windows(2) == 13
+        before = packing.time.monotonic()
         assert packing._last_growth == (8, 100.0), "it returned nothing"
         assert windows(4) == 13, "a release that returned less than it left"
-        later = packing.time.monotonic() + packing.SHRINK_RESIDUAL_HOLD_S
-        with mock.patch.object(packing.time, "monotonic", return_value=later):
-            assert windows(2) == 14, "the wait ends after 30 s"
+        with mock.patch.object(packing.time, "monotonic") as now:
+            now.return_value = before + 29
+            assert windows(2) == 13
+            now.return_value = before + 30
+            windows(1)
+            assert packing.maybe_shrink(100) is False
+            assert mps.empty_cache_calls == 14, "the wait ends after 30 s"
+    packing.note_trimmed()
+    assert packing._last_growth == (8, 100.0), (
+        "a trim that returned nothing keeps it too"
+    )
+    assert not memory._release_state["armed"]
 
 
 def test_the_clamp_credits_a_split_pool_the_release_decision_refuses(fake_torch):
@@ -3158,9 +3170,9 @@ def test_a_spill_that_outlives_its_release_releases_nothing_until_one_fits(
     measurements = first["measurements"] + second["measurements"]
     assert [m["items"] for m in measurements] == [4, 2, 1, 1, 1, 1]
     assert all(m["spilled"] for m in measurements)
-    assert [m.get("regrow_after") for m in measurements] == [
-        None, memory.SPILL_RELEASE, None, None, None, None
-    ]
+    assert [m.get("regrow_after") for m in measurements] == [None] * 6, (
+        "a release that returned nothing arms no re-grow report"
+    )
     assert spill_host.empty_cache_calls == 2, "the first spill, and the last"
     spills = [r for r in caplog.records if "system memory" in r.getMessage()]
     assert [r.levelno for r in spills] == (
