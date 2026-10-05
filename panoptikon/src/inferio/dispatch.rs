@@ -428,8 +428,8 @@ pub(crate) fn in_flight_target_units(target: u64, grant: Option<&Grant>) -> u64 
     }
 }
 
-/// A fatal worker death: the message for queued requests and the dead
-/// replica's GPU, if known.
+/// A fatal worker death: the message for the manager's death handler and the
+/// dead worker's own requests, and the dead replica's GPU, if known.
 struct Death {
     message: String,
     gpu: Option<String>,
@@ -444,7 +444,7 @@ impl From<String> for Death {
 /// Why the dispatcher loop ended.
 enum End {
     Graceful,
-    /// A worker died fatally (message kept for failing queued requests).
+    /// A worker died fatally (message kept for the death handler).
     Fatal(Death),
 }
 
@@ -609,9 +609,10 @@ pub(crate) async fn run_dispatcher(
                     }
                 }
             }
-            // A request whose caller has gone is never sent. The bounds hold
-            // for the cap they were computed for.
+            // A request whose caller has gone is never sent. Recompute the
+            // bounds if the front request changed.
             queue.retain(|queued| !queued.request.reply.is_closed());
+            ctx.stats.queue_len.store(queue.len(), Relaxed);
             if queue.front().is_none_or(|front| front.shape.cap != cap) {
                 free.push(replica);
                 continue;
@@ -999,7 +1000,8 @@ async fn run_batch(
         item_bound,
     )
     .await;
-    // A replica that cannot run one item fails the rest of the queue once.
+    // A replica that cannot run one item ends the model; the queue goes back
+    // to its callers and meets the load cooldown.
     let outcome = match grant.and_then(|token| token.finish(ledger)) {
         Some(verdict) if !matches!(outcome, BatchOutcome::Fatal(_)) => BatchOutcome::Fatal(Death {
             message: verdict.to_string(),
@@ -1065,6 +1067,9 @@ async fn run_batch_inner(
             let mut remaining = window.drain(..).zip(counts);
             while let Some((request, count)) = remaining.next() {
                 let inputs = combined.drain(..count).collect::<Vec<_>>();
+                if request.reply.is_closed() {
+                    continue;
+                }
                 match predict_chunked(inference_id, worker, &inputs, retry_grant, None, item_bound)
                     .await
                 {
@@ -2030,11 +2035,11 @@ mod tests {
     }
 
     impl Harness {
-        async fn predict(
+        fn queue(
             &self,
             inputs: Vec<WorkerInput>,
             max_batch: Option<u32>,
-        ) -> Result<Vec<WorkerOutput>> {
+        ) -> oneshot::Receiver<Result<Vec<WorkerOutput>>> {
             let (reply, answer) = oneshot::channel();
             self.tx
                 .send(DispatchMsg::Predict(DispatchRequest {
@@ -2043,11 +2048,21 @@ mod tests {
                     reply,
                 }))
                 .expect("queued");
+            answer
+        }
+
+        async fn predict(
+            &self,
+            inputs: Vec<WorkerInput>,
+            max_batch: Option<u32>,
+        ) -> Result<Vec<WorkerOutput>> {
+            let answer = self.queue(inputs, max_batch);
             answer.await.expect("the dispatcher replied")
         }
 
+        /// A dispatcher a death ended has closed its channel already.
         async fn shutdown(self) {
-            self.tx.send(DispatchMsg::Shutdown).expect("shutdown");
+            let _ = self.tx.send(DispatchMsg::Shutdown);
             self.dispatcher.await.expect("dispatcher exits");
         }
     }
@@ -2405,32 +2420,109 @@ mod tests {
         dispatcher.await.expect("dispatcher exits");
     }
 
-    /// A request whose caller has gone is never sent: here it would kill the
-    /// worker and fail the request queued with it.
+    /// A request whose caller has gone is never sent: not one that would kill
+    /// the worker, not a queue of them, and not a front request whose user cap
+    /// the window's bounds were computed for. One window serves the rest.
     #[tokio::test]
     async fn a_request_whose_caller_has_gone_is_never_sent() {
-        let harness = one_replica(32_768, "dieflag_test", item_cost(8)).await;
-        // Queued before the dispatcher task first runs.
-        let mut answers: Vec<_> = [json!(0), json!({"die": true}), json!(2)]
-            .into_iter()
-            .map(|data| {
-                let (reply, answer) = oneshot::channel();
-                harness
-                    .tx
-                    .send(DispatchMsg::Predict(DispatchRequest {
-                        inputs: vec![json_input(data)],
-                        max_batch: None,
-                        reply,
-                    }))
-                    .expect("queued");
-                answer
-            })
-            .collect();
-        drop(answers.remove(1));
-        for answer in answers {
-            answer.await.expect("replied").expect("the worker lives");
+        // (fixture, queued (data, max_batch, caller waits), one more request
+        // once the dispatcher has run, the waiting callers' replies)
+        let rows = [
+            (
+                "dieflag_test",
+                vec![
+                    (json!(0), None, true),
+                    (json!({"die": true}), None, false),
+                    (json!(2), None, true),
+                ],
+                false,
+                vec![json!({"echo": 0}), json!({"echo": 2})],
+            ),
+            (
+                "batchsize_test",
+                vec![(json!(0), None, false); 3],
+                true,
+                vec![json!({"batch": 1})],
+            ),
+            (
+                "batchsize_test",
+                vec![
+                    (json!(0), Some(8), false),
+                    (json!(1), Some(1), true),
+                    (json!(2), Some(1), true),
+                ],
+                false,
+                vec![json!({"batch": 1}); 2],
+            ),
+        ];
+        for (fixture, queued, late, replies) in rows {
+            let harness = one_replica(32_768, fixture, item_cost(8)).await;
+            // Queued before the dispatcher task first runs.
+            let mut answers = Vec::new();
+            for (data, max_batch, waits) in queued {
+                let answer = harness.queue(vec![json_input(data)], max_batch);
+                if waits {
+                    answers.push(answer);
+                }
+            }
+            if late {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                answers.push(harness.queue(json_inputs(1), None));
+            }
+            let mut outputs = Vec::new();
+            for answer in answers {
+                outputs.extend(answer.await.expect("replied").expect("the worker lives"));
+            }
+            let replies: Vec<_> = replies.into_iter().map(WorkerOutput::Json).collect();
+            assert_eq!(outputs, replies, "{fixture}");
+            assert_eq!(harness.stats.total_batches.load(Relaxed), 1, "{fixture}");
+            harness.shutdown().await;
         }
-        harness.shutdown().await;
+    }
+
+    /// When a merged window fails and a request retried alone kills the
+    /// worker, the requests not yet retried go back unsent with their own
+    /// inputs. A retried request whose caller has gone is skipped.
+    #[tokio::test]
+    async fn the_per_request_retry_hands_back_what_a_death_left_unsent() {
+        for middle_waits in [true, false] {
+            let harness = one_replica(32_768, "dieflag_test", item_cost(8)).await;
+            // Queued before the dispatcher task first runs: one merged window.
+            let [first, middle, last] = [json!(0), json!({"die_alone": true}), json!(2)]
+                .map(|data| harness.queue(vec![json_input(data)], None));
+            let middle = if middle_waits {
+                Some(middle)
+            } else {
+                // Gone while the merged call runs.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                drop(middle);
+                None
+            };
+            let first = first.await.expect("replied").expect("retried alone");
+            assert_eq!(first, vec![WorkerOutput::Json(json!({"echo": 0}))]);
+            let last = last.await.expect("replied");
+            match middle {
+                Some(middle) => {
+                    let err = middle.await.expect("replied").expect_err("the worker died");
+                    assert!(
+                        err.downcast_ref::<Unsent>().is_none(),
+                        "it was sent: {err:#}"
+                    );
+                    let err = last.expect_err("handed back");
+                    let Unsent(inputs) = err.downcast::<Unsent>().expect("unsent");
+                    let inputs: Vec<_> = inputs
+                        .into_iter()
+                        .map(|input| (input.data, input.file))
+                        .collect();
+                    assert_eq!(inputs, vec![(Some(json!(2)), None)]);
+                }
+                None => assert_eq!(
+                    last.expect("the worker lives"),
+                    vec![WorkerOutput::Json(json!({"echo": 2}))]
+                ),
+            }
+            harness.shutdown().await;
+        }
     }
 
     /// A [`DispatchMsg::Trim`] naming a free replica is delivered to it and
