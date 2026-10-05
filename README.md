@@ -441,8 +441,8 @@ containers as root) and any other uid in group 0 (`--user 1234`, or
 `--user <uid>:0` when you give a group or the uid exists in the image) work
 too, with models on the cache volume.
 
-What one user writes to the volumes belongs to that user, and another user
-cannot write to it: a start on another user's database stops with an error
+What one user writes to the volumes belongs to that user, and no other user
+but root can write to it: a start on another user's database stops with an error
 naming the owner, and model downloads into another user's cache fail. Hand the
 volumes to the user that will run the container first (here the default user;
 `1234:0` for `--user 1234`):

@@ -124,10 +124,10 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 #
 # /app and /home/ubuntu belong to the runtime user (ubuntu:24.04's built-in
 # uid-1000 `ubuntu` user) and to group 0 with the owner's permissions, so the
-# image also runs under any other uid, which Docker starts in group 0. A named
-# volume mounted there takes this ownership on first use (Docker creates
-# missing mountpoints as root). Done in the layer that creates the venv so it
-# is not copied into a second layer.
+# image also runs under any other uid in group 0 (Docker's group for a uid the
+# image has no entry for). A named volume mounted there takes this ownership on
+# first use (Docker creates missing mountpoints as root). Done in the layer that
+# creates the venv so it is not copied into a second layer.
 ARG ACCELERATOR=cpu
 RUN panoptikon setup --accelerator ${ACCELERATOR} \
     && cp /app/runtime/venv/lib/python*/site-packages/pypdfium2_raw/libpdfium.so \
