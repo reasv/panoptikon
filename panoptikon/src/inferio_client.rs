@@ -899,6 +899,7 @@ fn endpoint_runtime(base_url: &str, checks: HealthCheckTiming) -> Result<Arc<End
     }
     // Only lane 0 is built here; `pick_lane` recruits the rest.
     let tls = is_tls_endpoint(base_url);
+    let h1_ceiling = http1_gate_ceiling(crate::rlimit::soft_nofile_limit());
     let seed = EndpointClients::build(h2_client_builder, 1)?;
     let negotiating = if tls {
         Some(
@@ -923,10 +924,7 @@ fn endpoint_runtime(base_url: &str, checks: HealthCheckTiming) -> Result<Arc<End
     let runtime = Arc::new(EndpointRuntime {
         h2: lanes,
         h2_seed: seed,
-        h1: EndpointClients::build(
-            |builder| builder.http1_only(),
-            INFERENCE_MAX_CONCURRENT_REQUESTS,
-        )?,
+        h1: EndpointClients::build(|builder| builder.http1_only(), h1_ceiling)?,
         tls,
         negotiating,
         transport: RwLock::new(None),
@@ -934,7 +932,7 @@ fn endpoint_runtime(base_url: &str, checks: HealthCheckTiming) -> Result<Arc<End
         probe_lock: tokio::sync::Mutex::new(()),
         last_probe: std::sync::Mutex::new((0, Transport::Http11)),
         h2_gate: Gate::new(INFERENCE_MAX_CONCURRENT_STREAMS),
-        h1_gate: Gate::new(http1_gate_ceiling(crate::rlimit::soft_nofile_limit())),
+        h1_gate: Gate::new(h1_ceiling),
         probe_log: LogThrottle::new(
             format!("could not reach the inference endpoint {base_url}"),
             tracing::Level::WARN,
