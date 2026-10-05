@@ -1330,7 +1330,7 @@ impl InferenceApiClient {
     }
 
     /// Starts the check task unless it runs; whether this call started it.
-    fn start_health_checks(&self) -> bool {
+    pub(crate) fn start_health_checks(&self) -> bool {
         {
             let mut state = self.endpoint.health_checks.lock();
             if state.running {

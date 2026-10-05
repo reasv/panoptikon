@@ -460,10 +460,10 @@ health check when the connection cannot see it.
   still waits, and while the last check missed short of a verdict: a miss is
   kept when the keep-alive fails the waiting requests first, so their
   re-submissions are cut off at the verdict instead of starting a new stall.
-  One task per base URL runs them. Besides a waiting request,
-  only a request to a server declared frozen starts one (see "Health"). A
-  check misses on its deadline or on a 502, 503 or 504, a proxy saying the
-  server behind it did not answer. Any other outcome, a refused connection or
+  One task per base URL runs them. Besides a waiting request, a request to a
+  server declared frozen starts one, and so does a proxied health report that
+  missed its deadline (see "Health"). A check misses on its deadline or on a
+  502, 503 or 504, a proxy saying the server behind it did not answer. Any other outcome, a refused connection or
   a failed TLS handshake included, is no evidence of a freeze, and neither is
   a missed check when a response other than those came from the base URL
   since the previous check. `/health` reads in-memory state and touches no
@@ -527,7 +527,10 @@ That request has the health check's 10 s deadline. While the gateway holds
 the upstream frozen, it does not wait at all: it answers 504 at once, with the
 reason in `detail` and its own `inference_clients`, whose `frozen_since` says
 since when (`null` while the server answers). The same 504 answers a server
-that misses the deadline. While frozen, each such request also starts a health
+that misses the deadline, and the miss starts the health checks, so a gateway
+polled only for this report declares a frozen server after two missed checks.
+With gateways chained, the outer one's checks miss on the inner one's 504 and
+reach the same verdict. While frozen, each such request also starts a health
 check unless one runs, so polling the route finds the server again once it
 answers.
 
