@@ -513,18 +513,30 @@ class Supervisor:
         creationflags = 0
         if IS_WINDOWS:
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-        popen = subprocess.Popen(
-            [str(part) for part in argv],
-            stdout=handle if handle is not None else subprocess.DEVNULL,
-            stderr=subprocess.STDOUT if handle is not None
-            else subprocess.DEVNULL,
-            cwd=str(cwd) if cwd else None,
-            env=env,
-            creationflags=creationflags,
-            start_new_session=not IS_WINDOWS,
-        )
-        child = Child(name, popen, handle)
-        self.children.append(child)
+        # A stop signal waits until the child is registered, so the teardown
+        # stops it, and is then raised again.
+        held: List[int] = []
+        saved = {sig: signal.signal(sig, lambda signum, _: held.append(signum))
+                 for sig in (signal.SIGINT, *STOP_SIGNALS)
+                 if signal.getsignal(sig) is not signal.SIG_IGN}
+        try:
+            popen = subprocess.Popen(
+                [str(part) for part in argv],
+                stdout=handle if handle is not None else subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if handle is not None
+                else subprocess.DEVNULL,
+                cwd=str(cwd) if cwd else None,
+                env=env,
+                creationflags=creationflags,
+                start_new_session=not IS_WINDOWS,
+            )
+            child = Child(name, popen, handle)
+            self.children.append(child)
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+            for signum in held[:1]:
+                signal.raise_signal(signum)
         return child
 
     def stop(self, child: Child, grace: Optional[float] = None) -> str:

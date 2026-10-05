@@ -254,6 +254,34 @@ def test_an_ignored_sighup_stays_ignored():
             signal.signal(sig, handler)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signal")
+@pytest.mark.parametrize("sig", ["SIGINT", "SIGTERM"])
+def test_a_signal_while_a_child_starts_is_raised_once_it_is_registered(
+        monkeypatch, sig):
+    """The teardown stops a child whose start a stop signal interrupted."""
+    saved = {each: signal.getsignal(each)
+             for each in (signal.SIGINT, *legs.STOP_SIGNALS)}
+    popen = subprocess.Popen
+
+    def signalled(*args, **kwargs):
+        signal.raise_signal(getattr(signal, sig))
+        return popen(*args, **kwargs)
+
+    monkeypatch.setattr(legs.subprocess, "Popen", signalled)
+    supervisor = legs.Supervisor(grace=5.0)
+    try:
+        legs.stop_on_signals()
+        with pytest.raises(KeyboardInterrupt):
+            supervisor.start("child", [sys.executable, "-c",
+                                       "import time; time.sleep(60)"])
+    finally:
+        for each, handler in saved.items():
+            signal.signal(each, handler)
+    (child,) = supervisor.children
+    supervisor.stop_all()
+    assert child.popen.returncode == -signal.SIGTERM
+
+
 def test_job_start_is_marked_before_the_post(monkeypatch, tmp_path):
     leg = types.SimpleNamespace(
         db="cal", base="http://gw", events=[], path=lambda name: tmp_path / name,
