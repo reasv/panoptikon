@@ -178,12 +178,15 @@ def test_each_fixture_passes_at_its_thresholds_and_fails_one_past(tmp_path,
         over = _verdicts(tmp_path / flag, model, expect,
                          {**at, flag: at[flag] + 1})
         assert over[check] == "FAIL", flag
-    # A declared fault that never fired.
+    # A declared fault that never fired; once is enough.
     for flag in ("--expect-ooms", "--expect-deaths"):
         if at[flag]:
             none = _verdicts(tmp_path / f"none{flag}", model, expect,
                              {**at, flag: 0})
             assert none["failures"] == "FAIL", flag
+            once = _verdicts(tmp_path / f"once{flag}", model, expect,
+                             {**at, flag: 1})
+            assert once["failures"] == "PASS", flag
     # Unpriced (a `_cpu` twin on a GPU host), it settles no window, but a
     # death is still logged.
     unpriced = _verdicts(tmp_path / "unpriced", model, expect,
