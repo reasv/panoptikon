@@ -12,9 +12,11 @@
 //! Unit counts here are estimates; the worker reprices after decode.
 //!
 //! A merged window failing with a [`WorkerError`] is retried per request; a
-//! fatal error fails everything queued and takes the whole model down. Every
-//! exit settles the window's grant. See docs/batch-calibration-design.md,
-//! "Dispatcher windows and the batch cap" onwards.
+//! fatal error fails the requests the dead worker held and takes the whole
+//! model down; the requests still queued go back to their callers
+//! ([`Unsent`]) for the reloaded model. Every exit settles the window's grant.
+//! See docs/batch-calibration-design.md, "Dispatcher windows and the batch
+//! cap" onwards.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -84,6 +86,25 @@ pub(crate) struct DispatchRequest {
     pub max_batch: Option<u32>,
     pub reply: oneshot::Sender<Result<Vec<WorkerOutput>>>,
 }
+
+/// The reply to a request a worker death left unsent: its inputs go back to
+/// the caller, which queues them again on the reloaded model.
+pub(crate) struct Unsent(pub Vec<WorkerInput>);
+
+impl std::fmt::Display for Unsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the model's worker died before this request was sent")
+    }
+}
+
+/// Without the inputs, which can be large.
+impl std::fmt::Debug for Unsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for Unsent {}
 
 /// A queued request with its estimates, computed once on enqueue.
 struct Queued {
@@ -768,44 +789,15 @@ pub(crate) async fn run_dispatcher(
     match end {
         End::Graceful => {
             let reason = format!("model {} was unloaded", ctx.inference_id);
-            fail_requests(queue.drain(..).map(|queued| queued.request), &reason);
-            rx.close();
-            while let Ok(msg) = rx.try_recv() {
-                if let DispatchMsg::Predict(request) = msg {
-                    fail_requests(std::iter::once(request), &reason);
-                }
-            }
-            // Let in-flight windows finish, bounded by `unload_grace`.
-            let drain = async {
-                while let Some(finished) = in_flight.join_next().await {
-                    match finished {
-                        Ok((replica, BatchOutcome::Continue | BatchOutcome::Trimmed)) => {
-                            free.push(replica)
-                        }
-                        Ok((replica, BatchOutcome::Fatal(death))) => {
-                            tracing::warn!(
-                                model = %ctx.inference_id,
-                                "replica died while draining for unload: {}",
-                                death.message
-                            );
-                            replica.worker.kill().await;
-                        }
-                        Err(join_err) => tracing::error!(
-                            model = %ctx.inference_id,
-                            "dispatch window task panicked during unload drain: {join_err}"
-                        ),
-                    }
-                }
-            };
-            if timeout(ctx.unload_grace, drain).await.is_err() {
-                tracing::warn!(
+            let failed = fail_requests(take_queued(&mut queue, &mut rx).into_iter(), &reason);
+            if failed > 0 {
+                tracing::info!(
                     model = %ctx.inference_id,
-                    grace_secs = ctx.unload_grace.as_secs(),
-                    stuck_windows = in_flight.len(),
-                    "in-flight predicts did not finish within the unload grace; killing their workers"
+                    requests = failed,
+                    "failed the queued predicts of an unloaded model"
                 );
-                in_flight.shutdown().await;
             }
+            drain_in_flight(&ctx, &mut in_flight, &mut free).await;
             // Then the unload ladder on every replica concurrently.
             let results = join_all(free.into_iter().map(|replica| replica.worker.shutdown())).await;
             for result in results {
@@ -822,16 +814,10 @@ pub(crate) async fn run_dispatcher(
             ctx.stats.queue_len.store(0, Relaxed);
             ctx.stats.in_flight_windows.store(0, Relaxed);
             ctx.stats.replicas_free.store(0, Relaxed);
-            fail_requests(queue.drain(..).map(|queued| queued.request), &message);
-            rx.close();
-            while let Ok(msg) = rx.try_recv() {
-                if let DispatchMsg::Predict(request) = msg {
-                    fail_requests(std::iter::once(request), &message);
-                }
-            }
-            // Abort other windows; their grants settle via GrantToken's Drop.
-            in_flight.shutdown().await;
+            // The other replicas' windows finish and keep their outputs.
+            drain_in_flight(&ctx, &mut in_flight, &mut free).await;
             join_all(free.into_iter().map(|replica| replica.worker.kill())).await;
+            // Before the requests go back, so their callers load a new set.
             if let Some(manager) = ctx.manager.upgrade() {
                 manager.handle_worker_death(
                     &ctx.inference_id,
@@ -840,7 +826,62 @@ pub(crate) async fn run_dispatcher(
                     gpu.as_deref(),
                 );
             }
+            take_queued(&mut queue, &mut rx)
+                .into_iter()
+                .for_each(hand_back);
         }
+    }
+}
+
+/// Close the channel and take every request still queued or in it.
+fn take_queued(
+    queue: &mut VecDeque<Queued>,
+    rx: &mut mpsc::UnboundedReceiver<DispatchMsg>,
+) -> Vec<DispatchRequest> {
+    rx.close();
+    let mut requests: Vec<DispatchRequest> = queue.drain(..).map(|queued| queued.request).collect();
+    while let Ok(msg) = rx.try_recv() {
+        if let DispatchMsg::Predict(request) = msg {
+            requests.push(request);
+        }
+    }
+    requests
+}
+
+/// Let in-flight windows finish, bounded by `unload_grace`; their live
+/// replicas join `free`. Windows still running then are aborted.
+async fn drain_in_flight(
+    ctx: &DispatcherContext,
+    in_flight: &mut JoinSet<(Replica, BatchOutcome)>,
+    free: &mut Vec<Replica>,
+) {
+    let drain = async {
+        while let Some(finished) = in_flight.join_next().await {
+            match finished {
+                Ok((replica, BatchOutcome::Continue | BatchOutcome::Trimmed)) => free.push(replica),
+                Ok((replica, BatchOutcome::Fatal(death))) => {
+                    tracing::warn!(
+                        model = %ctx.inference_id,
+                        "replica died while draining: {}",
+                        death.message
+                    );
+                    replica.worker.kill().await;
+                }
+                Err(join_err) => tracing::error!(
+                    model = %ctx.inference_id,
+                    "dispatch window task panicked while draining: {join_err}"
+                ),
+            }
+        }
+    };
+    if timeout(ctx.unload_grace, drain).await.is_err() {
+        tracing::warn!(
+            model = %ctx.inference_id,
+            grace_secs = ctx.unload_grace.as_secs(),
+            stuck_windows = in_flight.len(),
+            "in-flight predicts did not finish within the unload grace; killing their workers"
+        );
+        in_flight.shutdown().await;
     }
 }
 
@@ -1037,7 +1078,10 @@ async fn run_batch_inner(
                         let message = format!("{individual_err:#}");
                         let _ = request.reply.send(Err(individual_err));
                         if fatal {
-                            fail_requests(remaining.map(|(request, _)| request), &message);
+                            for (mut request, count) in remaining {
+                                request.inputs = combined.drain(..count).collect();
+                                hand_back(request);
+                            }
                             return (BatchOutcome::Fatal(message.into()), settle);
                         }
                     }
@@ -1201,12 +1245,20 @@ fn split_window_outputs(
     slices
 }
 
-/// Fail every request with a copy of the same message.
-fn fail_requests(requests: impl Iterator<Item = DispatchRequest>, message: &str) {
-    for request in requests {
-        // Every caller fails requests that never reached a model.
-        let _ = request.reply.send(Err(Unattempted::error(message)));
-    }
+/// Fail every request with a copy of the same message; returns how many
+/// callers were still waiting.
+fn fail_requests(requests: impl Iterator<Item = DispatchRequest>, message: &str) -> usize {
+    // Every caller fails requests that never reached a model.
+    requests
+        .map(|request| request.reply.send(Err(Unattempted::error(message))).is_ok())
+        .filter(|&waiting| waiting)
+        .count()
+}
+
+/// Return a request a death left unsent to its caller, as [`Unsent`].
+fn hand_back(request: DispatchRequest) {
+    let DispatchRequest { inputs, reply, .. } = request;
+    let _ = reply.send(Err(anyhow::Error::new(Unsent(inputs))));
 }
 
 #[cfg(test)]

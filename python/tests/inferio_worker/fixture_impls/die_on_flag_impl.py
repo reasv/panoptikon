@@ -7,8 +7,7 @@ echoes. The timings make the multi-replica death test deterministic: the
 poison request holds one replica for 200ms (long enough for the normal
 requests to be queued/dispatched on the other replica) and the normal
 predict is slow enough (1s) to still be in flight when the death is
-detected — so every outstanding request must error under the
-whole-set-death policy.
+detected.
 """
 
 import os

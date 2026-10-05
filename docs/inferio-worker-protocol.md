@@ -1590,8 +1590,9 @@ either way, so a trim never races a batch.
   cross-platform soft terminate and Windows (the primary platform) has no
   SIGTERM equivalent — the `unload` exchange *is* the soft step. The whole
   tree is additionally under a kill-on-close Job Object on Windows.
-- Unexpected worker exit at any point: all pending/queued requests for that
-  model fail with the stderr tail; the model is marked unloaded.
+- Unexpected worker exit at any point: the requests the dead worker held fail
+  with the stderr tail; the model is marked unloaded, and the requests still
+  queued for it run on the reloaded model.
 - Every fatal path — whichever request was on the wire — reaps the child and
   records one **death report** before the error is returned: the worker
   label, the pid latched at spawn, the exit status, the terminating signal

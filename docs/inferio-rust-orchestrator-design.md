@@ -227,9 +227,10 @@ frame). The harness:
   Python terminate-then-kill ladder.
 - Startup handshake deadline; a worker that dies or hangs during `load`
   surfaces the traceback in the load/predict HTTP error, like today.
-- Unexpected worker exit → model marked unloaded, all queued requests for it
-  fail with a clear error, LRU entries dropped. (Python's behavior on a dead
-  process is murkier; we make it explicit.)
+- Unexpected worker exit → the requests the dead worker held fail with a clear
+  error, the other replicas' windows finish, the model is marked unloaded and
+  its LRU entries dropped, and the requests still queued run on the reloaded
+  model. (Python's behavior on a dead process is murkier; we make it explicit.)
 
 ---
 

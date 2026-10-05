@@ -43,7 +43,7 @@ use tokio::task::JoinHandle;
 use super::calibration::CalibrationProfiles;
 use super::cost::{CostDimension, CostUnit};
 use super::dispatch::{
-    DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, Replica, run_dispatcher,
+    DispatchMsg, DispatchRequest, DispatcherContext, ModelStats, Replica, Unsent, run_dispatcher,
 };
 use super::gpu::{GpuInfo, GpuInventory};
 use super::ledger::{Admission, GpuBudgetHealth, LoadReservation, VramBudgets, VramLedger};
@@ -906,6 +906,7 @@ impl ModelManager {
 
     /// `POST /predict/{group}/{id}`: auto-loads, pins the model, queues the
     /// request, and restores the requested TTL whether it succeeded or not.
+    /// A request a dispatcher hands back unsent goes to the next load.
     #[allow(clippy::too_many_arguments)]
     pub async fn predict(
         &self,
@@ -915,41 +916,55 @@ impl ModelManager {
         ttl_seconds: i64,
         max_batch: Option<u32>,
         prewarm_hint: Option<bool>,
-        inputs: Vec<WorkerInput>,
+        mut inputs: Vec<WorkerInput>,
     ) -> Result<Vec<WorkerOutput>> {
-        let (tx, pin) = self
-            .ensure_loaded(
-                inference_id,
-                cache_key,
-                lru_size,
-                ttl_seconds,
-                true,
-                prewarm_hint.unwrap_or(true),
-            )
-            .await?
-            .expect("ensure_loaded returns a sender when pinning");
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let request = DispatchRequest {
-            inputs,
-            max_batch,
-            reply: reply_tx,
-        };
-        // Both arms are [`Unattempted`]: the request never ran.
-        let result = if tx.send(DispatchMsg::Predict(request)).is_err() {
-            Err(Unattempted::error(format!(
-                "model {inference_id} was unloaded before the request could be queued"
-            )))
-        } else {
-            match reply_rx.await {
-                Ok(result) => result,
+        // A closed channel the model still maps to cannot take the request.
+        let mut closed: Option<mpsc::UnboundedSender<DispatchMsg>> = None;
+        loop {
+            let (tx, pin) = self
+                .ensure_loaded(
+                    inference_id,
+                    cache_key,
+                    lru_size,
+                    ttl_seconds,
+                    true,
+                    prewarm_hint.unwrap_or(true),
+                )
+                .await?
+                .expect("ensure_loaded returns a sender when pinning");
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let request = DispatchRequest {
+                inputs,
+                max_batch,
+                reply: reply_tx,
+            };
+            // Both failure arms are [`Unattempted`]: the request never ran.
+            let result = match tx.send(DispatchMsg::Predict(request)) {
+                Ok(()) => match reply_rx.await {
+                    Ok(result) => result,
+                    Err(_) => Err(Unattempted::error(format!(
+                        "the dispatcher for model {inference_id} dropped the request"
+                    ))),
+                },
+                Err(mpsc::error::SendError(DispatchMsg::Predict(request)))
+                    if !closed.as_ref().is_some_and(|old| old.same_channel(&tx)) =>
+                {
+                    closed = Some(tx);
+                    inputs = request.inputs;
+                    continue;
+                }
                 Err(_) => Err(Unattempted::error(format!(
-                    "the dispatcher for model {inference_id} dropped the request"
+                    "model {inference_id} was unloaded before the request could be queued"
                 ))),
+            };
+            drop(pin);
+            self.deliver_pending_trims();
+            match result.map_err(|err| err.downcast::<Unsent>()) {
+                Ok(outputs) => return Ok(outputs),
+                Err(Ok(Unsent(returned))) => inputs = returned,
+                Err(Err(err)) => return Err(err),
             }
-        };
-        drop(pin);
-        self.deliver_pending_trims();
-        result
+        }
     }
 
     /// Items a caller should keep in flight, for the predict response header;
@@ -3403,11 +3418,12 @@ metadata.cost.seed_units = 1000000
         manager.shutdown().await;
     }
 
-    /// ANY replica dying fatally kills the whole model: every outstanding
-    /// request errors, the model vanishes from all caches, and the next predict
-    /// auto-loads a fresh set that serves normally.
+    /// ANY replica dying fatally takes the whole model down, and only the
+    /// request the dead worker held fails: the other replica's window keeps
+    /// its outputs and the queued requests run on a reloaded set. No ERROR.
     #[tokio::test]
-    async fn replica_death_kills_whole_set_and_next_predict_respawns() {
+    async fn replica_death_fails_only_the_dead_workers_request() {
+        let (logs, _capture) = crate::test_utils::LogCounts::capture();
         let setup = test_manager(Duration::from_secs(60), 32);
         let manager = setup.manager.clone();
 
@@ -3417,7 +3433,7 @@ metadata.cost.seed_units = 1000000
         let generation = manager.loaded_generation("dieflag/test").expect("loaded");
 
         // The poison request dispatches first and holds replica A for 200 ms;
-        // the rest land on replica B and the queue, still outstanding at the death.
+        // the first normal one runs on replica B, the others queue.
         let die = {
             let manager = manager.clone();
             tokio::spawn(async move {
@@ -3444,43 +3460,26 @@ metadata.cost.seed_units = 1000000
         die.await
             .unwrap()
             .expect_err("the poison request fails with the fatal death");
-        for task in normals {
-            task.await.unwrap().expect_err(
-                "whole-set death policy: outstanding requests on other replicas error too",
-            );
+        for (i, task) in normals.into_iter().enumerate() {
+            let outputs = task.await.unwrap().expect("no other request is lost");
+            assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": i}))]);
         }
-
-        // Death cleanup runs in the dispatcher task; poll briefly.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while !manager.cached_models().is_empty() {
-            if tokio::time::Instant::now() > deadline {
-                panic!(
-                    "dead model never dropped from caches: {:?}",
-                    manager.cached_models()
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert_eq!(manager.loaded_generation("dieflag/test"), None);
-
-        // A fresh predict auto-loads a brand new 2-replica set and works.
-        let outputs = predict_one(&manager, "dieflag/test", "k", -1, Some(1), json!("ok"))
-            .await
-            .expect("fresh worker set serves after the death");
-        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": "ok"}))]);
         assert!(
-            manager.loaded_generation("dieflag/test").expect("loaded") > generation,
-            "the respawned set has a new generation"
+            manager.loaded_generation("dieflag/test").expect("reloaded") > generation,
+            "the queued requests ran on a new set"
         );
-
+        assert_eq!(logs.at(tracing::Level::ERROR, "panoptikon"), 0);
+        assert!(
+            logs.at(tracing::Level::WARN, "panoptikon") <= 2,
+            "the death and one summary"
+        );
         manager.shutdown().await;
     }
 
     /// A death the *ledger* called is a costed load failure: the cooldown
     /// arms with the verdict's sentence, so the reload waits rather than
     /// being respawned by the next item. Every other fatal death still
-    /// respawns at once
-    /// (`replica_death_kills_whole_set_and_next_predict_respawns`).
+    /// respawns at once (`worker_death_cleans_up_and_next_predict_respawns`).
     #[tokio::test]
     async fn a_condemned_models_death_arms_the_cooldown() {
         let setup = test_manager_with(ManagerOpts {
