@@ -239,6 +239,10 @@ fn reason(tree: &Path, paths: &[PathBuf], read_only_too: bool) -> Option<String>
     {
         // SAFETY: geteuid has no preconditions and cannot fail.
         let uid = unsafe { libc::geteuid() };
+        #[cfg(test)]
+        if tests::READ_ONLY.get() {
+            return unix::reason(tree, paths, read_only_too, uid, |_| unix::Access::ReadOnly);
+        }
         unix::reason(tree, paths, read_only_too, uid, unix::access)
     }
     #[cfg(not(unix))]
@@ -352,6 +356,10 @@ pub(crate) mod tests {
     use super::unix::Access;
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
+
+    thread_local! {
+        pub(super) static READ_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     /// A folder another user owns, with its owner, where creating a file
     /// really succeeds (`writable`) or really fails. `None` where the host
@@ -751,6 +759,19 @@ pub(crate) mod tests {
             let reason = unix::reason(tree, &paths, true, 1000, access);
             assert_eq!(reason, expected, "{path}");
         }
+    }
+
+    /// Every caller but the startup check names a read-only filesystem.
+    #[test]
+    fn a_read_only_filesystem_is_named_by_every_caller_but_the_startup_check() {
+        let data = tempfile::tempdir().unwrap();
+        let data = data.path();
+        READ_ONLY.set(true);
+        assert!(create_problem(data, &data.join("a")).is_some());
+        let failed = anyhow::anyhow!("failed");
+        assert!(create_databases_problem(&failed, data, "default").is_some());
+        assert!(database_problem(&data.join("index/default"), "index.db").is_some());
+        assert!(check_databases(data, "default").is_ok());
     }
 
     /// The transcode cache's shape: a folder holding one database.
