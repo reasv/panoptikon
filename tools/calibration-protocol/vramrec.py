@@ -339,7 +339,7 @@ _MEMINFO_KEYS = {
     # The product's free host RAM is MemAvailable less SReclaimable (before any
     # cgroup limit).
     "SReclaimable": "s_reclaimable_mb",
-    # Shared memory, which no single process's RSS accounts for.
+    # tmpfs and /dev/shm pages: in Cached, yet the kernel cannot drop them.
     "Shmem": "shmem_mb",
 }
 

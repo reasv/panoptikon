@@ -54,11 +54,14 @@ def test_the_leg_waits_for_every_recorder_and_marks_a_silent_one(
     writer.join()
     assert leg.events == []
 
-    # A missing file, and a partly written sample line, hold no sample.
+    # A missing file, and a partly written sample line, hold no sample; only
+    # the silent recordings are listed.
     sampled.unlink()
     late.write_text(HEADER + SAMPLE[:20])
+    (tmp_path / "healthrec-remote.jsonl").write_text(HEADER + SAMPLE)
     monkeypatch.setattr(legs.time, "monotonic", lambda: 1234.56789)
-    legs.Leg.wait_for_recorders(leg, ["healthrec"], timeout=0)
+    legs.Leg.wait_for_recorders(leg, ["healthrec", "healthrec-remote"],
+                                timeout=0)
     (event,) = leg.events
     assert (event["event"], event["files"], event["waited_s"]) == (
         "recorder_sample_timeout", ["vramrec.jsonl", "healthrec.jsonl"], 0)
