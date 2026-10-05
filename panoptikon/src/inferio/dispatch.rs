@@ -1948,6 +1948,7 @@ mod tests {
     /// function under a paused clock, so the timings are exact.
     #[tokio::test(start_paused = true)]
     async fn the_settle_waits_only_for_a_window_that_is_short_of_its_budget() {
+        use DispatchMsg::{ReapIdle, Shutdown};
         let cost = item_cost(8);
         let ctx = dispatcher_ctx(cost, Arc::new(ModelStats::default()));
         let bounds = WindowBounds {
@@ -1969,12 +1970,22 @@ mod tests {
                 .map(|input| enqueue(request(input), &cost))
                 .collect()
         };
-        let run = async |mut queue: VecDeque<Queued>, refills: u64, deadline| {
+        let refills = |count| -> Vec<DispatchMsg> {
+            json_inputs(count)
+                .into_iter()
+                .map(|input| DispatchMsg::Predict(request(input)))
+                .collect()
+        };
+        // Some(elapsed) when the settle continues, None when it ends.
+        let run = async |mut queue: VecDeque<Queued>, late: Vec<DispatchMsg>, deadline| {
             let (tx, mut rx) = mpsc::unbounded_channel();
-            for input in json_inputs(refills) {
-                tx.send(DispatchMsg::Predict(request(input)))
-                    .expect("receiver alive");
-            }
+            let sender = tx.clone();
+            tokio::spawn(async move {
+                for msg in late {
+                    tokio::time::sleep(WINDOW_SETTLE_QUIET / 2).await;
+                    let _ = sender.send(msg);
+                }
+            });
             let mut free = Vec::new();
             let mut in_flight = JoinSet::new();
             let started = tokio::time::Instant::now();
@@ -1988,37 +1999,44 @@ mod tests {
                 deadline,
             )
             .await;
-            assert!(matches!(outcome, SettleOutcome::Continue));
-            started.elapsed()
+            matches!(outcome, SettleOutcome::Continue).then(|| started.elapsed())
         };
 
         let now = tokio::time::Instant::now;
-        let full = run(queued(16), 0, now() + WINDOW_SETTLE_MAX).await;
+        let full = run(queued(16), Vec::new(), now() + WINDOW_SETTLE_MAX).await;
         assert_eq!(
             full,
-            Duration::ZERO,
+            Some(Duration::ZERO),
             "a queue that already fills the window must not wait"
         );
         // A deadline in the past is a model nothing has answered recently:
         // a lone request arriving at a quiet model pays nothing at all.
-        let idle = run(queued(1), 0, now()).await;
-        assert_eq!(idle, Duration::ZERO, "an idle model must not wait");
-        let short = run(queued(1), 0, now() + WINDOW_SETTLE_MAX).await;
+        let idle = run(queued(1), Vec::new(), now()).await;
+        assert_eq!(idle, Some(Duration::ZERO), "an idle model must not wait");
+        let short = run(queued(1), Vec::new(), now() + WINDOW_SETTLE_MAX).await;
         assert_eq!(
-            short, WINDOW_SETTLE_QUIET,
+            short,
+            Some(WINDOW_SETTLE_QUIET),
             "a short window right after a reply waits for one quiet gap, not for the deadline"
         );
-        let near = run(queued(1), 0, now() + WINDOW_SETTLE_QUIET / 2).await;
+        let near = run(queued(1), Vec::new(), now() + WINDOW_SETTLE_QUIET / 2).await;
         assert_eq!(
             near,
-            WINDOW_SETTLE_QUIET / 2,
+            Some(WINDOW_SETTLE_QUIET / 2),
             "the settle never outlasts its deadline"
         );
-        let filled = run(queued(1), 15, now() + WINDOW_SETTLE_MAX).await;
+        let filled = run(queued(1), refills(15), now() + WINDOW_SETTLE_MAX).await;
         assert_eq!(
             filled,
-            Duration::ZERO,
-            "refills that fill the window end the wait at once"
+            Some(WINDOW_SETTLE_QUIET / 2 * 15),
+            "each refill restarts the quiet gap; the one that fills the window ends it"
+        );
+        let shutdown = run(queued(1), vec![Shutdown], now() + WINDOW_SETTLE_MAX).await;
+        assert_eq!(shutdown, None, "a shutdown ends the wait");
+        let waited = run(queued(1), vec![ReapIdle], now() + WINDOW_SETTLE_MAX).await;
+        assert!(
+            waited.is_some_and(|waited| waited >= WINDOW_SETTLE_QUIET),
+            "a message that is not a refill does not end the wait"
         );
     }
 
