@@ -559,13 +559,15 @@ impl CalibrationStore {
     ) -> Option<String> {
         let path = &self.paths.local_path;
         let folder = path.parent().unwrap_or(Path::new("."));
+        // The folder to hand over is the data folder.
+        let data_folder = folder.parent().unwrap_or(folder);
         // A name not in the folder checks the folder alone.
         let checked = if write {
             path.with_extension("new")
         } else {
             path.clone()
         };
-        let cause = crate::ownership::create_problem(folder, &checked).unwrap_or(error);
+        let cause = crate::ownership::create_problem(data_folder, &checked).unwrap_or(error);
         if state.warned.as_ref() == Some(&cause) {
             return None;
         }
@@ -2477,11 +2479,12 @@ sample_delta_mb = [80, 160]
     /// A store folder another user owns is warned about once, naming it and
     /// its owner, however many writes fail, again after a write succeeds, and
     /// once for a new cause; the update stays in memory. A store file another
-    /// user owns is no cause of a failed write, which replaces it.
+    /// user owns is no cause of a failed write, which replaces it, but is the
+    /// cause of a failed read.
     #[cfg(unix)]
     #[test]
     fn a_store_folder_another_user_owns_is_warned_about_once() {
-        use crate::ownership::tests::{foreign_folder, not_writable_by_current_user};
+        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
         use std::os::unix::fs::{PermissionsExt as _, symlink};
         let Some((folder, owner)) = foreign_folder(false) else {
             return;
@@ -2524,12 +2527,23 @@ sample_delta_mb = [80, 160]
         store.record(update("clip/vit", "fp16", 1.1));
         let own_mode = fs::Permissions::from_mode(0o755);
         fs::set_permissions(own.path().join("share/inferio"), own_mode).unwrap();
+        let link = own.path().join("share/inferio/calibration.toml");
+        let reader = CalibrationStore::with_debounce(
+            StorePaths {
+                shipped_dirs: vec![root.path().join("shipped")],
+                local_path: link.clone(),
+            },
+            env(),
+            Duration::ZERO,
+        );
+        let _ = lookup(&reader, "clip/vit");
         let reasons = reasons.lock().unwrap();
         let share = data.join("share");
-        let expected = Some(not_writable_by_current_user(&share, owner));
+        let expected = Some(owned_by_another_user(&share, owner, &share));
         assert_eq!(reasons[..2], [expected.clone(), expected]);
         let denied = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
-        assert_eq!(reasons[2..], [Some(denied)]);
+        let read = owned_by_another_user(&link, owner, folder);
+        assert_eq!(reasons[2..], [Some(denied), Some(read)]);
     }
 
     /// A local entry with no fit of its own — what the ledger writes while it
