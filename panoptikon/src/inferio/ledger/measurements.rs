@@ -275,6 +275,7 @@ impl VramLedger {
         let mut allocated_at_load = entry.allocated_at_load_mb;
         let mut ram_at_load = entry.ram_at_load_mb;
         let mut ram_started = entry.ram_started;
+        let mut ram_largest = entry.ram_largest_units;
         let known_startup = cal_locked(state, entry).map_or(0, |cal| cal.ram_startup_mb);
         // What the replica's first batch kept: start-up memory.
         let mut startup_mb: Option<u64> = None;
@@ -438,6 +439,9 @@ impl VramLedger {
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
+            let ran_units = measurement.units.unwrap_or(0);
+            let after_larger = ran_units < ram_largest;
+            ram_largest = ram_largest.max(ran_units);
             if let Some(retries) = measurement.alloc_retries {
                 alloc_retries = Some(alloc_retries.unwrap_or(0).saturating_add(retries));
             }
@@ -578,13 +582,15 @@ impl VramLedger {
             let units = measurement.units.filter(|units| *units > 0);
             // The batch's envelope in host RAM, over the baseline. A batch
             // that peaked no higher than the resident set before it ran in
-            // memory kept from an earlier one, and one that left it below the
-            // baseline released memory before or after its peak: the cost of
-            // either is unknown.
+            // memory kept from an earlier one, one smaller than a batch run
+            // before may have too, and one that left it below the baseline
+            // released memory before or after its peak: the cost of each is
+            // unknown.
             if let (Some(units), Some(peak), Some(base)) =
                 (units, measurement.peak_rss_mb, batch_ram_base)
                 && peak > batch_ram_before
                 && !first_batch
+                && !after_larger
                 && measurement.rss_after_mb.is_none_or(|after| after >= base)
             {
                 ram_samples.push(FitSample {
@@ -778,6 +784,7 @@ impl VramLedger {
         }
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.fit_watermark = new_watermark;
+            entry.ram_largest_units = ram_largest;
             entry.settled_windows = entry.settled_windows.saturating_add(1);
             entry.ran_batches = ran_batches;
             // Doubled after a batch that filled it. It ends once it would
