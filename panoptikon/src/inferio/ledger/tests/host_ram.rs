@@ -1570,60 +1570,64 @@ fn a_short_window_does_not_double_the_item_cap() {
     }
 }
 
-/// Variable input cost under a worker that keeps what it peaked at: a costly
-/// first page stays in the load level, and the next window's cheaper pages
-/// read almost no cost. That estimate prices only an item-capped window,
-/// whose shortfall is at most its own pages; the second size gives the slope,
-/// and no later window books less than its pages add, none costing more than
-/// one measured.
+/// Pages of 300 to 650 MiB under a worker that keeps what it peaked at: what
+/// its first page kept stays in the load level, and later pages read only
+/// what they add above it. Item-capped windows, unbooked or priced from one
+/// size, run up to [`WINDOW_DEPTH_MULTIPLIER`] batches deep, and each falls
+/// short of its peak by at most one capped batch at the costliest page,
+/// whether the pages come in random order or cheap ones come first. A second
+/// size gives the slope: once the pages cost what was measured, no window
+/// falls short, and the ramp goes on.
 #[test]
 fn a_costly_first_input_under_retention_costs_at_most_a_capped_batch() {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
     const STARTUP: u64 = 700;
     const COSTLIEST: u64 = 650;
-    let ledger = host(&[GPU], None);
-    let (handle, admission) = cold_gpu_replica(&ledger, "g/pages", GPU, item_cost(16));
-    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
-    let mut kept = 0;
-    for window in 0..8 {
-        let token = admission
-            .request_grant(u64::MAX, None, 1, 0)
-            .expect("granted");
-        let grant = *token.grant();
-        let pages = grant
-            .unit_budget
-            .min(grant.user_cap_items.map_or(u64::MAX, u64::from));
-        let cost: u64 = match window {
-            0 => COSTLIEST,
-            1 => 300 + 360,
-            _ => 460 * pages,
-        };
-        let peak = kept.max(STARTUP + cost);
-        let need = peak - kept;
-        let booked = row(&ledger, "g/pages").ram_booked_mb;
-        if booked > 0 {
-            let allowed = if grant.user_cap_items.is_some() {
-                COSTLIEST * pages
-            } else {
-                0
+    for (seed, random) in (1..=40u64).flat_map(|seed| [(seed, true), (seed, false)]) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let ledger = host(&[GPU], None);
+        let (handle, admission) = cold_gpu_replica(&ledger, "g/pages", GPU, item_cost(16));
+        ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+        let mut kept = 0;
+        for window in 0..8 {
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            let grant = *token.grant();
+            let cap = grant.user_cap_items.map(u64::from);
+            let pages = grant.unit_budget.min(cap.unwrap_or(u64::MAX));
+            let mut page = || match (random, window) {
+                (true, _) => rng.random_range(300..=COSTLIEST),
+                (false, 1) => 300,
+                (false, _) => COSTLIEST,
             };
-            assert!(
-                booked + allowed >= need,
-                "window {window}: {pages} pages booked at {booked} MiB, need {need}"
-            );
+            let depth = if cap > Some(1) {
+                WINDOW_DEPTH_MULTIPLIER
+            } else {
+                1
+            };
+            let batches: Vec<_> = (0..depth)
+                .map(|_| {
+                    kept = kept.max(STARTUP + (0..pages).map(|_| page()).sum::<u64>());
+                    ram_batch(pages, RSS_AT_LOAD_MB + kept, RSS_AT_LOAD_MB + kept)
+                })
+                .collect();
+            let short = (RSS_AT_LOAD_MB + kept).saturating_sub(cpu_row(&ledger).charges_mb);
+            let case = format!("seed {seed}, random {random}, window {window}: {pages} pages");
+            if cap > Some(1) {
+                assert!(short <= COSTLIEST * pages, "{case}, {short} MiB short");
+            } else if cap.is_none() && !random {
+                assert_eq!(short, 0, "{case}");
+            }
+            handle.lock().unwrap().record_measurements(batches);
+            token.finish(WindowOutcome::Responded { oom: None });
+            admission.earn_next_size();
         }
-        kept = peak;
-        handle.lock().unwrap().record_measurements(vec![ram_batch(
-            pages,
-            RSS_AT_LOAD_MB + peak,
-            RSS_AT_LOAD_MB + kept,
-        )]);
-        token.finish(WindowOutcome::Responded { oom: None });
-        admission.earn_next_size();
+        assert!(
+            row(&ledger, "g/pages").unit_budget >= 64,
+            "the ramp goes on"
+        );
     }
-    assert!(
-        row(&ledger, "g/pages").unit_budget >= 64,
-        "the ramp goes on"
-    );
 }
 
 /// A replica loaded after the cost is known books the start-up memory the
