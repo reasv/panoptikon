@@ -884,12 +884,22 @@ fn managed_uv_path() -> PathBuf {
 /// Run `<uv> --version` and return the parsed version string (e.g.
 /// "0.11.28").
 async fn validate_uv(uv: &Path) -> Result<String> {
-    let output = Command::new(uv)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .with_context(|| format!("failed to run '{} --version'", uv.display()))?;
+    let mut command = Command::new(uv);
+    command.arg("--version").stdin(Stdio::null());
+    // A uv just written can still be open for writing in a child forked while
+    // it was written, until that child execs. Running it fails with ETXTBSY
+    // until then, so that error is retried for up to a second.
+    let mut retries = 20;
+    let output = loop {
+        match command.output().await {
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy && retries > 0 => {
+                retries -= 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            output => break output,
+        }
+    };
+    let output = output.with_context(|| format!("failed to run '{} --version'", uv.display()))?;
     if !output.status.success() {
         bail!("'{} --version' failed with {}", uv.display(), output.status);
     }
@@ -1255,6 +1265,26 @@ pub async fn maybe_auto_setup(settings: &Settings, inference_enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A uv still open for writing (in the server, by a child forked while
+    /// it was written) is run once it is closed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_uv_still_open_for_writing_is_run_once_closed() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let uv = dir.path().join("uv");
+        let mut file = std::fs::File::create(&uv).unwrap();
+        file.write_all(b"#!/bin/sh\necho 'uv 0.11.28'\n").unwrap();
+        std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let closed = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            drop(file);
+        });
+        assert_eq!(validate_uv(&uv).await.unwrap(), "0.11.28");
+        closed.await.unwrap();
+    }
 
     fn probes(os: &'static str) -> DetectionProbes {
         DetectionProbes {
