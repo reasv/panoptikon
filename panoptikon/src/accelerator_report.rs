@@ -284,40 +284,30 @@ pub fn log_report(settings: &Settings) {
     for w in &report.warnings {
         tracing::warn!("{w}");
     }
-    // The ROCm wheels are x86_64 only.
-    let kfd_gpus = if cfg!(target_arch = "x86_64") {
-        crate::inferio::gpu::rocm_topology_gpus(false)
-    } else {
-        Vec::new()
-    };
+    if report.backend != Accelerator::Cpu || report.backend_source != BackendSource::InstalledVenv {
+        return;
+    }
     let configured = settings.inference_local.python_env.accelerator;
-    if let Some(gfx) = rocm_gpu_beside_a_cpu_venv(configured, &report, &kfd_gpus) {
+    if let Ok((target, evidence)) = resolve_accelerator(configured)
+        && cpu_venv_beside(&report, target)
+    {
+        let slug = accelerator_slug(target);
         tracing::info!(
-            gfx,
-            "the managed venv holds the CPU build of torch, and a re-sync \
-             keeps it, but this host has a GPU the ROCm build supports; run \
-             `panoptikon setup --accelerator rocm` to use it"
+            backend = slug,
+            evidence,
+            "the managed venv holds the CPU build of torch, but this host can \
+             use {slug}; run `panoptikon setup --accelerator {slug}` to install \
+             it (in Docker, use the {slug} image)"
         );
     }
 }
 
-/// A KFD GPU the ROCm wheel has kernels for, when the managed venv holds the
-/// CPU build and the config does not ask for the CPU.
-fn rocm_gpu_beside_a_cpu_venv<'a>(
-    configured: Accelerator,
-    report: &AcceleratorReport,
-    kfd_gpus: &'a [(String, bool)],
-) -> Option<&'a str> {
-    if configured == Accelerator::Cpu
-        || report.backend != Accelerator::Cpu
-        || report.backend_source != BackendSource::InstalledVenv
-    {
-        return None;
-    }
-    kfd_gpus
-        .iter()
-        .map(|(gfx, _)| gfx.as_str())
-        .find(|gfx| crate::inferio::gpu::ROCM_WHEEL_GFX.contains(gfx))
+/// The managed venv holds the CPU build of torch while the config resolves
+/// to a GPU backend.
+fn cpu_venv_beside(report: &AcceleratorReport, target: Accelerator) -> bool {
+    report.backend == Accelerator::Cpu
+        && report.backend_source == BackendSource::InstalledVenv
+        && target != Accelerator::Cpu
 }
 
 /// Print to stdout (`panoptikon accelerator`).
@@ -601,6 +591,7 @@ mod tests {
         assert_eq!(report.warnings.len(), 1);
         assert!(report.warnings[0].contains("cuda"));
         assert!(report.format_text().contains("warning:"));
+        assert!(!report.format_text().contains(ROCM_UNDER_WSL));
     }
 
     #[test]
@@ -692,30 +683,25 @@ mod tests {
         );
     }
 
-    /// A CPU venv on a host with a GPU the ROCm wheel supports names the GPU,
-    /// unless the config asks for the CPU or the venv is not the CPU build.
+    /// Only a CPU build from the venv sentinel beside a GPU target is reported.
     #[test]
-    fn a_cpu_venv_beside_a_supported_rocm_gpu_is_reported() {
-        use Accelerator::{Auto, Cpu, Rocm};
+    fn a_cpu_venv_beside_a_gpu_backend_is_reported() {
+        use Accelerator::{Cpu, Rocm};
         let venv = BackendSource::InstalledVenv;
         let probed = BackendSource::ConfigOrProbe {
             evidence: String::new(),
         };
-        let gpus = [("gfx1036".to_owned(), false), ("gfx1100".to_owned(), false)];
-        // (configured, backend, its source, KFD GPUs) -> the GPU named.
-        #[rustfmt::skip]
+        // (backend, its source, resolved target) -> reported.
         let cases = [
-            (Auto, Cpu, &venv, &gpus[..], Some("gfx1100")),
-            (Rocm, Cpu, &venv, &gpus[..], Some("gfx1100")),
-            (Auto, Cpu, &venv, &gpus[..1], None),
-            (Cpu, Cpu, &venv, &gpus[..], None),
-            (Auto, Rocm, &venv, &gpus[..], None),
-            (Auto, Cpu, &probed, &gpus[..], None),
+            (Cpu, &venv, Rocm, true),
+            (Cpu, &venv, Cpu, false),
+            (Cpu, &probed, Rocm, false),
+            (Rocm, &venv, Rocm, false),
         ];
-        for (configured, backend, source, kfd_gpus, expected) in cases {
+        for (backend, source, target, expected) in cases {
             let report = assemble_report(backend, source.clone(), empty_stacks(), false);
-            let found = rocm_gpu_beside_a_cpu_venv(configured, &report, kfd_gpus);
-            assert_eq!(found, expected, "{configured:?} {backend:?} {source:?}");
+            let found = cpu_venv_beside(&report, target);
+            assert_eq!(found, expected, "{backend:?} {source:?} {target:?}");
         }
     }
 
