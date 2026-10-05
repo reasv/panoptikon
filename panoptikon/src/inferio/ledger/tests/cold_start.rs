@@ -200,11 +200,11 @@ fn gpu_pair(headroom: u64, seeds: [u32; 2], percent: u64) -> (Arc<VramLedger>, V
 fn cpu_host(count: u64, headroom: u64, percent: u64) -> (Arc<VramLedger>, Vec<Cold>) {
     const RAM_MB: u64 = 16_000;
     let base_mb = (RAM_MB - cpu::ram_reserve_mb(RAM_MB) - headroom) / count;
-    let ledger = VramLedger::new(
+    let ledger = unprobed(VramLedger::new(
         &GpuInventory::known_cpu(RAM_MB),
         VramBudget::default().into(),
         None,
-    );
+    ));
     let replicas = (0..count)
         .map(|index| {
             let handle = loaded_cpu(Some(RAM_MB));

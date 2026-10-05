@@ -475,11 +475,20 @@ const CPU_RAM_MB: u64 = 64 * 1024 - 700;
 /// The ledger a CPU-only host gets, built through `VramLedger::new` over a
 /// real CPU inventory, which derives the adoption scope.
 fn cpu_ledger(budgets: impl Into<VramBudgets>) -> Arc<VramLedger> {
-    VramLedger::new(
+    unprobed(VramLedger::new(
         &crate::inferio::gpu::GpuInventory::known_cpu(CPU_RAM_MB),
         budgets.into(),
         None,
-    )
+    ))
+}
+
+/// `ledger` without this host's own memory readings: free readings are the
+/// test's own, or a probe stub's.
+fn unprobed(mut ledger: Arc<VramLedger>) -> Arc<VramLedger> {
+    Arc::get_mut(&mut ledger)
+        .expect("not shared yet")
+        .probe_external = false;
+    ledger
 }
 
 /// A CPU worker's load report: no UUID and no PCI address (there is no GPU),

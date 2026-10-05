@@ -527,11 +527,11 @@ fn a_grant_one_mib_short_of_a_batchs_price_does_not_cover_it() {
 #[test]
 fn memory_a_cpu_replica_keeps_is_not_reserved_again() {
     const RAM_MB: u64 = 21_000;
-    let ledger = VramLedger::new(
+    let ledger = unprobed(VramLedger::new(
         &crate::inferio::gpu::GpuInventory::known_cpu(RAM_MB),
         VramBudget::default().into(),
         None,
-    );
+    ));
     let handle = loaded_cpu(Some(RAM_MB));
     let keeping = ledger
         .register_worker("g/keeping", item_cost(8), &handle, None)
@@ -677,11 +677,11 @@ fn a_pre_fit_cpu_share_is_a_part_of_the_headroom_under_the_ram_reserve() {
         cap_fraction: Some(1.0),
         ..no_margin()
     };
-    let ledger = VramLedger::new(
+    let ledger = unprobed(VramLedger::new(
         &crate::inferio::gpu::GpuInventory::known_cpu(RAM_MB),
         budget.into(),
         None,
-    );
+    ));
     let replicas: Vec<Admission> = ["g/a", "g/b"]
         .iter()
         .map(|model| {
