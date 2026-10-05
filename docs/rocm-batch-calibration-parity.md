@@ -736,10 +736,11 @@ accepted difference, so a ROCm user does not read the missing overlay as a
 bug.
 
 **Backend list (2026-10-04).** A model that loads on some backends only says
-so in its registry metadata, `accelerators = ["cuda"]` (dots.ocr, whose load
-asks for FlashAttention 2), and the overlay marks it unavailable wherever
-models run on another backend: ROCm, MPS, or the CPU device. That is
-independent of the capability floor, which still filters nothing on ROCm.
+so in its registry metadata, `accelerators = ["cuda", "rocm"]` (dots.ocr, whose
+load asks for FlashAttention 2, which has no CPU or MPS kernels), and the
+overlay marks it unavailable wherever models run on another backend: MPS or
+the CPU device. That is independent of the capability floor, which still
+filters nothing on ROCm.
 
 ### D8 (G8) — Windows machinery: structurally dormant, comparator stays
 

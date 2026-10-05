@@ -401,6 +401,11 @@ mod tests {
         let mut cuda = template.clone();
         overlay_metadata(&mut cuda, &HostComputeCaps::unknown(), "cuda");
         assert_eq!(cuda, template);
+        overlay_metadata(&mut cuda, &HostComputeCaps::from_caps(vec![(7, 5)]), "cuda");
+        assert_eq!(
+            cuda["doctr"]["inference_ids"]["dots_ocr"]["unavailable"],
+            json!(true)
+        );
     }
 
     #[test]
