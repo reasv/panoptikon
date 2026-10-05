@@ -307,7 +307,9 @@ Single synthetic device:
   - **Warning: the file cache is taken too** (`external_page_count`). At
     warning macOS makes room by compressing and swapping other processes'
     memory, not only by dropping clean file pages, so a grant priced on the
-    file cache swaps someone else out.
+    file cache swaps someone else out. That price applies to new memory
+    only: a deficit against the reserve does not come out of the pool a
+    replica holds, as it does while paging.
   - **Any window above normal** (the ledger reads `MemoryPressure` itself at
     grant and at settle and keeps the higher) earns no ramp step, feeds no
     knee, does not count as the size the ramp reached or toward a knee's

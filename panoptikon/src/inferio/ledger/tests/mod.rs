@@ -406,9 +406,14 @@ const MAC_RAM_MB: u64 = 128 * 1024;
 /// The one-GPU unified ledger a Mac gets: the probe's 75 % seed, with the
 /// host's RAM recorded as the unified-memory bound.
 fn mps_ledger() -> Arc<VramLedger> {
+    mps_ledger_with(no_margin())
+}
+
+/// [`mps_ledger`] under `budget`.
+fn mps_ledger_with(budget: VramBudget) -> Arc<VramLedger> {
     let ledger = VramLedger::for_test_gpus_probed(
         &[(MPS_GPU, "Apple M3 Max (128 GB)", MAC_RAM_MB / 4 * 3, None)],
-        no_margin(),
+        budget,
         None,
         GpuMemoryQuery::Mps {
             key: MPS_GPU.to_owned(),

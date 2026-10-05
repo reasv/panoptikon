@@ -138,7 +138,14 @@ impl VramLedger {
                 item_cap,
             )
         };
-        let share = self.share_locked(&state, worker, signed_headroom, wanted);
+        // At warning without paging a replica keeps the pool it holds: a
+        // deficit against the reserve comes out of new memory only.
+        let own_headroom = if pressure == mps::MemoryPressure::Warning {
+            signed_headroom.max(0)
+        } else {
+            signed_headroom
+        };
+        let share = self.share_locked(&state, worker, own_headroom, wanted);
         let (
             mut unit_budget,
             mut mb,

@@ -2034,7 +2034,11 @@ fn the_pool_is_in_the_room_and_in_the_charge_so_only_free_ram_is_admitted() {
 
 /// A Mac replica ramped 4 → 64 on an idle machine, its next budget 128.
 fn ramped_mac_replica() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
-    let ledger = mps_ledger();
+    ramped_mac_replica_on(mps_ledger())
+}
+
+/// [`ramped_mac_replica`] on `ledger`.
+fn ramped_mac_replica_on(ledger: Arc<VramLedger>) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
     let handle = loaded_mps(Some(MAC_TOTAL_MB));
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
@@ -2759,7 +2763,7 @@ fn window_at_20_mib_a_unit(handle: &TelemetryHandle, admission: &Admission, work
 /// While macOS pages, a pre-fit replica alone on the Mac runs what the pool
 /// it holds covers at its pre-fit price, not its batch size: nothing beyond
 /// the pool is free. A window there that the queue sized, squeezed or not,
-/// sets no size kept.
+/// sets no size kept. At warning with as little free, the size is held.
 #[test]
 fn while_the_mac_pages_a_pre_fit_batch_fits_the_pool_held() {
     let (ledger, handle, admission) = paging_pre_fit_mac_replica();
@@ -2774,13 +2778,20 @@ fn while_the_mac_pages_a_pre_fit_batch_fits_the_pool_held() {
     let grant = window_at_20_mib_a_unit(&handle, &admission, 2);
     assert_eq!((grant.unit_budget, grant.squeezed), (2, true));
     assert_eq!(pressure_cap(&ledger), None, "2 units of work, a pool for 6");
+
+    let (ledger, handle, admission) = paging_pre_fit_mac_replica();
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
+    push_ram(&handle, MAC_TOTAL_MB, 40, 120, 0);
+    ledger.health();
+    let grant = window_at_20_mib_a_unit(&handle, &admission, u64::MAX);
+    assert_eq!(grant.unit_budget, 16, "at warning the batch size is held");
 }
 
 /// At warning with nothing being paged out the replica keeps its working
 /// size: the trial of the next one is put off, and there is no growth and
 /// no throughput sample. A squeeze there is not kept once its cause is
-/// gone. The trial is taken up again after the pressure ends, within two
-/// doublings of the working size.
+/// gone, and leaves the replica the pool it holds. The trial is taken up
+/// again after the pressure ends, within two doublings of the working size.
 #[test]
 fn at_warning_without_paging_the_batch_size_is_held() {
     let (ledger, handle, admission) = ramped_mac_replica();
@@ -2819,6 +2830,16 @@ fn at_warning_without_paging_the_batch_size_is_held() {
         "a squeeze, not a paging episode"
     );
     assert_eq!(ramp_windows(&handle, &admission, 1), [64]);
+    // Under the default margin free memory is short of the reserve, which
+    // does not come out of the 740 MiB pool held.
+    let (held, held_handle, held_admission) =
+        ramped_mac_replica_on(mps_ledger_with(VramBudget::default()));
+    held.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
+    push_ram(&held_handle, MAC_TOTAL_MB, 300, 740, 0);
+    assert_eq!(
+        ramp_window(&held_handle, &held_admission, &MINILM_M3_MAX),
+        64
+    );
 
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
     let after = ramp_windows(&handle, &admission, RETEST_WINDOWS as usize + 3);
