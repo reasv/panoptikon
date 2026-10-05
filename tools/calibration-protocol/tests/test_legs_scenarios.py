@@ -65,6 +65,8 @@ def test_a_hog_event_squeezes_during_the_job_on_any_hog_target(capsys,
                       "--hog-event", "at=130,leave_free=0",
                       "--hog-event", "at=140,hold=30000"]) == 0
     plan = json.loads(capsys.readouterr().out)
+    argv = plan["analyze_command"]
+    assert argv[argv.index("--checks") + 1] == "all"
     hog = plan["hog"]
     assert (hog["target"], hog["schedule"], hog["reeval"]) == (
         "ram", ["hold", "0"], 999999)
@@ -90,7 +92,8 @@ def test_a_hog_event_squeezes_during_the_job_on_any_hog_target(capsys,
                       "--no-dotenv", "--dry-run",
                       "--hog-event", "at=5,leave_free=4096"]) == 0
     argv = json.loads(capsys.readouterr().out)["analyze_command"]
-    assert "hog_tracking" in argv[argv.index("--checks") + 1]
+    assert {"hog_tracking", "deflation_recovery"} <= set(
+        argv[argv.index("--checks") + 1].split(","))
 
     for bad in ("at=5,leave_free=1,hold=2", "leave_free=1", "at=5,hold=x",
                 "at=5,release=x", "at=-1,release", "at=nan,release",
