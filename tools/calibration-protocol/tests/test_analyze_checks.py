@@ -638,12 +638,16 @@ def test_grant_safety_never_passes_a_grant_a_release_may_have_covered():
                                [_timed(99.8, 10000), later])
         assert analyze.check_grant_safety(held).verdict == "FAIL"
     # `used` moved by up to each row's `skew_mb` while its processes were
-    # read: 5500 - 2 * 300 no longer covers 5000.
-    skewed = [_timed(99.8, 10000), _timed(100.1, 15500)]
-    for sample in skewed:
-        sample["gpus"][0]["skew_mb"] = 300
-    assert analyze.check_grant_safety(_safety_context(
-        [_room_grant(100.0, 15000, 15000)], skewed)).verdict == "FAIL"
+    # read: that comes off the release, and an unknown skew proves none.
+    def skewed(before_mb, after_mb):
+        samples = [_timed(99.8, 10000), _timed(100.1, 15500)]
+        samples[0]["gpus"][0]["skew_mb"] = before_mb
+        samples[1]["gpus"][0]["skew_mb"] = after_mb
+        return analyze.check_grant_safety(_safety_context(
+            [_room_grant(100.0, 15000, 15000)], samples)).numbers
+    assert skewed(100, 200)["covered_by_release"][0]["released_mb"] == 5200
+    assert skewed(300, 300)["over_free"][0]["released_mb"] == 4900
+    assert skewed(None, 0)["over_free"][0]["released_mb"] == 0
 
 
 def test_a_sample_older_than_twice_the_recorder_interval_is_not_joined():
