@@ -697,10 +697,10 @@ inference server is the same process (the gateway's `inference_local`) it
 costs a second for the accepted end, so N items in flight cost up to 2N
 descriptors in one descriptor table on top of databases, listeners and worker
 pipes. The gateway therefore raises its own soft limit to the hard limit at
-startup and caps the ceiling above at
-`(soft_nofile - 256) / 2` (`rlimit::http1_requests_within`, with `FD_RESERVE`
-and `FDS_PER_HTTP1_REQUEST` in `rlimit.rs`). Ignoring a published figure — downward, never
-upward — is always allowed.
+startup and caps the ceiling above at `(soft_nofile - 256) / 2`
+(`rlimit::http1_requests_within`, with `FD_RESERVE` and
+`FDS_PER_HTTP1_REQUEST` in `rlimit.rs`). Ignoring a published figure —
+downward, never upward — is always allowed.
 
 **A server that publishes a figure must be able to carry it, and the
 transport is part of that promise.** Over HTTP/2 every in-flight predict is a

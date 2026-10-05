@@ -226,17 +226,11 @@ the same bound `in_flight_unit_ceiling` puts on a job's window over HTTP/1.1.
 Below a soft limit of 768 the floor's 256 sockets exceed the budget, and the
 job's window, which may go lower, is the bound. An image model sends one item
 per request, so over HTTP/1.1 the gate is the most items the server can hold
-for batching; a fixed 256 held it well below the server's own figure. The
-gate is taken on both transports because HTTP/1.1 is reachable *after* a job
-has sized its window for multiplexing — `in_flight_unit_ceiling` is evaluated
-once, before the item loop, so a peer restarted mid-job into a build without
-HTTP/2 flips the transport under a window sized for h2c.
-
-A fixed 256 was justified as "four times a job's in-flight budget (4096 units
-at 64 units per request)", which only holds for a model whose items carry 64
-units each. An image item carries one, so 4096 units is 4096 concurrent
-requests, and 256 was 1/16 of the budget rather than 4x it — a throughput cap
-for exactly the models the feature exists for.
+for batching. The gate is taken on both transports because HTTP/1.1 is
+reachable *after* a job has sized its window for multiplexing —
+`in_flight_unit_ceiling` is evaluated once, before the item loop, so a peer
+restarted mid-job into a build without HTTP/2 flips the transport under a
+window sized for h2c.
 
 The published figure is in *items* and the gate counts *requests*. Using it
 directly is conservative in the safe direction: for the models that matter one
@@ -465,9 +459,10 @@ health check when the connection cannot see it.
   missed its deadline (see "Health"). A check misses on its deadline or on a
   502, 503 or 504, a proxy saying the server behind it did not answer. Any
   other outcome, a refused connection or a failed TLS handshake included, is
-  no evidence of a freeze, and neither is a missed check when a response
-  other than those came from the base URL since the previous check. `/health` reads in-memory state and touches no
-  model, so a busy server answers it and a long batch is never cut off.
+  no evidence of a freeze, and neither is a missed check when one of this
+  gateway's requests to the server got a response other than those since the
+  previous check. `/health` reads in-memory state and touches no model, so a
+  busy server answers it and a long batch is never cut off.
 - `HEALTH_CHECK_MISSES` (2) checks in a row without an answer declare the
   server frozen, about 50 s into the stall, and log one WARN. Every request
   waiting on it fails as a keep-alive timeout fails it (phase `Headers`, class
