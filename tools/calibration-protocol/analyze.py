@@ -1564,7 +1564,9 @@ def check_failures(ctx: Context) -> Verdict:
     """OOM negatives, worker deaths and merged-window fallbacks in the log.
 
     Counts within `--expect-ooms` / `--expect-deaths` PASS; a declared
-    count with none seen FAILs, as the fault never fired. Where the log
+    count with none seen FAILs, as the fault never fired. A model the ledger
+    never granted memory settles no window, so it is held to no OOM floor
+    (a `_cpu` fixture on a GPU host). Where the log
     names the tier that classified each negative, it is tallied as
     `source/trust`; a recording predating that line carries none, and the
     clause is then omitted rather than reported empty."""
@@ -1601,7 +1603,9 @@ def check_failures(ctx: Context) -> Verdict:
             tier_clause += f", {unnamed} unnamed"
     expected_ooms = ctx.args.expect_ooms
     expected_deaths = ctx.args.expect_deaths
-    unfired = (expected_ooms and not ooms) or (expected_deaths and not deaths)
+    priced = bool(ctx.log_events("issued a memory grant"))
+    unfired = ((priced and expected_ooms and not ooms)
+               or (expected_deaths and not deaths))
     bad = ooms > expected_ooms or deaths > expected_deaths or unfired
     return Verdict(
         "failures", "FAIL" if bad else "PASS",

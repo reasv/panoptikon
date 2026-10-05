@@ -108,12 +108,14 @@ COUNTS = {"--expect-ooms": "failures", "--expect-deaths": "failures",
 
 
 def _verdicts(directory: Path, model: str, expect, counts,
-              job_ends=("drained",)):
+              job_ends=("drained",), priced=True):
     """`failures`, `job_outcome` and `deflation_recovery` over a recording
     holding `counts`, a worker deflated with no clean window, and one job
     per `job_ends` entry in legs.json (None: no `job_end`)."""
     directory.mkdir()
     log = ["2026-10-03T00:00:00.000000Z  INFO panoptikon: started"]
+    log += [f"2026-10-03T00:00:00.000000Z DEBUG panoptikon::inferio::ledger: "
+            f"issued a memory grant model={model}"] * priced
     log += [f"2026-10-03T00:00:00.{index:06d}Z  WARN panoptikon::inferio::"
            f"ledger: settled a granted window model={model} outcome=negative "
            f"reason=oom" for index in range(counts["--expect-ooms"])]
@@ -177,6 +179,13 @@ def test_each_fixture_passes_at_its_thresholds_and_fails_one_past(tmp_path,
             none = _verdicts(tmp_path / f"none{flag}", model, expect,
                              {**at, flag: 0})
             assert none["failures"] == "FAIL", flag
+    # Unpriced (a `_cpu` twin on a GPU host), it settles no window, but a
+    # death is still logged.
+    unpriced = _verdicts(tmp_path / "unpriced", model, expect,
+                         {**at, "--expect-ooms": 0, "--expect-deaths": 0},
+                         priced=False)
+    assert unpriced["failures"] == ("FAIL" if at["--expect-deaths"]
+                                    else "PASS")
 
 
 def test_a_job_that_did_not_drain_fails_job_outcome(tmp_path):
