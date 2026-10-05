@@ -726,7 +726,7 @@ def test_grant_safety_counts_only_releases_by_other_live_processes():
             "FAIL", "FAIL", "WARN"]
     sightings = [_worker_sample(t, workers) for t, workers in (
         (20.0, {5001: 1000}), (87.0, {5000: 1000}), (88.5, {5000: 1000, 900: 1000}),
-        (99.0, {5000: 1000, 5001: 1000, 899: 1000}))]
+        (99.0, {5000: 1000, 5001: 1000, 899: 1000}), (170.0, {5000: 1000}))]
     for proc in (proc for row in sightings for proc in row["gpus"][0]["procs"]):
         proc["ns_pid"] = 17
     assert analyze.Context(
@@ -806,10 +806,10 @@ def test_oracle_agreement_skips_the_samples_while_no_job_ran():
 
 
 def test_a_hog_event_the_hog_answered_with_under_a_chunk_is_void_and_warns(tmp_path):
-    """A leave-free event, or a hold at or above what the hog held, is void
-    when `held_mb`, progress rows included, rises by less than one chunk
-    before the next request, even when no health sample joins the hog or
-    there is none. A step-down or a release asks for nothing more."""
+    """A leave-free event, or a hold at or above what the hog held, is void when
+    `held_mb`, progress rows included, rises by less than one chunk before the next
+    request, even when no health sample joins the hog, there is none, or there is no
+    `hog.jsonl`. A step-down or a release asks for nothing more."""
     held = {100.0: 0, 101.0: 0, 105.0: 0, 111.0: 8192, 115.0: 8192, 121.0: 8192,
             131.0: 8192, 141.0: 4096, 151.0: 4096, 161.0: 4608, 165.0: 4096,
             171.0: 0}
@@ -826,13 +826,15 @@ def test_a_hog_event_the_hog_answered_with_under_a_chunk_is_void_and_warns(tmp_p
             ("gpu", GPU, [], "INFO", []),
             ("ram", GPU, events, "WARN", ["spike", "hold", "small", "ease"]),
             ("gpu", "GPU-other", events, "WARN", ["spike", "hold", "small", "ease"]),
-            ("gpu", None, events, "WARN", ["spike", "hold", "small", "ease"])):
+            ("gpu", None, events, "WARN", ["spike", "hold", "small", "ease"]),
+            ("gpu", "GPU-other", [], "SKIP", []), ("gpu", None, [], "SKIP", []),
+            (None, GPU, events[:2], "WARN", ["spike"])):
         (tmp_path / "healthrec.jsonl").write_text(
             json.dumps(_health_sample(0)) + "\n" if uuid else "")
         (tmp_path / "hog.jsonl").write_text("".join(json.dumps(row) + "\n" for row in [
             {"kind": "header", "target": target, "gpu_uuid": uuid, "chunk_mb": 512},
             *({"kind": "progress" if t == 161.0 else "state", "t_wall": t,
-               "held_mb": mb} for t, mb in held.items())]))
+               "held_mb": mb} for t, mb in held.items())]) if target else "")
         (tmp_path / "legs.json").write_text(json.dumps({"events": logged}))
         analyze.main(["--scenario", str(tmp_path), "--checks", "hog_tracking",
                       "--json", str(tmp_path / "v.json"), "--quiet"])
@@ -983,13 +985,13 @@ def test_oracle_agreement_counts_another_process_window_when_it_meets_the_span()
     ], 108.0, start=99.75)
     healthrec = [_ledger(100.25, 6020, age_ms=350), _ledger(100.5, 6020, age_ms=750),
                  _ledger(106.0, 20, age_ms=1500), _ledger(107.0, 11000, age_ms=1800),
-                 _ledger(107.5, 6020, age_ms=15000)]
+                 _ledger(107.5, 6020, age_ms=15000), _ledger(105.05, 11020, age_ms=25)]
     verdict = _agreement(vramrec, healthrec)
     assert (verdict.verdict, verdict.numbers["joined"],
             verdict.numbers["releasing_samples"],
             verdict.numbers["read_age_samples"],
             verdict.numbers["read_age_worst_mb"],
-            verdict.numbers["stale_samples"]) == ("PASS", 1, 3, 2, 10980, 1)
+            verdict.numbers["stale_samples"]) == ("PASS", 1, 4, 2, 10980, 1)
     assert _agreement(vramrec, healthrec + [_ledger(101.0, 6020)]).verdict == "FAIL"
 
 

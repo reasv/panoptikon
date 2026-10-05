@@ -846,7 +846,7 @@ that move them are in `analyze.py --help`.
 | `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) unless the leg declared it, and so does a job `legs.json` shows did not drain (`job_end` outcome other than `drained`, e.g. cut at `--job-cap`, or no `job_end`) | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs), `--expect-empty-setters` | PASS/FAIL |
 | `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | FAIL on an `over_grant` breach, WARN on a `limit_fell` one |
 | `peak_fds` | peak open descriptors and sockets against the process's own limit | — | INFO; SKIP when nothing recorded them |
-| `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form; WARN when a hog event applied no pressure: it set a leave-free level, or a hold at or above what the hog held, and `hog.jsonl`'s `held_mb` rose by less than one chunk before the next event, also when the check otherwise SKIPs |
+| `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form; WARN when a hog event applied no pressure: it set a leave-free level, or a hold above 0 at or above what the hog held, and no `hog.jsonl` row (none when the file is missing) shows `held_mb` one chunk higher before the next event, also when the check otherwise SKIPs |
 | `ramp_progress` | `unit_budget` / `fit_samples` / the working size over time | — | INFO |
 | `calibration_learned` | the same three numbers, as a verdict | see below | FAIL only under `--learning` |
 | `batch_coverage` | the `seq` of each replica's `recent_batches` across health samples: a number no sample showed is a batch the recording missed; batches a worker runs after its last sample are not counted, so PASS means no gap between samples, not that every batch was seen | none missed | PASS/WARN; SKIP without `healthrec.jsonl` or when no sample showed a batch |
@@ -948,7 +948,8 @@ which made a resident nemotron worker holding up to 66 GiB count as
 is what lets a recording already on disk be re-analysed correctly. A gateway
 in a container logs its workers' PIDs in the container's PID namespace;
 `vramrec.py` records each process's PID there as `ns_pid`, and a spawn line's
-PID is read as the first process with that `ns_pid` to appear on a GPU after it.
+PID is read as the first process with that `ns_pid` to appear on a GPU from
+2 s before it on.
 
 **Which of our PIDs is *this* replica.** The pid the log states, when it
 states one: the spawn line carries `inference_id=` and `pid=` as two fields

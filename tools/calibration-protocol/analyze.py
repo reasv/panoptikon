@@ -252,19 +252,20 @@ class Context:
         # `ns_pid` beside the host PID. A spawn takes the first such process
         # to appear on a GPU after it.
         self._pid_first_seen: Optional[Dict[int, float]] = None
-        host_pids: Dict[int, List[Tuple[float, int]]] = {}
+        last: Dict[int, float] = {}
+        starts: Dict[int, List[Tuple[float, int]]] = {}
         for sample in self.vram_samples:
             for gpu in sample.get("gpus", []):
                 for proc in gpu.get("procs", []):
-                    if proc.get("ns_pid") not in (None, proc["pid"]):
-                        host_pids.setdefault(proc["ns_pid"], []).append(
-                            (sample["t_wall"], proc["pid"]))
+                    pid, t_wall = proc["pid"], sample["t_wall"]
+                    if (proc.get("ns_pid") not in (None, pid)
+                            and t_wall - last.get(pid, -math.inf) > PID_REUSE_GAP_S):
+                        starts.setdefault(proc["ns_pid"], []).append((t_wall, pid))
+                    last[pid] = t_wall
         for spawn in self.worker_spawns:
             floor = spawn["t_wall"] - SPAWN_CLOCK_SLACK_S
-            for t_wall, pid in host_pids.get(spawn["pid"], []):
-                if t_wall >= floor and self.pid_first_seen()[pid] >= floor:
-                    spawn["pid"] = pid
-                    break
+            spawn["pid"] = next((pid for t_wall, pid in starts.get(spawn["pid"], [])
+                                 if t_wall >= floor), spawn["pid"])
         self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
         self._release_windows: Dict[str, Tuple[List[Tuple[float, float, int, int]],
                                                List[float], List[float]]] = {}
@@ -828,7 +829,7 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     """`external_mb` vs (GPU used - our workers' NVML usage): +/-1 GiB or 2%.
 
     Skipped from a drained `job_end` (or the hog stop) to the next
-    `job_start`, where GPU used moved past the allowance, or by
+    `job_start`; where GPU used moved past the allowance, or by
     an unknown amount, during the per-process scan, where the ledger's free
     reading is over 10 s old, or while a release or hog move larger than the
     allowance lies between that reading and the oracle sample."""
@@ -906,8 +907,9 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                     releasing += 1
                 else:
                     hog_moving += 1
-                if max(ctx.released_mb(uuid, first, last, (vram["t_wall"], first)),
-                       ctx.hog_moved_mb(uuid, (first, last))) <= allowance:
+                if read_t < first and max(
+                        ctx.released_mb(uuid, first, last, (vram["t_wall"], first)),
+                        ctx.hog_moved_mb(uuid, (first, last))) <= allowance:
                     read_age += 1
                     read_age_worst = max(read_age_worst, raw)
                 continue
@@ -966,8 +968,8 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
         f"GPU-samples; {breaches} outside the allowance"
         + (f"; {unpriced} further samples priced no PID and were skipped"
            if unpriced else "")
-        + (f"; {idle} health samples while no job ran were not joined"
-           if idle else "")
+        + (f"; {idle} health samples from a drained job_end (or the hog stop)"
+           " to the next job_start were not joined" if idle else "")
         + skipped,
         {"joined": joined, "breaches": breaches, "worst_mb": worst,
          "unpriced_samples": unpriced, **excluded,
@@ -2314,8 +2316,8 @@ def _idle_spans(legs: Optional[Dict[str, Any]]) -> List[Tuple[float, float]]:
 
 def _void_hog_events(legs: Optional[Dict[str, Any]],
                      hog: List[Dict[str, Any]]) -> List[str]:
-    """The hog events that asked for pressure (any leave-free level, or a
-    hold at or above what the hog held) while its `held_mb`, progress rows
+    """The hog events that asked for pressure (any leave-free level, or a hold
+    above 0 at or above what the hog held) while its `held_mb`, progress rows
     included, rose by less than one chunk before the next event."""
     header = next((row for row in hog if row.get("kind") == "header"), {})
     chunk = header.get("chunk_mb") or 1
@@ -2525,8 +2527,8 @@ def check_hog_tracking(ctx: Context) -> Verdict:
     """
     void = ctx.void_hog_events
     void_note = ("; WARN: the hog event(s) " + ", ".join(void) + " applied no "
-                 "pressure: the hog held less than one chunk more before the next "
-                 "event" if void else "")
+                 "pressure: no hog.jsonl row shows the hog holding one chunk more "
+                 "before the next event" if void else "")
     if not ctx.hog_samples or not ctx.health_samples:
         return Verdict("hog_tracking", "WARN" if void else "SKIP",
                        "needs hog.jsonl and healthrec.jsonl" + void_note,
