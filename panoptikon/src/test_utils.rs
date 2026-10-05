@@ -143,3 +143,42 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AskEveryEvent {
         false
     }
 }
+
+/// Counts the events logged on this thread by level and target, for tests
+/// that bound how many lines something logs. Never reads message text.
+#[derive(Clone, Default)]
+pub(crate) struct LogCounts(std::sync::Arc<Mutex<Vec<(tracing::Level, &'static str)>>>);
+
+impl LogCounts {
+    /// Counts this thread's events until the guard drops.
+    pub(crate) fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt;
+        install_ask_every_event();
+        let counts = Self::default();
+        let subscriber = tracing_subscriber::registry().with(counts.clone());
+        (counts, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// Events at `level` whose target starts with `target`.
+    pub(crate) fn at(&self, level: tracing::Level, target: &str) -> usize {
+        let events = self.0.lock().unwrap();
+        events
+            .iter()
+            .filter(|(at, from)| *at == level && from.starts_with(target))
+            .count()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCounts {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let metadata = event.metadata();
+        self.0
+            .lock()
+            .unwrap()
+            .push((*metadata.level(), metadata.target()));
+    }
+}

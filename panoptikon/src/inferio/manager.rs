@@ -1259,7 +1259,7 @@ impl ModelManager {
     ) -> Result<TouchOutcome> {
         let mut state = self.state.lock().unwrap();
         if state.shutting_down {
-            bail!("the model manager is shutting down");
+            return Err(Unattempted::error("the model manager is shutting down"));
         }
         let unloads =
             state
@@ -2813,6 +2813,10 @@ metadata.cost.seed_units = 1000000
             .await
             .expect_err("predicts refused after shutdown");
         assert!(format!("{err:#}").contains("shutting down"));
+        assert!(
+            err.downcast_ref::<Unattempted>().is_some(),
+            "a refused predict never ran"
+        );
     }
 
     /// An unconvertible output is a per-request error, not a fatal one.

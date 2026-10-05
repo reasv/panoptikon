@@ -903,8 +903,12 @@ fn predict_failure_response(err: anyhow::Error, full_id: &str) -> Result<Respons
         return Ok(response);
     }
     let chain = format!("{err:#}");
-    tracing::error!(model = %full_id, error = %chain, "prediction failed");
-    match classify_predict_failure(&err, &chain, full_id) {
+    let failure = classify_predict_failure(&err, &chain, full_id);
+    // An unattempted predict is logged where it failed: the death or the unload.
+    if failure != PredictFailure::Unattempted {
+        tracing::error!(model = %full_id, error = %chain, "prediction failed");
+    }
+    match failure {
         PredictFailure::LoadFailed => Err(load_failure_error(&chain)),
         PredictFailure::Unattempted => Ok(structured_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1882,6 +1886,7 @@ metadata.description = "echo fixture"
     /// classified right but answered the wrong body would re-queue nothing.
     #[tokio::test]
     async fn every_shape_of_a_worker_death_reaches_the_job_as_worker_died() {
+        let (logs, _capture) = crate::test_utils::LogCounts::capture();
         let model = "clip/model-a";
         let status = StatusCode::INTERNAL_SERVER_ERROR;
         for rendering in death_renderings(model) {
@@ -1905,11 +1910,18 @@ metadata.description = "echo fixture"
                 "the job records what actually happened"
             );
         }
+        let errors = || logs.at(tracing::Level::ERROR, "panoptikon::inferio::http");
+        assert_eq!(
+            errors(),
+            0,
+            "a death is logged by the worker, not per request"
+        );
 
         // The counterexample: an ordinary predict failure must stay a plain
         // error, or every failed item would be re-submitted for nothing.
         let ordinary = predict_failure_response(anyhow!("the model returned no outputs"), model);
         assert!(ordinary.is_err(), "an ordinary failure is not structured");
+        assert_eq!(errors(), 1);
     }
 
     /// The 500 a failed load answers carries the load error, because the
