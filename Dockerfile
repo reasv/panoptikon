@@ -132,7 +132,7 @@ ARG ACCELERATOR=cpu
 RUN panoptikon setup --accelerator ${ACCELERATOR} \
     && cp /app/runtime/venv/lib/python*/site-packages/pypdfium2_raw/libpdfium.so \
           /app/libpdfium.so \
-    && rm -rf /home/ubuntu/.cache/uv \
+    && uv cache clean \
     && rm -rf /app/runtime/venv/lib/python*/site-packages/static_ffmpeg/bin \
     && mkdir -p /app/data /home/ubuntu/.cache \
     && chown -R ubuntu:0 /app /home/ubuntu \
