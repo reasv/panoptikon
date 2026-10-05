@@ -1759,7 +1759,8 @@ fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
 
 /// At warning, once the paging has stopped, the batch grows back by doubling
 /// to half the size the episode began at and no further; a second episode
-/// halves that bound again. The full size returns only at normal.
+/// halves that bound again. The full size returns only at normal. A death's
+/// cap is part of that size.
 #[test]
 fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() {
     use mps::MemoryPressure::{Normal, Warning};
@@ -1783,6 +1784,23 @@ fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() 
     ledger.set_memory_pressure_for_test(Normal);
     assert_eq!(ramp_windows(&handle, &admission, 4), [32, 64, 64, 64]);
     assert_eq!(pressure_cap(&ledger), None);
+
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(token.grant().unit_budget, 64);
+    token.finish(WindowOutcome::WorkerDied);
+    let handle = loaded_mps(Some(MAC_TOTAL_MB));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("reloads");
+    paging_windows(&ledger, &handle, &admission, 2);
+    ledger.set_memory_pressure_for_test(Warning);
+    assert_eq!(
+        ramp_windows(&handle, &admission, 4),
+        [8, 16, 16, 16],
+        "half of the 32 the death left"
+    );
 }
 
 /// The bound lasts until the batch is back at what the ramp admits. A
