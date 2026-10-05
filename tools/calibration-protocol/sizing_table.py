@@ -254,6 +254,11 @@ def model_lines(a, cls, seeds):
             for n in DAILY_ITEMS:
                 lines.append(name("daily", mode, f"warm{n}") + f" items={n} starts=7 restart=0")
                 lines.append(name("daily", mode, f"restart{n}") + f" items={n} starts=7")
+                # The same jobs when the caller does not say how many items it has left.
+                lines.append(name("daily", mode, f"nocount-warm{n}")
+                             + f" items={n} starts=7 restart=0 count=0")
+                lines.append(name("daily", mode, f"nocount-restart{n}")
+                             + f" items={n} starts=7 count=0")
                 if gpu:
                     lines.append(name("daily", mode, f"shipped{n}") + f" items={n} starts=7 "
                                  + SHIPPED_W)
@@ -503,13 +508,15 @@ def daily_tables(g, versus, a):
             runs = lambda var, m: g[("daily", cls, m, mode, f"{var}{n}")]
             day_s = lambda var, first: sum(mean(pick(runs(var, m), first), num("ms"))
                                            for m in daily) / 1000
-            for store, vars_ in (("none", ("warm", "restart")), (SHIPPED_W, ("shipped",))):
+            for store, vars_ in (("none", ("warm", "restart")),
+                                 ("none, no count", ("nocount-warm", "nocount-restart")),
+                                 (SHIPPED_W, ("shipped",))):
                 if not runs(vars_[0], daily[0]):
                     continue
                 both = [r for var in vars_ for m in daily for r in runs(var, m)]
                 later = [r for r in both if r["start"] != "0" and int(r["ostored"]) > 0]
                 first = day_s(vars_[-1], True)
-                w = day_s("warm", False) if "warm" in vars_ else None
+                w = day_s(vars_[0], False) if len(vars_) == 2 else None
                 again = day_s(vars_[-1], False)
                 row(cls, mode, f"{store} ({DAY.get(day, day)})" if day != "-" else store, n,
                     f"{first:.1f}", "-" if w is None else f"{w:.1f}", f"{again:.1f}",
