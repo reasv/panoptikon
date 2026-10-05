@@ -139,7 +139,7 @@ def test_each_fixture_passes_at_its_thresholds_and_fails_one_past(tmp_path,
     # A failed-item threshold is the item count.
     assert at["--expect-failures"] in (0, legs.SMOKE_IMAGES)
     verdicts = _verdicts(tmp_path / "at", model, expect, at)
-    assert verdicts["failures"] in ("PASS", "WARN")
+    assert verdicts["failures"] == "PASS"
     assert verdicts["job_outcome"] == "PASS"
     # Only `oom` declares that it ends deflated.
     assert ("--expect-deflated" in expect) == (name == "oom")

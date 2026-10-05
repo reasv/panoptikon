@@ -1563,8 +1563,9 @@ def check_grant_safety(ctx: Context) -> Verdict:
 def check_failures(ctx: Context) -> Verdict:
     """OOM negatives, worker deaths and merged-window fallbacks in the log.
 
-    Where the log names the tier that classified each negative, it is tallied
-    as `source/trust`; a recording predating that line carries none, and the
+    Counts within `--expect-ooms` / `--expect-deaths` PASS. Where the log
+    names the tier that classified each negative, it is tallied as
+    `source/trust`; a recording predating that line carries none, and the
     clause is then omitted rather than reported empty."""
     if not ctx.log:
         return Verdict("failures", "SKIP", "no panoptikon.log")
@@ -1600,9 +1601,8 @@ def check_failures(ctx: Context) -> Verdict:
     expected_ooms = ctx.args.expect_ooms
     expected_deaths = ctx.args.expect_deaths
     bad = ooms > expected_ooms or deaths > expected_deaths
-    verdict = "FAIL" if bad else ("WARN" if (ooms or deaths) else "PASS")
     return Verdict(
-        "failures", verdict,
+        "failures", "FAIL" if bad else "PASS",
         f"{ooms} OOM negatives (expected <= {expected_ooms}), "
         f"{collapses} throughput-collapse negatives, "
         f"{unified_deaths} unified-memory-device death negatives, "
