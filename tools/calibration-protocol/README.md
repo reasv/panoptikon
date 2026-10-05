@@ -186,10 +186,9 @@ is this host's reference GPU, so a cross-platform comparison can state
 exactly what changed. The fractions come from this host's legs: S4a `leave-free`
 12 288 / 97 887, S4b's step `hold` 30 720 / 97 887 at t+60 s, S4d
 `leave-free` 8 192 / 97 887 released at t+120 s. **S4c's spike is not a
-fraction**: its "~2 GB free" is the defensive clamp's own threshold, the
-number the scenario is defined against, so it is 2 048 MiB on every GPU, not
-scaled, and raised only by a `--min-free-mb` above it, at t+90 s and released
-at t+100 s. On a 32 607 MiB GPU the four resolve to S4a 4 093, S4b 10 233,
+fraction**: it squeezes the GPU to about 2 GB free, so it is 2 048 MiB on
+every GPU, not scaled, and raised only by a `--min-free-mb` above it, at
+t+90 s and released at t+100 s. On a 32 607 MiB GPU the four resolve to S4a 4 093, S4b 10 233,
 S4c 2 048 and S4d 2 729 MiB. Every event is timed **from the job's POST**,
 not from the leg's start, because what the scenario describes is a change
 during the job. `--hog-event` adds such an event in MiB to any scenario

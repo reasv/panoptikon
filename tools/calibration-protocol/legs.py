@@ -70,9 +70,9 @@ event into `legs.json` and prints a `PRECONDITION:` line: the leg is then
 applying the floor's pressure, not the fraction's, and two legs written to
 different fractions can land on the same level.
 
-S4c's spike is not a fraction. Its "~2 GB free" is the defensive clamp's own
-threshold, so it is 2 048 MiB on every GPU, not scaled, and raised only by a
-`--min-free-mb` above it. A `--hog-event` figure is in MiB too: not scaled,
+S4c's spike is not a fraction: it squeezes the GPU to about 2 GB free, so it
+is 2 048 MiB on every GPU, not scaled, and raised only by a `--min-free-mb`
+above it. A `--hog-event` figure is in MiB too: not scaled,
 but bounded like every figure.
 Both the fraction and the resolved MiB are recorded in `legs.json`, and the
 reference column in `--list` is the figure this host's runs used, so a
@@ -174,9 +174,8 @@ class HogEvent:
     hold_fraction: Optional[float] = None
     leave_free_fraction: Optional[float] = None
     #: absolute levels, for a figure stated in MiB rather than as a share of
-    #: the GPU's total: S4c's 2 GB is the defensive clamp's own threshold, the
-    #: same number on a 24 GB card as on a 96 GB one, and `--hog-event` is in
-    #: MiB.
+    #: the GPU's total: S4c squeezes to about 2 GB free, the same number on a
+    #: 24 GB card as on a 96 GB one, and `--hog-event` is in MiB.
     leave_free_mb: Optional[int] = None
     hold_mb: Optional[int] = None
     label: str = ""
