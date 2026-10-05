@@ -173,11 +173,11 @@ Linux only:
    CPU. A render node that cannot be opened while KFD still exposes the
    GPU is different: on ROCm 7.2, with that restriction emulated, ROCr
    enumerated no GPU at all, which the worker's pin check refuses. If *no*
-   GPU node is openable, or `/dev/kfd` does not open read-write, the
-   inventory is known empty and models run on the CPU device. On a ROCm
-   host, opening `/dev/kfd` and every render node at startup can resume a
-   runtime-suspended GPU, and registers the gateway as a KFD process (0
-   VRAM) until it exits.
+   GPU node is openable, or `/dev/kfd` is missing or denied (any other
+   open error leaves the inventory unknown), the inventory is known empty
+   and models run on the CPU device. On a ROCm host, opening `/dev/kfd`
+   and every render node at startup can resume a runtime-suspended GPU,
+   and registers the gateway as a KFD process (0 VRAM) until it exits.
 4. From `/sys/bus/pci/devices/<bdf>/`: `mem_info_vram_total` → `total_mb`.
    The all-or-nothing rule (the CUDA parser's, for the same reason) covers
    the whole identity, not just that file. Any **one** of these on any
@@ -251,16 +251,17 @@ Linux only:
 **Ambient visibility handling (review F3):** stricter than the CUDA rule.
 If *any* of `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`,
 `CUDA_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL` is set non-empty on a ROCm
-host, the inventory is blanked and workers inherit the ambient environment
-verbatim (today's behaviour). No UUID-form carve-out: an ambient ROCR
-filter *changes the HIP index space* (HIP indices count the ROCR-filtered
-set in the ambient list's order), so composing our relative index pins on
-top of it is exactly the ordinal-correlation mistake finding 1 forbids.
-CUDA can afford the UUID carve-out because its pins are absolute UUIDs;
-ROCm pins are relative indices, so "symmetric" would not be symmetric.
-Cost: ambient-restricted hosts (Slurm-style schedulers set ROCR) stay
-unpriced in v1 — safe, documented, and revisitable once the single-var
-ROCR-only composition is worth the complexity.
+host where this process can open a GPU, the inventory is blanked and
+workers inherit the ambient environment verbatim (today's behaviour). No
+UUID-form carve-out: an ambient ROCR filter *changes the HIP index space*
+(HIP indices count the ROCR-filtered set in the ambient list's order), so
+composing our relative index pins on top of it is exactly the
+ordinal-correlation mistake finding 1 forbids. CUDA can afford the UUID
+carve-out because its pins are absolute UUIDs; ROCm pins are relative
+indices, so "symmetric" would not be symmetric. Cost: ambient-restricted
+hosts (Slurm-style schedulers set ROCR) stay unpriced in v1 — safe,
+documented, and revisitable once the single-var ROCR-only composition is
+worth the complexity.
 
 Blanking the inventory withdraws the pins *we* derive; it does not decide
 what happens to a pin the **operator** wrote in the registry. That depends
