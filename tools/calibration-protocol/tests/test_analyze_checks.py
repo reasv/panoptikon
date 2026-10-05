@@ -1176,14 +1176,17 @@ def test_deflation_recovery_reads_the_settle_lines_before_health():
         assert stuck.numbers["clean_windows_at_level"] == {f"{MODEL}@{GPU}": 3}
     # Short of three clean windows at the end: the third window repays a level
     # the clock already lowered; one window short; a time repay restarts the
-    # count; a worker that left at 1.
+    # count; a worker that left at 1; a replica at 1 beside one at 0 on the
+    # same GPU.
     for log in ([_deflation(3, "negative"), _deflation(3), _deflation(3),
                  _deflation(2, None), _deflation(1)],
                 two_levels[:-1],
                 [_deflation(2, "negative"), _deflation(2, clean_windows=1),
                  _deflation(1, None), _deflation(1, clean_windows=2),
                  _deflation(1, clean_windows=3)],
-                replaced + [_deflation(1, "negative", gpu="GPU-1111")]):
+                replaced + [_deflation(1, "negative", gpu="GPU-1111")],
+                [_deflation(1, "negative"), *[_deflation(0)] * 3,
+                 _deflation(1, clean_windows=1)]):
         assert _deflation_recovery(log, [_deflated_health(0)]).verdict == "WARN"
     # Another target at DEBUG, the ledger's at INFO: only negatives logged.
     other = {**_deflation(0), "target": "panoptikon::db", "message": "chose"}

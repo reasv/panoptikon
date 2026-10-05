@@ -1644,7 +1644,8 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
     # CLEAN_WINDOWS_TO_RESTORE. The window that repays a level is logged at
     # the new level and does not count toward it. A time repay restarts the
     # count, because its line is logged inside the ledger lock and can print
-    # ahead of the settle line of a window that settled first.
+    # ahead of the settle line of a window that settled first. Any change of
+    # level restarts it too: two replicas of a model on one GPU share a key.
     rows: Dict[str, Dict[str, int]] = {}
     for event in ctx.log if from_log else []:
         fields = event["fields"]
@@ -1661,7 +1662,7 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
         if outcome == "worker_died":
             value = 0
         if outcome == "clean":
-            row["clean"] = 0 if value < row["final"] else row["clean"] + 1
+            row["clean"] = 0 if value != row["final"] else row["clean"] + 1
         else:
             row["clean"] = 0
         row["final"] = value
