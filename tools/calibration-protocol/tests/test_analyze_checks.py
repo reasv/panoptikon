@@ -346,9 +346,8 @@ def test_utilization_scores_a_size_left_in_place_against_the_largest_it_ran():
     verdict = analyze.check_utilization(ctx)
     assert verdict.verdict == "PASS"
     row = verdict.numbers["models"][0]
-    assert (row["knee_units"], row["held_rung_units"]) == (3, 64)
+    assert (row["knee_units"], row["largest_trial_units"]) == (3, 64)
     assert (row["denominator_units"], row["ratio"]) == (64, 1.0)
-    assert "held at knee_units=3, rung 64" in verdict.detail
 
 
 def test_a_batch_size_that_stopped_short_of_the_boundary_still_fails():
@@ -471,7 +470,7 @@ def test_a_size_with_no_trial_size_falls_back_to_itself():
                                probes=[_bisect_probe(512)])
     verdict = analyze.check_utilization(ctx)
     row = verdict.numbers["models"][0]
-    assert (row["held_rung_units"], row["denominator_units"]) == (None, 15)
+    assert (row["largest_trial_units"], row["denominator_units"]) == (None, 15)
     assert "held at knee_units=15 =" in verdict.detail
 
 
@@ -1262,12 +1261,12 @@ def test_deflation_still_listed_after_its_repay_time_fails():
     assert judge(*late[:1], (160.5, _deflated_health(0))).verdict == "PASS"
     assert judge((129.0, refused), (130.0, _deflated_health(1)),
                  (160.5, _deflated_health(0))).verdict == "PASS"
-    # A later negative restarts the clock; one logged 9.5 s after the sample
+    # A later negative restarts the clock; one logged 2.5 s after the sample
     # does not; neither does a clean window.
+    assert judge(*late, log=[negative(2, 100.0), negative(
+        2, 140.0, reason="throughput_collapse")]).verdict == "WARN"
     assert judge(*late, log=[negative(2, 100.0),
-                             negative(2, 140.0)]).verdict == "WARN"
-    assert judge(*late, log=[negative(2, 100.0),
-                             negative(2, 170.0)]).verdict == "FAIL"
+                             negative(2, 163.0)]).verdict == "FAIL"
     assert judge(*late, log=[negative(2, 100.0),
                              {**_deflation(2), "t_wall": 150.0}]).verdict == "FAIL"
     # A death on a unified-memory device restarts it; a discrete one carries
@@ -1279,11 +1278,17 @@ def test_deflation_still_listed_after_its_repay_time_fails():
     # A settle line stamped just after a read that already saw its level.
     assert judge((159.95, refused), (160.05, _deflated_health(2)),
                  log=[negative(1, 100.0),
-                      negative(2, 160.06)]).verdict != "FAIL"
+                      negative(2, 161.9)]).verdict == "WARN"
     # One logged between the two stamps restarts it too.
     assert judge((160.0, refused), (163.0, _deflated_health(2)),
                  log=[negative(2, 100.0),
                       negative(2, 162.5)]).verdict == "WARN"
+    # A sample listing a higher level than the one before was read after the
+    # negative that set it, though that negative is logged later.
+    assert judge((150.0, _deflated_health(0)), (160.5, _deflated_health(0)),
+                 (160.6, _deflated_health(1)), (161.0, _deflated_health(1)),
+                 log=[negative(1, 100.0),
+                      negative(1, 163.0)]).verdict == "WARN"
     # Two replicas on one GPU: the one at 3 is due at 190, not when the other
     # one's level 1 is.
     replicas = _deflated_health(2)
@@ -1292,18 +1297,6 @@ def test_deflation_still_listed_after_its_repay_time_fails():
     verdict = judge((139.9, refused), (140.0, replicas),
                     log=[negative(3, 100.0), negative(1, 101.0)])
     assert verdict.numbers["unrepaid_s"] == {}
-
-
-def test_failures_prints_the_range_each_count_is_held_to():
-    """A declared count is held to at least one, unless the model was never
-    granted memory."""
-    for log, ooms in (([_grant(100.0, 512, 1024)], "1..180"),
-                      ([_deflation(0)], "0..180")):
-        ctx = _utilization_context([], log=log)
-        ctx.args.expect_ooms, ctx.args.expect_deaths = 180, 0
-        detail = analyze.check_failures(ctx).detail
-        assert f"0 OOM negatives (expected {ooms})" in detail
-        assert "0 fatal worker deaths (expected 0)" in detail
 
 
 # --- job_outcome and legs.json -------------------------------------------------

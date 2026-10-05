@@ -821,6 +821,14 @@ def corpus_tier_scale(name: str) -> Tuple[str, float]:
     return name, 1.0
 
 
+def corpus_dir(args: argparse.Namespace, scenario: Scenario) -> Path:
+    # Absolute, always: the gateway chdirs into `--root`, so a relative
+    # `included_folders` entry resolves against a different directory there and
+    # the rescan quietly indexes nothing.
+    return (Path(args.corpus) if args.corpus
+            else Path(args.results) / "corpus" / scenario.corpus).resolve()
+
+
 def corpus_command(corpus: Path, tier: str, scale: float) -> str:
     return (f"corpus.py --tier {tier}"
             + (f" --scale {scale:g}" if scale != 1.0 else "")
@@ -1131,11 +1139,21 @@ class Leg:
 
     def expectations(self) -> Tuple[str, ...]:
         """`analyze.py --expect-*` for this leg: the fixture's own, where it
-        runs one, and the scenario's otherwise."""
+        runs one, a failed-item ceiling on a `poison` corpus, and the
+        scenario's otherwise."""
         for model in self.models:
             fixture = fixture_for(model)
             if fixture is not None:
                 return fixture.expect
+        try:
+            manifest = corpus_dir(self.args, self.scenario) / "manifest.json"
+            tier = json.loads(manifest.read_text(encoding="utf-8")).get("tier")
+        except Exception:  # no corpus, or no readable manifest
+            tier = None
+        if tier == "poison":
+            # poison's items are built to fail as input.
+            return ("--expect-failures", str(sum(
+                group.count for group in corpus_tiers.tier_groups("poison"))))
         return self.scenario.expect
 
     def job_items(self, model: str, tag: str) -> Optional[int]:
@@ -2037,11 +2055,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"rejects a bare id (`tags/wd-vit-tagger-v3`, "
             f"`textembed/all-MiniLM-L6-v2`). `--list` prints each scenario's "
             f"own id")
-    # Absolute, always: the gateway chdirs into `--root`, so a relative
-    # `included_folders` entry resolves against a different directory there and
-    # the rescan quietly indexes nothing.
-    corpus = (Path(args.corpus) if args.corpus
-              else Path(args.results) / "corpus" / scenario.corpus).resolve()
+    corpus = corpus_dir(args, scenario)
     measured_total_mb = nvml_total_mb(args.hog_device)
     measured_source = "nvml"
     rocm_host = measured_total_mb is None and bool(rocm_sysfs.inventory())

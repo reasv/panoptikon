@@ -687,12 +687,6 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
     working batch size beside it: one source for `ramp_progress` and
     `calibration_learned`, so they agree.
 
-    The working size is read here because a budget can be *deliberately* low:
-    a batch grows only on a measured gain, so a model that gains nothing
-    from larger batches stays at a small size, and a worker there tries the
-    sizes next to it every so often. Without it those samples look exactly
-    like a batch size that never left the seed.
-
     Only a working size `/health` marks `knee_is_local` counts: a trial on
     this machine measured the sizes next to it and moved to it or left it in
     place. The size a replica merely opened at, or one seeded from a shipped
@@ -1565,9 +1559,9 @@ def check_failures(ctx: Context) -> Verdict:
 
     Counts within `--expect-ooms` / `--expect-deaths` PASS; a declared
     count with none seen FAILs, as the fault never fired. A model the ledger
-    never granted memory settles no window, so it is held to no OOM floor
-    (a `_cpu` fixture on a GPU host). Where the log
-    names the tier that classified each negative, it is tallied as
+    never granted memory settles no window, so a log at DEBUG with no grant
+    line holds it to no OOM floor (a `_cpu` fixture on a GPU host). Where the
+    log names the tier that classified each negative, it is tallied as
     `source/trust`; a recording predating that line carries none, and the
     clause is then omitted rather than reported empty."""
     if not ctx.log:
@@ -1603,7 +1597,10 @@ def check_failures(ctx: Context) -> Verdict:
             tier_clause += f", {unnamed} unnamed"
     expected_ooms = ctx.args.expect_ooms
     expected_deaths = ctx.args.expect_deaths
-    priced = bool(ctx.log_events("issued a memory grant"))
+    debug = any(event["level"] in ("DEBUG", "TRACE")
+                and event["target"].startswith("panoptikon::inferio")
+                for event in ctx.log)
+    priced = bool(ctx.log_events("issued a memory grant")) or not debug
     unfired = ((priced and expected_ooms and not ooms)
                or (expected_deaths and not deaths))
     bad = ooms > expected_ooms or deaths > expected_deaths or unfired
@@ -1652,10 +1649,9 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
     FAIL: a level outlasted `CLEAN_WINDOWS_TO_RESTORE` clean windows, or a
     worker is still deflated in a health sample read `DEFLATION_REPAY_S` per
     level after the negative that set it (the latest due time on the model
-    and GPU): time alone repays it by then. WARN:
-    still deflated when the recording ended.
-    `--expect-deflated` declares a model that OOMs on every batch: ending
-    deflated is then its result, and never deflating FAILs."""
+    and GPU): time alone repays it by then. WARN: still deflated when the
+    recording ended. `--expect-deflated` declares a model that OOMs on every
+    batch: ending deflated is then its result, and never deflating FAILs."""
     settle = "settled a granted window"
     from_log = any(event["level"] == "DEBUG"
                    and event["target"].startswith("panoptikon::inferio::ledger")
@@ -1721,15 +1717,29 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
                                 []).append((event["t_wall"], event["t_wall"]
                                             + int(fields["deflation"])
                                             * DEFLATION_REPAY_S))
-    unrepaid: Dict[str, float] = {}
-    for previous, sample in zip(ctx.health_samples, ctx.health_samples[1:]):
+
+    def listed(sample: Dict[str, Any]) -> Dict[str, int]:
+        """Each key's highest level in this sample."""
+        levels: Dict[str, int] = {}
         for worker in (sample.get("health") or {}).get("workers") or []:
             key = f"{worker['inference_id']}@{worker.get('gpu_uuid')}"
+            levels[key] = max(levels.get(key, 0),
+                              int(worker.get("deflation") or 0))
+        return levels
+
+    unrepaid: Dict[str, float] = {}
+    for previous, sample in zip(ctx.health_samples, ctx.health_samples[1:]):
+        before = listed(previous)
+        for key, level in listed(sample).items():
+            # The read behind a sample that lists a higher level saw it, so
+            # the negative that set it was noted before the sample's stamp.
+            if key in restarts and level > before.get(key, level):
+                restarts[key].append((sample["t_wall"], sample["t_wall"]
+                                      + level * DEFLATION_REPAY_S))
             due = max((repaid for logged, repaid in restarts.get(key, [])
                        if logged <= sample["t_wall"] + SETTLE_LOG_SLACK_S),
                       default=math.inf)
-            if (not declared and int(worker.get("deflation") or 0)
-                    and previous["t_wall"] >= due):
+            if not declared and level and previous["t_wall"] >= due:
                 unrepaid[key] = max(unrepaid.get(key, 0.0),
                                     round(previous["t_wall"] - due, 1))
     if held or unrepaid or (declared and not peak):
@@ -1808,14 +1818,16 @@ def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
     size trial is over` lines with `moved=false`, the `knee_units` of every
     `/health` sample marked `knee_is_local` (the only one a leg that *resumed*
     a stored size has), and the local store's own `knee_units`, which is
-    written only for a size a trial placed. The rung is the largest size this
-    leg's trials ran (`largest_units`); the settle lines' `max_units_measured`
-    is the anchor, which a seeded or stored profile raises, so it is not read.
+    written only for a size a trial placed. The largest trial size is the
+    largest size this leg's trials ran (`largest_units`); the settle lines'
+    `max_units_measured` is the anchor, which a seeded or stored profile
+    raises, so it is not read.
     """
     rows: Dict[str, Dict[str, int]] = {}
 
     def row(model: str) -> Dict[str, int]:
-        return rows.setdefault(model, {"knee": 0, "knee_named": 0, "rung": 0})
+        return rows.setdefault(model, {"knee": 0, "knee_named": 0,
+                                       "largest_trial": 0})
 
     ran: Dict[str, int] = {}
     for event in ctx.log_matching("a batch size trial is over"):
@@ -1844,7 +1856,7 @@ def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
             # one the detail names when the trial lines disagree.
             entry["knee_named"] = int(knee)
     for model, entry in rows.items():
-        entry["rung"] = ran.get(model, 0)
+        entry["largest_trial"] = ran.get(model, 0)
     return {model: entry for model, entry in rows.items() if entry["knee"]}
 
 
@@ -1986,7 +1998,7 @@ def check_utilization(ctx: Context) -> Verdict:
             rows.append({**row, "boundary_units": None})
             continue
         knee = knees.get(model)
-        allowed = (knee["rung"] or knee["knee"]) if knee else 0
+        allowed = (knee["largest_trial"] or knee["knee"]) if knee else 0
         held = _hog_least_held_mb(
             ctx, issued_at.get(model) or published_at.get(model, []))
         # The ledger also withholds its reserve: the least on the model's
@@ -2005,7 +2017,8 @@ def check_utilization(ctx: Context) -> Verdict:
         rows.append({**row, "boundary_units": boundary,
                      "knee_units": ((knee["knee_named"] or knee["knee"])
                                     if knee else None),
-                     "held_rung_units": (knee["rung"] or None) if knee else None,
+                     "largest_trial_units": ((knee["largest_trial"] or None)
+                                             if knee else None),
                      "room_units": room, "denominator_units": denominator,
                      "ratio": round(ratio, 4), "ok": ok})
         verdict = "PASS" if (verdict in ("INFO", "PASS") and ok) else "FAIL"
@@ -2025,9 +2038,9 @@ def check_utilization(ctx: Context) -> Verdict:
         if not row.get("knee_units"):
             return (f" / probe boundary {row['boundary_units']} = "
                     f"{row['ratio']:.2f}")
-        held = (f", rung {row['held_rung_units']}"
-                if row.get("held_rung_units") else "")
-        if row["denominator_units"] != (row.get("held_rung_units")
+        held = (f", largest trial size {row['largest_trial_units']}"
+                if row.get("largest_trial_units") else "")
+        if row["denominator_units"] != (row.get("largest_trial_units")
                                         or row["knee_units"]):
             return (f" / held at knee_units={row['knee_units']}{held}, capped "
                     f"at the probe boundary {row['boundary_units']} = "
@@ -2571,16 +2584,9 @@ def check_calibration_learned(ctx: Context) -> Verdict:
     == 0` for some model, no `[[profile]]` in `calibration.after.toml`, a peak
     `unit_budget` no higher than the first recorded. See the README's "Checks".
 
-    **A size this leg measured is learning.** The seed is a starting guess,
-    not a floor: a batch grows only on a measured gain, so a model that gains
-    nothing from larger batches stays at or *under* its seed on purpose. A
-    worker deliberately running at 3-7 units would otherwise read "peak
-    unit_budget never left the seed (seed 64, peak 64)" and FAIL for doing
-    exactly the right thing. What counts is a size `/health` marks
-    `knee_is_local` that this leg measured (`_budget_rows`' `measured`): one
-    present from the worker's first sample, never moved and with no trial
-    line, was resumed from the store. The size a replica opened at is still
-    "stuck".
+    A model with a `knee_is_local` size this leg measured (`_budget_rows`'
+    `measured`) does not count as "never left the seed"; a size resumed from
+    the store, or the size a replica opened at, still does.
     """
     learning = _declared_learning(ctx)
     profiles = (ctx.after or {}).get("profile") or []

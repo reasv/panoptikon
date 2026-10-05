@@ -1,10 +1,7 @@
 """Each S5 fault-injection fixture is read against what it was written to inject.
 
-One `analyze.py` command for the whole S5 table -- `--expect-ooms 1`, the
-`oom_second_batch` fixture's figure -- would FAIL every other fixture for
-working as designed. The thresholds come from the table, per fixture, and
-`dies_on_load` carries the one declaration the zero-item rule needs: its
-setter records no items by construction.
+Each fixture is read against its own `S5_FIXTURES` row; `dies_on_load` also
+declares that its setter records no items.
 
 Run with the managed interpreter:
 
@@ -13,10 +10,12 @@ Run with the managed interpreter:
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import sys
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -95,6 +94,16 @@ def test_each_fixture_gets_its_own_expectations_not_the_tables(tmp_path):
     assert expect == ()
     assert _verdicts(tmp_path / "real", real, expect,
                      _thresholds(expect))["failures"] == "PASS"
+    # Over `poison` it declares the tier's items as failed items, no more.
+    corpus = tmp_path / "poison"
+    corpus.mkdir()
+    (corpus / "manifest.json").write_text(json.dumps({"tier": "poison"}))
+    poison = replace(_leg(real), args=argparse.Namespace(corpus=str(corpus)))
+    expect = poison.expectations()
+    assert expect == ("--expect-failures", "4")
+    verdicts = _verdicts(tmp_path / "poisoned", real, expect,
+                         {**_thresholds(expect), "--expect-failures": 3})
+    assert verdicts["job_outcome"] == "PASS"
 
 
 def test_the_dies_on_load_leg_declares_its_empty_setter_both_ways():
@@ -113,12 +122,13 @@ COUNTS = {"--expect-ooms": "failures", "--expect-deaths": "failures",
 
 
 def _verdicts(directory: Path, model: str, expect, counts,
-              job_ends=("drained",), priced=True):
+              job_ends=("drained",), priced=True, debug=True):
     """`failures`, `job_outcome` and `deflation_recovery` over a recording
     holding `counts`, a worker deflated with no clean window, and one job
     per `job_ends` entry in legs.json (None: no `job_end`)."""
     directory.mkdir()
-    log = ["2026-10-03T00:00:00.000000Z  INFO panoptikon: started"]
+    log = [f"2026-10-03T00:00:00.000000Z {'DEBUG' if debug else ' INFO'} "
+           f"panoptikon::inferio: started"]
     log += [f"2026-10-03T00:00:00.000000Z DEBUG panoptikon::inferio::ledger: "
             f"issued a memory grant model={model}"] * priced
     log += [f"2026-10-03T00:00:00.{index:06d}Z  WARN panoptikon::inferio::"
@@ -194,6 +204,12 @@ def test_each_fixture_passes_at_its_thresholds_and_fails_one_past(tmp_path,
                          priced=False)
     assert unpriced["failures"] == ("FAIL" if at["--expect-deaths"]
                                     else "PASS")
+    # At INFO the log cannot show that no grant was issued.
+    info = _verdicts(tmp_path / "info", model, expect,
+                     {**at, "--expect-ooms": 0, "--expect-deaths": 0},
+                     priced=False, debug=False)
+    assert info["failures"] == ("FAIL" if at["--expect-ooms"]
+                                or at["--expect-deaths"] else "PASS")
 
 
 def test_a_job_that_did_not_drain_fails_job_outcome(tmp_path):
