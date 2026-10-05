@@ -913,9 +913,10 @@ named as "never left the seed". So is a size `knee_is_local` from its worker's
 first sample (a worker is a model on one GPU), never moved and with no trial
 line: this machine's store resumed it, and this leg measured nothing. A trial
 line with no local size is not enough either: a failed or put-off trial logs
-it too. `utilization` reads the same flag: only a size
-a trial left in place lowers its denominator from the probe boundary to the
-largest size this leg's trials ran.
+it too. `utilization` reads the same flag, a resumed size included: a size a
+trial left in place, on this leg or an earlier one, lowers its denominator
+from the probe boundary to the largest size this leg's trials ran, or to the
+size itself when no trial ran.
 
 `peak_fds` is report-only and exists because, with local
 inference every in-flight predict is loopback HTTP inside one process and so
