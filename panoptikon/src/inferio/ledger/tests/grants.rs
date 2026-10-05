@@ -999,60 +999,57 @@ fn charges_now(ledger: &Arc<VramLedger>) -> u64 {
 /// grant keeps `Σ charges after <= max(effective limit, Σ charges before)`.
 #[test]
 fn a_sole_claimants_grant_keeps_the_charge_invariant_in_both_branches() {
-    {
-        // (a) the grant inside the pool: 1000 base + 8500 pool, free 0.
-        // external = 10000 - 0 - 9500 = 500; limit = 9500; bonus reserve
-        // ceil(500*0.15) = 75; limit_eff = 9425; headroom = 9425 - 9500 = -75;
-        // credit = 8500; own_room = 8425.
-        let ledger = ledger(10_000, no_margin());
-        let handle = loaded(Some(1000), Some(0));
-        let admission = ledger
-            .register_worker("g/pinned", item_cost(4), &handle, None)
-            .unwrap();
-        push_memory(&handle, 0, 8500);
-        ledger.ingest_all_for_test();
-        assert_eq!(ledger.health()[0].headroom_mb, 0);
-        let limit_eff = effective_limit(&ledger, 10_000);
-        assert_eq!(limit_eff, 9425);
-        let charges_before = charges_now(&ledger);
-        assert_eq!(charges_before, 9500);
+    // (a) grants below pool growth: 1000 base + 8500 pool, free 0.
+    // external = 10000 - 0 - 9500 = 500; limit = 9500; bonus reserve
+    // ceil(500*0.15) = 75; limit_eff = 9425; headroom = 9425 - 9500 = -75;
+    // credit = 8500 - 0; own_room = 8425.
+    let ledger = ledger(10_000, no_margin());
+    let handle = loaded(Some(1000), Some(0));
+    let admission = ledger
+        .register_worker("g/pinned", item_cost(4), &handle, None)
+        .unwrap();
+    push_memory(&handle, 0, 8500);
+    ledger.ingest_all_for_test();
+    assert_eq!(ledger.health()[0].headroom_mb, 0);
+    let limit_eff = effective_limit(&ledger, 10_000);
+    assert_eq!(limit_eff, 9425);
+    let charges_before = charges_now(&ledger);
+    assert_eq!(charges_before, 9500);
 
-        let grant = admission
-            .request_grant(u64::MAX, None, 1, 0)
-            .expect("granted");
-        assert_eq!(grant.grant().mb, 8425, "limit_eff - base");
-        assert_eq!(
-            charges_now(&ledger),
-            9500,
-            "spent inside the pool: charge = base + max(8500, 8425)"
-        );
-        assert!(charges_now(&ledger) <= charges_before.max(limit_eff));
-    }
-    {
-        // (b) the grant past the pool: 1000 base + 300 pool, free 5000.
-        // external = 10000 - 5000 - 1300 = 3700; limit = 6300; bonus 555;
-        // limit_eff = 5745; charges 1300; headroom 4445; credit 300;
-        // own_room 4745.
-        let ledger = ledger(10_000, no_margin());
-        let handle = loaded(Some(1000), Some(0));
-        let admission = ledger
-            .register_worker("g/one", item_cost(4), &handle, None)
-            .unwrap();
-        push_memory(&handle, 5000, 300);
-        ledger.ingest_all_for_test();
-        let limit_eff = effective_limit(&ledger, 10_000);
-        assert_eq!(limit_eff, 5745);
+    let first = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(first.grant().mb, 8425, "limit_eff - base");
+    assert_eq!(
+        charges_now(&ledger),
+        9500,
+        "spent inside the pool: charge = base + max(8500, 8425)"
+    );
+    assert!(charges_now(&ledger) <= charges_before.max(limit_eff));
 
-        let grant = admission
-            .request_grant(u64::MAX, None, 1, 0)
-            .expect("granted");
-        assert_eq!(grant.grant().mb, 4745);
-        assert_eq!(
-            charges_now(&ledger),
-            5745,
-            "grants past the pool: charge = base + grants, exactly the limit"
-        );
-    }
+    // (b) grants past the pool: 1000 base + 300 pool, free 5000. external =
+    // 10000 - 5000 - 1300 = 3700; limit = 6300; bonus 555; limit_eff = 5745;
+    // charges 1300; headroom 4445; credit 300; own_room 4745.
+    let ledger = super::ledger(10_000, no_margin());
+    let handle = loaded(Some(1000), Some(0));
+    let admission = ledger
+        .register_worker("g/one", item_cost(4), &handle, None)
+        .unwrap();
+    push_memory(&handle, 5000, 300);
+    ledger.ingest_all_for_test();
+    let limit_eff = effective_limit(&ledger, 10_000);
+    assert_eq!(limit_eff, 5745);
+
+    let first = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(first.grant().mb, 4745);
+    assert_eq!(
+        charges_now(&ledger),
+        5745,
+        "grants past the pool: charge = base + grants, exactly the limit"
+    );
+    assert!(charges_now(&ledger) <= limit_eff, "never past the limit");
 }
 
 /// The two-claimant split: the credit is added after the division, and the
