@@ -223,7 +223,7 @@ def _drm_fdinfo(roots: Roots, pid: int) -> Optional[List[str]]:
     base = os.path.join(roots.proc, str(pid))
     texts = []
     try:
-        for fd in os.listdir(os.path.join(base, "fd")):
+        for fd in sorted(os.listdir(os.path.join(base, "fd")), key=int):
             try:
                 if not os.readlink(os.path.join(base, "fd", fd)).startswith("/dev/dri/"):
                     continue

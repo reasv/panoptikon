@@ -29,7 +29,7 @@ machine with a GPU; nothing here is specific to one host. What the keys mean:
    anywhere — it just prices and embeds the wrong audio. `--list-tiers` has
    the rest.
 4. A GPU with nothing else on it. Stop whatever else holds VRAM, confirm the
-   board reads idle, and run one probe process per GPU — never two.
+   GPU reads idle, and run one probe process per GPU — never two.
 
 ## 2. Probe
 

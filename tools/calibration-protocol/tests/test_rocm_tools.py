@@ -216,11 +216,11 @@ def test_a_descriptor_inherited_across_fork_counts_once(tmp_path):
     for pid in (700, 701):
         host.fdinfo(pid, 3, _fd(BDF_03, 11, 150 * 1024, pasid=32770))
     (gpu,) = rocm_sysfs.inventory(host.roots)
-    assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu], [701, 700])[gpu.key] == (
         "kfd", {700: 300}, [])
     host.kfd(4243, 1, 500 * MIB, pasid=32771)
     host.fdinfo(701, 4, _fd(BDF_03, 12, 200 * 1024, pasid=32771))
-    assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu], [701, 700])[gpu.key] == (
         "kfd", {700: 300, 701: 500}, [])
 
 
@@ -780,7 +780,7 @@ def test_selftest_reads_free_until_it_settles():
     reads = iter([1500, None, None] + [2000] * 9)
     memory = types.SimpleNamespace(
         free_total_mb=lambda: (1000, 24576, "amdgpu-sysfs"),
-        _free_mb=lambda source: (next(reads), source),
+        _free_mb=lambda source: (lambda free: (free, free and source))(next(reads)),
         _unified_gpu=lambda: False)
     sleeps = []
     assert selftest.settled_free_mb(memory, sleeps.append) == (
@@ -791,7 +791,10 @@ def test_selftest_reads_free_until_it_settles():
         1005, "amdgpu-sysfs", 1.25, False)
     reads = iter([None] * 9)
     assert selftest.settled_free_mb(memory, lambda s: None, reads=9) == (
-        None, "amdgpu-sysfs", 2.25, False)
+        None, None, 2.25, False)
+    reads = iter([1000] * 7 + [2000] * 9)
+    assert selftest.settled_free_mb(memory, lambda s: None) == (
+        2000, "amdgpu-sysfs", 4.0, True)
     for source, unified in (("nvml", False), ("amdgpu-sysfs", True)):
         reads = iter([1000, 2000])
         memory = types.SimpleNamespace(

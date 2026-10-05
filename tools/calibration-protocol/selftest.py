@@ -1128,7 +1128,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print_document(document, sys.stdout)
     settle = "" if settled is None else (
-        f", {'settled' if settled else 'still changing'} after {settle_s} s")
+        f", {'settled' if settled else 'not settled'} after {settle_s} s")
     print(f"device free after teardown: {free_after_mb} MiB "
           f"({free_after_source}){settle}")
     if args.json_path:
