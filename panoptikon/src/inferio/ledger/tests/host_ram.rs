@@ -554,7 +554,9 @@ fn ram_kept_after_a_window_is_not_booked_again() {
 }
 
 /// A reading taken after the window's batches already counts what they
-/// kept, so it is left as it is.
+/// kept, so it is left as it is. One taken between two replies of a window
+/// is moved by the window's whole change, so it never counts less than the
+/// window kept.
 #[test]
 fn a_reading_newer_than_the_window_is_not_moved() {
     const OTHERS: u64 = 50_000;
@@ -571,6 +573,28 @@ fn a_reading_newer_than_the_window_is_not_moved() {
     ledger.record_free_for_test(cpu::DEVICE_KEY, CPU_RAM_MB - OTHERS - kept);
     token.finish(WindowOutcome::Responded { oom: None });
     assert_eq!(cpu_row(&ledger).external_mb, OTHERS);
+
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/between", GPU, 256);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let units = token.grant().unit_budget;
+    let reply = |kept| {
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![ram_batch(units, kept, kept)]);
+    };
+    reply(RSS_AT_LOAD_MB + 1_000);
+    ledger.record_free_for_test(
+        cpu::DEVICE_KEY,
+        CPU_RAM_MB - OTHERS - (RSS_AT_LOAD_MB + 1_000),
+    );
+    reply(RSS_AT_LOAD_MB + 3_000);
+    token.finish(WindowOutcome::Responded { oom: None });
+    let external = cpu_row(&ledger).external_mb;
+    assert!(external >= OTHERS, "{external} MiB counted, {OTHERS} used");
 }
 
 /// Batches of one reply may carry one capture time (a coarse clock): the
