@@ -2317,7 +2317,7 @@ fn a_first_batch_pinned_then_freed_leaves_no_large_window_under_booked() {
     };
     // The window whose batch frees the pinned memory, and whether after its
     // peak.
-    let mut freed_before = HashMap::new();
+    let mut freed_before: HashMap<_, Vec<u64>> = HashMap::new();
     for (freed, others) in [
         (None, 8_000),
         (None, 20_000),
