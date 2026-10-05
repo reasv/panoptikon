@@ -850,7 +850,7 @@ that move them are in `analyze.py --help`.
 | `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form; SKIP when `legs.json` marks a hog event `hog_event_void` (a leave-free target at or under what the hog held, or a hold that left the target where it was) |
 | `ramp_progress` | `unit_budget` / `fit_samples` / the working size over time | — | INFO |
 | `calibration_learned` | the same three numbers, as a verdict | see below | FAIL only under `--learning` |
-| `batch_coverage` | the `seq` of each replica's `recent_batches` across health samples: a number no sample showed is a lost batch; batches a worker runs after its last sample are not counted, so PASS means no gap between samples, not that every batch was seen | none lost | PASS/WARN |
+| `batch_coverage` | the `seq` of each replica's `recent_batches` across health samples: a number no sample showed is a batch the recording missed; batches a worker runs after its last sample are not counted, so PASS means no gap between samples, not that every batch was seen | none missed | PASS/WARN; SKIP without `healthrec.jsonl` or when no sample showed a batch |
 
 `ledger_invariant` has two forms and reports both. The strict form — Σ charges
 + load reservations ≤ `limit_mb` — cannot hold on a nearly-full GPU: `limit =

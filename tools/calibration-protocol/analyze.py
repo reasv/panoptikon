@@ -2696,10 +2696,13 @@ def check_alloc_retries(ctx: Context) -> Verdict:
 
 
 def check_batch_coverage(ctx: Context) -> Verdict:
-    """`seq` numbers each worker's batches from 1, so a number no health sample
-    showed is a lost batch, and a seq that goes back starts a new worker.
-    Batches a worker runs after its last health sample are not counted, so
-    PASS means no gap between samples, not that every batch was seen."""
+    """Batches no health sample showed, per model.
+
+    `seq` numbers each worker's batches from 1, so a number no health sample
+    showed is a batch the recording missed, and a seq that goes back starts a
+    new worker. Batches a worker runs after its last health sample are not
+    counted, so PASS means no gap between samples, not that every batch was
+    seen."""
     if not ctx.health_samples:
         return Verdict("batch_coverage", "SKIP", "no healthrec.jsonl")
     held: Dict[Tuple[Any, ...], Set[int]] = {}
