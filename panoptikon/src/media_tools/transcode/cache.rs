@@ -1226,9 +1226,10 @@ mod tests {
         );
     }
 
-    /// A cache folder the current user cannot write opens with a warning and
-    /// still serves the artifacts it holds. Read-only modes stand in for a
-    /// folder another user owns, which a test cannot create.
+    /// While its writer holds it open, a cache folder the current user cannot
+    /// write opens with a warning and still serves the artifacts it holds.
+    /// Read-only modes stand in for a folder another user owns, which a test
+    /// cannot create.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_cache_folder_it_cannot_write_still_serves_its_artifacts() {
@@ -1250,13 +1251,16 @@ mod tests {
 
         let reader =
             TranscodeCache::open_checked(dir.clone(), 1, 1, |_| Some("not writable".to_string()))
-                .await
-                .expect("the cache opens");
-        let found = reader.lookup("kept").await;
+                .await;
+        let found = match &reader {
+            Ok(reader) => reader.lookup("kept").await,
+            Err(_) => None,
+        };
         set_mode(&dir, 0o755);
         for file in &database {
             set_mode(Path::new(file), 0o644);
         }
+        reader.expect("the cache opens");
         assert_eq!(found.expect("the artifact is served").path, kept.path);
     }
 
