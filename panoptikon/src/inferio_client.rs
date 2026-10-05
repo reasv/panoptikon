@@ -2557,14 +2557,33 @@ pub(crate) mod tests {
             while let Some(result) = inflight.join_next().await {
                 result.expect("no panic");
             }
-            let expected = if transport.is_multiplexed() {
+            let used = if transport.is_multiplexed() {
                 burst.div_ceil(H2_STREAMS_PER_CONNECTION)
             } else {
                 burst
             };
-            assert_eq!(sockets, expected, "{label}: sockets for {burst} requests");
+            assert_eq!(
+                probe.sockets(),
+                used,
+                "{label}: connections that carried a request"
+            );
+            // hyper-util's h2 pool can dial one more connection per lane and
+            // drop it unused: a request whose checkout began before the lane's
+            // first connection landed and whose connect began after.
+            let dialed = if transport.is_multiplexed() {
+                used..=2 * used
+            } else {
+                used..=used
+            };
+            assert!(
+                dialed.contains(&sockets),
+                "{label}: {sockets} sockets for {burst} requests"
+            );
             let total = accepted.load(SeqCst) - before;
-            assert_eq!(total, expected, "{label}: sockets once they all answered");
+            assert!(
+                dialed.contains(&total),
+                "{label}: {total} sockets once they all answered"
+            );
             let health = endpoint_health();
             let health = health
                 .iter()
