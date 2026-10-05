@@ -216,7 +216,8 @@ fn a_cpu_replica_is_charged_what_it_holds_and_what_it_was_granted() {
     assert!(second.grant().mb < 10);
 }
 
-/// The per-batch level a CPU worker reports replaces its peak as the pool.
+/// The per-batch level a CPU worker reports replaces its peak as the pool;
+/// a batch without it leaves the pool as it was.
 #[test]
 fn a_cpu_batch_reports_the_resident_set_it_left() {
     const RAM_MB: u64 = 64 * GIB;
@@ -225,22 +226,24 @@ fn a_cpu_batch_reports_the_resident_set_it_left() {
     let admission = ledger
         .register_worker("g/a", item_cost(8), &handle, None)
         .expect("admitted");
-    let token = admission
-        .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
-    handle
-        .lock()
-        .unwrap()
-        .record_measurements(vec![BatchMeasurement {
-            reserved_after_mb: Some(9_000),
-            rss_after_mb: Some(650),
-            ..measurement(8, 800, 9_000)
-        }]);
-    token.finish(WindowOutcome::Responded { oom: None });
-    let worker = &ledger.health()[0].workers[0];
-    assert_eq!(worker.reserved_at_load_mb, Some(500));
-    assert_eq!(worker.reserved_mb, Some(650));
-    assert_eq!(worker.footprint_mb, 500 + 150);
+    for rss_after_mb in [Some(650), None] {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                reserved_after_mb: Some(9_000),
+                rss_after_mb,
+                ..measurement(8, 800, 9_000)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.reserved_at_load_mb, Some(500));
+        assert_eq!(worker.reserved_mb, Some(650));
+        assert_eq!(worker.footprint_mb, 500 + 150);
+    }
 }
 
 /// The reserve a CPU worker's clamp keeps is the one its grant was priced
