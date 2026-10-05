@@ -4,6 +4,8 @@ use super::*;
 use crate::inferio::cost::SEED_BUDGET_MB;
 use crate::inferio::gpu::GpuInventory;
 
+use super::unified_memory::push_basis;
+
 /// A cold replica with a cost of its own, which the ledger does not know.
 struct Cold {
     model: String,
@@ -27,6 +29,10 @@ struct Cold {
     batches: u64,
     pool_mb: u64,
     open: Option<GrantToken>,
+    /// On a Mac, the MPS device's total, the RAM, and the RAM available
+    /// beside every replica's base: its worker reports a memory frame after
+    /// each window.
+    mac_ram: Option<(u64, u64, u64)>,
 }
 
 impl Cold {
@@ -58,6 +64,7 @@ impl Cold {
             batches: 0,
             pool_mb: 0,
             open: None,
+            mac_ram: None,
         }
     }
 
@@ -120,6 +127,33 @@ impl Cold {
         self.admission.earn_next_size();
     }
 
+    /// The frame a Mac worker sends after its window: its pool, and the RAM
+    /// the replicas' bases and `pools_mb`, every pool kept, leave available.
+    fn report_memory(&self, pools_mb: u64) {
+        let Some((device_mb, ram_mb, available_mb)) = self.mac_ram else {
+            return;
+        };
+        let available_mb = available_mb - pools_mb;
+        if self.device == MPS_GPU {
+            push_basis(
+                &self.handle,
+                device_mb,
+                ram_mb,
+                available_mb,
+                self.pool_mb,
+                self.pool_mb,
+            );
+            return;
+        }
+        self.handle.lock().unwrap().memory = Some(Timestamped::now(MemorySample {
+            free_mb: Some(available_mb),
+            free_source: Some("ram".to_owned()),
+            reserved_mb: Some(self.pool_mb),
+            allocated_mb: Some(self.pool_mb),
+            ..MemorySample::default()
+        }));
+    }
+
     /// Its cost is fitted with a slope a grant can be priced with.
     fn fitted(&self, ledger: &Arc<VramLedger>) -> bool {
         let fit = ledger
@@ -152,6 +186,8 @@ fn run(ledger: &Arc<VramLedger>, replicas: &mut [Cold], headroom: u64, windows: 
             let budgets = (0..replicas.len())
                 .map(|index| {
                     replicas[index].settle();
+                    let pools = replicas.iter().map(|replica| replica.pool_mb).sum();
+                    replicas[index].report_memory(pools);
                     if fitted[index].is_none() && replicas[index].fitted(ledger) {
                         fitted[index] = Some(window);
                     }
@@ -234,6 +270,7 @@ fn cpu_host(count: u64, headroom: u64, percent: u64) -> (Arc<VramLedger>, Vec<Co
                 batches: 0,
                 pool_mb: 0,
                 open: None,
+                mac_ram: None,
             }
         })
         .collect();
@@ -243,7 +280,8 @@ fn cpu_host(count: u64, headroom: u64, percent: u64) -> (Arc<VramLedger>, Vec<Co
 
 /// A 16 GB Mac (recommended max 12 288 MiB) with a cold MPS replica whose
 /// pool is `pool_ratio` times its tensors and a cold CPU replica, 2500 MiB
-/// of base each: 7288 MiB of headroom on both devices.
+/// of base each: 7288 MiB of headroom on both devices. Each worker reports
+/// its pool and the RAM left after every window.
 fn mac(pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>) {
     const RAM_MB: u64 = 16_384;
     const RECOMMENDED_MAX_MB: u64 = RAM_MB / 4 * 3;
@@ -286,6 +324,7 @@ fn mac(pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>) {
             batches: 0,
             pool_mb: 0,
             open: None,
+            mac_ram: Some((RECOMMENDED_MAX_MB, RAM_MB, RAM_MB - 2 * BASE_MB)),
         });
     }
     // Nothing else holds RAM: both bases are ours.
