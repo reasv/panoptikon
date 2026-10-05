@@ -620,7 +620,7 @@ struct GrantCharge {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Share {
     mb: u64,
-    /// The requester's room: headroom plus its own free pool.
+    /// The requester's room: headroom plus its own reusable pool.
     room: u64,
     floor: u64,
     /// Σ every hungry worker's floor; a share at its floor is squeezed only
