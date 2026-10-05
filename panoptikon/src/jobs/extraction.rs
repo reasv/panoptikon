@@ -2972,7 +2972,8 @@ mod tests {
     /// no item is charged for a body this end built too big — and an input
     /// still refused alone fails once, with the limit named. The same holds
     /// for an untyped 413, which is a reverse proxy's body limit. Each half
-    /// carries the job's count.
+    /// carries the job's count, 0 once more items are done than the job counted
+    /// at its start.
     #[tokio::test]
     async fn a_413_splits_the_chunk_and_an_oversize_input_fails_alone() {
         use crate::config::InferenceEndpointConfig;
@@ -3011,7 +3012,7 @@ mod tests {
                     async move {
                         let ids = ids_in(&body);
                         let query = query.unwrap_or_default();
-                        assert!(query.split('&').any(|p| p == "remaining_items=8"));
+                        assert!(query.split('&').any(|p| p == "remaining_items=0"));
                         seen.lock().unwrap().push(ids.len());
                         let json = [(axum::http::header::CONTENT_TYPE, "application/json")];
                         if ids.len() > accepts && !typed {
@@ -3072,7 +3073,7 @@ mod tests {
         let budget = Arc::new(UnitBudget::new(1_000));
         let counters = Arc::new(Mutex::new(JobCounters {
             total: 10,
-            processed: 2,
+            processed: 12,
             ..Default::default()
         }));
 
