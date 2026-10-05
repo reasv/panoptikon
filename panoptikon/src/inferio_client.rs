@@ -786,6 +786,22 @@ impl Drop for Stalled<'_> {
     }
 }
 
+/// The check task's claim on `running`. Clears it when the task ends without
+/// clearing it itself, by a panic or dropped with its runtime, so a later
+/// stall can start checks again.
+struct ChecksRunning {
+    endpoint: Arc<EndpointRuntime>,
+    cleared: bool,
+}
+
+impl Drop for ChecksRunning {
+    fn drop(&mut self) {
+        if !self.cleared {
+            self.endpoint.health_checks.lock().running = false;
+        }
+    }
+}
+
 /// Retry rule for the non-predict endpoints. Unlike the middleware default, a
 /// 503 (possibly the load cooldown) and a 500 (a failed load, possibly after
 /// the full load deadline) are not retried; `predict` has its own loop.
@@ -1309,8 +1325,14 @@ impl InferenceApiClient {
             }
             state.running = true;
         }
+        // Built outside the task, so a task dropped before its first poll
+        // clears `running` too.
+        let running = ChecksRunning {
+            endpoint: Arc::clone(&self.endpoint),
+            cleared: false,
+        };
         let client = self.clone();
-        tokio::spawn(async move { client.run_health_checks().await });
+        tokio::spawn(async move { client.run_health_checks(running).await });
         true
     }
 
@@ -1319,7 +1341,7 @@ impl InferenceApiClient {
     /// [`HEALTH_CHECK_MISSES`]th miss in a row declares it frozen and an answer
     /// clears that, each change logged once. A task of its own, so a verdict
     /// outlives the requests that asked for it.
-    async fn run_health_checks(&self) {
+    async fn run_health_checks(&self, mut running: ChecksRunning) {
         let checks = &self.endpoint.health_checks;
         loop {
             let started = tokio::time::Instant::now();
@@ -1358,7 +1380,10 @@ impl InferenceApiClient {
             let mut state = checks.lock();
             let verdict_pending = (1..HEALTH_CHECK_MISSES).contains(&state.misses);
             if state.stalled == 0 && !verdict_pending {
+                // Under the lock the stall count was read with: a stall
+                // counted after this starts a new task.
                 state.running = false;
+                running.cleared = true;
                 return;
             }
         }
@@ -2935,6 +2960,49 @@ pub(crate) mod tests {
         );
     }
 
+    /// A request to `client` that never gets an answer.
+    fn spawn_unanswered(
+        client: &InferenceApiClient,
+    ) -> tokio::task::JoinHandle<Result<(), PeerFrozen>> {
+        let client = client.clone();
+        tokio::spawn(async move { client.until_answered(std::future::pending()).await })
+    }
+
+    /// A check task that ends without finishing, as a panic or its runtime's
+    /// shutdown ends it, does not keep a later stall from starting checks.
+    #[test]
+    fn a_check_task_that_is_dropped_lets_the_next_stall_start_checks() {
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let first = runtime();
+        let client = first.block_on(async {
+            let url = format!("http://{}", closed_port().await);
+            let client = health_checked_client(&url, Transport::Http11).await;
+            assert!(client.start_health_checks());
+            // The task is between two checks.
+            tokio::time::sleep(SHORT_HEALTH_CHECKS.timeout / 4).await;
+            client
+        });
+        drop(first);
+        runtime().block_on(async {
+            let mut verdict = client.endpoint.health_checks.verdict.subscribe();
+            let seen = verdict.borrow_and_update().checks;
+            let stalled = spawn_unanswered(&client);
+            tokio::time::timeout(
+                4 * SHORT_HEALTH_CHECKS.timeout,
+                verdict.wait_for(|now| now.checks > seen),
+            )
+            .await
+            .expect("the stall starts a check")
+            .unwrap();
+            stalled.abort();
+        });
+    }
+
     /// A miss is not forgotten when the requests that started the checks end
     /// first, as when the keep-alive fails them: the checks go on until an
     /// answer or a verdict, so a re-sent request is cut off `after` + 2 x
@@ -2944,15 +3012,12 @@ pub(crate) mod tests {
     async fn a_miss_outlives_the_requests_that_started_the_checks() {
         let url = format!("http://{}", spawn_raw_peer(RawPeer::Silent).await);
         let client = InferenceApiClient::new_with_metadata_cache(url, false).unwrap();
-        let stall = |client: InferenceApiClient| {
-            tokio::spawn(async move { client.until_answered(std::future::pending::<()>()).await })
-        };
         let started = tokio::time::Instant::now();
-        let first = stall(client.clone());
+        let first = spawn_unanswered(&client);
         // Ends between the first check's start and its miss.
         tokio::time::sleep(HEALTH_CHECKS.after + HEALTH_CHECKS.timeout / 2).await;
         first.abort();
-        let resent = stall(client.clone());
+        let resent = spawn_unanswered(&client);
         assert!(resent.await.unwrap().is_err(), "cut off by the verdict");
         let bound = HEALTH_CHECKS.after + (HEALTH_CHECK_MISSES + 1) * HEALTH_CHECKS.timeout;
         assert!(started.elapsed() <= bound, "{:?}", started.elapsed());
