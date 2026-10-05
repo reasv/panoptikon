@@ -1579,11 +1579,14 @@ def run_window(
                     executed,
                     len(batch),
                 )
-            whole = clamped is None and priceable and not absorbed_ooms
-            if whole:
+            ran = priceable and not absorbed_ooms
+            if ran:
                 ran_whole.append(priced)
             split_ran = (
-                split_from is not None and whole and priced < split_from
+                split_from is not None
+                and ran
+                and clamped is None
+                and priced < split_from
             )
             impl_cut = (
                 _utils_total("total_index_limit_events") > index_limits_before
@@ -1599,7 +1602,7 @@ def run_window(
                 if not impl_cut:
                     split_clamp = clamped
                     bound_split(split_clamp)
-            elif split_ran:
+            elif split_clamp is not None and ran:
                 bound_split(split_clamp)
             measurement = memory.measure_batch(
                 state,

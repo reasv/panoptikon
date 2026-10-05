@@ -2701,6 +2701,27 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
     assert halved["oom"] is True and "clamped" not in halved
     assert clamps(payload["measurements"]) == [(2, (8, 4))]
 
+    def absorbs_200(inputs):
+        if [item.data for item in inputs] == [20000]:
+            fake_oom_retry.record(1, halvings=1)
+        return len(inputs) > 1
+
+    assert pixel_window([150, 200, 50], absorbs_200, 30000) == (
+        [1, 2, 1, 1],
+        [(3, (25000, 15000))],
+    )
+
+    # A batch the live memory clamp cut still ran whole at its size.
+    def fails_then_clamps(inputs):
+        low = len(inputs) < 4 and any(item.data == 20000 for item in inputs)
+        fake_torch.free = (250 if low else 8000) * MIB
+        return sum(item.data for item in inputs) > 20000
+
+    batches, found = pixel_window([1, 150, 200, 200], fails_then_clamps, 55100)
+    assert batches == [4, 2, 2, 1, 1]
+    assert found[0] == (1, (40000, 20000))
+    fake_torch.free = 8000 * MIB
+
     def fails_on_item_5(inputs):
         return any(item.data == 5 for item in inputs)
 
