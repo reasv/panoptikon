@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,22 @@ def test_only_dies_on_load_declares_that_it_extracts_nothing():
     declared = {name for name, fixture in legs.S5_FIXTURES.items()
                 if fixture.no_items}
     assert declared == {"dies_on_load"}
+
+
+def test_oom_timed_ooms_on_its_first_predicts_then_succeeds():
+    """A count, not a time: every recording longer than it shows recovery."""
+    pytest.importorskip("torch")
+    impl = _load("_calib_oom_timed",
+                 HERE / "fixtures" / "impls" / "oom_timed_cuda_impl.py")
+    model = impl.IMPL_CLASS(oom_predicts=2)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="INFERENCE_OOM_BATCH_SIZE_1"):
+            model.predict([0])
+    assert model.predict([0, 1]) == [{"batch": 2}] * 2
+    registry = tomllib.loads((HERE / "fixtures" / "registry" /
+                              "calibration-fixtures.toml").read_text())
+    ids = registry["group"]["calibfixture"]["inference_ids"]
+    assert ids["oom_timed_cuda"]["config"]["oom_predicts"] > 0
 
 
 # --- what legs.py prints ---------------------------------------------------
