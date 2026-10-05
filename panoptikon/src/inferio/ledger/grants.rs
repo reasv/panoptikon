@@ -210,9 +210,10 @@ impl VramLedger {
                     mb = price.cost_mb(units);
                 }
             }
-            // A probe's size above the working size is run in full or not at all.
-            if units < wanted
-                && (squeezed || ram_bound)
+            // A probe's size above the working size is run in full or not at
+            // all, and not under memory pressure.
+            let cut = units < wanted && (squeezed || ram_bound);
+            if (cut || pressure != mps::MemoryPressure::Normal)
                 && let Some(working) = Self::probe_floor_locked(&state, entry)
                 && working < units
             {

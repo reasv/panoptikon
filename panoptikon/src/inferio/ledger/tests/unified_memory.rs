@@ -1902,8 +1902,8 @@ fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
 }
 
 /// At warning with nothing being paged out the replica keeps its working
-/// size: the trial of the next one is put off, and there is no growth and
-/// no throughput sample. A squeeze there is not kept once its cause is
+/// size: the probe of the next one is granted the working size and put
+/// off, and there is no growth and no throughput sample. A squeeze there is not kept once its cause is
 /// gone. The trial is taken up again after the pressure ends, within two
 /// doublings of the working size.
 #[test]
@@ -1914,7 +1914,7 @@ fn at_warning_without_paging_the_batch_size_is_held() {
     let held: Vec<u64> = (0..3)
         .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
         .collect();
-    assert_eq!(held, [128, 64, 64], "the probe under way is put off");
+    assert_eq!(held, [64, 64, 64], "the probe under way is put off");
     let (size_during, _, samples_during, _) = ramp_figures(&ledger);
     assert_eq!(size_during, Some(64), "what the probes had measured");
     assert!(samples_during <= samples);
