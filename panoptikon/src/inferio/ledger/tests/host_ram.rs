@@ -768,6 +768,33 @@ fn a_death_cap_is_re_tested_once_the_wait_of_a_failed_probe_has_run_out() {
     assert_eq!(state(), (Some(256), None));
 }
 
+/// A replica a death's cap holds below its seed opens at the cap, probes
+/// below it, and steps down on a flat rate; nothing runs above the cap.
+#[test]
+fn a_replica_a_death_cap_holds_below_its_seed_opens_there_and_steps_down() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/died", GPU, 64);
+    cpu_free_to_book(&ledger, 45_000);
+    let window = |outcome| {
+        ram_window_ending(
+            &handle,
+            &admission,
+            (0, RAM_PER_UNIT_MB),
+            |_| 100.0,
+            outcome,
+        )
+        .unit_budget
+    };
+    assert_eq!(window(WindowOutcome::WorkerDied), 64);
+    let budgets: Vec<u64> = (0..60)
+        .map(|_| window(WindowOutcome::Responded { oom: None }))
+        .collect();
+    assert_eq!(budgets[0], 32);
+    assert!(budgets.iter().all(|units| *units <= 32), "{budgets:?}");
+    let working = row(&ledger, "g/died").knee_units;
+    assert!(working.is_some_and(|units| units < 32), "{budgets:?}");
+}
+
 /// A probe stub answering `free_mb` for the CPU device.
 fn host_ram_free(ledger: &VramLedger, free_mb: u64) {
     ledger.install_probe_stub(Some(vec![GpuMemory {
