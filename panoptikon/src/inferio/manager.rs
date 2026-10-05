@@ -1830,6 +1830,32 @@ impl ModelManager {
             .get(inference_id)
             .map(|handle| handle.generation)
     }
+
+    /// Test hook: `inference_id` loaded, with the returned mailbox standing in
+    /// for its dispatcher.
+    #[cfg(test)]
+    pub(crate) fn install_dispatcher_for_test(
+        &self,
+        inference_id: &str,
+        cost: CostDimension,
+        telemetry: Vec<TelemetryHandle>,
+    ) -> mpsc::UnboundedReceiver<DispatchMsg> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let handle = ModelHandle {
+            tx,
+            task: tokio::spawn(async {}),
+            generation: 1,
+            stats: Arc::new(ModelStats::default()),
+            cost,
+            telemetry,
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .models
+            .insert(inference_id.to_owned(), handle);
+        rx
+    }
 }
 
 /// The per-item caps (`pixel` canvas, `token` window) folded into the cost
@@ -2639,18 +2665,7 @@ metadata.cost.seed_units = 1000000
             IDLE_POOL_RELEASE + Duration::from_secs(1),
         );
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        manager.state.lock().unwrap().models.insert(
-            "echo/test".to_owned(),
-            ModelHandle {
-                tx,
-                task: tokio::spawn(async {}),
-                generation: 1,
-                stats: Arc::new(ModelStats::default()),
-                cost,
-                telemetry: vec![Arc::clone(&handle)],
-            },
-        );
+        let mut rx = manager.install_dispatcher_for_test("echo/test", cost, vec![handle]);
 
         manager.sweep();
 
@@ -2667,40 +2682,6 @@ metadata.cost.seed_units = 1000000
             Some((admission.worker_id(), "idle")),
             "the tick never asked the stopped resident for its 4096 MiB"
         );
-    }
-
-    /// The caller's count of items left reaches the dispatcher with its
-    /// request.
-    #[tokio::test]
-    async fn predict_hands_the_dispatcher_the_callers_count_of_items_left() {
-        let setup = test_manager(Duration::from_secs(60), 32);
-        let manager = &setup.manager;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        manager.state.lock().unwrap().models.insert(
-            "echo/test".to_owned(),
-            ModelHandle {
-                tx,
-                task: tokio::spawn(async {}),
-                generation: 1,
-                stats: Arc::new(ModelStats::default()),
-                cost: CostDimension::fallback(),
-                telemetry: Vec::new(),
-            },
-        );
-        let inputs = vec![data_input(json!(1))];
-        let predict = manager.predict("echo/test", "k", 10, -1, None, None, Some(7), inputs);
-        let dispatcher = async {
-            let Some(DispatchMsg::Predict(request)) = rx.recv().await else {
-                panic!("no request reached the dispatcher");
-            };
-            assert_eq!(request.remaining_items, Some(7));
-            request
-                .reply
-                .send(Ok(Vec::new()))
-                .expect("the caller waits");
-        };
-        let (answer, ()) = tokio::join!(predict, dispatcher);
-        answer.expect("answered");
     }
 
     /// A worker that dies mid-predict drops the model everywhere and respawns.

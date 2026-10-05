@@ -1774,6 +1774,36 @@ metadata.description = "echo fixture"
         state.manager.shutdown().await;
     }
 
+    /// The caller's count of items left reaches the dispatcher with its
+    /// request.
+    #[tokio::test]
+    async fn predict_hands_the_dispatcher_the_callers_count_of_items_left() {
+        use super::super::dispatch::DispatchMsg;
+        let (state, base_url, _registry_dir) = spawn_test_server().await;
+        let fallback = super::super::cost::CostDimension::fallback();
+        let mut rx = state
+            .manager
+            .install_dispatcher_for_test("echo/test", fallback, Vec::new());
+        let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+        let inputs = [InferenceInput::new(json!({"text": "hi"}), None)];
+        let predict = client.predict("echo/test", "k", 10, -1, None, None, Some(7), &inputs);
+        let dispatcher = async {
+            let request = loop {
+                // The sweeper's liveness check may come first.
+                if let DispatchMsg::Predict(request) = rx.recv().await.expect("mailbox open") {
+                    break request;
+                }
+            };
+            assert_eq!(request.remaining_items, Some(7));
+            request
+                .reply
+                .send(Ok(Vec::new()))
+                .expect("the caller waits");
+        };
+        let (answer, ()) = tokio::join!(predict, dispatcher);
+        answer.expect("answered");
+    }
+
     /// The six renderings that mean the request never reached a model, in the
     /// order [`UNATTEMPTED_REQUEST_MARKERS`] documents them: `Worker::fatal`,
     /// `dispatch::reap_idle_replicas` (which does *not* say "failed fatally"),
