@@ -1116,7 +1116,9 @@ a smaller set is future work). The dead worker's requests fail; windows on
 other replicas finish, bounded by `unload_grace` (one still running then is
 aborted); then every replica gets a ladder-less kill, the manager's death
 handler runs, and the queued requests go back to their callers for the
-reloaded model. A death is
+reloaded model. Requests the dead worker's per-request retry had not sent go
+back with the queue, and a death seen while draining, an unload's drain
+included, arms a condemned card's cooldown. A death is
 normally discovered by a request failing on the pipe, which leaves an *idle*
 replica's death invisible — a model nobody predicts against reads nothing —
 so the manager's sweeper ticks a liveness message that `try_wait`s every free
