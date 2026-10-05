@@ -1281,7 +1281,6 @@ class Leg:
                 before = {}
             # Record the fill, so `legs.json` states how long the GPU took
             # to change and `analyze.py`'s hog_tracking has a wall clock.
-            applied: Optional[Dict[str, Any]] = None
             for _ in range(40):
                 try:
                     state = get_json(self.hog_url("/state"), timeout=5)
@@ -1296,24 +1295,11 @@ class Leg:
                 if state.get("seq", 0) < before.get("seq", -2) + 2:
                     time.sleep(1.0)
                     continue
-                applied = state
                 if target == 0 and held == 0:
                     break
                 if target and held >= target - 256:
                     break
                 time.sleep(1.0)
-            # An event meant to add pressure that asked for nothing: a
-            # leave-free target at or under what the hog held, or a hold that
-            # left the target where it was. A step-down is a release.
-            resolved = (applied or {}).get("target_mb") or 0
-            if applied is not None and (
-                    resolved <= (before.get("held_mb") or 0)
-                    if "leave_free_mb" in event else
-                    event.get("mb", 0) > 0
-                    and resolved == (before.get("target_mb") or 0)):
-                self.mark("hog_event_void", label=event["label"],
-                          held_mb=before.get("held_mb"),
-                          target_mb=applied.get("target_mb"))
 
     # -- gateway ------------------------------------------------------------
 

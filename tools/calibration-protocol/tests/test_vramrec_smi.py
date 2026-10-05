@@ -160,6 +160,15 @@ def test_a_healthy_nvml_gpu_never_calls_nvidia_smi():
     assert row["procs"][0]["used_mb"] == 512
 
 
+def test_a_process_row_records_its_pid_in_its_own_namespace(monkeypatch):
+    """`NSpid` lists the PID in each namespace, innermost last."""
+    monkeypatch.setattr(vramrec, "_read_text", lambda path: (
+        "NSpid:\t48211\t17\nVmHWM:\t2048 kB\nVmRSS:\t1024 kB\n"
+        if path.endswith("/status") else None))
+    row, _ = _sample([_gpu([{"pid": 48211, "used_mb": 512, "type": "compute"}])], {})
+    assert (row["procs"][0]["ns_pid"], row["procs"][0]["rss_mb"]) == (17, 1)
+
+
 def test_a_blind_gpu_is_priced_from_nvidia_smi_and_says_so():
     row, smi = _sample([_gpu([{"pid": 9, "used_mb": None, "type": "compute"}])],
                        {9: 4096})

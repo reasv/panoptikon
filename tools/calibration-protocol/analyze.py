@@ -231,7 +231,7 @@ class Context:
     # When no job ran, from `legs.json`: each drained `job_end` to the next
     # `job_start`, and the hog stop to the end of the recording.
     idle_spans: List[Tuple[float, float]] = field(default_factory=list)
-    # Labels of the hog events `legs.py` marked `hog_event_void`.
+    # Labels of the hog events that applied no pressure (`_void_hog_events`).
     void_hog_events: List[str] = field(default_factory=list)
     # How far the wall clock stepped during the first job, the one jobs.json
     # records, and that job's monotonic seconds, from `legs.json`.
@@ -248,6 +248,21 @@ class Context:
         self._hog_times = [row["t_wall"] for row in self.hog_samples]
         self.worker_re = re.compile(self.args.worker_pattern)
         self.worker_spawns = _worker_spawns(self.log)
+        # A worker in a container logs its PID there, which vramrec records as
+        # `ns_pid` beside the host PID. A spawn takes the first such process
+        # sighted after it.
+        host_pids: Dict[int, List[Tuple[float, int]]] = {}
+        for sample in self.vram_samples:
+            for gpu in sample.get("gpus", []):
+                for proc in gpu.get("procs", []):
+                    if proc.get("ns_pid") not in (None, proc["pid"]):
+                        host_pids.setdefault(proc["ns_pid"], []).append(
+                            (sample["t_wall"], proc["pid"]))
+        for spawn in self.worker_spawns:
+            for t_wall, pid in host_pids.get(spawn["pid"], []):
+                if t_wall >= spawn["t_wall"] - SPAWN_CLOCK_SLACK_S:
+                    spawn["pid"] = pid
+                    break
         self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
         self._pid_first_seen: Optional[Dict[int, float]] = None
         self._release_windows: Dict[str, Tuple[List[Tuple[float, float, int, int]],
@@ -306,7 +321,7 @@ class Context:
             rows = [(sample["t_wall"], gpu) for sample in self.vram_samples
                     for gpu in [self.oracle_gpu(sample, uuid)]
                     if gpu is not None and gpu.get("used_mb") is not None
-                    and not gpu.get("error") and not gpu.get("unreadable_pids")]
+                    and not gpu.get("error")]
             unattributed = [_unattributed_mb(gpu) for _, gpu in rows]
             windows = []
             for index in range(1, len(rows)):
@@ -315,9 +330,12 @@ class Context:
                        for proc in shown.get("procs") or []}
                 ours = others = 0
                 opened = t_before
+                unreadable = shown.get("unreadable_pids") or []
                 for proc in before.get("procs") or []:
                     held, later = proc.get("used_mb"), now.get(proc["pid"], 0)
-                    if held is None or later is None or later >= held:
+                    # An unreadable PID's figure is unknown, not fallen.
+                    if (held is None or later is None or later >= held
+                            or proc["pid"] in unreadable):
                         continue
                     if self.is_ours(proc):
                         ours += int(held) - int(later)
@@ -332,9 +350,13 @@ class Context:
                 end_t = t_shown + (ours + others) / 1024 * RELEASE_LAG_S_PER_GIB
                 level = unattributed[index - 1] + allowance_mb(shown.get("total_mb"))
                 cap = end_t + RELEASE_DRAIN_MAX_S
-                drained = next((rows[later][0] for later in itertools.takewhile(
-                    lambda later: rows[later][0] < cap, range(index, len(rows)))
-                    if unattributed[later] <= level), cap)
+                drained = cap
+                for later in range(index, len(rows)):
+                    if rows[later][0] >= cap:
+                        break
+                    if unattributed[later] <= level:
+                        drained = rows[later][0]
+                        break
                 windows.append((opened, max(end_t, drained), ours, others))
             # Sorted by opening, with the latest close up to each window.
             windows.sort()
@@ -355,9 +377,14 @@ class Context:
         header = next((row for row in self.hog if row.get("kind") == "header"), {})
         if header.get("target", "gpu") != "gpu" or header.get("gpu_uuid") != uuid:
             return 0
-        first, second = ([row.get("held_mb") or 0 for row in self.hog_samples[
-            max(0, bisect.bisect_left(self._hog_times, t) - 1):
-            bisect.bisect_right(self._hog_times, t) + 1]] for t in readings)
+
+        def held_near(t: float) -> List[int]:
+            """`held_mb` from the last hog row before `t` to the first after it."""
+            rows = self.hog_samples[max(0, bisect.bisect_left(self._hog_times, t) - 1):
+                                    bisect.bisect_right(self._hog_times, t) + 1]
+            return [row.get("held_mb") or 0 for row in rows]
+
+        first, second = held_near(readings[0]), held_near(readings[1])
         return max((abs(a - b) for a in first for b in second), default=0)
 
     def oracle_gpu(self, sample: Dict[str, Any], uuid: str) -> Optional[Dict[str, Any]]:
@@ -651,7 +678,7 @@ RELEASE_LAG_S_PER_GIB = 0.040
 RELEASE_DRAIN_MAX_S = 2.0
 #: How long a dead worker's PID may stay listed after its death line.
 WORKER_TEARDOWN_MAX_S = 10.0
-#: The ledger's `EXTERNAL_SAMPLE_MAX_AGE`: it refreshes an older reading at a batch or load.
+#: The ledger's `EXTERNAL_SAMPLE_MAX_AGE`: it refreshes an older reading before a grant.
 LEDGER_READ_MAX_AGE_S = 10.0
 
 # How long a hog must hold, and how much, before `external_mb` not moving at
@@ -800,9 +827,9 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     """`external_mb` vs (GPU used - our workers' NVML usage): +/-1 GiB or 2%.
 
     Skipped while no job ran, where GPU used moved past the allowance, or by
-    an unknown amount, during the per-process scan, or while a release or hog
-    move larger than the allowance lies between the ledger's free reading and
-    the oracle sample."""
+    an unknown amount, during the per-process scan, where the ledger's free
+    reading is over 10 s old, or while a release or hog move larger than the
+    allowance lies between that reading and the oracle sample."""
     if not ctx.health_samples or not ctx.vram_samples:
         return Verdict("oracle_agreement", "SKIP",
                        "needs both healthrec.jsonl and vramrec.jsonl")
@@ -815,6 +842,7 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     per_gpu: Dict[str, float] = {}
     idle = 0
     skewed = 0
+    stale = 0
     releasing = 0
     hog_moving = 0
     # Of those two, skipped only because the ledger read before both samples.
@@ -858,9 +886,13 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             ours, _ = ctx.our_pids_mb(oracle)
             oracle_external = max(0, int(oracle["used_mb"]) - ours)
             raw = abs(int(gpu.get("external_mb") or 0) - oracle_external)
+            # The ledger re-reads an older figure before it grants from it.
+            age = (gpu.get("external_sample_age_ms") or 0) / 1000.0
+            if age > LEDGER_READ_MAX_AGE_S:
+                stale += 1
+                continue
             # From the ledger's free reading, or the earlier sample, to the later one.
-            age = gpu.get("external_sample_age_ms")
-            read_t = sample["t_wall"] - min((age or 0) / 1000.0, LEDGER_READ_MAX_AGE_S)
+            read_t = sample["t_wall"] - age
             first = min(sample["t_wall"], vram["t_wall"])
             last = max(sample["t_wall"], vram["t_wall"])
             released = ctx.released_mb(uuid, min(read_t, first), last,
@@ -897,11 +929,13 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
         f"; {count} GPU-samples {why} were skipped" for count, why in (
             (skewed, "read while GPU used moved past the allowance, "
                      "or by an unknown amount"),
+            (stale, f"whose ledger free reading was over "
+                    f"{LEDGER_READ_MAX_AGE_S:.0f} s old"),
             (releasing, "read while a release was still leaving GPU used"),
             (hog_moving, "read while the hog moved")) if count) + (
         f" ({read_age} of them only because the ledger read free before both "
         f"samples; worst difference {read_age_worst} MiB)" if read_age else "")
-    excluded = {"idle_samples": idle, "skewed_samples": skewed,
+    excluded = {"idle_samples": idle, "skewed_samples": skewed, "stale_samples": stale,
                 "releasing_samples": releasing, "hog_moving_samples": hog_moving,
                 "read_age_samples": read_age, "read_age_worst_mb": read_age_worst}
     if joined == 0 and unpriced:
@@ -918,7 +952,7 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     if joined == 0:
         return Verdict("oracle_agreement", "SKIP",
                        ("every joined GPU-sample was skipped"
-                        if idle + skewed + releasing + hog_moving else
+                        if idle + skewed + stale + releasing + hog_moving else
                         "no health sample could be joined to a vramrec sample "
                         f"within {ctx.vram_tolerance:.2f}s") + skipped,
                        {"joined": 0, **excluded})
@@ -1505,6 +1539,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
             row["released_mb"] = max(released)
         over_free.append(row)
     zero_mb = sum(1 for event in grants if event["fields"].get("mb") == 0)
+    no_next = sum(1 for row in over_free if "released_mb" not in row)
     if over_headroom or over_free:
         verdict = "FAIL"
     elif joined == 0 or covered or without_spawn_line or undecided:
@@ -1514,9 +1549,10 @@ def check_grant_safety(ctx: Context) -> Verdict:
         verdict = "PASS"
     detail = (f"{len(grants)} grants; {len(over_headroom)} exceeded the headroom "
               f"they were priced against; {len(over_free)} exceeded the oracle's "
-              f"live free memory plus their own pool ({joined} judged, "
-              f"{undecided} not decidable: no oracle sample shortly before; "
-              f"{on_cpu} on the CPU device, which the oracle does not record); "
+              f"live free memory plus their own pool ({no_next} with no next "
+              f"sample within {ctx.vram_tolerance:.2f}s to show a release; "
+              f"{joined} judged, {undecided} not decidable: no oracle sample "
+              f"shortly before; {on_cpu} on the CPU device, which the oracle does not record); "
               f"{zero_mb} were memory-blind (mb=0)")
     if covered:
         detail += (f"  -- {len(covered)} exceeded the free memory seen before "
@@ -1549,6 +1585,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
          "over_free": over_free[:10], "covered_by_release": covered[:10],
          "covered_without_spawn_line": without_spawn_line[:10],
          "zero_mb_grants": zero_mb, "joined": joined, "undecided": undecided,
+         "no_next_sample": no_next,
          "cpu_grants": on_cpu, "vramrec_samples": len(ctx.vram_samples),
          "oracle_clause_ran": joined > 0},
     )
@@ -2272,6 +2309,34 @@ def _idle_spans(legs: Optional[Dict[str, Any]]) -> List[Tuple[float, float]]:
     return spans
 
 
+def _void_hog_events(legs: Optional[Dict[str, Any]],
+                     hog: List[Dict[str, Any]]) -> List[str]:
+    """The hog events that asked for more than the hog held (a leave-free
+    target, or a hold at or above what it held) while its `held_mb` rose by
+    less than one chunk before the next event."""
+    header = next((row for row in hog if row.get("kind") == "header"), {})
+    chunk = header.get("chunk_mb") or 1
+    states = [(row["t_wall"], row.get("held_mb") or 0) for row in hog
+              if row.get("kind") in ("state", "final")]
+    requests = []
+    for event in (legs or {}).get("events") or []:
+        t_wall = _iso_epoch(str(event.get("iso", "")))
+        if event.get("event") == "hog_event_request" and t_wall is not None:
+            requests.append((t_wall, event))
+    void = []
+    for index, (start, event) in enumerate(requests):
+        end = requests[index + 1][0] if index + 1 < len(requests) else math.inf
+        held = ([mb for t_wall, mb in states if t_wall <= start] or [0])[-1]
+        rose = max([mb for t_wall, mb in states if start < t_wall <= end],
+                   default=held) - held
+        kind, _, mb = str(event.get("query")).partition("=")
+        asked = kind == "leave_free" or (kind == "mb" and int(mb) > 0
+                                         and int(mb) >= held)
+        if asked and rose < chunk:
+            void.append(str(event.get("label") or f"t+{event.get('at_s')}s"))
+    return void
+
+
 def _unfinished_jobs(legs: Optional[Dict[str, Any]]) -> List[str]:
     events = (legs or {}).get("events") or []
     ends = [str(event.get("outcome")) for event in events
@@ -2453,23 +2518,22 @@ def check_hog_tracking(ctx: Context) -> Verdict:
     Report-only in general: `external` is a window-boundary quantity with a
     real staleness, so a GPU that updates *late* is behaving as designed. One
     shape is not staleness and FAILs: a hog held at `HOG_STALL_MB` or more for
-    `HOG_STALL_SECONDS` while `external_mb` never moved. See the README.
+    `HOG_STALL_SECONDS` while `external_mb` never moved. A hog event that
+    applied no pressure makes it WARN. See the README.
     """
     if not ctx.hog_samples or not ctx.health_samples:
         return Verdict("hog_tracking", "SKIP", "needs hog.jsonl and healthrec.jsonl")
-    if ctx.void_hog_events:
-        return Verdict("hog_tracking", "SKIP",
-                       "the hog event(s) " + ", ".join(ctx.void_hog_events)
-                       + " asked for no memory beyond what the hog held, so "
-                       "the leg applied no pressure (`hog_event_void` in "
-                       "legs.json)")
+    void = ctx.void_hog_events
+    void_note = ("; WARN: the hog event(s) " + ", ".join(void) + " asked for more "
+                 "memory and the hog held less than one chunk more before the next "
+                 "event, so they applied no pressure" if void else "")
     header = next((row for row in ctx.hog if row.get("kind") == "header"), {})
     gpu_uuid = header.get("gpu_uuid")
     if header.get("target") == "ram":
-        return Verdict("hog_tracking", "INFO",
+        return Verdict("hog_tracking", "WARN" if void else "INFO",
                        "the hog pressured RAM, not a GPU; see the vramrec "
-                       "MemAvailable and SReclaimable series",
-                       {"header": header})
+                       "MemAvailable and SReclaimable series" + void_note,
+                       {"header": header, "void_events": void})
     rows = []
     worst_lag = 0.0
     worst = None
@@ -2540,8 +2604,9 @@ def check_hog_tracking(ctx: Context) -> Verdict:
                    + f" [FAIL needs both: > {HOG_STALL_SECONDS:.0f}s held and "
                      f"no movement at all]")
     return Verdict(
-        "hog_tracking", "FAIL" if stalled else "INFO", detail,
-        {"joined": len(rows), "steps": deltas[:20],
+        "hog_tracking", "FAIL" if stalled else ("WARN" if void else "INFO"),
+        detail + void_note,
+        {"joined": len(rows), "steps": deltas[:20], "void_events": void,
          "max_external_sample_age_s": max_age,
          "hog_held_seconds_over_threshold": round(held_seconds, 1),
          "hog_threshold_mb": HOG_STALL_MB,
@@ -3058,11 +3123,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             probes.append(payload)
 
     legs = read_json(pick(None, "legs.json"))
+    hog = read_jsonl(pick(args.hog, "hog.jsonl"))
     ctx = Context(
         args=args,
         vramrec=read_jsonl(pick(args.vramrec, "vramrec.jsonl")),
         healthrec=read_jsonl(pick(args.healthrec, "healthrec.jsonl")),
-        hog=read_jsonl(pick(args.hog, "hog.jsonl")),
+        hog=hog,
         log=parse_log(pick(args.logfile, "panoptikon.log")),
         before=read_toml(pick(args.before, "calibration.before.toml")),
         after=read_toml(pick(args.after, "calibration.after.toml")),
@@ -3070,9 +3136,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         probes=probes,
         fds=read_fds(pick(None, "fds.jsonl")) or read_fds(pick(None, "fdrec.txt")),
         idle_spans=_idle_spans(legs),
-        void_hog_events=[str(event.get("label")) for event
-                         in (legs or {}).get("events") or []
-                         if event.get("event") == "hog_event_void"],
+        void_hog_events=_void_hog_events(legs, hog),
         clock_step=None if args.jobs else _clock_step(legs),
         unfinished_jobs=_unfinished_jobs(legs),
     )

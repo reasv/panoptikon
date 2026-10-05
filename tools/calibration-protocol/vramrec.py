@@ -30,6 +30,7 @@ Line 1 is a `"kind": "header"` object: argv, interval, host, an `"nvml"` block
                 "skew_mb" (ROCm only),
                 "procs": [{"pid", "used_mb", "cmdline", "comm",
                 "type": "compute"|"graphics", "gone", "rss_mb", "vmhwm_mb",
+                "ns_pid",
                 "env": {"CUDA_VISIBLE_DEVICES": str, ...}}]}],
      "mem":   {"mem_total_mb", "mem_available_mb", "mem_free_mb",
                "swap_free_mb", "cached_mb", "s_reclaimable_mb", "shmem_mb",
@@ -298,25 +299,30 @@ def proc_env_read(pid: int, keys: Iterable[str]) -> Tuple[Dict[str, str], bool]:
 
 
 def proc_mem(pid: int) -> Dict[str, Optional[int]]:
-    """RSS and VmHWM (lifetime high-water RSS) in MiB."""
+    """RSS and VmHWM (lifetime high-water RSS) in MiB, and `ns_pid`: the PID
+    in the process's own PID namespace, the one a container's log names."""
     raw = _read_text(f"/proc/{pid}/status")
     if raw is None:
         if _PSUTIL is not None:
             try:
                 info = _PSUTIL.Process(pid).memory_info()
-                return {"rss_mb": int(info.rss // MIB), "vmhwm_mb": None}
+                return {"rss_mb": int(info.rss // MIB), "vmhwm_mb": None,
+                        "ns_pid": None}
             except Exception:
-                return {"rss_mb": None, "vmhwm_mb": None}
-        return {"rss_mb": None, "vmhwm_mb": None}
-    rss = hwm = None
+                return {"rss_mb": None, "vmhwm_mb": None, "ns_pid": None}
+        return {"rss_mb": None, "vmhwm_mb": None, "ns_pid": None}
+    rss = hwm = ns_pid = None
     for line in raw.splitlines():
-        if line.startswith("VmRSS:"):
+        # `NSpid:` gives the PID in each namespace, innermost last, before `Vm*`.
+        if line.startswith("NSpid:"):
+            ns_pid = int(line.split()[-1])
+        elif line.startswith("VmRSS:"):
             rss = _kb_to_mib(line)
         elif line.startswith("VmHWM:"):
             hwm = _kb_to_mib(line)
         if rss is not None and hwm is not None:
             break
-    return {"rss_mb": rss, "vmhwm_mb": hwm}
+    return {"rss_mb": rss, "vmhwm_mb": hwm, "ns_pid": ns_pid}
 
 
 def _kb_to_mib(line: str) -> Optional[int]:
@@ -1283,6 +1289,7 @@ def build_sample(
                     "env": meta["env"],
                     "rss_mb": mem["rss_mb"],
                     "vmhwm_mb": mem["vmhwm_mb"],
+                    "ns_pid": mem["ns_pid"],
                     "gone": meta["cmdline"] is None and mem["rss_mb"] is None,
                 }
             )

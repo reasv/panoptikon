@@ -633,7 +633,7 @@ def test_grant_safety_never_joins_a_sample_taken_after_the_grant():
 def test_grant_safety_never_passes_a_grant_a_release_may_have_covered():
     """Over the free memory seen before it, with a release in the next sample
     that covers it: WARN, whatever else the leg holds. No release, or one that
-    comes later than the join tolerance: FAIL."""
+    comes later than the join tolerance (no next sample): FAIL."""
     released = _safety_context([_room_grant(100.0, 15000, 15000),
                                 _room_grant(100.0, 100, 100)],
                                [_timed(99.8, 10000), _timed(100.1, 15500)])
@@ -643,10 +643,10 @@ def test_grant_safety_never_passes_a_grant_a_release_may_have_covered():
     no_sample_before = _safety_context([_room_grant(100.0, 100, 100)],
                                        [_timed(100.1, 15500)])
     assert analyze.check_grant_safety(no_sample_before).verdict == "WARN"
-    for later in (_timed(100.1, 12000), _timed(160.0, 15500)):
-        held = _safety_context([_room_grant(100.0, 15000, 15000)],
-                               [_timed(99.8, 10000), later])
-        assert analyze.check_grant_safety(held).verdict == "FAIL"
+    for later, no_next in ((_timed(100.1, 12000), 0), (_timed(160.0, 15500), 1)):
+        held = analyze.check_grant_safety(_safety_context(
+            [_room_grant(100.0, 15000, 15000)], [_timed(99.8, 10000), later]))
+        assert (held.verdict, held.numbers["no_next_sample"]) == ("FAIL", no_next)
     # `used` moved by up to each row's `skew_mb` while its processes were
     # read: that comes off the release, and an unknown skew proves none.
     def skewed(before_mb, after_mb):
@@ -707,17 +707,30 @@ def _worker_sample(t_wall, workers, free_mb=None):
 
 def test_grant_safety_counts_only_releases_by_other_live_processes():
     """The requester emptying its cache after an out-of-memory error, or a
-    worker the grant killed, is no release; another worker's is."""
-    log = [_spawn(900, MODEL), _spawn(901, "other/model"),
-           _room_grant(100.0, 5000, 5000)]
-    before = _worker_sample(99.8, {900: 10000, 901: 6000})
-    verdicts = [analyze.check_grant_safety(analyze.Context(
-        args=_args(), vramrec=[before, _worker_sample(100.1, workers)],
-        healthrec=[], hog=[], log=log, before=None, after=None, jobs=None,
-        probes=[])).verdict
-        for workers in ({900: 6000, 901: 6000}, {900: 10000},
-                        {900: 10000, 901: 500})]
-    assert verdicts == ["FAIL", "FAIL", "WARN"]
+    worker the grant killed, is no release; another worker's is. A spawn line
+    from a container names the PID vramrec records as `ns_pid`: it is the
+    first process with that `ns_pid` sighted from 2 s before the line on."""
+    def verdict(workers, logged):
+        rows = [_worker_sample(99.8, {900: 10000, 901: 6000}),
+                _worker_sample(100.1, workers)]
+        for proc in (proc for row in rows for proc in row["gpus"][0]["procs"]):
+            proc["ns_pid"] = logged[proc["pid"]]
+        log = [_spawn(logged[900], MODEL), _spawn(logged[901], "other/model"),
+               _room_grant(100.0, 5000, 5000)]
+        return analyze.check_grant_safety(analyze.Context(
+            args=_args(), vramrec=rows, healthrec=[], hog=[], log=log, before=None,
+            after=None, jobs=None, probes=[])).verdict
+    for logged in ({900: 900, 901: 901}, {900: 17, 901: 18}):
+        assert [verdict(workers, logged) for workers in (
+            {900: 4000, 901: 6000}, {900: 10000}, {900: 10000, 901: 500})] == [
+            "FAIL", "FAIL", "WARN"]
+    sightings = [_worker_sample(t, {pid: 1000}) for t, pid in (
+        (80.0, 5000), (95.0, 900), (99.0, 901))]
+    for row in sightings:
+        row["gpus"][0]["procs"][0]["ns_pid"] = 17
+    assert analyze.Context(
+        args=_args(), vramrec=sightings, healthrec=[], hog=[], log=[_spawn(17, MODEL)],
+        before=None, after=None, jobs=None, probes=[]).spawned_pids == {900}
 
 
 def test_grant_safety_without_a_spawn_line_tries_each_possible_requester():
@@ -740,6 +753,7 @@ def test_grant_safety_without_a_spawn_line_tries_each_possible_requester():
     assert judge([_spawn(950, MODEL)], {900: 10000, 901: 500}) == ("WARN", [MODEL])
     # 901 grows 4000 MiB while another process frees 6000.
     assert judge([], {900: 10000, 901: 10000}, 2000) == ("WARN", [MODEL])
+    assert judge([_spawn(901, None)], {900: 10000, 901: 10000}, 2000) == ("WARN", [MODEL])
     assert judge([_spawn(901, "other/model")], {900: 10000, 901: 10000},
                  2000) == ("FAIL", [])
     assert judge([], {901: 500}, 5500,
@@ -790,6 +804,31 @@ def test_oracle_agreement_skips_the_samples_while_no_job_ran():
     assert (verdict.verdict, verdict.numbers["idle_samples"]) == ("PASS", 1)
 
 
+def test_a_hog_event_the_hog_answered_with_under_a_chunk_is_void_and_warns(tmp_path):
+    """An event that asks for more than the hog held (a leave-free target, or
+    a hold at or above it) is void when `held_mb` rises by less than one chunk
+    before the next event. A step-down or a release asks for nothing more."""
+    held = {100.0: 0, 101.0: 0, 105.0: 0, 111.0: 8192, 115.0: 8192, 121.0: 8192,
+            131.0: 8192, 141.0: 4096, 151.0: 4096, 161.0: 4608, 165.0: 4608}
+    (tmp_path / "hog.jsonl").write_text("".join(json.dumps(row) + "\n" for row in [
+        {"kind": "header", "target": "gpu", "gpu_uuid": GPU, "chunk_mb": 512},
+        *({"kind": "state", "t_wall": t, "held_mb": mb} for t, mb in held.items())]))
+    (tmp_path / "healthrec.jsonl").write_text(json.dumps(_health_sample(0)) + "\n")
+    events = [{"event": "hog_event_request", "iso": f"1970-01-01T00:0{iso}Z",
+               "label": label, "query": query} for iso, label, query in (
+        ("1:40", "release", "mb=0"), ("1:40.5", "spike", "leave_free=2048"),
+        ("1:50", "step up", "mb=8192"), ("2:00", "hold", "mb=8192"),
+        ("2:10", "small", "mb=8400"), ("2:20", "step down", "mb=4096"),
+        ("2:40", "refill", "leave_free=20000"))]
+    for logged, verdict, void in ((events, "WARN", ["spike", "hold", "small"]),
+                                  ([], "INFO", [])):
+        (tmp_path / "legs.json").write_text(json.dumps({"events": logged}))
+        analyze.main(["--scenario", str(tmp_path), "--checks", "hog_tracking",
+                      "--json", str(tmp_path / "v.json"), "--quiet"])
+        (result,) = json.loads((tmp_path / "v.json").read_text())["verdicts"]
+        assert (result["verdict"], result["numbers"]["void_events"]) == (verdict, void)
+
+
 def _row(t_wall, used_mb, procs):
     """An oracle sample on a 32607 MiB GPU: allowance 1024 MiB. PIDs below
     900 are not ours."""
@@ -833,7 +872,8 @@ def _died(t_wall, model):
 def test_oracle_agreement_release_window_lasts_the_lag_or_the_drain():
     """A release window opens at the oracle sample before a process's figure
     falls, or at a death logged for one of our workers' model at most 10 s
-    before its PID leaves. It lasts 40 ms per GiB freed, or longer until
+    before its PID leaves, for a worker of that model spawned before the
+    death. It lasts 40 ms per GiB freed, or longer until
     `used` is back within the allowance of its level before, but at most 2 s
     past that bound. A ledger figure read, or an oracle sample taken, in it
     is skipped; one past it is judged."""
@@ -862,15 +902,14 @@ def test_oracle_agreement_release_window_lasts_the_lag_or_the_drain():
         assert _agreement(vramrec, healthrec + [extra]).verdict == "FAIL"
 
     # 900's PID and `used` leave together, after its death line. 901, spawned
-    # before the death and configured after it, leaves 30 s later; 950 is a
-    # respawn. On amdgpu the PID leaves first and the death line comes later.
+    # before the death and configured after it, leaves 30 s later. On amdgpu
+    # the PID leaves first and the death line comes later.
     dying = _recording([(101.0, 12020, {900: 6000, 901: 6000}),
                         (131.0, 6020, {901: 6000}), (132.0, 20, {})], 132.0)
     died = [_spawn(900, MODEL), _died(100.5, MODEL)]
     spare = [{**_spawn(901, None), "t_wall": 95.0, "fields": {"pid": 901, "worker": "v"}},
              {**_spawn(901, None), "t_wall": 101.0, "message": f"Configured as {MODEL}",
               "fields": {"worker": "v"}}]
-    respawn = [{**_spawn(950, MODEL), "t_wall": 101.5}]
     amdgpu = _recording([(100.0, 6020, {900: 6000}), (100.25, 6020, {}),
                          (101.0, 20, {})], 101.0)
     # `used` lags 900's fall by a row; 901's release never leaves `used`.
@@ -878,24 +917,53 @@ def test_oracle_agreement_release_window_lasts_the_lag_or_the_drain():
                           (100.25, 1020, {900: 1000})], 100.25, start=99.75)
     stuck = _recording([(100.0, 7020, {900: 1000, 901: 6000}),
                         (103.0, 7020, {900: 1000})], 103.0)
+    # A PID the oracle could not read, not ours, closes no other window.
+    foreign = _recording([(100.0, 7020, {900: 1000, 901: 6000}),
+                          (103.0, 7020, {900: 1000})], 103.0)
+    for row in foreign:
+        row["gpus"][0]["unreadable_pids"] = [1]
+    # A death opens no window for a worker of another model, one still
+    # listed, or one spawned after it.
+    other_model = _recording([(100.25, 12020, {900: 6000, 901: 6000}),
+                              (107.75, 6020, {901: 6000}), (110.0, 20, {})], 110.0)
+    sibling = _recording([(100.5, 13020, {900: 6000, 901: 7000}),
+                          (104.75, 7020, {901: 7000}), (110.0, 2020, {901: 2000})], 110.0)
+    respawn = _recording([(100.5, 6020, {900: 6000}), (101.75, 20, {}),
+                          (105.75, 5020, {950: 5000}), (110.0, 20, {})], 110.0)
+    # Windows out of opening order: 900's opens at its death, before 8's.
+    late = _recording([(100.0, 10020, {7: 2000, 8: 2000, 900: 6000}),
+                       (101.0, 8020, {8: 2000, 900: 6000}),
+                       (101.75, 6020, {900: 6000}), (103.0, 20, {})], 103.0)
+    # A long window, 7's, then a short one, 900's.
+    nested = _recording([(100.0, 8120, {7: 6000, 900: 2100}), (100.5, 8120, {900: 2100}),
+                         (102.75, 7020, {900: 1000}), (104.0, 1020, {900: 1000})], 104.0)
     for vramrec, log, ledger, expected in (
             (dying, died, _ledger(100.75, 6020), "SKIP"),
             (dying, died[:1], _ledger(100.75, 6020), "FAIL"),
             (dying, died + spare, _ledger(100.75, 6020), "SKIP"),
             (dying, died + spare, _ledger(130.0, 6020), "FAIL"),
-            (dying, died + respawn, _ledger(100.75, 6020), "SKIP"),
             (amdgpu, [_spawn(900, MODEL), _died(100.6, MODEL)], _ledger(100.25, 20),
              "SKIP"),
             (lagging, [], _ledger(100.0, 20, age_ms=500), "SKIP"),
             (stuck, [], _ledger(101.5, 20), "SKIP"),
-            (stuck, [], _ledger(102.75, 20), "FAIL")):
+            (stuck, [], _ledger(102.75, 20), "FAIL"),
+            (foreign, [], _ledger(101.5, 20), "SKIP"),
+            (other_model, [_spawn(900, MODEL), _spawn(901, "other/model"),
+                           _died(100.5, MODEL)], _ledger(104.0, 6020), "FAIL"),
+            (sibling, [_spawn(900, MODEL), _spawn(901, MODEL), _died(100.5, MODEL)],
+             _ledger(103.0, 6020), "FAIL"),
+            (respawn, [_spawn(900, MODEL), _died(100.5, MODEL),
+                       {**_spawn(950, MODEL), "t_wall": 102.0}], _ledger(104.0, 6020), "FAIL"),
+            (late, [_spawn(900, MODEL), _died(100.6, MODEL)], _ledger(100.75, 8020), "SKIP"),
+            (nested, [], _ledger(101.5, 20), "SKIP")):
         assert _agreement(vramrec, [ledger], log=log).verdict == expected
 
 
 def test_oracle_agreement_counts_another_process_window_when_it_meets_the_span():
     """Another process's window counts when it meets the span from the
     ledger's free reading to the oracle sample. One of our workers' counts
-    only when it holds the oracle sample or the ledger's reading."""
+    only when it holds the oracle sample or the ledger's reading. A reading
+    over 10 s old is skipped: the ledger re-reads it before it grants."""
     vramrec = _recording([
         (99.75, 18020, {7: 6000, 900: 12000}),
         (100.0, 18020, {900: 12000}),  # 7 freed 6000 MiB, `used` not yet
@@ -903,18 +971,21 @@ def test_oracle_agreement_counts_another_process_window_when_it_meets_the_span()
         (108.0, 1020, {900: 1000}),
     ], 108.0, start=99.75)
     healthrec = [_ledger(100.25, 6020, age_ms=350), _ledger(100.5, 6020, age_ms=750),
-                 _ledger(106.0, 20, age_ms=1500), _ledger(107.0, 11000, age_ms=1800)]
+                 _ledger(106.0, 20, age_ms=1500), _ledger(107.0, 11000, age_ms=1800),
+                 _ledger(107.5, 6020, age_ms=15000)]
     verdict = _agreement(vramrec, healthrec)
     assert (verdict.verdict, verdict.numbers["joined"],
             verdict.numbers["releasing_samples"],
             verdict.numbers["read_age_samples"],
-            verdict.numbers["read_age_worst_mb"]) == ("PASS", 1, 3, 2, 10980)
+            verdict.numbers["read_age_worst_mb"],
+            verdict.numbers["stale_samples"]) == ("PASS", 1, 3, 2, 10980, 1)
     assert _agreement(vramrec, healthrec + [_ledger(101.0, 6020)]).verdict == "FAIL"
 
 
 def test_oracle_agreement_rows_with_a_failed_read_open_no_window():
-    """A row whose process query failed, that names an unreadable PID, or that
-    has no `used`, opens no window; nor does a figure that turns null."""
+    """A row whose process query failed, or that has no `used`, opens no
+    window; nor does a PID the row lists as unreadable, or a figure that turns
+    null."""
     vramrec = _recording([(102.5, 7020, {900: 1000, 901: 6000})], 102.5)
     _gpu_at(vramrec, 100.5).update(procs=[], error="process query failed")
     _gpu_at(vramrec, 101.0).update(procs=[_proc(900, 1000, "inferio-worker")],
@@ -931,7 +1002,7 @@ def test_oracle_agreement_skips_samples_while_the_hog_moved():
     writes its state row when done, after the ledger read. A release reaches
     `used` after the hog's figure, and after its state row. A move under the
     allowance is taken off the difference, on the hog's GPU only. A free
-    reading counts as at most 10 s old: the ledger refreshes an older one."""
+    reading 10 s old is still judged."""
     def judge(ledger, held, rows=(99.0, 99.5, 100.0, 100.5, 101.0, 101.5, 102.0),
               vramrec=None):
         hog = [{"kind": "header", "target": "gpu", "gpu_uuid": GPU}] + [
@@ -942,7 +1013,7 @@ def test_oracle_agreement_skips_samples_while_the_hog_moved():
         return (verdict.verdict, verdict.numbers["hog_moving_samples"],
                 verdict.numbers["releasing_samples"], verdict.numbers["read_age_samples"])
     step_up = lambda t: 8192 if t >= 100.5 else 0
-    assert judge(_ledger(101.0, 20, age_ms=1000), step_up) == ("SKIP", 1, 0, 1)
+    assert judge(_ledger(101.0, 20, age_ms=2000), step_up) == ("SKIP", 1, 0, 1)
     assert judge(_ledger(101.0, 8212, age_ms=1000),
                  lambda t: 8192 - step_up(t))[:3] == ("SKIP", 0, 1)
     lagged = [_row(99.75, 8212, {4: 8192}), _row(100.0, 8212, {4: 196}),
@@ -953,7 +1024,7 @@ def test_oracle_agreement_skips_samples_while_the_hog_moved():
     assert judge(_ledger(102.0, 20), step_up)[0] == "FAIL"
     assert judge(_ledger(101.0, 20), step_up,
                  (99.0, 99.5, 100.0, 101.5)) == ("SKIP", 1, 0, 0)
-    assert judge(_ledger(101.5, 20, age_ms=15000), lambda t: 8192 if t >= 89.5 else 0,
+    assert judge(_ledger(101.5, 20, age_ms=10000), lambda t: 8192 if t >= 89.5 else 0,
                  (86.0, 89.5, 95.0, 100.0, 101.0, 102.0))[0] == "FAIL"
     # Up and back between the two readings, in no oracle sample.
     flat = [_row(t, 20, {}) for t in (100.0, 102.0)]
