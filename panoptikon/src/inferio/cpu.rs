@@ -282,7 +282,7 @@ mod sys {
             unsafe { K32GetProcessMemoryInfo(process, ptr::from_mut(&mut counters).cast(), size) };
         // SAFETY: the handle came from `OpenProcess` and is closed once.
         unsafe { CloseHandle(process) };
-        (ok != 0).then(|| counters.PrivateUsage as u64 / MIB)
+        (ok != 0).then_some(counters.PrivateUsage as u64 / MIB)
     }
 }
 
