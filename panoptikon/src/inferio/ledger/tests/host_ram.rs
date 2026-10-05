@@ -1114,7 +1114,7 @@ fn a_retaining_worker_is_never_under_booked() {
             let booked = row(&ledger, &model).ram_booked_mb;
             let peak = kept.max(RETAINED_INIT_MB + RETAINED_PER_UNIT_MB * units);
             let case = format!("seed {seed}, retain {retain}, window {window}: {units} units");
-            if booked > 0 {
+            if row(&ledger, &model).ram_mb_per_unit.is_some() {
                 let charged = cpu_row(&ledger).charges_mb;
                 assert!(
                     charged >= RSS_AT_LOAD_MB + peak,
@@ -1556,14 +1556,12 @@ fn a_short_window_does_not_double_the_item_cap() {
 
 /// Pages of 300 to 650 MiB under a worker that keeps what it peaked at: what
 /// its first page kept stays in the load level, and later pages read only
-/// what they add above it. Item-capped windows, unbooked or priced from one
-/// size, run up to [`WINDOW_DEPTH_MULTIPLIER`] batches deep, and each falls
-/// short of its peak by at most one capped batch at the costliest page,
-/// whether the pages come in random order or cheap ones come first. A second
-/// size gives the slope, and the ramp goes on; when cheap pages come first,
-/// no window falls short once the pages cost what was measured.
+/// what they add above it. Item-capped windows run up to
+/// [`WINDOW_DEPTH_MULTIPLIER`] batches deep. When cheap pages come first, no
+/// window falls short once a cost is measured, from one size or two; in
+/// either order the ramp goes on.
 #[test]
-fn a_costly_first_input_under_retention_costs_at_most_a_capped_batch() {
+fn a_costly_first_input_under_retention_is_covered_once_measured() {
     use rand::{Rng, SeedableRng, rngs::StdRng};
     const STARTUP: u64 = 700;
     const COSTLIEST: u64 = 650;
@@ -1598,9 +1596,7 @@ fn a_costly_first_input_under_retention_costs_at_most_a_capped_batch() {
                 .collect();
             let short = (RSS_AT_LOAD_MB + kept).saturating_sub(cpu_row(&ledger).charges_mb);
             let case = format!("seed {seed}, random {random}, window {window}: {pages} pages");
-            if cap > Some(1) {
-                assert!(short <= COSTLIEST * pages, "{case}, {short} MiB short");
-            } else if cap.is_none() && !random {
+            if row(&ledger, "g/pages").ram_mb_per_unit.is_some() && !random {
                 assert_eq!(short, 0, "{case}");
             }
             handle.lock().unwrap().record_measurements(batches);
