@@ -234,8 +234,8 @@ class Context:
     # Labels of the hog events `legs.py` marked `hog_event_void`.
     void_hog_events: List[str] = field(default_factory=list)
     # How far the wall clock stepped during the first job, the one jobs.json
-    # records, from `legs.json`.
-    clock_step: Optional[float] = None
+    # records, and that job's monotonic seconds, from `legs.json`.
+    clock_step: Optional[Tuple[float, float]] = None
     # `legs.json`'s jobs that did not drain: each `job_end` outcome other
     # than `drained`, and "no job_end" for a job the leg never saw end.
     unfinished_jobs: List[str] = field(default_factory=list)
@@ -1999,18 +1999,19 @@ def check_throughput(ctx: Context) -> Verdict:
     if not records:
         return Verdict("throughput", "SKIP",
                        "jobs.json has no LogRecord history entries")
-    step = ctx.clock_step
+    clock = ctx.clock_step
     baseline = ctx.args.baseline_items_per_s
-    baseline_step = None
+    baseline_clock = None
     if baseline is None and ctx.args.baseline_jobs:
         path = Path(ctx.args.baseline_jobs)
         if path.name == "jobs.json":
-            baseline_step = _clock_step(read_json(path.with_name("legs.json")))
+            baseline_clock = _clock_step(read_json(path.with_name("legs.json")))
         # Both sides corrected for the clock step, or neither.
-        if step is None or baseline_step is None:
-            step = baseline_step = None
-        baseline = _items_per_s(_log_records(read_json(path)), baseline_step)
-    ours = _items_per_s(records, step)
+        if clock is None or baseline_clock is None:
+            clock = baseline_clock = None
+        baseline = _items_per_s(_log_records(read_json(path)), baseline_clock)
+    ours = _items_per_s(records, clock)
+    step = clock[0] if clock else None
     if not baseline:
         return Verdict("throughput", "INFO",
                        f"{ours:.3f} items/s over {len(records)} job(s); "
@@ -2025,7 +2026,8 @@ def check_throughput(ctx: Context) -> Verdict:
                    {"items_per_s": ours, "baseline_items_per_s": baseline,
                     "ratio": ratio, "jobs": len(records),
                     "clock_step_s": step,
-                    "baseline_clock_step_s": baseline_step})
+                    "baseline_clock_step_s":
+                        baseline_clock[0] if baseline_clock else None})
 
 
 def _log_records(payload: Any) -> List[Dict[str, Any]]:
@@ -2044,46 +2046,53 @@ def _log_records(payload: Any) -> List[Dict[str, Any]]:
             if isinstance(row, dict) and "total_segments" in row]
 
 
-def _clock_step(legs: Optional[Dict[str, Any]]) -> Optional[float]:
-    """How far the wall clock stepped from the first `job_posted` to the
-    `job_end` after it, the job jobs.json records: their `iso` span less their
-    `t_mono` span, or None without `t_mono`."""
+def _clock_step(legs: Optional[Dict[str, Any]]
+                ) -> Optional[Tuple[float, float]]:
+    """How far the wall clock stepped from the first `job_start` to the
+    `job_end` after it, the job jobs.json records (their `iso` span less their
+    `t_mono` span), and that `t_mono` span; None without `t_mono`."""
     events = iter((legs or {}).get("events") or [])
-    posted = next((event for event in events
-                   if event.get("event") == "job_posted"), {})
+    start = next((event for event in events
+                  if event.get("event") == "job_start"), {})
     end = next((event for event in events
                 if event.get("event") == "job_end"), {})
-    start_wall = _iso_epoch(str(posted.get("iso", "")))
+    start_wall = _iso_epoch(str(start.get("iso", "")))
     end_wall = _iso_epoch(str(end.get("iso", "")))
-    if None in (posted.get("t_mono"), end.get("t_mono"), start_wall, end_wall):
+    if None in (start.get("t_mono"), end.get("t_mono"), start_wall, end_wall):
         return None
-    return (end_wall - start_wall) - (end["t_mono"] - posted["t_mono"])
+    job_s = end["t_mono"] - start["t_mono"]
+    return (end_wall - start_wall) - job_s, job_s
 
 
 def _items_per_s(records: List[Dict[str, Any]],
-                 clock_step: Optional[float] = None) -> float:
+                 clock: Optional[Tuple[float, float]] = None) -> float:
     """Items over the server's start-to-end spans, a record's busy time
-    standing in for a span that is missing or not positive. A clock step of
-    1 s or more comes off the summed spans instead (the times are whole
-    seconds, so a smaller step is noise); busy time then stands in for all of
-    them when a span is missing or the corrected total is under 1 s per
-    record."""
+    standing in for a span that is missing or not positive. A clock step
+    (`clock`: the step and the job's monotonic seconds) of 1 s or more comes
+    off the summed spans instead (the times are whole seconds, so a smaller
+    step is noise), unless the corrected total exceeds the job's monotonic
+    seconds by over 1 s per record: the job ran inside them, so the step fell
+    outside the spans. Busy time stands in for all of them when a span is
+    missing or the corrected total is under 1 s per record."""
     items = sum(float(record.get("total_segments") or 0) for record in records)
     spans = [(_iso_epoch(str(record.get("start_time", "")).replace(" ", "T")),
               _iso_epoch(str(record.get("end_time", "")).replace(" ", "T")),
               float(record.get("inference_time") or 0)
               + float(record.get("data_load_time") or 0))
              for record in records]
-    step = clock_step or 0.0
-    if abs(step) < 1:
-        seconds = sum(end - start if start is not None and end is not None
-                      and end > start else busy for start, end, busy in spans)
-    else:
+    step, job_s = clock or (0.0, 0.0)
+    seconds = None
+    if abs(step) >= 1:
         seconds = 0.0
         if all(start is not None and end is not None for start, end, _ in spans):
             seconds = sum(end - start for start, end, _ in spans) - step
-        if seconds < len(spans):
+        if seconds > job_s + len(spans):
+            seconds = None
+        elif seconds < len(spans):
             seconds = sum(busy for _, _, busy in spans)
+    if seconds is None:
+        seconds = sum(end - start if start is not None and end is not None
+                      and end > start else busy for start, end, busy in spans)
     return items / seconds if seconds > 0 else 0.0
 
 

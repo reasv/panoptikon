@@ -1039,13 +1039,13 @@ def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
     # The wall clock stepped back 1.8 s in the first job and forward 5 s in
     # the second, which jobs.json does not record.
     ours = leg("ours", 100, 8.2, [
-        ("job_posted", 0.0, 1000.25), ("job_end", 8.45, 1010.5),
-        ("job_posted", 9.0, 1011.0), ("job_end", 17.0, 1014.0)])
+        ("job_start", 0.0, 1000.25), ("job_end", 8.45, 1010.5),
+        ("job_start", 9.0, 1011.0), ("job_end", 17.0, 1014.0)])
     # A baseline whose clock stepped back 5 s: both sides are corrected.
     stepped = leg("stepped", 100, 20.0, [
-        ("job_posted", 0.0, 500.0), ("job_end", 20.0, 525.0)])
+        ("job_start", 0.0, 500.0), ("job_end", 20.0, 525.0)])
     # An older baseline: marks without t_mono, so neither side is corrected.
-    old = leg("c0", 100, 20.0, [("job_posted", 0.0), ("job_end", 24.0)])
+    old = leg("c0", 100, 20.0, [("job_start", 0.0), ("job_end", 24.0)])
 
     def throughput(*argv):
         out = tmp_path / "verdicts.json"
@@ -1068,9 +1068,10 @@ def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
     other.write_text(stepped.read_text())
     assert throughput("--baseline-jobs", str(other))[
         "baseline_items_per_s"] == pytest.approx(5.0)
-    # An explicit --jobs may be another job's: no step is subtracted.
-    assert throughput("--jobs", str(ours))["items_per_s"] == pytest.approx(
-        100 / 8.2)
+    # An explicit --jobs may be another job's: neither side.
+    numbers = throughput("--jobs", str(ours), "--baseline-jobs", str(stepped))
+    assert numbers["items_per_s"] == pytest.approx(100 / 8.2)
+    assert numbers["baseline_items_per_s"] == pytest.approx(5.0)
 
     def record(start, end):
         return {"total_segments": 100, "inference_time": 4.0,
@@ -1078,27 +1079,33 @@ def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
                 "start_time": f"2026-10-03 10:00:{start}",
                 "end_time": f"2026-10-03 10:00:{end}"}
 
+    # `job_s`: the job's monotonic seconds, which bound the corrected spans.
+    def per_s(records, step, job_s=60.0):
+        return analyze._items_per_s(records, (step, job_s))
+
     # A backward step longer than the job: end before start, still the span.
-    assert analyze._items_per_s([record(10, "05")], -10.0) == pytest.approx(
-        20.0)
+    assert per_s([record(10, "05")], -10.0) == pytest.approx(20.0)
     # A step larger than the span fell outside it: busy time, no step.
-    assert analyze._items_per_s([record(10, 20)], 30.0) == pytest.approx(
-        100 / 4.5)
-    # A step under 1 s is not subtracted: a sub-second job's start equals its
-    # end, and that span uses busy time.
-    assert analyze._items_per_s([record(10, 20)], -0.9) == pytest.approx(10.0)
-    assert analyze._items_per_s([record(10, 10)], -0.002) == pytest.approx(
-        100 / 4.5)
-    # A step inside a record shorter than a second: busy time.
-    assert analyze._items_per_s([record(10, "09")], -1.002) == pytest.approx(
-        100 / 4.5)
+    assert per_s([record(10, 20)], 30.0) == pytest.approx(100 / 4.5)
+    # A backward step the job's 12 s cannot hold fell outside the span; the
+    # whole-second times allow 1 s per record over the job's time.
+    assert per_s([record(10, 20)], -5.0, 12.0) == pytest.approx(10.0)
+    assert per_s([record(10, 20)], -5.0, 14.5) == pytest.approx(100 / 15)
+    # A step under 1 s is not subtracted, one of 1 s is. A sub-second job's
+    # start equals its end, and that span uses busy time.
+    assert per_s([record(10, 20)], -0.9) == pytest.approx(10.0)
+    assert per_s([record(10, 20)], -1.0) == pytest.approx(100 / 11)
+    assert per_s([record(10, 10)], -0.002) == pytest.approx(100 / 4.5)
+    # A step inside records shorter than a second each: busy time.
+    assert per_s([record(10, "09")], -1.002) == pytest.approx(100 / 4.5)
+    assert per_s([record(10, "09"), record(20, 21)], -1.5) == pytest.approx(
+        200 / 9)
     # Without a step, each record on its own: a span, or busy time.
     assert analyze._items_per_s([record(10, 20), {**record(21, 21),
                                  "end_time": None}]) == pytest.approx(200 / 14.5)
     # With a step and a missing end: busy time for every record.
-    assert analyze._items_per_s([record(10, 20), {**record(20, 20),
-                                 "end_time": None}], -2.0) == pytest.approx(
-        200 / 9)
+    assert per_s([record(10, 20), {**record(20, 20), "end_time": None}],
+                 -2.0) == pytest.approx(200 / 9)
 
 
 # --- deflation_recovery ------------------------------------------------------
