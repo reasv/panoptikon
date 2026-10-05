@@ -734,6 +734,30 @@ fn a_death_in_a_booked_item_capped_window_caps() {
     assert_eq!(row(&ledger, "g/capped").death_cap_units, Some(2));
 }
 
+/// A probe's larger size is booked in host RAM in full or not at all: with
+/// room for 100 units beside a working size of 64, the probe of 128 is
+/// granted 64, and nothing between the two is booked.
+#[test]
+fn a_probe_books_host_ram_for_its_larger_size_in_full_or_not_at_all() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/a", GPU, 64);
+    cpu_free_to_book(&ledger, 100 * RAM_PER_UNIT_MB);
+    let budgets: Vec<u64> = (0..40)
+        .map(|_| {
+            ram_window_at(
+                &handle,
+                &admission,
+                (0, RAM_PER_UNIT_MB),
+                |_| 100.0,
+                u64::MAX,
+            )
+            .unit_budget
+        })
+        .collect();
+    assert!(budgets.iter().all(|units| *units <= 64), "{budgets:?}");
+    assert!(ledger.trial_for_test("g/a", GPU).1 > 0, "a probe ran");
+}
+
 /// The cap a death left is re-tested like any other size. The working size
 /// comes down to the cap and waits as after a failed probe; then a probe of
 /// the doubling from the cap runs the size that died. Two clean windows of
