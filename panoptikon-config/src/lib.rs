@@ -60,12 +60,10 @@ impl TomlDocument {
             .context("new TOML document value is not a table")?;
         let root = self.document.as_table_mut();
         let block = patch_table(root, before, after)?;
-        if !block.is_empty() {
-            // The root has no header: its body starts after its decor prefix.
-            let prefix = root.decor().prefix().and_then(RawString::as_str);
-            let prefix = format!("{}{block}", prefix.unwrap_or(""));
-            root.decor_mut().set_prefix(prefix);
-        }
+        // The root has no header: its body starts after its decor prefix.
+        let prefix = root.decor().prefix().and_then(RawString::as_str);
+        let prefix = format!("{}{block}", prefix.unwrap_or(""));
+        root.decor_mut().set_prefix(prefix);
         Ok(())
     }
 
@@ -882,7 +880,7 @@ mod tests {
     /// above it stays where it was, before the comments of whatever follows.
     #[test]
     fn removing_a_key_keeps_the_comment_block_above_it() {
-        let dotted = "[vram]\n# a note\ngpu.CPU.a = 1\n# b note\ngpu.CPU.b = 2\n# k\nkeep = 1\n# n\n[next]\n";
+        let dotted = "[vram]\n# a note\ngpu.CPU.a = 1\n# b note\ngpu.CPU.b = 2\n# k\n# k2\nkeep = 1\n# n\n[next]\n";
         let cases: [(&str, &[&str]); 13] = [
             // Next key in the same table.
             (
@@ -918,7 +916,7 @@ mod tests {
             // The whole dotted-key table.
             (dotted, &["gpu.CPU.a = 1\n", "gpu.CPU.b = 2\n"]),
             // Last key of an array-of-tables element.
-            ("[[p]]\nn = 1\n# x\nx = 1\n[[p]]\nn = 2\n", &["x = 1\n"]),
+            ("[[p]]\nn = 1 # n\n# x\nx = 1\n[[p]]\nn = 2\n", &["x = 1\n"]),
             // Its first two keys.
             ("[[p]]\n# a\na = 1\n# b\nb = 1\n", &["a = 1\n", "b = 1\n"]),
             // A whole [table]: its keys' comments go with it.
@@ -928,8 +926,8 @@ mod tests {
             ),
             // The next line is a dotted key.
             (
-                "[vram]\n# a note\na = 1\n# g note\ngpu.x = 1\n",
-                &["a = 1\n"],
+                "[vram]\n# a note\na = 1\n# g note\ngpu.x = 1\ngpu.y = 2\n",
+                &["a = 1\n", "gpu.x = 1\n"],
             ),
         ];
         for (source, removed) in cases {
