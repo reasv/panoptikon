@@ -1647,7 +1647,7 @@ Worker, per batch within its window:
   currency, where a freed page is already in the free reading) — against
   the grant, rounded to nearest so a shortfall under half a unit costs
   no unit. The worker's credit is not the host's: the ledger credits
-  `reserved_now − reserved_at_load − grants` (`free_pool_mb`,
+  `reserved_now − reserved_at_load` (`reusable_pool_mb`; it holds no grant while it asks;
   "Contention split" below), the worker credits the pool it holds *now*,
   because those are the bytes this batch can spend in place. It is still
   why the gap exists — a pre-fit grant alone on its device is `headroom +
