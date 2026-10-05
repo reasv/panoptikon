@@ -2932,6 +2932,12 @@ CHECKS: Dict[str, Callable[[Context], Verdict]] = {
 }
 
 
+#: What a split leg (`legs.py --inference-url`) is judged on: its GPU,
+#: ledger log and store are on the inference server's host, not this one.
+SPLIT_LEG_CHECKS = ("failures", "idle_liveness", "job_outcome", "peak_fds",
+                    "ramp_progress", "batch_coverage")
+
+
 # --- Plot (optional) -------------------------------------------------------
 
 
@@ -3156,6 +3162,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     unknown = [name for name in selected if name not in CHECKS]
     if unknown:
         parser.error(f"unknown check(s): {', '.join(unknown)}")
+    if (legs or {}).get("inference_url"):
+        dropped = [name for name in selected if name not in SPLIT_LEG_CHECKS]
+        selected = [name for name in selected if name in SPLIT_LEG_CHECKS]
+        if dropped and not args.quiet:
+            print(f"split leg: not judged here: {', '.join(dropped)}")
 
     verdicts = [CHECKS[name](ctx) for name in selected]
 

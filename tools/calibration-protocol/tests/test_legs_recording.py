@@ -75,7 +75,8 @@ def test_a_split_gateway_forwards_inference_and_both_sides_are_polled(
         capsys, tmp_path):
     """`--inference-url` replaces the config's inference servers and turns
     local inference off; the server's own /health is polled beside the
-    gateway's. A hog is refused: it would pressure this host."""
+    gateway's. A hog, a restart and learning are refused: each acts on this
+    host."""
     config = tmp_path / "server-X.toml"
     config.write_text('[server]\nport = 16342\n\n[inference_local]\n'
                       'enabled = true\n\n[[upstreams.inference]]\n'
@@ -94,7 +95,8 @@ def test_a_split_gateway_forwards_inference_and_both_sides_are_polled(
     plan = json.loads(capsys.readouterr().out)
     assert plan["health_urls"] == {"healthrec": "http://127.0.0.1:16342",
                                    "healthrec-remote": REMOTE}
-    for hog in (["--scenario", "S4a"],
+    for hog in (["--scenario", "S4a"], ["--scenario", "S3"],
+                ["--scenario", "S2"],
                 ["--scenario", "S14", "--hog-event", "at=5,release"]):
         assert legs.main([*hog, *argv]) == 0
         with pytest.raises(SystemExit):

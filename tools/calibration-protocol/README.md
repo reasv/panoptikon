@@ -149,7 +149,11 @@ server. `healthrec.jsonl` then holds the server's report as the gateway
 forwards it, with the gateway's own `inference_clients`; a second healthrec
 polls the server directly into `healthrec-remote.jsonl`. A 504 from the
 gateway (a server it declared frozen) keeps its `inference_clients` and
-`detail`. Recorders on the server's host are started there by hand.
+`detail`. The GPU, the ledger's log and the store are on the server's host,
+so a split leg refuses a hog, a restart and learning, and `analyze.py` judges
+it only on `failures`, `idle_liveness`, `job_outcome`, `peak_fds`,
+`ramp_progress` and `batch_coverage`. The server's memory safety is tested by
+a leg run on its own host.
 
 **S3's second job runs on its own database** (`cal2`). Re-creating `cal`
 does not empty it, so the first job's extractions are still there and the

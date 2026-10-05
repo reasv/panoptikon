@@ -842,6 +842,17 @@ def test_a_hog_event_the_hog_answered_with_under_a_chunk_is_void_and_warns(tmp_p
         assert (result["verdict"], result["numbers"]["void_events"]) == (verdict, void)
 
 
+def test_a_split_leg_is_judged_only_on_what_the_gateway_answers_for(tmp_path):
+    (tmp_path / "legs.json").write_text(json.dumps(
+        {"inference_url": "http://10.0.0.5:7777", "events": []}))
+    for checks, judged in (("all", list(analyze.SPLIT_LEG_CHECKS)),
+                           ("oracle_agreement,failures", ["failures"])):
+        analyze.main(["--scenario", str(tmp_path), "--checks", checks,
+                      "--json", str(tmp_path / "v.json"), "--quiet"])
+        verdicts = json.loads((tmp_path / "v.json").read_text())["verdicts"]
+        assert [row["name"] for row in verdicts] == judged
+
+
 def _row(t_wall, used_mb, procs):
     """An oracle sample on a 32607 MiB GPU: allowance 1024 MiB. PIDs below
     900 are not ours."""

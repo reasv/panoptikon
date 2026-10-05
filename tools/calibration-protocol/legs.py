@@ -2056,10 +2056,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     total_mb = args.gpu_total_mb or measured_total_mb or REFERENCE_TOTAL_MB
     wants_hog = (scenario.hog_hold_fraction is not None
                  or scenario.hog_leave_free_fraction is not None)
-    if args.inference_url and (wants_hog or args.hog_event):
+    if args.inference_url and (wants_hog or args.hog_event or scenario.restart
+                               or scenario.learning):
         raise SystemExit(
-            "legs.py: --inference-url with a hog: the hog would pressure this "
-            "host, not the inference server's")
+            "legs.py: --inference-url with a hog, a restart or learning: each "
+            "acts on this host, not on the inference server's")
     if ((wants_hog or args.hog_event) and not args.gpu_total_mb
             and measured_total_mb is None):
         # Scaling or bounding a figure by another machine's total is a
