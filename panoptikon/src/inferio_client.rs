@@ -2188,6 +2188,18 @@ pub(crate) mod tests {
         InferenceInput::new(serde_json::json!({"text": text}), None)
     }
 
+    /// Drops the runtimes of the endpoints at `addr`, over either scheme. The
+    /// caller holds `addr` bound, so they belonged to a server that is gone.
+    pub(crate) fn forget_endpoint(addr: SocketAddr) {
+        let at = format!("://{addr}/");
+        if let Some(registry) = ENDPOINTS.get() {
+            registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|url, _| !url.contains(&at));
+        }
+    }
+
     /// Held by the tests that open many sockets and by the one that bounds
     /// this process's descriptor growth, which the others would push over.
     static SOCKET_HEAVY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2281,7 +2293,7 @@ pub(crate) mod tests {
                     },
                 ),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             // The product's own serve loop, so the stream limit under test is
@@ -2473,7 +2485,7 @@ pub(crate) mod tests {
         config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
         let backend = backend.trim_start_matches("http://").to_owned();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let addr = listener.local_addr().unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&accepted);
@@ -2586,7 +2598,7 @@ pub(crate) mod tests {
         }
 
         let backend = backend.trim_start_matches("http://").to_owned();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((front, _)) = listener.accept().await {
@@ -3008,7 +3020,7 @@ pub(crate) mod tests {
     async fn spawn_raw_peer(kind: RawPeer) -> SocketAddr {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let mut held = Vec::new();
@@ -3181,7 +3193,7 @@ pub(crate) mod tests {
         );
 
         // This binary's own inference client, whose preface comes first.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let peer = listener.local_addr().unwrap();
         let client =
             InferenceApiClient::new_with_metadata_cache(format!("http://{peer}"), false).unwrap();
@@ -3223,7 +3235,7 @@ pub(crate) mod tests {
                 }),
             )
             .route("/api/inference/metadata", get(|| async { Json(json!({})) }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             crate::serve_with_stream_limit(listener, app, std::future::pending()).await
@@ -3351,7 +3363,7 @@ pub(crate) mod tests {
     async fn spawn_slow_peer() -> (SocketAddr, Arc<AtomicUsize>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&seen);
@@ -3443,7 +3455,7 @@ pub(crate) mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             crate::serve_with_stream_limit(listener, app, std::future::pending()).await
@@ -3629,7 +3641,7 @@ pub(crate) mod tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             crate::serve_with_stream_limit(listener, app, std::future::pending()).await
@@ -3855,7 +3867,7 @@ pub(crate) mod tests {
                     axum::body::Body::from_stream(head.chain(lost))
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             crate::serve_with_stream_limit(listener, app, std::future::pending()).await
@@ -3936,7 +3948,7 @@ pub(crate) mod tests {
                 "/broken/api/inference/external-inputs",
                 get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -3982,7 +3994,7 @@ pub(crate) mod tests {
                 "/api/inference/load/{group}/{id}",
                 axum::routing::put(sink(&captured, json!({"status": "loaded"}))),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();

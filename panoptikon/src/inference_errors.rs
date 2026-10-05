@@ -139,7 +139,7 @@ mod tests {
     use axum::{Router, routing::get};
 
     async fn serve(app: Router) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -211,7 +211,7 @@ mod tests {
     /// handshake inside the TLS library, like an untrusted certificate does.
     #[tokio::test]
     async fn a_failed_handshake_is_a_tls_failure() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};

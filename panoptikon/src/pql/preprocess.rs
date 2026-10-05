@@ -1381,7 +1381,7 @@ mod inference_error_tests {
     async fn a_refused_embed_is_a_502_from_the_entry_point() {
         use axum::Router;
         let app = Router::new().fallback(|| async { StatusCode::FORBIDDEN });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();

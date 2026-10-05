@@ -3033,7 +3033,7 @@ mod tests {
                     }
                 }),
             );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = crate::test_utils::loopback_listener().await;
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move {
                 crate::serve_with_stream_limit(listener, app, std::future::pending()).await
@@ -4089,7 +4089,7 @@ mod tests {
     async fn refused_model_metadata_is_a_502_naming_the_server() {
         use axum::response::IntoResponse;
         let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::FORBIDDEN });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::test_utils::loopback_listener().await;
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();

@@ -114,6 +114,16 @@ pub(crate) async fn closed_port() -> std::net::SocketAddr {
     addr
 }
 
+/// A listener on an ephemeral loopback port, for a server an inference client
+/// is built for. The port may be one an earlier test's server held, so the
+/// endpoint state this process keeps per URL is dropped for it: a client for
+/// it starts as a client for a new server does.
+pub(crate) async fn loopback_listener() -> tokio::net::TcpListener {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    crate::inferio_client::tests::forget_endpoint(listener.local_addr().unwrap());
+    listener
+}
+
 /// Replaces `path` with a new file (a new inode, so a descriptor some child
 /// inherited on the old one does not matter) holding `contents`, executable.
 /// A child process writes it, so this process never holds a write descriptor

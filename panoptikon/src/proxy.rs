@@ -1332,7 +1332,7 @@ allow = "*"
     /// its clients, and the ones dialing it live here.
     #[tokio::test]
     async fn the_proxied_health_report_carries_this_gateways_clients() {
-        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_listener = crate::test_utils::loopback_listener().await;
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let upstream_app = axum::Router::new()
             .route(
@@ -1391,7 +1391,7 @@ allow = "*"
     async fn the_proxied_health_report_does_not_wait_on_a_frozen_server() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let answers = Arc::new(AtomicBool::new(false));
-        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_listener = crate::test_utils::loopback_listener().await;
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let health = {
             let answers = Arc::clone(&answers);

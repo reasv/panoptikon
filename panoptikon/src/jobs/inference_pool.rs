@@ -275,7 +275,7 @@ mod tests {
     async fn a_kept_load_error_names_its_endpoint() {
         async fn spawn(status: StatusCode) -> String {
             let app = Router::new().fallback(move || async move { status });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = crate::test_utils::loopback_listener().await;
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
@@ -315,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn a_cooldown_survives_a_plainer_failure_on_another_endpoint() {
         async fn spawn(handler: Router) -> String {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = crate::test_utils::loopback_listener().await;
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move {
                 axum::serve(listener, handler).await.unwrap();
