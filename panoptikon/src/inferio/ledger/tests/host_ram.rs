@@ -1088,8 +1088,10 @@ fn a_batch_in_memory_its_window_kept_is_dropped() {
 
 /// Seeded runs of short and full windows, with other processes' usage moving,
 /// under a worker that keeps what it peaked at from its first batch on, or
-/// only its start-up: once the cost is measured, no grant books less than
-/// its batch will add to the resident set.
+/// only its start-up: once the cost is measured, the replica's charge on the
+/// CPU device covers its batch's peak (the booking covers the peak over the
+/// load level, or the batch runs in memory the worker kept), and before that
+/// no window runs more than twice the largest batch run, or one seed batch.
 #[test]
 fn a_retaining_worker_is_never_under_booked() {
     use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -1098,7 +1100,7 @@ fn a_retaining_worker_is_never_under_booked() {
         let ledger = host(&[GPU], None);
         let (handle, admission) = cold_gpu_replica(&ledger, &model, GPU, item_cost(16));
         let mut rng = StdRng::seed_from_u64(seed);
-        let mut kept = 0;
+        let (mut kept, mut largest) = (0, 0);
         for window in 0..40 {
             let others: u64 = rng.random_range(5_000..25_000);
             ledger.record_free_for_test(
@@ -1110,13 +1112,16 @@ fn a_retaining_worker_is_never_under_booked() {
                 .expect("granted");
             let units = token.grant().unit_budget;
             let booked = row(&ledger, &model).ram_booked_mb;
-            let need = (RETAINED_INIT_MB + RETAINED_PER_UNIT_MB * units).saturating_sub(kept);
+            let peak = kept.max(RETAINED_INIT_MB + RETAINED_PER_UNIT_MB * units);
+            let case = format!("seed {seed}, retain {retain}, window {window}: {units} units");
             if booked > 0 {
+                let charged = cpu_row(&ledger).charges_mb;
                 assert!(
-                    booked >= need,
-                    "seed {seed}, retain {retain}, window {window}: {units} units \
-                     booked at {booked} MiB, need {need}"
+                    charged >= RSS_AT_LOAD_MB + peak,
+                    "{case} booked at {booked} MiB, charged {charged}, peak {peak}"
                 );
+            } else {
+                assert!(units <= (2 * largest).clamp(1, 16), "{case} unbooked");
             }
             drop(token);
             let run = if rng.random_bool(0.4) {
@@ -1124,7 +1129,8 @@ fn a_retaining_worker_is_never_under_booked() {
             } else {
                 units
             };
-            retained_window(&handle, &admission, run, &mut kept, retain);
+            let grant = retained_window(&handle, &admission, run, &mut kept, retain);
+            largest = largest.max(run.min(grant.unit_budget));
         }
     }
 }
