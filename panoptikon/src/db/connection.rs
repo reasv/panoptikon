@@ -307,37 +307,65 @@ async fn acquire_read_conn(
             let pool = build_read_pool(&paths, attach_user_data).await?;
             let mut pools = read_pools().lock().expect("read pool registry poisoned");
             // A concurrent request may have raced us here; keep the first pool.
-            pools.entry(key).or_insert(pool).clone()
+            pools.entry(key.clone()).or_insert(pool).clone()
         }
     };
 
-    pool.acquire().await.map_err(|err| {
-        tracing::error!(error = %err, "failed to acquire read connection");
-        let paths = db_paths_unchecked(&names.index_db, &names.user_data_db);
-        log_open_problem(&paths, attach_user_data);
-        ApiError::internal("Failed to open database")
-    })
+    match pool.acquire().await {
+        Ok(conn) => Ok(conn),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to acquire read connection");
+            // A pool whose connections are all busy times out the same way;
+            // only a database that cannot be opened drops it.
+            let paths = db_paths_unchecked(&names.index_db, &names.user_data_db);
+            if probe_read_conn(&paths, attach_user_data).await.is_err() {
+                let mut pools = read_pools().lock().expect("read pool registry poisoned");
+                pools.remove(&key);
+            }
+            Err(ApiError::internal("Failed to open database"))
+        }
+    }
 }
 
-async fn build_read_pool(paths: &DbPaths, attach_user_data: bool) -> Result<SqlitePool, ApiError> {
-    ensure_sqlite_extensions()?;
+/// The pool's connect options, storage path and user-data attach path.
+fn read_conn_parts(
+    paths: &DbPaths,
+    attach_user_data: bool,
+) -> (SqliteConnectOptions, String, Option<String>) {
     let options = SqliteConnectOptions::new()
         .filename(&paths.index_db_file)
         .read_only(true);
     let storage_path = paths.storage_db_file.to_string_lossy().to_string();
     let user_data_path = attach_user_data.then(|| user_data_attach_path(&paths.user_db_file, true));
+    (options, storage_path, user_data_path)
+}
 
-    // The pool retries a failing connection setup until its acquire timeout
-    // (30 s), so a database that cannot be opened is refused here, at once.
+/// Opens one read connection as the pool does. The pool retries a failing
+/// connection setup until its acquire timeout (30 s), so this is what tells
+/// at once that a database cannot be opened.
+async fn probe_read_conn(paths: &DbPaths, attach_user_data: bool) -> Result<(), ApiError> {
+    let (options, storage_path, user_data_path) = read_conn_parts(paths, attach_user_data);
     let opened = async {
         let mut conn = SqliteConnection::connect_with(&options).await?;
-        setup_read_conn(&mut conn, storage_path.clone(), user_data_path.clone()).await
+        setup_read_conn(&mut conn, storage_path, user_data_path).await
     };
-    if let Err(err) = opened.await {
-        tracing::error!(error = %err, "failed to open read connection");
-        log_open_problem(paths, attach_user_data);
-        return Err(ApiError::internal("Failed to open database"));
+    match opened.await {
+        Ok(()) => {
+            log_open_success(paths, attach_user_data);
+            Ok(())
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "failed to open read connection");
+            log_open_problem(paths, attach_user_data);
+            Err(ApiError::internal("Failed to open database"))
+        }
     }
+}
+
+async fn build_read_pool(paths: &DbPaths, attach_user_data: bool) -> Result<SqlitePool, ApiError> {
+    ensure_sqlite_extensions()?;
+    probe_read_conn(paths, attach_user_data).await?;
+    let (options, storage_path, user_data_path) = read_conn_parts(paths, attach_user_data);
     let pool = SqlitePoolOptions::new()
         .max_connections(READ_POOL_MAX_CONNECTIONS)
         .min_connections(0)
@@ -644,32 +672,53 @@ async fn connect_db(
     attach_user_data: bool,
 ) -> Result<SqliteConnection, ApiError> {
     let conn = open_db(paths, write_lock, user_data_wl, attach_user_data).await;
-    if conn.is_err() {
-        log_open_problem(paths, attach_user_data);
+    match conn {
+        Ok(_) => log_open_success(paths, attach_user_data),
+        Err(_) => log_open_problem(paths, attach_user_data),
     }
     conn
 }
 
-/// Logs, once per cause for the life of the process, why a database in
-/// `paths` cannot be written: another user owns it or its filesystem is
-/// read-only. The user-data file is checked only when it was attached.
-fn log_open_problem(paths: &DbPaths, attach_user_data: bool) {
-    static LOGGED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// The database files whose open problem was logged and that have not been
+/// opened since.
+static OPEN_PROBLEMS: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// The files an open of `paths` opens: the user-data file only when attached.
+fn opened_files(paths: &DbPaths, attach_user_data: bool) -> impl Iterator<Item = &PathBuf> {
     let user_db_file = attach_user_data.then_some(&paths.user_db_file);
     let files = [
         Some(&paths.index_db_file),
         Some(&paths.storage_db_file),
         user_db_file,
     ];
-    let Some(reason) = files.into_iter().flatten().find_map(|file| {
+    files.into_iter().flatten()
+}
+
+/// Logs why a database in `paths` cannot be written: another user owns it or
+/// its filesystem is read-only. Logged once per database file until an open
+/// of it succeeds.
+fn log_open_problem(paths: &DbPaths, attach_user_data: bool) {
+    let Some((file, reason)) = opened_files(paths, attach_user_data).find_map(|file| {
         let name = file.file_name()?.to_str()?;
-        crate::ownership::database_problem(file.parent()?, name)
+        Some((
+            file,
+            crate::ownership::database_problem(file.parent()?, name)?,
+        ))
     }) else {
         return;
     };
-    let mut logged = LOGGED.lock().unwrap_or_else(|err| err.into_inner());
-    if logged.insert(reason.clone()) {
+    let mut logged = OPEN_PROBLEMS.lock().unwrap_or_else(|err| err.into_inner());
+    if logged.insert(file.clone()) {
         tracing::warn!(reason, "cannot open a database");
+    }
+}
+
+/// After an open of `paths` succeeds, a problem with its files is logged
+/// again.
+fn log_open_success(paths: &DbPaths, attach_user_data: bool) {
+    let mut logged = OPEN_PROBLEMS.lock().unwrap_or_else(|err| err.into_inner());
+    for file in opened_files(paths, attach_user_data) {
+        logged.remove(file);
     }
 }
 
@@ -915,12 +964,13 @@ mod tests {
     }
 
     /// A database that cannot be opened fails a request at once, and each
-    /// folder another user owns is logged once, naming the folder and its
-    /// owner.
+    /// folder another user owns is logged once until an open of it succeeds,
+    /// naming the folder and its owner. A cached read pool for it is dropped.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_database_that_cannot_be_opened_fails_at_once_and_names_the_owner() {
         use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        use std::os::unix::fs::symlink;
         let env = crate::test_utils::test_data_dir();
         let folder = env.path().join("index/index_only");
         fs::create_dir_all(&folder).unwrap();
@@ -940,32 +990,95 @@ mod tests {
         let Some((foreign, owner)) = foreign_folder(false) else {
             return;
         };
-        let link = env.path().join("index/foreign_owned");
-        let read_link = env.path().join("index/foreign_read");
-        std::os::unix::fs::symlink(foreign, &link).unwrap();
-        std::os::unix::fs::symlink(foreign, &read_link).unwrap();
+        let names = |index_db: &str| {
+            resolve_db_names_unchecked(&DbQuery {
+                index_db: Some(index_db.to_owned()),
+                user_data_db: None,
+            })
+        };
+        let [link, read_link, pool_link] = ["foreign_owned", "foreign_read", "foreign_pool"]
+            .map(|name| env.path().join("index").join(name));
+        for link in [&link, &read_link, &pool_link] {
+            symlink(foreign, link).unwrap();
+        }
         let (_guard, reasons) = crate::test_utils::warned_reasons();
         let no_names = DbQuery {
             index_db: None,
             user_data_db: None,
         };
-        let read_names = resolve_db_names_unchecked(&DbQuery {
-            index_db: Some("foreign_read".to_owned()),
-            user_data_db: None,
-        });
-        let read = acquire_read_conn(&no_names, &read_names, false).await;
-        let mut opened = Vec::new();
-        for _ in 0..2 {
-            opened.push(open_index_db_write_no_user_data("foreign_owned").await);
+        let read = acquire_read_conn(&no_names, &names("foreign_read"), false).await;
+        let open = || open_index_db_write_no_user_data("foreign_owned");
+        let mut failed = vec![read.is_err(), open().await.is_err(), open().await.is_err()];
+        let opened = |opens: bool| {
+            if opens {
+                fs::remove_file(&link).unwrap();
+                fs::create_dir(&link).unwrap();
+                for db in ["index.db", "storage.db"] {
+                    fs::write(link.join(db), "").unwrap();
+                }
+            } else {
+                fs::remove_dir_all(&link).unwrap();
+                symlink(foreign, &link).unwrap();
+            }
+        };
+        opened(true);
+        let pooled = acquire_read_conn(&no_names, &names("foreign_owned"), false).await;
+        drop(pooled.unwrap());
+        opened(false);
+        failed.push(open().await.is_err());
+        opened(true);
+        assert!(open().await.is_ok());
+        opened(false);
+        failed.push(open().await.is_err());
+
+        let key = ("foreign_pool".to_owned(), String::new(), false);
+        let pool = SqlitePoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy_with(SqliteConnectOptions::new().filename(pool_link.join("index.db")));
+        read_pools().lock().unwrap().insert(key.clone(), pool);
+        let pooled = acquire_read_conn(&no_names, &names("foreign_pool"), false).await;
+        failed.push(pooled.is_err());
+        let dropped = !read_pools().lock().unwrap().contains_key(&key);
+        read_pools()
+            .lock()
+            .unwrap()
+            .remove(&("foreign_owned".to_owned(), String::new(), false));
+        for link in [&link, &read_link, &pool_link] {
+            fs::remove_file(link).unwrap();
         }
-        fs::remove_file(&link).unwrap();
-        fs::remove_file(&read_link).unwrap();
-        assert!(read.is_err() && opened.iter().all(Result::is_err));
-        let expected = [
-            Some(owned_by_another_user(&read_link, owner, foreign)),
-            Some(owned_by_another_user(&link, owner, foreign)),
-        ];
+        assert!(failed.iter().all(|failed| *failed) && dropped, "{failed:?}");
+        let [read, write, pool] = [&read_link, &link, &pool_link]
+            .map(|link| Some(owned_by_another_user(link, owner, foreign)));
+        let expected = [read, write.clone(), write.clone(), write, pool];
         assert_eq!(*reasons.lock().unwrap(), expected);
+    }
+
+    /// A read pool whose connections are all busy times out and is kept.
+    #[tokio::test]
+    async fn a_read_pool_that_is_busy_is_kept() {
+        let env = crate::test_utils::test_data_dir();
+        let folder = env.path().join("index/busy_pool");
+        fs::create_dir_all(&folder).unwrap();
+        for db in ["index.db", "storage.db"] {
+            fs::write(folder.join(db), "").unwrap();
+        }
+        let query = DbQuery {
+            index_db: Some("busy_pool".to_owned()),
+            user_data_db: None,
+        };
+        let names = resolve_db_names_unchecked(&query);
+        let key = ("busy_pool".to_owned(), String::new(), false);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy_with(SqliteConnectOptions::new().filename(folder.join("index.db")));
+        let held = pool.acquire().await.unwrap();
+        read_pools().lock().unwrap().insert(key.clone(), pool);
+        let busy = acquire_read_conn(&query, &names, false).await;
+        let kept = read_pools().lock().unwrap().remove(&key).is_some();
+        drop(held);
+        fs::remove_dir_all(&folder).unwrap();
+        assert!(busy.is_err() && kept);
     }
 
     /// Pins the `UserDataWrite` connection shape: index (`main`) and
