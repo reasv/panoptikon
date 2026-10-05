@@ -924,8 +924,8 @@ fn no_size_books_less_than_a_smaller_batch_measured() {
 /// as well, also where the fit's fixed part is negative and taken as 0. Up
 /// to twice the largest, each unit books at most the costliest growth per
 /// unit among the batches near the largest, counted beyond the first
-/// batch's units when that batch kept memory (or the slope, if higher), with
-/// one unit for rounding: what the first batch kept is not priced per unit.
+/// batch's units when that batch kept memory (or the slope, if higher): what
+/// the first batch kept is not priced per unit.
 #[test]
 fn the_booking_never_falls_as_the_batch_grows() {
     for (pairs, first_units, kept) in [
@@ -952,7 +952,7 @@ fn the_booking_never_falls_as_the_batch_grows() {
             .fold(cost.slope_mb_per_unit, f64::max);
         for units in cost.measured_units + 1..=cost.fitted_reach() {
             assert!(
-                cost.booking_mb(units) as f64 <= costliest * (units + 1) as f64,
+                cost.booking_mb(units) as f64 <= costliest * units as f64 + 1.0,
                 "{pairs:?}, kept {kept}: {units} units"
             );
         }
