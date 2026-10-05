@@ -217,13 +217,15 @@ def _numbered(root: str) -> List[int]:
 
 
 def _drm_fdinfo(roots: Roots, pid: int) -> Optional[List[str]]:
-    """The fdinfo text of every `/dev/dri/*` descriptor this PID holds, or
-    None when its descriptors may not be read (another user's process, without
-    CAP_SYS_PTRACE). A PID that exits meanwhile holds nothing."""
+    """The fdinfo text of every `/dev/dri/*` descriptor this PID holds,
+    highest-numbered first, or None when its descriptors may not be read
+    (another user's process, without CAP_SYS_PTRACE). A PID that exits
+    meanwhile holds nothing."""
     base = os.path.join(roots.proc, str(pid))
     texts = []
     try:
-        for fd in sorted(os.listdir(os.path.join(base, "fd")), key=int):
+        for fd in sorted(os.listdir(os.path.join(base, "fd")), key=int,
+                         reverse=True):
             try:
                 if not os.readlink(os.path.join(base, "fd", fd)).startswith("/dev/dri/"):
                     continue
@@ -287,12 +289,13 @@ def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = N
 
     KFD's counter where a PID can be tied to its KFD entry: by PID in the
     initial PID namespace, else by the `pasid:` of the PID's DRM fdinfo, which
-    KFD sets to its own PASID for that process. A unified GPU is read from
-    fdinfo (KFD counts VRAM only, not GTT). When PIDs are matched by PASID, so
-    is a GPU where a PID holding memory has no KFD entry, and each PID takes
-    its first PASID whose KFD entry no lower PID took, so an entry two PIDs
-    reach (a descriptor inherited across fork carries the parent's PASID) is
-    credited once, to the lower PID.
+    KFD sets to its own PASID for that process. A unified GPU, or one without
+    a KFD `gpu_id`, is read from fdinfo (KFD counts VRAM only, not GTT), as is,
+    when PIDs are matched by PASID, a GPU where a PID holding memory has no KFD
+    entry. PIDs are taken in ascending order, and each takes the PASID of its
+    highest-numbered descriptor whose KFD entry no lower PID took. A descriptor
+    inherited across fork carries the parent's PASID and a lower number than
+    the child's own, so an entry two PIDs reach is credited once.
     """
     kfd_root = os.path.join(roots.kfd, "proc")
     kfd_present = os.path.isdir(kfd_root)

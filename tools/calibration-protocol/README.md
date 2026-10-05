@@ -64,7 +64,8 @@ one batch of `--batch` items priced by the worker's own
 `peak_reserved_mb` and `duration_ms`; then what `empty_cache()` returned. It
 ends with a `VERDICT:` line naming the degraded tiers, exits 0 either way
 (degraded is a fact about the platform, not an error) and prints the device's
-free memory after teardown, because it must never leave the GPU allocated.
+free memory after teardown, which on a discrete amdgpu GPU is reread until it
+holds for 2 s (at most 10 s), because it must never leave the GPU allocated.
 
 It needs no corpus: without `--corpus` the batch's images are synthesised with
 Pillow, so it runs on a machine that has never generated one. Pass `--corpus`
