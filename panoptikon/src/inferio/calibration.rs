@@ -2457,7 +2457,7 @@ sample_delta_mb = [80, 160]
     #[cfg(unix)]
     #[test]
     fn a_store_folder_another_user_owns_is_warned_about_once() {
-        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        use crate::ownership::tests::{foreign_folder, not_writable_by_current_user};
         use std::os::unix::fs::{PermissionsExt as _, symlink};
         let Some((folder, owner)) = foreign_folder(false) else {
             return;
@@ -2499,7 +2499,7 @@ sample_delta_mb = [80, 160]
         store.record(update("clip/vit", "fp16", 1.1));
         let reasons = reasons.lock().unwrap();
         let share = data.join("share");
-        let expected = Some(owned_by_another_user(&share, owner, &share));
+        let expected = Some(not_writable_by_current_user(&share, owner));
         assert_eq!(reasons[..2], [expected.clone(), expected]);
         assert_eq!(reasons.len(), 3);
         assert_ne!(reasons[2], reasons[1]);

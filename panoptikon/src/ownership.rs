@@ -84,7 +84,8 @@ fn migration_paths(err: &anyhow::Error) -> Vec<PathBuf> {
 /// another user owns it or because its filesystem is read-only; `err`
 /// unchanged without one. In the first case the folder whose owner to change
 /// is `tree` (the data folder for a migration), or the target of a symlink
-/// at or below it (`chown_target`); a path outside `tree` names none.
+/// at or below it (`chown_target`); a path outside `tree`, or a folder to
+/// change that is `/`, names none.
 pub(crate) fn explain(err: anyhow::Error, tree: &Path, paths: &[PathBuf]) -> anyhow::Error {
     #[cfg(unix)]
     {
@@ -137,17 +138,15 @@ pub(crate) fn explain_create(err: anyhow::Error, tree: &Path, path: &Path) -> an
 
 /// Why `path` cannot be created or replaced, if it cannot: what [`explain`]
 /// would add over `path` and the folder it is created in, its nearest
-/// existing ancestor. That folder replaces `tree` when it lies above it.
+/// existing ancestor.
 pub(crate) fn create_problem(tree: &Path, path: &Path) -> Option<String> {
-    let (tree, paths) = create_paths(&absolute(tree), &absolute(path))?;
-    reason(&tree, &paths, true)
+    let paths = create_paths(&absolute(path))?;
+    reason(&absolute(tree), &paths, true)
 }
 
-fn create_paths(tree: &Path, path: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
+fn create_paths(path: &Path) -> Option<Vec<PathBuf>> {
     let folder = path.ancestors().skip(1).find(|folder| folder.is_dir())?;
-    let tree = Some(tree).filter(|tree| folder.starts_with(tree));
-    let paths = vec![path.to_path_buf(), folder.to_path_buf()];
-    Some((tree.unwrap_or(folder).to_path_buf(), paths))
+    Some(vec![path.to_path_buf(), folder.to_path_buf()])
 }
 
 /// Why a database kept in a `folder` of its own cannot be written, if it
@@ -276,14 +275,16 @@ mod unix {
                      (uid {uid})",
                     path.display()
                 );
-                // Outside `tree` there is no folder known to hand over.
-                if !path.starts_with(tree) {
+                let target = chown_target(tree, path);
+                // Outside `tree` there is no folder known to hand over, and
+                // `/` is never one.
+                if !path.starts_with(tree) || tree.parent().is_none() || target.parent().is_none() {
                     return Some(fact);
                 }
                 Some(format!(
                     "{fact}; run as uid {owner}, or change the owner of '{}' and \
                      everything in it to uid {uid}",
-                    chown_target(tree, path).display()
+                    target.display()
                 ))
             }
             Access::ReadOnly if read_only_too => {
@@ -367,6 +368,12 @@ pub(crate) mod tests {
     pub(crate) fn owned_by_another_user(path: &Path, owner: u32, tree: &Path) -> String {
         // SAFETY: geteuid has no preconditions and cannot fail.
         owned_by(path, owner, unsafe { libc::geteuid() }, tree)
+    }
+
+    /// [`not_writable`] for the current user, with no folder to hand over.
+    pub(crate) fn not_writable_by_current_user(path: &Path, owner: u32) -> String {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        not_writable(path, owner, unsafe { libc::geteuid() })
     }
 
     /// The message for `path`, owned by `owner` and not writable by `uid`.
@@ -702,21 +709,28 @@ pub(crate) mod tests {
     }
 
     /// A file that cannot be created or replaced is explained by itself or
-    /// by the nearest folder that exists, which is also the folder to hand
-    /// over when it lies above the tree.
+    /// by the nearest folder that exists. Outside the tree, with `/` as the
+    /// tree, or through a link to `/`, only the fact is given.
     #[test]
     fn a_file_is_explained_by_itself_or_the_folder_it_is_created_in() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
         std::fs::create_dir_all(root.join("conf/old")).unwrap();
         std::fs::write(root.join("conf/old/a.toml"), b"").unwrap();
-        for (tree, path, owned, target) in [
-            ("", "conf/old/a.toml", "conf/old/a.toml", Some("")),
-            ("", "conf/old/b.toml", "conf/old", Some("")),
-            ("", "conf/old/b.toml", "conf", None),
-            ("", "conf/old", "conf", Some("")),
-            ("", "conf/new/b.toml", "conf", Some("")),
-            ("conf/new", "conf/new/b.toml", "conf", Some("conf")),
+        std::os::unix::fs::symlink("/", root.join("up")).unwrap();
+        std::os::unix::fs::symlink(root.join("conf"), root.join("link")).unwrap();
+        let new = root.join("conf/new");
+        // `advice`: `None` for no reason, else whether a folder to hand over
+        // is named.
+        for (tree, path, owned, advice) in [
+            (root, "conf/old/a.toml", "conf/old/a.toml", Some(true)),
+            (root, "conf/old/b.toml", "conf/old", Some(true)),
+            (root, "conf/old/b.toml", "conf", None),
+            (root, "conf/old", "conf", Some(true)),
+            (root, "conf/new/b.toml", "conf", Some(true)),
+            (&new, "conf/new/b.toml", "conf", Some(false)),
+            (Path::new("/"), "link/b.toml", "link", Some(false)),
+            (root, "up/b.toml", "up/b.toml", Some(false)),
         ] {
             let owned = root.join(owned);
             let access = |path: &Path| {
@@ -726,9 +740,15 @@ pub(crate) mod tests {
                     Access::Writable
                 }
             };
-            let (tree, paths) = create_paths(&root.join(tree), &root.join(path)).unwrap();
-            let expected = target.map(|target| owned_by(&owned, 0, 1000, &root.join(target)));
-            let reason = unix::reason(&tree, &paths, true, 1000, access);
+            let expected = advice.map(|advice| {
+                if advice {
+                    owned_by(&owned, 0, 1000, root)
+                } else {
+                    not_writable(&owned, 0, 1000)
+                }
+            });
+            let paths = create_paths(&root.join(path)).unwrap();
+            let reason = unix::reason(tree, &paths, true, 1000, access);
             assert_eq!(reason, expected, "{path}");
         }
     }

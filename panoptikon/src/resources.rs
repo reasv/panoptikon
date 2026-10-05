@@ -309,8 +309,7 @@ fn marker_matches(dest: &Path, hash: &str) -> bool {
 /// marker or is fair game to be replaced (stale version content, partial
 /// state from a meddled-with dir). Returns `true` when a fresh extraction
 /// happened. A failure names another user owning, or a read-only filesystem
-/// holding, `dest` or the folder it is made in; the folder whose owner to
-/// change is the server root (the working directory).
+/// holding, `dest` or the folder it is made in.
 #[cfg(any(feature = "bundled", feature = "bundled-ui", test))]
 pub(crate) fn ensure_extracted_archive(archive_gz: &[u8], dest: &Path, what: &str) -> Result<bool> {
     extract_archive(archive_gz, dest, what)
@@ -682,11 +681,14 @@ mod tests {
     }
 
     /// An extraction or a config dump into a folder another user owns names
-    /// the folder and its owner above the failure.
+    /// the folder and its owner above the failure; outside the server root
+    /// (the working directory for an extraction) no folder to hand over.
     #[cfg(unix)]
     #[test]
     fn a_folder_another_user_owns_is_named() {
-        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        use crate::ownership::tests::{
+            foreign_folder, not_writable_by_current_user, owned_by_another_user,
+        };
         let Some((folder, owner)) = foreign_folder(false) else {
             return;
         };
@@ -700,10 +702,11 @@ mod tests {
         let archive = tar_gz(&[("a.txt", "")]);
         let error = ensure_extracted_archive(&archive, &share.join("pysrc/1.0.0"), "test set");
         let error = format!("{:#}", error.unwrap_err());
-        let expected = owned_by_another_user(&share, owner, &share);
-        assert!(error.starts_with(&expected), "{error}");
+        let expected = not_writable_by_current_user(&share, owner);
+        assert!(error.starts_with(&format!("{expected}: ")), "{error}");
         #[cfg(feature = "bundled")]
         {
+            let expected = owned_by_another_user(&share, owner, &share);
             let error = format!("{:#}", write_default_configs_in(&share).unwrap_err());
             assert!(error.starts_with(&expected), "{error}");
         }
