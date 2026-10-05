@@ -160,6 +160,17 @@ unsafe fn install_ask_every_event() {
     tracing::subscriber::set_global_default(subscriber).expect("no global subscriber yet");
 }
 
+/// Turns transparent huge pages off for the test process and every child it
+/// spawns (the setting survives fork and exec). x264 asks for huge pages, and
+/// on a host with fragmented memory each request waits on compaction: a
+/// fixture encode that takes 0.4 s then takes 30 s or more.
+// SAFETY: runs before `main`; the prctl only sets a flag on this process.
+#[cfg(target_os = "linux")]
+#[ctor::ctor]
+unsafe fn disable_transparent_huge_pages() {
+    unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+}
+
 struct AskEveryEvent;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AskEveryEvent {
