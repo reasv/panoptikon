@@ -84,8 +84,8 @@ fn migration_paths(err: &anyhow::Error) -> Vec<PathBuf> {
 /// another user owns it or because its filesystem is read-only; `err`
 /// unchanged without one. In the first case the folder whose owner to change
 /// is `tree` (the data folder for a migration), or the target of a symlink
-/// at or below it (`chown_target`); a path outside `tree`, or a folder to
-/// change that is `/`, names none.
+/// at or below it (`chown_target`); a path outside `tree`, or a `tree` or
+/// folder to change that is `/`, names none.
 pub(crate) fn explain(err: anyhow::Error, tree: &Path, paths: &[PathBuf]) -> anyhow::Error {
     #[cfg(unix)]
     {
