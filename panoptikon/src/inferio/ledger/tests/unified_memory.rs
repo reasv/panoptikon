@@ -1790,6 +1790,7 @@ fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() 
         .expect("granted");
     assert_eq!(token.grant().unit_budget, 64);
     token.finish(WindowOutcome::WorkerDied);
+    drop(admission);
     let handle = loaded_mps(Some(MAC_TOTAL_MB));
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
