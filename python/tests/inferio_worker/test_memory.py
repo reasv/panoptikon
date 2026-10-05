@@ -2293,14 +2293,8 @@ def test_a_deep_mps_window_does_not_ratchet_the_next_batchs_fit_sample() -> None
 
 
 def test_the_mps_sampler_runs_on_mps_alone() -> None:
-    # CUDA has real peak counters, so only its host RAM is sampled. A
-    # CPU-priced host samples its RSS instead, even on a Mac whose torch has
+    # A CPU-priced host samples its RSS instead, even on a Mac whose torch has
     # MPS.
-    with isolated(fake_torch_module(FakeCuda())):
-        state = memory.begin_batch()
-        assert state["mps_sampler"] is None
-        assert state["rss_sampler"] is not None
-        memory.abandon_batch(state)
     with cpu_host(torch_module=fake_mps_torch_module(FakeMpsAllocator())):
         state = memory.begin_batch()
         assert state["mps_sampler"] is None
@@ -2449,8 +2443,9 @@ def test_a_cpu_batch_is_priced_on_its_own_rss_not_the_high_water() -> None:
 
 
 def test_the_rss_sampler_runs_on_cpu_and_gpu_workers_not_mps() -> None:
-    # MPS memory is RAM and samples its own; each host runs one sampler at
-    # most, and the bracket stops it.
+    # MPS memory is RAM and samples its own; CUDA has real peak counters, so
+    # only its host RAM is sampled. Each host runs one sampler at most, and
+    # the bracket stops it.
     with mps_host(40 * 1024):
         state = memory.begin_batch()
         assert state["rss_sampler"] is None
