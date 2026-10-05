@@ -560,8 +560,10 @@ server encodes must round-trip through it unchanged.
   additive; the string form is unchanged for every failure that had one.
 
 Additive query params: `max_batch` on predict (the dispatcher's per-request
-item cap) and `prewarm` on load and predict (the lazy-warm hint, absent =
-true). `GET /health` has no Python counterpart and lives on the nested
+item cap), `prewarm` on load and predict (the lazy-warm hint, absent =
+true) and `remaining_items` on predict (the items the caller's job has not
+finished, this request's included; a batch size probe starts only while they
+repay it). `GET /health` has no Python counterpart and lives on the nested
 router, with the bare `/health` path also kept in standalone mode.
 
 ### Constants

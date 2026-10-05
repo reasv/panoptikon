@@ -1635,7 +1635,7 @@
           {
             "name": "remaining_items",
             "in": "query",
-            "description": "Additive: items the caller has left to send after this request; a\nbatch size probe starts only while they repay it.",
+            "description": "Additive: the items the caller's job has not finished, this request's\nincluded; a batch size probe starts only while they repay it.",
             "required": false,
             "schema": {
               "type": "integer",

@@ -1449,7 +1449,7 @@ impl InferenceApiClient {
         if let Some(prewarm) = prewarm {
             query.push(("prewarm", prewarm.to_string()));
         }
-        // Items the caller has left to send after this request.
+        // The items the caller's job has not finished, this request's included.
         if let Some(items) = remaining_items {
             query.push(("remaining_items", items.to_string()));
         }

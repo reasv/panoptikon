@@ -425,8 +425,8 @@ struct PredictParams {
     max_batch: Option<u32>,
     /// Additive: lazy prewarm hint, as on load (absent = true).
     prewarm: Option<bool>,
-    /// Additive: items the caller has left to send after this request; a
-    /// batch size probe starts only while they repay it.
+    /// Additive: the items the caller's job has not finished, this request's
+    /// included; a batch size probe starts only while they repay it.
     remaining_items: Option<u64>,
 }
 

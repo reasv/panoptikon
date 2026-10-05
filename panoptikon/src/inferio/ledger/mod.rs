@@ -746,8 +746,8 @@ struct WorkerEntry {
     item_cap: Option<u32>,
     /// Items its job has left, when the caller says ([`Admission::note_remaining_items`]).
     remaining_items: Option<u64>,
-    /// Items settled since its queue last ran dry with no probe on: what its
-    /// job is taken to have left when the caller does not say.
+    /// Requests settled since its queue last ran dry with no probe on: what
+    /// its job is taken to have left when the caller does not say.
     items_since_dry: u64,
 }
 
