@@ -192,7 +192,8 @@ def reset_shrink_state() -> None:
 def note_trimmed() -> None:
     """Reset everything a completed `empty_cache()` invalidates; the throughput
     comparator is kept when the release returned less than
-    `SHRINK_BLIND_SLACK_MB`, which left the pool as it was."""
+    `SHRINK_BLIND_SLACK_MB`, too little to make the next batch's rate
+    incomparable."""
     released = memory.last_release()[0]
     if released is None or released >= SHRINK_BLIND_SLACK_MB:
         reset_comparator()
@@ -284,7 +285,8 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     if released is not None and released < SHRINK_BLIND_SLACK_MB:
         logger.debug(
             "released the %d MiB allocator pool against %d MiB of releasable "
-            "slack; it returned %d MiB, so the pool is unchanged",
+            "slack; it returned %d MiB, under 256 MiB, so the next batch's "
+            "rate stays comparable",
             reserved_mb,
             slack_mb,
             released,

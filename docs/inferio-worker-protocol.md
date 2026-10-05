@@ -1458,16 +1458,17 @@ residents"):
   release can leave its slack in the pool; after a release that left at
   least 256 MiB of its slack in the pool, or more than it returned, the rule
   does not count again for 30 s (the orchestrator's trim interval) unless the
-  slack grows 256 MiB past what it left. Another release, a trim or the
-  OOM-retry loop's, ends that wait. A shrink or trim release that returned
-  less than 256 MiB left the pool as it was: it keeps the throughput
-  comparator, and a shrink's does not flag `trimmed`. A **memory-blind**
-  window (`grant.mb` is `0`: the GPU had nothing left to price it against) is
-  the strongest squeeze there is and counts as one of the two, provided the
-  slack is worth returning (256 MiB) — without that clause a pool that has
-  itself consumed the card's headroom pins the card behind the zero-MB grants
-  its own size produced, and no later window is ever priced again. This only
-  ever fires in a worker that is *receiving* windows.
+  slack grows 256 MiB past what it left. A trim or the OOM-retry loop's
+  release ends that wait. A shrink or trim release that returned less than
+  256 MiB is too small to make the next batch's rate incomparable: it keeps
+  the throughput comparator, and a shrink's does not flag `trimmed`. A
+  **memory-blind** window (`grant.mb` is `0`: the GPU had nothing left to
+  price it against) is the strongest squeeze there is and counts as one of
+  the two, provided the slack is worth returning (256 MiB) — without that
+  clause a pool that has itself consumed the card's headroom pins the card
+  behind the zero-MB grants its own size produced, and no later window is
+  ever priced again. This only ever fires in a worker that is *receiving*
+  windows.
 - **Trim** is the orchestrator's, for a resident that is receiving none. An
   idle worker's retained pool squeezes its neighbours indefinitely and it will
   never notice, so the orchestrator sends it a `trim` request. It is a message
@@ -1483,9 +1484,10 @@ reload cost.
 Both events are **calibration opportunities**, not just hygiene: the batches
 that regrow the pool afterwards are high-water batches, which are the only
 ones the cost fit accepts. Both therefore also reset the worker's
-throughput-collapse comparator — a post-`empty_cache()` batch is legitimately
-slower than one on a warm pool, and comparing across the event would
-manufacture a spurious `throughput_collapse`.
+throughput-collapse comparator, unless the release returned under 256 MiB
+(above) — a post-`empty_cache()` batch is legitimately slower than one on a
+warm pool, and comparing across the event would manufacture a spurious
+`throughput_collapse`.
 
 The orchestrator sends `trim` only to a replica it believes is **idle** — no
 window in flight, no demand behind it, and none for the last few seconds — with
