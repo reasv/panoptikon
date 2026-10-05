@@ -788,9 +788,9 @@ impl Drop for Stalled<'_> {
     }
 }
 
-/// The check task's claim on `running`. Clears it when the task ends without
-/// clearing it itself, by a panic or dropped with its runtime, so a later
-/// stall can start checks again.
+/// The check task's claim on `running`. Clears it and the miss count when the
+/// task ends without clearing them itself, by a panic or dropped with its
+/// runtime, so a later stall starts checks again from no misses.
 struct ChecksRunning {
     endpoint: Arc<EndpointRuntime>,
     cleared: bool,
@@ -799,7 +799,9 @@ struct ChecksRunning {
 impl Drop for ChecksRunning {
     fn drop(&mut self) {
         if !self.cleared {
-            self.endpoint.health_checks.lock().running = false;
+            let mut state = self.endpoint.health_checks.lock();
+            state.running = false;
+            state.misses = 0;
         }
     }
 }
