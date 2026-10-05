@@ -1109,6 +1109,8 @@ struct Ingested {
     filled: bool,
     /// A batch grew the allocator pool; `None` without pool figures.
     grew_pool: Option<bool>,
+    /// The largest pool a batch left; `None` without pool figures.
+    pool_mb: Option<u64>,
     /// Samples that entered the throughput ring.
     throughput_samples: usize,
     /// Which kind of negative, for the log; all fold into `negative`.
@@ -1143,6 +1145,9 @@ struct PressureCap {
     regrow_to: u64,
     /// When the window that last halved `regrow_to` settled.
     halved_at: Option<Instant>,
+    /// The largest pool a paging window of the episode left: growth up to it
+    /// refills memory we held, and is not new memory.
+    pool_mb: Option<u64>,
 }
 
 /// What the local store holds of a (model, GPU), as far as the write policy

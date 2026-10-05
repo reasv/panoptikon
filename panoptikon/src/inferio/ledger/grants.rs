@@ -112,7 +112,7 @@ impl VramLedger {
         // The batch size, and what of it the window's content asks for. An
         // item cap (the user's included) limits the content like a short
         // queue: for a count-priced model it is a unit count.
-        let (size_asked, units_asked, capped, wanted, item_cap) = {
+        let (size_asked, units_asked, capped, wanted, content, item_cap) = {
             let entry = state.workers.get(&worker)?;
             let capped = Self::budget_locked(&state, entry, pressure);
             let item_cap = Self::item_cap_locked(&state, entry)
@@ -135,6 +135,7 @@ impl VramLedger {
                 units_asked,
                 capped,
                 capped.min(content.max(1)).max(1),
+                content,
                 item_cap,
             )
         };
@@ -263,6 +264,7 @@ impl VramLedger {
             let held = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
             ram_mb.saturating_sub(held)
         });
+        let memory_cut = unit_budget < wanted;
         let grant_id = state.next_id();
         state
             .workers
@@ -280,7 +282,7 @@ impl VramLedger {
                     units_asked,
                     granted_at,
                     squeezed,
-                    memory_cut: unit_budget < wanted,
+                    memory_cut,
                     room_bound,
                     peak_occupants: 0,
                     queue_bound,
@@ -320,9 +322,11 @@ impl VramLedger {
                 Self::pricing_fit_locked(&state, entry).is_none(),
             )
         });
-        // Once per model, device and paging episode.
+        // Once per model, device and paging episode, when the grant is below
+        // what the ramp and the queue ask without the pressure cap.
+        let asked = units_asked.min(content);
         let paging_cut = pressure.paging()
-            && unit_budget < wanted
+            && unit_budget < asked
             && issued.as_ref().is_some_and(|(model, ..)| {
                 state.paging_cut_warned.insert((model.clone(), gpu.clone()))
             });
@@ -368,9 +372,9 @@ impl VramLedger {
                     model = %model,
                     gpu = %gpu,
                     unit_budget,
-                    asked_units = wanted,
-                    "macOS is paging: this model's batches are cut to the \
-                     memory it holds until the pressure eases"
+                    asked_units = asked,
+                    "macOS has no memory to spare: this model's batches are \
+                     cut until the pressure eases"
                 );
             }
         }
@@ -555,8 +559,7 @@ impl VramLedger {
                     &mut state,
                     worker,
                     charge,
-                    ingested.filled,
-                    ingested.grew_pool,
+                    &ingested,
                     negative,
                     paged_at_grant,
                 );

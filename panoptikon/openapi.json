@@ -9144,7 +9144,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "How far `pressure_cap_units` may grow back while macOS reports\nmemory pressure without paging.",
+            "description": "How far `pressure_cap_units` may grow back while macOS reports\nmemory pressure without paging; caps `unit_budget` while the level is\nabove normal.",
             "minimum": 0
           },
           "ram_booked_mb": {

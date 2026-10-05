@@ -248,7 +248,8 @@ pub struct LedgerWorkerHealth {
     /// pressure; runtime-only.
     pub pressure_cap_units: Option<u64>,
     /// How far `pressure_cap_units` may grow back while macOS reports
-    /// memory pressure without paging.
+    /// memory pressure without paging; caps `unit_budget` while the level is
+    /// above normal.
     pub pressure_regrow_to_units: Option<u64>,
     /// Throughput observations held (all occupancies); runtime-only.
     pub throughput_samples: usize,

@@ -330,10 +330,12 @@ impl VramLedger {
     /// the bound to at most half its unit budget (at least 1); after that
     /// only such a window moves it. A batch began the paging when its window
     /// was granted before it, ran a batch at its budget (`ran_full`), and
-    /// grew our pool; without pool figures, when instead its unit budget was
-    /// at least the smaller of the bound and the size asked, and it was
-    /// granted after the last such window. So paging another program began
-    /// while our batches ran inside the pool they held leaves the bound.
+    /// grew our pool past the largest pool a paging window of the episode
+    /// left; on the CPU device, when instead its unit budget was at least
+    /// the smaller of the bound and the size asked, and it was granted after
+    /// the last such window. So paging another program began while our
+    /// batches ran inside the pool they held, or refilled it, leaves the
+    /// bound.
     ///
     /// Otherwise a clean window that ran full doubles the cap: above normal up
     /// to that bound, at normal until it reaches the batch size admitted,
@@ -343,14 +345,17 @@ impl VramLedger {
         state: &mut LedgerState,
         worker: WorkerId,
         charge: GrantCharge,
-        ran_full: bool,
-        grew_pool: Option<bool>,
+        ingested: &Ingested,
         negative: bool,
         paged_at_grant: bool,
     ) {
         let Some(entry) = state.workers.get(&worker) else {
             return;
         };
+        let ran_full = ingested.filled;
+        // A CPU replica's pool figure is its peak resident set since start,
+        // which a regrowth never passes.
+        let grew_pool = ingested.grew_pool.filter(|_| entry.gpu != cpu::DEVICE_KEY);
         let anchor = Self::anchor_locked(state, entry);
         let ceiling = Self::batch_ceiling_locked(state, entry);
         let size = Self::size_locked(state, entry, mps::MemoryPressure::Normal);
@@ -371,10 +376,15 @@ impl VramLedger {
                 Some(cap) if halved_at.is_some() => cap.regrow_to,
                 Some(cap) => cap.regrow_to.max(asked),
             };
-            let ours = grew_pool.unwrap_or_else(|| {
-                charge.unit_budget >= bound.min(asked)
-                    && halved_at.is_none_or(|at| charge.granted_at >= at)
-            });
+            let pool_mb = cap.and_then(|cap| cap.pool_mb);
+            let ours = match grew_pool {
+                // Past the episode's largest pool: `None` is below any pool.
+                Some(grew) => grew && ingested.pool_mb > pool_mb,
+                None => {
+                    charge.unit_budget >= bound.min(asked)
+                        && halved_at.is_none_or(|at| charge.granted_at >= at)
+                }
+            };
             let halves = ran_full && !paged_at_grant && ours;
             let regrow_to = if halves {
                 bound.min(charge.unit_budget / 2).max(1)
@@ -388,6 +398,7 @@ impl VramLedger {
                 units: units.min(regrow_to),
                 regrow_to,
                 halved_at: halves.then(Instant::now).or(halved_at),
+                pool_mb: pool_mb.max(ingested.pool_mb),
             })
         } else if let Some(cap) = cap {
             let grown = if ran_full && !negative {

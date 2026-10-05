@@ -330,14 +330,18 @@ Single synthetic device:
     paging windows' grants asked. **A window whose batch began the paging
     lowers the bound to at most half its unit budget (at least 1): it was
     granted before the paging began, ran a batch at its budget, and grew our
-    pool.** Without pool figures (a CPU replica) its unit budget must
-    instead be at least the smaller of the bound and the size its grant
-    asked, and it must have been granted after the last window that lowered
-    the bound. After the first lowering only such a window moves the bound. The size asked is
-    read at the grant, so a deflation the settle repays or adds does not
-    change it. So a batch size whose memory growth began the paging is not
-    returned to above normal, and paging that began before the grant, or
-    while our batches ran inside the pool they held, leaves the bound alone.
+    pool past the largest pool a paging window of the episode left.** Growth
+    up to that pool refills memory the replica released, and is not new
+    memory. On the CPU device, whose pool figure is the peak resident set
+    since start, its unit budget must instead be at least the smaller of the
+    bound and the size its grant asked, and it must have been granted after
+    the last window our batch began. After the first lowering only such a
+    window moves the bound. The size asked is read at the grant, so a
+    deflation the settle repays or adds does not change it. So a batch size
+    whose memory growth began the paging is not returned to above normal,
+    and paging that began before the grant, or while our batches ran inside
+    or refilled the pool they held, leaves the bound alone. A batch whose
+    throughput collapse the pressure suppressed still counts here.
   - **Growing back.** Each clean window that filled its budget doubles the
     cap: above normal up to that bound, at normal until it reaches what the
     ramp admits, where the cap lifts and the bound is forgotten. Above normal
