@@ -957,7 +957,9 @@ booked centrally on the CPU device. It is never a throughput signal.
   released is not counted free again when the batch reports it.
 - **Grant.** The GPU side is sized as before, then capped at the largest batch
   whose booking fits the room, at least one unit, where room is the CPU
-  device's headroom plus the replica's own resident growth no booking claims.
+  device's headroom, split by appetite with the replicas waiting for it
+  ("Contention policy"), plus the replica's own resident growth no booking
+  claims.
   With RAM to spare the batch size is unchanged, and under tight RAM it can
   still double each window. The grant also tells the worker the CPU device's
   reserve and the RAM the booking needs beyond what the replica holds
@@ -1491,7 +1493,10 @@ impl's own kernels have said they cannot execute at this corpus's shapes.
   so nothing starves to zero. When even the floors oversubscribe
   headroom they shrink pro-rata — grants are reservations and the ledger
   invariant is never violated — bottoming out at the one-item minimum at
-  pack time.
+  pack time. On the CPU device a GPU replica waiting to book host RAM takes
+  part too, at the booking of its working size (`min(anchor, knee)`, the
+  seed before a batch ran) with a floor of one unit's booking, and its RAM
+  ceiling is its part of that headroom.
 
   **A pre-fit reservation beside other replicas.** The split above only
   sees replicas that are asking at the same instant. Post-fit that is enough:

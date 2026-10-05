@@ -478,30 +478,64 @@ async fn a_replica_alone_on_its_card_is_not_cut_for_another_cards_replicas() {
     assert_eq!(token.grant().mb, 199_000);
 }
 
-/// A GPU replica's host RAM booking is a reservation on the CPU device: a
-/// cold CPU replica asking beside it is cut to what is left, here one unit.
+/// A GPU replica's host RAM booking is a reservation on the CPU device,
+/// split by appetite with the replicas waiting for its room. With a CPU
+/// replica waiting, a GPU replica's window books its part, and a cold CPU
+/// replica asking beside that booking is cut to what is left; with the GPU
+/// replica waiting, a CPU replica takes its part.
 #[test]
-fn a_gpu_replicas_ram_booking_cuts_a_cold_cpu_replicas_batch() {
+fn a_gpu_replicas_ram_booking_shares_the_ram_with_cpu_replicas() {
     // 8080 MiB of RAM: a 6060 MiB limit, RAM less its reserve.
     const RAM_MB: u64 = 8080;
-    let ledger = host_with_ram(&[GPU], None, RAM_MB);
-    let (_handle, admission) = gpu_replica(&ledger, "g/on-gpu", GPU, 256);
-    let cpu_handle = loaded_on_cpu(Some(RAM_MB));
-    let on_cpu = ledger
-        .register_worker("g/on-cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
-        .expect("admitted on RAM");
-    // Nothing else holds RAM: the resident set and the base are ours.
-    ledger.record_free_for_test(cpu::DEVICE_KEY, RAM_MB - RSS_AT_LOAD_MB - 1000);
-    assert_eq!(ledger.headroom_mb(cpu::DEVICE_KEY), 3060);
+    let setup = |model: &str| {
+        let ledger = host_with_ram(&[GPU], None, RAM_MB);
+        let (_handle, on_gpu) = gpu_replica(&ledger, "g/on-gpu", GPU, 256);
+        let on_cpu = ledger
+            .register_worker(
+                model,
+                item_cost(4),
+                &loaded_on_cpu(Some(RAM_MB)),
+                Some(cpu::DEVICE_KEY),
+            )
+            .expect("admitted on RAM");
+        // Nothing else holds RAM: the resident set and the base are ours.
+        ledger.record_free_for_test(cpu::DEVICE_KEY, RAM_MB - RSS_AT_LOAD_MB - 1000);
+        assert_eq!(ledger.headroom_mb(cpu::DEVICE_KEY), 3060);
+        (ledger, on_gpu, on_cpu)
+    };
 
-    let booked = admission
-        .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
-    assert_eq!(booked.grant().unit_budget, 256);
-    assert_eq!(row(&ledger, "g/on-gpu").ram_booked_mb, 2560);
+    // The GPU replica's 2 560 MiB batch against the CPU replica's 1 000 MiB
+    // base: 2 200 MiB of the 3 060.
+    let (ledger, on_gpu, on_cpu) = setup("g/cold");
+    on_cpu.note_demand(1);
+    let booked = on_gpu.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert_eq!(booked.grant().unit_budget, 220);
+    assert_eq!(row(&ledger, "g/on-gpu").ram_booked_mb, 2200);
     let cut = on_cpu.request_grant(u64::MAX, None, 1, 0).expect("granted");
-    assert_eq!((cut.grant().mb, cut.grant().unit_budget), (500, 1));
+    assert_eq!((cut.grant().mb, cut.grant().unit_budget), (860, 1));
     assert!(cut.grant().squeezed);
+
+    // A CPU replica working at 32 units of 100 MiB asks with the GPU replica
+    // waiting.
+    let (ledger, on_gpu, on_cpu) = setup("g/fitted");
+    let fit = FitSnapshot {
+        slope_mb_per_unit: 100.0,
+        intercept_mb: 0.0,
+        residual_mb: 0.0,
+        samples: 20,
+        version: 1,
+    };
+    ledger.install_fit_for_test("g/fitted", cpu::DEVICE_KEY, fit);
+    let key = ("g/fitted".to_owned(), cpu::DEVICE_KEY.to_owned());
+    let mut state = ledger.lock();
+    let cal = state.calibration.get_mut(&key).expect("calibrated");
+    (cal.max_units_measured, cal.knee_units) = (32, Some(32));
+    drop(state);
+    on_gpu.note_demand(1);
+    // Its 4 000 MiB appetite (32 units at 125 with the pool margin) and the
+    // GPU replica's 2 560 split the 3 060: 1 865 MiB, 14 units, not 24.
+    let part = on_cpu.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert_eq!((part.grant().mb, part.grant().unit_budget), (1750, 14));
 }
 
 /// A GPU replica's resident set is ours on the CPU device, counted once:

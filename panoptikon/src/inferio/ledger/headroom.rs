@@ -167,9 +167,10 @@ impl VramLedger {
     /// The largest batch, in units, a GPU replica's host RAM admits, and the
     /// MiB per unit it books at; `None` without a RAM side. The room is the
     /// CPU device's headroom (its cap, reserve and other processes' usage,
-    /// net of every booking) plus this replica's own resident growth no
-    /// booking claims. At least one unit; the seed until a batch measured the
-    /// cost, when nothing is booked.
+    /// net of every booking), split by appetite with the other replicas
+    /// waiting for it ([`Self::hungry_on`]), plus this replica's own
+    /// resident growth no booking claims. At least one unit; the seed until a
+    /// batch measured the cost, when nothing is booked.
     pub(super) fn ram_ceiling_locked(
         &self,
         state: &LedgerState,
@@ -190,7 +191,17 @@ impl VramLedger {
             cost.startup_mb = cal.map_or(0, |cal| cal.ram_startup_mb) as f64;
         }
         let margin = self.budgets.for_gpu(cpu::DEVICE_KEY).margin_in_force();
-        let headroom = self.overdraft_with_margin_locked(state, cpu::DEVICE_KEY, margin);
+        let mut headroom = self.overdraft_with_margin_locked(state, cpu::DEVICE_KEY, margin);
+        let others: f64 = state
+            .workers
+            .values()
+            .filter(|other| !std::ptr::eq(*other, entry) && Self::hungry_on(other, cpu::DEVICE_KEY))
+            .map(|other| self.appetite_on_locked(state, other, cpu::DEVICE_KEY))
+            .sum();
+        if others > 0.0 && headroom > 0 {
+            let own = self.appetite_on_locked(state, entry, cpu::DEVICE_KEY);
+            headroom = (headroom as f64 * own / (own + others)).floor() as i128;
+        }
         let credit = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
         let room = (headroom + i128::from(credit)).max(0) as f64;
         let mut units = cost.units_within(room);
@@ -514,6 +525,44 @@ impl VramLedger {
         Self::fit_locked(state, entry).filter(|fit| fit.slope_mb_per_unit > 0.0)
     }
 
+    /// Whether a replica waits for room on `device`: requests in hand, no
+    /// grant, and on that device, or on the CPU device booking host RAM.
+    fn hungry_on(entry: &WorkerEntry, device: &str) -> bool {
+        entry.pending_requests > 0
+            && entry.grants.is_empty()
+            && (entry.gpu == device || (device == cpu::DEVICE_KEY && entry.has_ram_side()))
+    }
+
+    /// A replica's contention appetite on `device` in MiB: its
+    /// [`Self::appetite_mb_locked`] there, or on the CPU device a GPU
+    /// replica's host RAM booking at its working size (0 while its cost is
+    /// unknown, when it books nothing).
+    fn appetite_on_locked(&self, state: &LedgerState, entry: &WorkerEntry, device: &str) -> f64 {
+        if entry.gpu == device {
+            return self.appetite_mb_locked(state, entry);
+        }
+        Self::ram_booking_locked(state, entry, Self::working_units_locked(state, entry)) as f64
+    }
+
+    /// What a GPU replica's host RAM cost books for `units`; 0 while unknown.
+    fn ram_booking_locked(state: &LedgerState, entry: &WorkerEntry, units: u64) -> u64 {
+        cal_locked(state, entry)
+            .and_then(|cal| cal.ram_cost.as_ref())
+            .map_or(0, |cost| cost.booking_mb(units))
+    }
+
+    /// The batch size an appetite is priced at: `min(anchor, knee)`, or the
+    /// seed before a batch ran.
+    fn working_units_locked(state: &LedgerState, entry: &WorkerEntry) -> u64 {
+        let anchor = Self::anchor_locked(state, entry);
+        let anchor = Self::knee_locked(state, entry).map_or(anchor, |knee| anchor.min(knee));
+        if anchor > 0 {
+            anchor
+        } else {
+            entry.seed_units.max(1)
+        }
+    }
+
     /// The contention appetite in MiB: the price of `min(anchor, knee, what
     /// the card affords)` units, or the model's `base` pre-fit.
     pub(super) fn appetite_mb_locked(&self, state: &LedgerState, entry: &WorkerEntry) -> f64 {
@@ -636,8 +685,11 @@ impl VramLedger {
 
     /// Contention split among hungry workers (pending requests, no grant
     /// held): appetite-weighted shares with a floor of one seed batch each,
-    /// the floors shrunk pro-rata when they oversubscribe. The requester alone
-    /// is credited its own [`WorkerEntry::free_pool_mb`] on top.
+    /// the floors shrunk pro-rata when they oversubscribe. On the CPU device
+    /// GPU replicas that book host RAM there take part, at their
+    /// [`Self::appetite_on_locked`] and a floor of one unit's booking.
+    /// The requester alone is credited its own [`WorkerEntry::free_pool_mb`]
+    /// on top.
     ///
     /// Pre-fit the share is the reservation. Beside other replicas
     /// ([`Self::replicas_locked`]) it is at most an equal part of the
@@ -665,14 +717,15 @@ impl VramLedger {
         let hungry: Vec<&WorkerEntry> = state
             .workers
             .iter()
-            .filter(|(id, entry)| {
-                entry.gpu == requesting.gpu
-                    && (**id == worker || (entry.pending_requests > 0 && entry.grants.is_empty()))
-            })
+            .filter(|(id, entry)| **id == worker || Self::hungry_on(entry, &requesting.gpu))
             .map(|(_, entry)| entry)
             .collect();
-        let appetite = |entry: &WorkerEntry| -> f64 { self.appetite_mb_locked(state, entry) };
+        let appetite =
+            |entry: &WorkerEntry| -> f64 { self.appetite_on_locked(state, entry, &requesting.gpu) };
         let floor_mb = |entry: &WorkerEntry| -> u64 {
+            if entry.gpu != requesting.gpu {
+                return Self::ram_booking_locked(state, entry, 1);
+            }
             match Self::grant_price_locked(state, entry) {
                 Some(price) => price.cost_mb(entry.seed_units).max(1),
                 None => SEED_BATCH_FLOOR_MB,
