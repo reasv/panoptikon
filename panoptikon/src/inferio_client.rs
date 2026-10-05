@@ -522,6 +522,8 @@ struct HealthCheckState {
     stalled: usize,
     /// Whether the check task runs; at most one per endpoint.
     running: bool,
+    /// Checks in a row without an answer, kept across check tasks.
+    misses: u32,
 }
 
 /// Health checks of the server behind a base URL, sent through that URL so
@@ -1313,16 +1315,24 @@ impl InferenceApiClient {
     }
 
     /// Checks the server, then again every `timing.timeout` while a request is
-    /// stalled. The [`HEALTH_CHECK_MISSES`]th miss in a row declares it frozen
-    /// and an answer clears that, each change logged once. A task of its own,
-    /// so a verdict outlives the request that asked for it.
+    /// stalled or the last check missed short of a verdict. The
+    /// [`HEALTH_CHECK_MISSES`]th miss in a row declares it frozen and an answer
+    /// clears that, each change logged once. A task of its own, so a verdict
+    /// outlives the requests that asked for it.
     async fn run_health_checks(&self) {
         let checks = &self.endpoint.health_checks;
-        let mut misses = 0;
         loop {
             let started = tokio::time::Instant::now();
             let answer = self.health_check().await;
-            misses = if answer.is_ok() { 0 } else { misses + 1 };
+            let misses = {
+                let mut state = checks.lock();
+                state.misses = if answer.is_ok() {
+                    0
+                } else {
+                    state.misses.saturating_add(1)
+                };
+                state.misses
+            };
             let mut was_frozen = false;
             checks.verdict.send_modify(|verdict| {
                 was_frozen = verdict.frozen_since.is_some();
@@ -1346,7 +1356,8 @@ impl InferenceApiClient {
             }
             tokio::time::sleep_until(started + checks.timing.timeout).await;
             let mut state = checks.lock();
-            if state.stalled == 0 {
+            let verdict_pending = (1..HEALTH_CHECK_MISSES).contains(&state.misses);
+            if state.stalled == 0 && !verdict_pending {
                 state.running = false;
                 return;
             }
@@ -2922,6 +2933,29 @@ pub(crate) mod tests {
             cases.len(),
             "{log}"
         );
+    }
+
+    /// A miss is not forgotten when the requests that started the checks end
+    /// first, as when the keep-alive fails them: the checks go on until an
+    /// answer or a verdict, so a re-sent request is cut off `after` + 2 x
+    /// `timeout` into the first stall, not a whole stall later. Paused time,
+    /// against a peer that never answers, so every check misses at its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_miss_outlives_the_requests_that_started_the_checks() {
+        let url = format!("http://{}", spawn_raw_peer(RawPeer::Silent).await);
+        let client = InferenceApiClient::new_with_metadata_cache(url, false).unwrap();
+        let stall = |client: InferenceApiClient| {
+            tokio::spawn(async move { client.until_answered(std::future::pending::<()>()).await })
+        };
+        let started = tokio::time::Instant::now();
+        let first = stall(client.clone());
+        // Ends between the first check's start and its miss.
+        tokio::time::sleep(HEALTH_CHECKS.after + HEALTH_CHECKS.timeout / 2).await;
+        first.abort();
+        let resent = stall(client.clone());
+        assert!(resent.await.unwrap().is_err(), "cut off by the verdict");
+        let bound = HEALTH_CHECKS.after + (HEALTH_CHECK_MISSES + 1) * HEALTH_CHECKS.timeout;
+        assert!(started.elapsed() <= bound, "{:?}", started.elapsed());
     }
 
     /// A request with no answer is reported each time its wait doubles and

@@ -457,7 +457,10 @@ health check when the connection cannot see it.
   predicts) that picks the version as the requests do: ALPN over TLS, and in
   the clear h2 with prior knowledge or HTTP/1.1 as the transport in force
   says. It has a 10 s deadline and runs again every 10 s while any request
-  still waits. One task per base URL runs them. Besides a waiting request,
+  still waits, and while the last check missed short of a verdict: a miss is
+  kept when the keep-alive fails the waiting requests first, so their
+  re-submissions are cut off at the verdict instead of starting a new stall.
+  One task per base URL runs them. Besides a waiting request,
   only a request to a server declared frozen starts one (see "Health"). A
   check misses on its deadline or on a 502, 503 or 504, a proxy saying the
   server behind it did not answer. Any other outcome, a refused connection or
