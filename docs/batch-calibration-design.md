@@ -752,7 +752,9 @@ therefore differs from a GPU in six ways.
 - **The worker keeps the same reserve.** The grant carries it
   (`ram_reserve_mb`) and the worker's per-batch clamp spends
   `free − reserve + pool`. Without it the clamp would size the batch to all
-  the free RAM whenever the reading moved between grant and batch.
+  the free RAM whenever the reading moved between grant and batch. Each
+  grant reads the free RAM at that moment, as for a GPU replica's host RAM
+  (a cheap read, skipped while a probe is in flight or backing off).
 - **Free RAM on Linux is `MemAvailable − SReclaimable`**, in `cpu.rs` and in
   the worker's `memory.py` alike, still bounded by the cgroup limit.
   `MemAvailable` counts reclaimable slab, which the kernel may not free in

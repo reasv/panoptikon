@@ -721,9 +721,9 @@ fn host_ram_free(ledger: &VramLedger, free_mb: u64) {
     }]));
 }
 
-/// Each grant to a replica that books host RAM reads the host's free RAM
-/// first, so RAM another process took since the last grant shrinks the very
-/// next one.
+/// Each grant to a replica that books host RAM, or runs on the CPU device,
+/// reads the host's free RAM first, so RAM another process took since the
+/// last grant shrinks the very next one.
 #[test]
 fn a_grant_reads_host_ram_first() {
     let ledger = host(&[GPU], None);
@@ -739,6 +739,22 @@ fn a_grant_reads_host_ram_first() {
     // Another process takes 42 000 MiB between two grants.
     host_ram_free(&ledger, 3_000 + RESERVE_MB);
     assert_eq!(ram_window(&handle, &admission).unit_budget, 300);
+
+    drop(admission);
+    let on_cpu = ledger
+        .register_worker(
+            "g/fresh-cpu",
+            item_cost(4),
+            &loaded_on_cpu(Some(CPU_RAM_MB)),
+            Some(cpu::DEVICE_KEY),
+        )
+        .expect("admitted on RAM");
+    for free in [45_000, 3_000 + RESERVE_MB] {
+        host_ram_free(&ledger, free);
+        drop(on_cpu.request_grant(u64::MAX, None, 1, 0));
+        // Its base of 1 000 MiB is ours, not external usage.
+        assert_eq!(cpu_row(&ledger).external_mb, CPU_RAM_MB - free - 1_000);
+    }
 }
 
 /// Memory a GPU replica kept after its last batch is its own to reuse: it

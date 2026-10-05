@@ -84,8 +84,9 @@ impl VramLedger {
             let mut state = self.lock();
             Self::refresh_pools_locked(&mut state);
         }
-        self.maybe_refresh_external(worker);
+        // The host read first: on the CPU device it leaves no probe due.
         self.refresh_host_ram_now(worker);
+        self.maybe_refresh_external(worker);
         let pressure = self.memory_pressure();
         let mut state = self.lock();
         Self::repay_deflation_locked(&mut state, worker);

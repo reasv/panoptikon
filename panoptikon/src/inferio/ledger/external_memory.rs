@@ -330,18 +330,18 @@ impl VramLedger {
         });
     }
 
-    /// Read the CPU device's free RAM now for a replica that books host RAM,
-    /// so its grant cannot book RAM another process took since the last
-    /// grant. Synchronous: RAM statistics are a cheap read, unlike a GPU
-    /// driver query. Skipped while a probe of the device is in flight or
-    /// backing off after a failed one.
+    /// Read the CPU device's free RAM now for a replica on it or one that
+    /// books host RAM, so its grant cannot book RAM another process took
+    /// since the last grant. Synchronous: RAM statistics are a cheap read,
+    /// unlike a GPU driver query. Skipped while a probe of the device is in
+    /// flight or backing off after a failed one.
     pub(super) fn refresh_host_ram_now(&self, worker: WorkerId) {
         let due = {
             let state = self.lock();
             state
                 .workers
                 .get(&worker)
-                .is_some_and(WorkerEntry::has_ram_side)
+                .is_some_and(|entry| entry.gpu == cpu::DEVICE_KEY || entry.has_ram_side())
                 && state.gpus.get(cpu::DEVICE_KEY).is_some_and(|gpu| {
                     !gpu.refreshing
                         && gpu
