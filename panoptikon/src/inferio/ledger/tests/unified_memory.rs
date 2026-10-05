@@ -2239,8 +2239,8 @@ fn while_the_mac_pages_a_grant_with_a_probe_in_flight_reads_nothing_free() {
 
 /// While the Mac pages, a load re-reads the host too, and is priced against
 /// what it reads rather than a reading taken before the paging; with a probe
-/// of the device already in flight, against 0 free. A worker's reading
-/// recorded while it pages is 0.
+/// of the device already in flight, against 0 free. Either way it reserves
+/// its whole expected base. A worker's reading recorded while it pages is 0.
 #[tokio::test]
 async fn while_the_mac_pages_a_load_is_priced_from_a_fresh_reading() {
     for (pressure, refreshing, over_headroom, probes) in [
@@ -2271,6 +2271,8 @@ async fn while_the_mac_pages_a_load_is_priced_from_a_fresh_reading() {
             .expect("a reservation");
         assert_eq!(exceeds, over_headroom, "{pressure:?} {refreshing}");
         assert_eq!(ledger.probe_calls(), probes, "{pressure:?} {refreshing}");
+        let reserved: u64 = ledger.lock().gpus[MPS_GPU].load_reservations.values().sum();
+        assert_eq!(reserved, CONSERVATIVE_BASE_MB, "the whole expected base");
     }
 
     for (pressure, recorded) in [

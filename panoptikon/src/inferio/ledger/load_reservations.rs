@@ -8,10 +8,10 @@ impl VramLedger {
     ///
     /// The expected base is the larger of this run's measurement and the
     /// store's, else [`CONSERVATIVE_BASE_MB`]; the charge is clamped to the
-    /// headroom. `None` for an unknown GPU, a `none`-class model, or a model
-    /// known to put nothing on the device. A known base (or condemned working
-    /// set) above [`Self::refusal_room_locked`] refuses the load
-    /// ([`OversizedLoad`]).
+    /// headroom, except while macOS pages, when the headroom reads 0. `None`
+    /// for an unknown GPU, a `none`-class model, or a model known to put
+    /// nothing on the device. A known base (or condemned working set) above
+    /// [`Self::refusal_room_locked`] refuses the load ([`OversizedLoad`]).
     pub async fn reserve_load(
         self: &Arc<Self>,
         inference_id: &str,
@@ -164,8 +164,13 @@ impl VramLedger {
             }
             let expected = measured.unwrap_or(CONSERVATIVE_BASE_MB);
             let headroom = self.headroom_locked(&state, gpu);
-            // Charges plus reservations may not exceed the limit.
-            let reserved = expected.min(headroom);
+            // Charges plus reservations may not exceed the limit, except
+            // while macOS pages, when the headroom reads 0.
+            let reserved = if pressure.paging() {
+                expected
+            } else {
+                expected.min(headroom)
+            };
             let id = state.next_id();
             state
                 .gpus
