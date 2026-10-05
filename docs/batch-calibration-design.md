@@ -993,8 +993,8 @@ booked centrally on the CPU device. It is never a throughput signal.
   already run, and never beyond one seed batch. A request
   of several items still runs whole in its window, at the cap per batch; for
   a count-priced model the cap is the unit budget too, for any other the
-  cap times the window's largest input, at most the window's units: no
-  batch within the cap holds more.
+  cap times the window's largest input (no batch within the cap holds
+  more), at most the window's units.
 - **What a capped window changes.** The grant reads `squeezed` for the
   dispatcher and `/health` reports `ram_ceiling_binding`. The window feeds
   no throughput sample, counts toward neither `max_units_measured_here` nor
@@ -1044,27 +1044,28 @@ Under auto:
   budget on their own (whole audio tracks, RAW scans) would persist nothing
   — while it is no window at its budget for the gain rule, because the wall
   bounds the next window just as hard.
-- **Dispatcher-side unit counts are estimates, and safety never depends
-  on them.** Window sizing and grant pricing need per-item units before
-  any worker has decoded anything: `pixel` models use image-header
-  dimensions (parsed at dispatch, or forwarded by core, which already
-  knows post-slicing dims); `token` models use a bytes-per-token
-  heuristic (the dispatcher cannot tokenize); `max-times-count` window
-  depth uses the sum-of-units approximation (true max×count is undefined
-  before the worker buckets). Mis-estimates only mis-size windows — an
-  over-estimate yields a larger grant still clamped by headroom, an
-  under-estimate yields more GPU batches per window — because the worker
-  packs within the grant using exact post-decode counts.
+- **Dispatcher-side unit counts are estimates.** Window sizing and grant
+  pricing need per-item units before any worker has decoded anything:
+  `pixel` models use image-header dimensions (parsed at dispatch, or
+  forwarded by core, which already knows post-slicing dims); `token`
+  models use a bytes-per-token heuristic (the dispatcher cannot tokenize);
+  `max-times-count` window depth uses the sum-of-units approximation (true
+  max×count is undefined before the worker buckets). Mis-estimates mostly
+  mis-size windows — an over-estimate yields a larger grant still clamped
+  by headroom, an under-estimate yields more GPU batches per window; the
+  worker packs within the grant by its own estimates, and an input it
+  prices above the grant runs alone.
 - **The user cap travels per request.** Windows are partitioned by cap
   value — capped jobs are the exception under auto, so mixed-cap queues
   are rare and the partition costs nothing — and the worker enforces the
   cap at pack time as an **item-count constraint**, never converted to
-  units. A capped window is *also* bounded in items, at the same batch
-  depth the unit budget uses: the cap makes the worker's batches small
-  regardless of the budget, so an unbounded capped window would become
-  thousands of one-item batches — one measurement and one driver query
-  each, overflowing the telemetry ring and deferring the grant's
-  re-evaluation for minutes.
+  units except under the item cap of a cold start, where the unit budget
+  is at most the cap times the window's largest input. A capped window is
+  *also* bounded in items, at the same batch depth the unit budget uses:
+  the cap makes the worker's batches small regardless of the budget, so an
+  unbounded capped window would become thousands of one-item batches — one
+  measurement and one driver query each, overflowing the telemetry ring
+  and deferring the grant's re-evaluation for minutes.
 
 ### The unpriced path
 
