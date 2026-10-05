@@ -840,6 +840,9 @@ def test_a_hog_event_the_hog_answered_with_under_a_chunk_is_void_and_warns(tmp_p
                       "--json", str(tmp_path / "v.json"), "--quiet"])
         (result,) = json.loads((tmp_path / "v.json").read_text())["verdicts"]
         assert (result["verdict"], result["numbers"]["void_events"]) == (verdict, void)
+    assert analyze._void_hog_events({"events": [
+        {"event": "hog_event_void", "label": "late", "reason": "after the job"}]},
+        []) == ["late"]
 
 
 def test_a_split_leg_is_judged_only_on_what_the_gateway_answers_for(tmp_path):

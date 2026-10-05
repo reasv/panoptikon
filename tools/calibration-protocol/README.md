@@ -124,7 +124,8 @@ a wait of up to 30 s for a sample in every recording (a
 from a thread; wait for `/api/client-config`; create the
 `cal` databases and point the job config at the corpus; rescan; post the
 extraction job — one per `--models` id, in order, in the same database — and
-fire the scenario's timed hog events; wait for the queue;
+fire the scenario's timed hog events (one the jobs end before is marked
+`hog_event_void` and not fired); wait for the queue;
 snapshot jobs / failures / metadata / health and `calibration.after.toml`;
 stop everything in reverse; copy `panoptikon.log`. Then `legs.json`: every
 resolved parameter, every event with its wall clock and monotonic `t_mono`,
@@ -850,7 +851,7 @@ that move them are in `analyze.py --help`.
 | `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) unless the leg declared it, and so does a job `legs.json` shows did not drain (`job_end` outcome other than `drained`, e.g. cut at `--job-cap`, or no `job_end`) | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs), `--expect-empty-setters` | PASS/FAIL |
 | `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | FAIL on an `over_grant` breach, WARN on a `limit_fell` one |
 | `peak_fds` | peak open descriptors and sockets against the process's own limit | — | INFO; SKIP when nothing recorded them |
-| `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form; WARN when a hog event applied no pressure: it set a leave-free level, or a hold above 0 at or above what the hog held, and no `hog.jsonl` row (none when the file is missing) shows `held_mb` one chunk higher before the next event, also when the check otherwise SKIPs |
+| `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form; WARN when a hog event applied no pressure: it set a leave-free level, or a hold above 0 at or above what the hog held, and no `hog.jsonl` row (none when the file is missing) shows `held_mb` one chunk higher before the next event, or the jobs ended before it fired, also when the check otherwise SKIPs |
 | `ramp_progress` | `unit_budget` / `fit_samples` / the working size over time | — | INFO |
 | `calibration_learned` | the same three numbers, as a verdict | see below | FAIL only under `--learning` |
 | `batch_coverage` | the `seq` of each replica's `recent_batches` across health samples: a number no sample showed is a batch the recording missed; batches a worker runs after its last sample are not counted, so PASS means no gap between samples, not that every batch was seen | none missed | PASS/WARN; SKIP without `healthrec.jsonl` or when no sample showed a batch |

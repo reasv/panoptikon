@@ -291,13 +291,44 @@ def test_a_hog_event_from_the_command_line_asks_for_a_pinned_level(
     monkeypatch.setattr(legs, "request", lambda url, **kw: sent.append(url))
     monkeypatch.setattr(legs, "get_json",
                         lambda url, **kw: {"target_mb": 0, "held_mb": 0})
-    leg = types.SimpleNamespace(events=[], hog_url=lambda path: path)
+    leg = types.SimpleNamespace(events=[], hog_url=lambda path: path,
+                                job_done=threading.Event())
     leg.mark = lambda name, **detail: legs.Leg.mark(leg, name, **detail)
     legs.Leg.drive_hog(leg, [
         {"at_s": 0.0, "label": "cli", "leave_free_mb": 4096, "pinned": True},
         {"at_s": 0.0, "label": "own", "leave_free_mb": 2048, "pinned": False},
     ], time.monotonic())
     assert sent == ["/set?leave_free=4096&pin=1", "/set?leave_free=2048"]
+
+
+def test_hog_events_stop_at_the_jobs_end_and_tracking_at_the_next_event(
+        monkeypatch):
+    """A fill still short of its target is tracked until the next event is
+    due, and the event fires on time; an event the jobs ended before is void
+    and not fired."""
+    sent = []
+    monkeypatch.setattr(legs, "request", lambda url, **kw: sent.append(url))
+    monkeypatch.setattr(legs, "get_json", lambda url, **kw: {
+        "target_mb": 4096 if sent[-1].endswith("mb=4096&pin=1") else 0,
+        "held_mb": 0})
+    leg = types.SimpleNamespace(events=[], hog_url=lambda path: path,
+                                job_done=threading.Event())
+    leg.mark = lambda name, **detail: legs.Leg.mark(leg, name, **detail)
+    events = [{"at_s": at_s, "label": label, "mb": mb, "pinned": True}
+              for at_s, label, mb in ((0.0, "fill", 4096), (1.5, "release", 0),
+                                      (1e9, "late", 0))]
+    driver = threading.Thread(target=legs.Leg.drive_hog, daemon=True,
+                              args=(leg, events, time.monotonic()))
+    driver.start()
+    assert legs.wait_for(lambda: len(sent) == 2, 5.0, interval=0.05)
+    leg.job_done.set()
+    driver.join(timeout=5.0)
+    assert not driver.is_alive()
+    assert sent == ["/set?mb=4096&pin=1", "/set?mb=0&pin=1"]
+    assert [(event["label"], event["reason"]) for event in leg.events
+            if event["event"] == "hog_event_void"] == [("late", "after the job")]
+    assert all(0 <= event["late_s"] < 1 for event in leg.events
+               if event["event"] == "hog_event_request")
 
 
 def test_job_start_is_marked_before_the_post(monkeypatch, tmp_path):

@@ -982,6 +982,8 @@ class Leg:
     endpoints: List[Dict[str, Any]] = field(default_factory=list)
     #: the extraction chain this leg runs, after `--model` / `--models`
     models: Tuple[str, ...] = ()
+    #: set once the jobs have ended; a hog event not yet fired is then void
+    job_done: threading.Event = field(default_factory=threading.Event)
 
     # -- recording ----------------------------------------------------------
 
@@ -1274,16 +1276,20 @@ class Leg:
         Timed from the job's POST rather than from the leg's start, because
         what the scenario is describing is a change *during* the job: the S4b
         step lands 60.0 s after the submit, not 60 s after the recorders came
-        up.
+        up. An event the jobs ended before is marked void and not fired.
         """
-        for event in events:
-            delay = posted_at + event["at_s"] - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
+        for index, event in enumerate(events):
+            due = posted_at + event["at_s"]
+            if self.job_done.wait(max(0.0, due - time.monotonic())):
+                for skipped in events[index:]:
+                    self.mark("hog_event_void", label=skipped["label"],
+                              at_s=skipped["at_s"], reason="after the job")
+                return
             query = ("leave_free=%d" % event["leave_free_mb"]
                      if "leave_free_mb" in event else "mb=%d" % event["mb"])
             self.mark("hog_event_request", label=event["label"], query=query,
-                      at_s=event["at_s"], pinned=event["pinned"])
+                      at_s=event["at_s"], pinned=event["pinned"],
+                      late_s=round(max(0.0, time.monotonic() - due), 3))
             try:
                 request(self.hog_url(f"/set?{query}"
                                      + ("&pin=1" if event["pinned"] else "")),
@@ -1294,8 +1300,12 @@ class Leg:
                 continue
             self.mark("hog_event_ack", label=event["label"])
             # Record the fill, so `legs.json` states how long the GPU took
-            # to change.
+            # to change, until the next event is due.
+            next_due = (posted_at + events[index + 1]["at_s"]
+                        if index + 1 < len(events) else math.inf)
             for _ in range(40):
+                if time.monotonic() >= next_due:
+                    break
                 try:
                     state = get_json(self.hog_url("/state"), timeout=5)
                 except HttpError:
@@ -2319,6 +2329,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             step = leg.run_job(chained, "" if index == 1 else f"-{index}")
             if step != "drained":
                 outcome = step
+        leg.job_done.set()
         if driver is not None:
             driver.join(timeout=max(60.0, max(e["at_s"] for e in events) + 60))
 

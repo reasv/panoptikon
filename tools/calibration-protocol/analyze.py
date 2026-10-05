@@ -2318,16 +2318,19 @@ def _void_hog_events(legs: Optional[Dict[str, Any]],
                      hog: List[Dict[str, Any]]) -> List[str]:
     """The hog events that asked for pressure (any leave-free level, or a hold
     above 0 at or above what the hog held) while its `held_mb`, progress rows
-    included, rose by less than one chunk before the next event."""
+    included, rose by less than one chunk before the next event, and those
+    `legs.py` did not fire because the jobs had ended."""
     header = next((row for row in hog if row.get("kind") == "header"), {})
     chunk = header.get("chunk_mb") or 1
     states = [(row["t_wall"], row.get("held_mb") or 0)
               for row in hog if row.get("kind") in ("state", "progress", "final")]
-    requests = []
+    requests, after_job = [], []
     for event in (legs or {}).get("events") or []:
         t_wall = _iso_epoch(str(event.get("iso", "")))
         if event.get("event") == "hog_event_request" and t_wall is not None:
             requests.append((t_wall, event))
+        elif event.get("event") == "hog_event_void":
+            after_job.append(str(event.get("label") or f"t+{event.get('at_s')}s"))
     void = []
     for index, (start, event) in enumerate(requests):
         end = requests[index + 1][0] if index + 1 < len(requests) else math.inf
@@ -2338,7 +2341,7 @@ def _void_hog_events(legs: Optional[Dict[str, Any]],
         asked = kind == "leave_free" or kind == "mb" and int(mb) > 0 and int(mb) >= held
         if asked and rose < chunk:
             void.append(str(event.get("label") or f"t+{event.get('at_s')}s"))
-    return void
+    return void + after_job
 
 
 def _unfinished_jobs(legs: Optional[Dict[str, Any]]) -> List[str]:
@@ -2527,8 +2530,8 @@ def check_hog_tracking(ctx: Context) -> Verdict:
     """
     void = ctx.void_hog_events
     void_note = ("; WARN: the hog event(s) " + ", ".join(void) + " applied no "
-                 "pressure: no hog.jsonl row shows the hog holding one chunk more "
-                 "before the next event" if void else "")
+                 "pressure: the jobs had ended, or no hog.jsonl row shows the hog "
+                 "holding one chunk more before the next event" if void else "")
     if not ctx.hog_samples or not ctx.health_samples:
         return Verdict("hog_tracking", "WARN" if void else "SKIP",
                        "needs hog.jsonl and healthrec.jsonl" + void_note,
