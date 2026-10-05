@@ -58,32 +58,15 @@ impl TomlDocument {
         let after = after
             .as_table()
             .context("new TOML document value is not a table")?;
-        // Blocks of removed keys that were last in a table body, by table position.
-        let mut blocks_after_table = Vec::new();
-        patch_table(
-            self.document.as_table_mut(),
-            before,
-            after,
-            &mut blocks_after_table,
-        )?;
-        for (owner, block) in blocks_after_table {
-            self.prepend_after_table_body(owner, &block);
+        let root = self.document.as_table_mut();
+        let block = patch_table(root, before, after)?;
+        if !block.is_empty() {
+            // The root has no header: its body starts after its decor prefix.
+            let prefix = root.decor().prefix().and_then(RawString::as_str);
+            let prefix = format!("{}{block}", prefix.unwrap_or(""));
+            root.decor_mut().set_prefix(prefix);
         }
         Ok(())
-    }
-
-    /// Puts `block` in front of what renders after the body of the table at
-    /// `owner` (the root is at 0): the next table header, or the end of file.
-    fn prepend_after_table_body(&mut self, owner: usize, block: &str) {
-        let root = self.document.as_table_mut();
-        match next_table_position(root, owner).and_then(|next| table_at_position(root, next)) {
-            Some(table) => prepend_prefix(table.decor_mut(), block, "\n"),
-            None => {
-                let trailing = self.document.trailing().as_str().unwrap_or("");
-                let trailing = format!("{block}{trailing}");
-                self.document.set_trailing(trailing);
-            }
-        }
     }
 
     pub fn write_atomic(&self, path: &Path) -> Result<()> {
@@ -108,34 +91,30 @@ impl std::fmt::Display for TomlDocument {
     }
 }
 
-/// Returns, for a dotted-key table, the comment blocks of removed keys that
-/// were last in it: they belong before what follows it in its parent's body.
-fn patch_table(
-    concrete: &mut Table,
-    before: &toml::Table,
-    after: &toml::Table,
-    blocks_after_table: &mut Vec<(usize, String)>,
-) -> Result<String> {
-    // Blocks with no key-value after them arrive bottom-up, so each goes in front.
-    let mut last = String::new();
+/// Returns the comment blocks of removed keys that had no key-value above them
+/// in this body: they belong after the line rendered before the body.
+fn patch_table(concrete: &mut Table, before: &toml::Table, after: &toml::Table) -> Result<String> {
+    // A block reaches `first` only when no key-value is left above it, so the
+    // blocks already there were above it.
+    let mut first = String::new();
     for key in before.keys().filter(|key| !after.contains_key(*key)) {
-        // The lines above a key-value are in the decor of its key's last segment:
-        // hand them to the next key-value rendered in this body.
+        // The lines above a removed key-value stay after the key-value rendered
+        // before it in this body.
         let Some(index) = concrete.iter().position(|(name, _)| name == key) else {
             continue;
         };
         let (key, item) = concrete.remove_entry(key).expect("the key was found above");
         let block = match &item {
-            Item::Value(_) => leading_lines(&key).to_owned(),
+            Item::Value(value) => removed_lines(&key, value),
             Item::Table(table) if table.is_dotted() => table
                 .get_values()
                 .iter()
-                .filter_map(|(path, _)| path.last().map(|key| leading_lines(key)))
+                .filter_map(|(path, value)| path.last().map(|key| removed_lines(key, value)))
                 .collect(),
             _ => continue,
         };
-        if let Some(block) = prepend_to_next_key(concrete, index, block) {
-            last.insert_str(0, &block);
+        if let Some(block) = append_to_previous_key(concrete, index, block) {
+            first.push_str(&block);
         }
     }
     for (key, new_value) in after {
@@ -149,51 +128,49 @@ fn patch_table(
                 Some(toml::Value::Table(old_value)),
                 toml::Value::Table(new_value),
             ) if table.is_dotted() => {
-                let block = patch_table(table, old_value, new_value, blocks_after_table)?;
+                let block = patch_table(table, old_value, new_value)?;
                 let index = concrete.iter().position(|(name, _)| name == key);
                 let index = index.expect("the patched key is in the table");
-                if let Some(block) = prepend_to_next_key(concrete, index + 1, block) {
-                    last.insert_str(0, &block);
+                if let Some(block) = append_to_previous_key(concrete, index, block) {
+                    first.push_str(&block);
                 }
             }
-            (Some(item), Some(old_value), _) => {
-                patch_item(item, old_value, new_value, blocks_after_table)?
-            }
+            (Some(item), Some(old_value), _) => patch_item(item, old_value, new_value)?,
             _ => {
                 concrete.insert(key, item_from_toml(new_value)?);
             }
         }
     }
-    if concrete.is_dotted() {
-        return Ok(last);
-    }
-    if !last.is_empty() {
-        // The root is the only table with key-values and no position; it renders first.
-        blocks_after_table.push((concrete.position().unwrap_or(0), last));
-    }
-    Ok(String::new())
+    Ok(first)
 }
 
-fn leading_lines(key: &Key) -> &str {
+/// The whole lines above a key-value and those `append_lines` put after it.
+fn removed_lines(key: &Key, value: &Value) -> String {
     let prefix = key.leaf_decor().prefix();
     let prefix = prefix.and_then(RawString::as_str).unwrap_or("");
-    &prefix[..prefix.rfind('\n').map_or(0, |end| end + 1)]
+    let above = &prefix[..prefix.rfind('\n').map_or(0, |end| end + 1)];
+    let suffix = value.decor().suffix().and_then(RawString::as_str);
+    match suffix.unwrap_or("").split_once('\n') {
+        Some((_, below)) => format!("{above}{below}\n"),
+        None => above.to_owned(),
+    }
 }
 
-/// Prepends `block` to the first key-value rendered from item `index` on,
+/// Appends `block` after the last key-value rendered before item `index`,
 /// descending into dotted-key tables; gives it back when there is none.
-fn prepend_to_next_key(table: &mut Table, index: usize, mut block: String) -> Option<String> {
+fn append_to_previous_key(table: &mut Table, index: usize, mut block: String) -> Option<String> {
     if block.is_empty() {
         return None;
     }
-    for (mut key, item) in table.iter_mut().skip(index) {
+    let items: Vec<_> = table.iter_mut().take(index).collect();
+    for (_, item) in items.into_iter().rev() {
         match item {
-            Item::Value(_) => {
-                prepend_prefix(key.leaf_decor_mut(), &block, "");
+            Item::Value(value) => {
+                append_lines(value.decor_mut(), &block);
                 return None;
             }
             Item::Table(table) if table.is_dotted() => {
-                block = prepend_to_next_key(table, 0, block)?
+                block = append_to_previous_key(table, usize::MAX, block)?
             }
             _ => {}
         }
@@ -201,55 +178,21 @@ fn prepend_to_next_key(table: &mut Table, index: usize, mut block: String) -> Op
     Some(block)
 }
 
-fn prepend_prefix(decor: &mut Decor, block: &str, default: &str) {
-    let prefix = decor
-        .prefix()
-        .and_then(RawString::as_str)
-        .unwrap_or(default);
-    let prefix = format!("{block}{prefix}");
-    decor.set_prefix(prefix);
+/// Puts the whole lines of `block` after the line that `decor` ends.
+fn append_lines(decor: &mut Decor, block: &str) {
+    let Some(lines) = block.strip_suffix('\n') else {
+        return;
+    };
+    let suffix = decor.suffix().and_then(RawString::as_str).unwrap_or("");
+    let suffix = format!("{suffix}\n{lines}");
+    decor.set_suffix(suffix);
 }
 
-/// The lowest table position above `after`: tables render in position order,
-/// and only tables with a header have one.
-fn next_table_position(table: &Table, after: usize) -> Option<usize> {
-    let own = table.position().filter(|position| *position > after);
-    table
-        .iter()
-        .flat_map(|(_, item)| {
-            let tables = item
-                .as_array_of_tables()
-                .into_iter()
-                .flat_map(ArrayOfTables::iter);
-            item.as_table().into_iter().chain(tables)
-        })
-        .filter_map(|child| next_table_position(child, after))
-        .chain(own)
-        .min()
-}
-
-fn table_at_position(table: &mut Table, position: usize) -> Option<&mut Table> {
-    if table.position() == Some(position) {
-        return Some(table);
-    }
-    table.iter_mut().find_map(|(_, item)| match item {
-        Item::Table(child) => table_at_position(child, position),
-        Item::ArrayOfTables(children) => children
-            .iter_mut()
-            .find_map(|child| table_at_position(child, position)),
-        _ => None,
-    })
-}
-
-fn patch_item(
-    concrete: &mut Item,
-    before: &toml::Value,
-    after: &toml::Value,
-    blocks_after_table: &mut Vec<(usize, String)>,
-) -> Result<()> {
+fn patch_item(concrete: &mut Item, before: &toml::Value, after: &toml::Value) -> Result<()> {
     match (concrete, before, after) {
         (Item::Table(table), toml::Value::Table(before), toml::Value::Table(after)) => {
-            patch_table(table, before, after, blocks_after_table)?;
+            let block = patch_table(table, before, after)?;
+            append_lines(table.decor_mut(), &block);
         }
         (
             Item::Value(Value::InlineTable(table)),
@@ -265,7 +208,7 @@ fn patch_item(
             if before.iter().all(toml::Value::is_table)
                 && after.iter().all(toml::Value::is_table) =>
         {
-            patch_array_of_tables(tables, before, after, blocks_after_table)?
+            patch_array_of_tables(tables, before, after)?
         }
         (slot, _, after) => replace_item_preserving_decor(slot, item_from_toml(after)?),
     }
@@ -336,17 +279,17 @@ fn patch_array_of_tables(
     concrete: &mut ArrayOfTables,
     before: &[toml::Value],
     after: &[toml::Value],
-    blocks_after_table: &mut Vec<(usize, String)>,
 ) -> Result<()> {
     let shared = before.len().min(after.len()).min(concrete.len());
     for index in 0..shared {
         if before[index] != after[index] {
-            patch_table(
-                concrete.get_mut(index).expect("shared table index exists"),
+            let table = concrete.get_mut(index).expect("shared table index exists");
+            let block = patch_table(
+                table,
                 before[index].as_table().expect("guarded above"),
                 after[index].as_table().expect("guarded above"),
-                blocks_after_table,
             )?;
+            append_lines(table.decor_mut(), &block);
         }
     }
     while concrete.len() > after.len() {
@@ -940,7 +883,7 @@ mod tests {
     #[test]
     fn removing_a_key_keeps_the_comment_block_above_it() {
         let dotted = "[vram]\n# a note\ngpu.CPU.a = 1\n# b note\ngpu.CPU.b = 2\n# k\nkeep = 1\n# n\n[next]\n";
-        let cases: [(&str, &[&str]); 11] = [
+        let cases: [(&str, &[&str]); 13] = [
             // Next key in the same table.
             (
                 "[vram]\n# margin note\nmargin = 0.10\n# cap note\ncap_fraction = 0.90\n",
@@ -968,14 +911,16 @@ mod tests {
                 "[vram]\n  # m\n  margin = 0.10\n  # c\n  cap_fraction = 0.90\n  # k\n[next]\n  n = 1\n  keep = 1\n[after]\n",
                 &["  margin = 0.10\n", "  cap_fraction = 0.90\n", "  n = 1\n"],
             ),
-            // Last key of a dotted-key table, which renders in its parent's
-            // body: before the parent's next key, else the next table header.
+            // Keys of a dotted-key table, which renders in its parent's body.
+            (dotted, &["gpu.CPU.a = 1\n"]),
             (dotted, &["gpu.CPU.b = 2\n"]),
             (dotted, &["gpu.CPU.b = 2\n", "keep = 1\n"]),
             // The whole dotted-key table.
             (dotted, &["gpu.CPU.a = 1\n", "gpu.CPU.b = 2\n"]),
             // Last key of an array-of-tables element.
             ("[[p]]\nn = 1\n# x\nx = 1\n[[p]]\nn = 2\n", &["x = 1\n"]),
+            // Its first two keys.
+            ("[[p]]\n# a\na = 1\n# b\nb = 1\n", &["a = 1\n", "b = 1\n"]),
             // A whole [table]: its keys' comments go with it.
             (
                 "[a]\nx = 1\n[t]\n# n note\nn = 1\n[z]\nq = 1\n",
@@ -1000,6 +945,12 @@ mod tests {
                 .unwrap();
             assert_eq!(document.to_string(), expected, "source:\n{source}");
         }
+        // A table added in the same save renders after the kept block.
+        let mut document = TomlDocument::parse("[a]\nx = 1\n# m\nm = 1\n").unwrap();
+        let before = toml::from_str("[a]\nx = 1\nm = 1\n").unwrap();
+        let after = toml::from_str("[a]\nx = 1\n[a.new]\nk = 1\n").unwrap();
+        document.patch_values(&before, &after).unwrap();
+        assert_eq!(document.to_string(), "[a]\nx = 1\n# m\n[a.new]\nk = 1\n");
     }
 
     /// A CRLF source (a Windows-authored or autocrlf-checked-out file) must
