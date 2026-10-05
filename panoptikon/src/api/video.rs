@@ -3609,7 +3609,7 @@ transcode_presets = ["playback"]
     /// instead of hanging the suite.
     async fn settle(id: Uuid) -> ArtifactRef {
         use crate::media_tools::transcode::pool::TranscodeJobEvent;
-        let deadline = std::time::Instant::now() + crate::test_utils::FFMPEG_HANG_DEADLINE;
+        let deadline = std::time::Instant::now() + crate::test_utils::HANG_DEADLINE;
         while std::time::Instant::now() < deadline {
             match pool::job_snapshot(id).await.unwrap().map(|snap| snap.event) {
                 Some(TranscodeJobEvent::Done { artifact }) => return artifact,

@@ -97,10 +97,9 @@ pub(crate) fn absent_path(name: &str) -> String {
     format!("{}{}{name}", absent_root(), std::path::MAIN_SEPARATOR)
 }
 
-/// How long a test waits on a real ffmpeg run before calling it hung. A hang
-/// detector, not a speed bound: a fixture encode that takes 0.4 s on a quiet
-/// host has taken over a minute on a loaded one.
-pub(crate) const FFMPEG_HANG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+/// How long a test waits on a job before calling it hung. A hang detector,
+/// not a speed bound.
+pub(crate) const HANG_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A port nothing in this process can be listening on. Binding and dropping
 /// an *ephemeral* port is not sound: it goes straight back to the pool this
@@ -161,9 +160,8 @@ unsafe fn install_ask_every_event() {
 }
 
 /// Turns transparent huge pages off for the test process and every child it
-/// spawns (the setting survives fork and exec). x264 asks for huge pages, and
-/// on a host with fragmented memory each request waits on compaction: a
-/// fixture encode that takes 0.4 s then takes 30 s or more.
+/// spawns (the setting survives fork and exec). x264 asks for huge pages; on
+/// fragmented memory each request waits on compaction.
 // SAFETY: runs before `main`; the prctl only sets a flag on this process.
 #[cfg(target_os = "linux")]
 #[ctor::ctor]

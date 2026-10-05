@@ -1985,7 +1985,7 @@ mod tests {
         });
 
         let outcome = finished
-            .recv_timeout(crate::test_utils::FFMPEG_HANG_DEADLINE)
+            .recv_timeout(crate::test_utils::HANG_DEADLINE)
             .expect("run_encode returns after the cancellation: the watchdog killed ffmpeg");
         producer.kill().unwrap();
         producer.wait().unwrap();

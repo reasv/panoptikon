@@ -1301,7 +1301,7 @@ mod tests {
 
         /// Polls until `id` is terminal, so tests never sleep on a guess.
         async fn await_terminal(&self, id: &str) -> TranscodeJobEvent {
-            let deadline = Instant::now() + crate::test_utils::FFMPEG_HANG_DEADLINE;
+            let deadline = Instant::now() + crate::test_utils::HANG_DEADLINE;
             while Instant::now() < deadline {
                 if let Some(snapshot) = self.snapshot(id).await
                     && snapshot.event.is_terminal()
