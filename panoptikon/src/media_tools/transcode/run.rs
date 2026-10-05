@@ -1941,31 +1941,26 @@ mod tests {
     /// reader's own check of it is nanoseconds away while the watchdog is
     /// parked in a `CANCEL_POLL` wait.
     ///
-    /// The source is a FIFO fed by an endless stream, so ffmpeg never exits on
-    /// its own: a watchdog that leaves it running fails the bounded wait below
-    /// however fast the host is. Skips (never fails) where there is no ffmpeg.
-    #[cfg(unix)]
+    /// The source is a list that repeats a short clip a million times, so
+    /// ffmpeg does not finish on its own: a watchdog that leaves it running
+    /// fails the bounded wait below however fast the host is. Skips (never
+    /// fails) where there is no ffmpeg.
     #[test]
     fn a_cancel_the_reader_notices_first_still_kills_ffmpeg() {
-        use std::os::unix::ffi::OsStrExt as _;
-
         if !crate::media_tools::ffmpeg_available() {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source.ts");
-        let fifo = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `fifo` is a valid NUL-terminated path.
-        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let mut producer = Command::new(crate::media_tools::ffmpeg())
-            .args(["-nostdin", "-v", "error", "-f", "lavfi"])
-            .args(["-i", "color=s=320x240:r=30", "-c:v", "mpeg2video"])
-            .args(["-f", "mpegts", "-y"])
-            .arg(&source)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let seed = dir.path().join("seed.mp4");
+        if !crate::jobs::files::write_clip(&seed, None, None) {
+            return;
+        }
+        let header = "ffconcat version 1.0\n";
+        let inner = header.to_owned() + &"file seed.mp4\n".repeat(1000);
+        std::fs::write(dir.path().join("inner.ffconcat"), inner).unwrap();
+        let outer = header.to_owned() + &"file inner.ffconcat\n".repeat(1000);
+        let source = dir.path().join("source.ffconcat");
+        std::fs::write(&source, outer).unwrap();
 
         let preset = preset("clip");
         let encoder = resolve_encoder(&preset, None, None);
@@ -1987,8 +1982,6 @@ mod tests {
         let outcome = finished
             .recv_timeout(crate::test_utils::HANG_DEADLINE)
             .expect("run_encode returns after the cancellation: the watchdog killed ffmpeg");
-        producer.kill().unwrap();
-        producer.wait().unwrap();
         assert!(
             matches!(outcome, Err(EncodeError::Cancelled)),
             "cancelling is the client's own doing, so it is a verdict on nothing: {outcome:?}"
