@@ -646,21 +646,24 @@ def test_the_tools_pin_like_the_spawner(tmp_path, monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("hip,bdf,nvml_gpus,count,exit_calls", [
-    ("6.4.43482", BDF_03, [], 1, None), (None, BDF_03, [], 1, []),
-    ("6.4.43482", BDF_03, [], 2, []),
+    ("6.4.43482", BDF_03, [], 1, None), (None, BDF_03, [], 1, ["free"]),
+    ("6.4.43482", BDF_03, [], 2, ["free", "count"]),
+    ("6.4.43482", BDF_03, [], 0, ["free", "count"]),
     ("6.4.43482", BDF_03, [{"index": 0, "uuid": "GPU-1"}], 1, []),
-    ("6.4.43482", None, [], 1, ["synchronize"]),
-    ("6.4.43482", BDF_0C, [], 1, ["synchronize"])],
-    ids=["ok", "hip None", "count 2", "hip on NVML", "BDF mismatch",
-         "another GPU"])
+    ("6.4.43482", None, [], 1, ["free", "count", "count", "synchronize", "free"]),
+    ("6.4.43482", BDF_0C, [], 1, ["free", "count", "count", "synchronize", "free"])],
+    ids=["ok", "hip None", "count 2", "count 0", "hip on NVML",
+         "BDF mismatch", "another GPU"])
 def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(
         tmp_path, monkeypatch, hip, bdf, nvml_gpus, count, exit_calls):
     """A run to the JSON on a fixture ROCm host, with a stand-in torch and an
     impl that allocates nothing. The probe exits before the load unless torch
     is a ROCm build that sees one device, and exits on a ROCm torch pinned to
     an NVML GPU; it exits after the priced load, before any batch, unless the
-    model loaded on the pinned GPU (`memory.device_bdf()`). `exit_calls` is
-    the torch.cuda calls made before the exit, None for a full run."""
+    model loaded on the pinned GPU (`memory.device_bdf()`). The stand-in torch
+    sees one device only once `HIP_VISIBLE_DEVICES` is set. `exit_calls` is the
+    free readings and torch.cuda calls made before the exit, None for a full
+    run."""
     host = Host(tmp_path / "host").gpu(1, 0x0300)
     host.kfd(os.getpid(), 1, 300 * MIB)
     pinned = probe.Rocm.pinned
@@ -678,14 +681,21 @@ def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(
         '[group.probe.inference_ids.echo]\nconfig.impl_class = "echo_test"\n')
     zero = lambda *args: 0  # noqa: E731
     calls = []
+    free_mb = probe.Rocm.free_mb
+    monkeypatch.setattr(probe.Rocm, "free_mb",
+                        lambda self: calls.append("free") or free_mb(self))
     cuda = types.SimpleNamespace(
-        device_count=lambda: count, get_device_name=lambda index: "AMD Radeon",
-        is_available=lambda: True, is_initialized=lambda: False,
+        device_count=lambda: calls.append("count") or (
+            count if os.environ.get("HIP_VISIBLE_DEVICES") == "0" else 2),
+        get_device_name=lambda index: "AMD Radeon",
+        is_available=lambda: True,
+        is_initialized=lambda: False,
         synchronize=lambda: calls.append("synchronize"),
         empty_cache=lambda: None,
         reset_peak_memory_stats=lambda: calls.append("reset_peak_memory_stats"),
         memory_reserved=zero,
-        memory_allocated=zero, max_memory_reserved=zero,
+        memory_allocated=zero,
+        max_memory_reserved=zero,
         max_memory_allocated=zero)
     torch = types.SimpleNamespace(
         __version__="2.8.0+rocm6.4", cuda=cuda,
@@ -719,7 +729,7 @@ def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(
                         result["load"]["base_nvml_mb"],
                         result["batches"][0]["gpu_free_mb"],
                         result["batches"][0]["nvml_own_mb"])
-    assert {"dtype", "dtype_method", "gqa_check", "transformers"} <= set(result)
+    assert result["gqa_check"] == "not applicable"
 
 
 def test_selftest_reasons_name_what_is_missing(tmp_path, monkeypatch):

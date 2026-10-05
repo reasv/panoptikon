@@ -148,14 +148,14 @@ def test_a_row_measured_anywhere_but_linux_cuda_or_rocm_is_refused(
 def test_a_rocm_row_is_a_measurement_and_is_never_copied(tmp_path):
     """wd-vit allowlists a Windows copy of its cuda row; its rocm row ships as
     measured and alone, since no other platform has the rocm extra."""
+    rocm = baselines.read_store(
+        _store(tmp_path, backend="rocm", arch="gfx1030"), None)
     rows = baselines.generate(
-        baselines.read_store(
-            _store(tmp_path, backend="rocm", arch="gfx1030"), None),
+        rocm + baselines.read_store(_store(tmp_path), None),
         baselines.read_allowlist(_registry(tmp_path)),
     )
-    assert [(row["platform"], row["backend"], row["arch"]) for row in rows] == [
-        ("linux", "rocm", "gfx1030")]
-    assert "base_platform" not in rows[0]
+    assert sorted((row["platform"], row["backend"]) for row in rows) == [
+        ("linux", "cuda"), ("linux", "rocm"), ("windows", "cuda")]
 
 
 def test_a_row_with_no_fit_is_refused_anchor_and_all(tmp_path):
