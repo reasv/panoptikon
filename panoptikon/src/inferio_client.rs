@@ -2222,6 +2222,8 @@ pub(crate) mod tests {
         gate: tokio::sync::watch::Sender<bool>,
         /// What `/health` answers; `None` hangs.
         health: tokio::sync::watch::Sender<Option<StatusCode>>,
+        /// The HTTP version of the last `/health` request.
+        health_version: StdMutex<Option<axum::http::Version>>,
     }
 
     impl ConcurrencyProbe {
@@ -2232,6 +2234,7 @@ pub(crate) mod tests {
                 peers: StdMutex::new(std::collections::HashSet::new()),
                 gate: tokio::sync::watch::channel(false).0,
                 health: tokio::sync::watch::channel(Some(StatusCode::OK)).0,
+                health_version: StdMutex::new(None),
             })
         }
 
@@ -2252,7 +2255,7 @@ pub(crate) mod tests {
     /// test releases it, served through the gateway's own serve loop and
     /// advertising `max_streams`. Every predict is counted and its peer
     /// recorded, so concurrency and sockets are measured. `/health` answers
-    /// as `probe.health` says.
+    /// as `probe.health` says and records its HTTP version.
     async fn spawn_blocking_stub(probe: Arc<ConcurrencyProbe>, max_streams: u32) -> String {
         use std::sync::atomic::Ordering::SeqCst;
 
@@ -2264,7 +2267,8 @@ pub(crate) mod tests {
             )
             .route(
                 "/api/inference/health",
-                get(move || {
+                get(move |version: axum::http::Version| {
+                    *probe.health_version.lock().expect("probe mutex") = Some(version);
                     let health = *probe.health.borrow();
                     async move {
                         match health {
@@ -2710,6 +2714,7 @@ pub(crate) mod tests {
     /// A busy server that answers its health check is waited for however long
     /// its answer takes, on both transports, even when every other check
     /// misses: one miss is not a freeze, and an answer starts the count over.
+    /// The checks speak the transport in force, h2c in the clear included.
     /// The server allows one stream per connection, so a check that shared
     /// the predict's connection would wait behind it.
     #[tokio::test]
@@ -2735,6 +2740,12 @@ pub(crate) mod tests {
                 "spaced"
             );
             assert!(!request.is_finished(), "{transport:?}: still waiting");
+            let version = match transport {
+                Transport::H2c => axum::http::Version::HTTP_2,
+                Transport::Http11 => axum::http::Version::HTTP_11,
+            };
+            let checked = *probe.health_version.lock().expect("probe mutex");
+            assert_eq!(checked, Some(version), "{transport:?}");
             probe.release(true);
             request.await.unwrap().expect("answered");
             assert_eq!(client.endpoint.health_checks.lock().stalled, 0);
