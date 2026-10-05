@@ -55,6 +55,15 @@ def test_only_dies_on_load_declares_that_it_extracts_nothing():
 
 def test_oom_timed_ooms_on_its_first_predicts_then_succeeds():
     """A count, not a time: every recording longer than it shows recovery."""
+    registry = tomllib.loads((HERE / "fixtures" / "registry" /
+                              "calibration-fixtures.toml").read_text())
+    ids = registry["group"]["calibfixture"]["inference_ids"]
+    # Short of the smoke tier, which leaves items for the recovery, and the
+    # leg's OOM threshold.
+    oom_predicts = ids["oom_timed_cuda"]["config"]["oom_predicts"]
+    assert 0 < oom_predicts < legs.SMOKE_IMAGES
+    expect = legs.S5_FIXTURES["oom_timed"].expect
+    assert int(expect[expect.index("--expect-ooms") + 1]) == oom_predicts == 20
     pytest.importorskip("torch")
     impl = _load("_calib_oom_timed",
                  HERE / "fixtures" / "impls" / "oom_timed_cuda_impl.py")
@@ -63,10 +72,6 @@ def test_oom_timed_ooms_on_its_first_predicts_then_succeeds():
         with pytest.raises(RuntimeError, match="INFERENCE_OOM_BATCH_SIZE_1"):
             model.predict([0])
     assert model.predict([0, 1]) == [{"batch": 2}] * 2
-    registry = tomllib.loads((HERE / "fixtures" / "registry" /
-                              "calibration-fixtures.toml").read_text())
-    ids = registry["group"]["calibfixture"]["inference_ids"]
-    assert ids["oom_timed_cuda"]["config"]["oom_predicts"] > 0
 
 
 # --- what legs.py prints ---------------------------------------------------
@@ -151,7 +156,7 @@ def test_each_fixture_passes_at_its_thresholds_and_fails_one_past(tmp_path,
     expect = list(_leg(model).expectations())
     at = _thresholds(expect)
     # One OOM negative per item: every image of the smoke tier.
-    if name in ("oom", "oom_timed"):
+    if name == "oom":
         assert at["--expect-ooms"] == legs.SMOKE_IMAGES == 180
     # A failed-item threshold is the item count.
     assert at["--expect-failures"] in (0, legs.SMOKE_IMAGES)
