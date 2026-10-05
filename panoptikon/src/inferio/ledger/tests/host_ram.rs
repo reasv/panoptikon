@@ -1254,13 +1254,25 @@ fn the_costliest_batch_at_a_size_is_kept() {
     );
 }
 
-/// A failed host read is not retried at every grant: it backs off like the
-/// probe.
+/// No host read is taken while a probe of the CPU device is in flight, and a
+/// failed one is not retried at every grant: it backs off like the probe.
 #[test]
-fn a_failed_host_read_backs_off() {
+fn a_host_read_skips_a_probe_in_flight_and_backs_off_after_a_failure() {
     let ledger = host(&[GPU], None);
     let (_handle, admission) = gpu_replica(&ledger, "g/unreadable", GPU, 8);
     ledger.install_probe_stub(None);
+    let set_in_flight = |in_flight: bool| {
+        let mut state = ledger.lock();
+        state
+            .gpus
+            .get_mut(cpu::DEVICE_KEY)
+            .expect("the CPU device")
+            .refreshing = in_flight;
+    };
+    set_in_flight(true);
+    drop(admission.request_grant(u64::MAX, None, 1, 0));
+    assert_eq!(ledger.probe_calls(), 0);
+    set_in_flight(false);
     drop(admission.request_grant(u64::MAX, None, 1, 0));
     drop(admission.request_grant(u64::MAX, None, 1, 0));
     assert_eq!(ledger.probe_calls(), 1);
