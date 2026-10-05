@@ -434,21 +434,22 @@ container, pair it with [Panoptikon Relay](https://github.com/reasv/panoptikon-r
 on your client (see above).
 
 **Running as another user.** The container runs as the image's `ubuntu` user
-(uid 1000), which owns `/app` and everything on the three volumes.
+(uid 1000). `/app` and `/home/ubuntu` belong to that user and to group 0 with
+the same permissions, and `HOME` is `/home/ubuntu` for every user, so root
+(`--user 0`, `user: "0"`, or a host that only runs containers as root) and any
+other uid (`--user 1234`, which Docker runs in group 0) work too, with models
+on the cache volume.
 
-- **root** (`--user 0`, `user: "0"`, or a host that only runs containers as
-  root) works, with two differences. Models are downloaded to `/root/.cache`,
-  so mount the cache volume there instead of `/home/ubuntu/.cache`. And what
-  root writes to the volumes belongs to root: once that includes a database,
-  a later start as the default user stops with an error naming it. Hand the
-  volumes back first (with the cache volume at its default mount point):
+What one user writes to the volumes belongs to that user: once that includes a
+database, a start as another user stops with an error naming the owner. The
+same happens to a uid other than 1000 on volumes created by an older image,
+which group 0 cannot write. Hand the volumes to the user that will run the
+container first (here the default user; `1234:0` for `--user 1234`):
 
-  ```bash
-  docker compose run --rm --user 0 --entrypoint chown panoptikon \
-    -R ubuntu:ubuntu /app/data /app/config /home/ubuntu/.cache
-  ```
-- **Any other uid** (`--user 1234`) is not supported: the server has to write
-  to `/app/runtime` inside the image, and stops at startup saying so.
+```bash
+docker compose run --rm --user 0 --entrypoint chown panoptikon \
+  -R ubuntu:0 /app/data /app/config /home/ubuntu/.cache
+```
 
 The server uses `/app` whatever the working directory, through
 `PANOPTIKON_ROOT` and `PANOPTIKON_CONFIG_PATH`: the image sets both in its
