@@ -72,6 +72,7 @@ fn a_tiny_pool_growth_teaches_no_margin() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 0);
     // The pool grows to twice the allocated peak, but that peak is 16 MiB.
     for units in [4u64, 8, 16] {
@@ -105,6 +106,7 @@ fn the_pool_margin_is_learned_from_the_largest_batch_and_clamped() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 900_000, 0);
     let grew = |units: u64, allocated: u64, reserved: u64| BatchMeasurement {
         reserved_before_mb: Some(0),
@@ -162,6 +164,7 @@ fn a_steady_state_at_one_size_keeps_the_largest_batchs_margin() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 900_000, 0);
     let grew = |units: u64, allocated: u64, reserved: u64| BatchMeasurement {
         reserved_before_mb: Some(0),
@@ -210,6 +213,7 @@ fn a_steady_state_at_one_size_leaves_the_slope_intact() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 0);
     // Six ramp steps on a 10 MiB/unit line.
     for units in [4u64, 8, 16, 32, 64, 128] {
@@ -407,6 +411,7 @@ fn fitted_with_a_fixed_part(
     let admission = ledger
         .register_worker(model, item_cost(2), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 0);
     for _ in 0..5 {
         let token = admission
@@ -518,6 +523,7 @@ fn the_cpu_device_charges_the_fixed_part_only_when_it_is_not_resident() {
         let admission = ledger
             .register_worker("g/a", item_cost(2), &handle, None)
             .expect("admitted");
+        admission.note_remaining_items(NO_END);
         push_memory_with_total(&handle, 40_000, kept_mb, Some(CPU_RAM_MB), "ram");
         for _ in 0..5 {
             let token = admission

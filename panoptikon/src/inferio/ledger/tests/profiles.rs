@@ -484,6 +484,7 @@ fn a_stored_working_size_opens_the_run_at_that_size() {
         let admission = ledger
             .register_worker("g/a", item_cost(64), &handle, None)
             .unwrap();
+        admission.note_remaining_items(NO_END);
         push_memory(&handle, 900_000, 0);
         ledger.ingest_all_for_test();
         (ledger, handle, admission)
@@ -705,6 +706,7 @@ fn the_write_policy_fires_on_evidence_not_per_window() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 0);
 
     // Windows that measure nothing teach nothing, so they persist nothing.
@@ -801,6 +803,7 @@ fn a_fallback_matched_local_profile_confers_growth_but_not_confirmation() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 50_000, 0);
     ledger.ingest_all_for_test();
     let worker = &ledger.health()[0].workers[0];
@@ -854,6 +857,7 @@ fn a_reload_resumes_a_written_profile_without_duplicating_its_ring() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 0);
     for units in [4, 8, 16] {
         measured_window(&handle, &admission, units);
@@ -916,6 +920,7 @@ fn a_seeded_fit_is_never_laundered_into_local_provenance() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 0);
 
     // One local sample: the anchor advanced, so the entry is written —

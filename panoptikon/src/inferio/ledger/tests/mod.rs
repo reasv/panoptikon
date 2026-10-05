@@ -20,6 +20,9 @@ use super::oom::{
 use super::test_hooks::CalibrationState;
 
 const GPU: &str = "GPU-aaaa";
+/// The count of a job with no end in sight: the payback gate never holds a
+/// probe back.
+const NO_END: Option<u64> = Some(u64::MAX);
 /// The profile keyspace every test replica reports: one architecture, so
 /// two cards of it share a profile and carry separate budgets.
 const ARCH: &str = super::TEST_ARCH;
@@ -587,6 +590,7 @@ fn knee_capped(knee: u64) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
     let admission = ledger
         .register_worker("g/a", item_cost(64), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 190_000, 1000);
     // One measured window, so the anchor is 64 and the knee has something
     // to cap.
@@ -636,6 +640,7 @@ fn ramping_from_seed(seed: u32) -> (Arc<VramLedger>, TelemetryHandle, Admission)
     let admission = ledger
         .register_worker("g/a", item_cost(seed), &handle, None)
         .expect("registers");
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 190_000, 1000);
     (ledger, handle, admission)
 }
@@ -654,20 +659,22 @@ fn window_at_the_rate(
     admission: &Admission,
     rate_at: impl Fn(u64) -> f64,
 ) -> u64 {
-    queued_window_at_the_rate(handle, admission, u64::MAX, rate_at)
+    queued_window_at_the_rate(handle, admission, u64::MAX, 1, rate_at)
 }
 
-/// The same window with only `window_units` of work in the queue behind it:
-/// what a job's first windows look like while the scanner is still filling
-/// them, and the state the ratchet walk starts from.
+/// The same window with only `window_units` of work in the queue behind it,
+/// sent as `requests` requests: what a job's first windows look like while
+/// the scanner is still filling them, and the state the ratchet walk starts
+/// from.
 fn queued_window_at_the_rate(
     handle: &TelemetryHandle,
     admission: &Admission,
     window_units: u64,
+    requests: usize,
     rate_at: impl Fn(u64) -> f64,
 ) -> u64 {
     let token = admission
-        .request_grant(window_units, None, 1, 0)
+        .request_grant(window_units, None, requests, 0)
         .expect("granted");
     let granted = token.grant().unit_budget;
     let rate_ = rate_at(granted);

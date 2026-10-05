@@ -83,6 +83,7 @@ fn cpu_replica(ledger: &Arc<VramLedger>) -> (TelemetryHandle, Admission) {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("admitted");
+    admission.note_remaining_items(NO_END);
     push_memory_with_total(&handle, 40_000, 0, Some(CPU_RAM_MB), "ram");
     (handle, admission)
 }
@@ -220,6 +221,7 @@ fn a_death_in_a_window_the_queue_sized_sets_no_cap() {
             let admission = ledger
                 .register_worker("g/a", cost, &handle, None)
                 .expect("admitted");
+            admission.note_remaining_items(NO_END);
             push_memory_with_total(&handle, 40_000, 0, Some(CPU_RAM_MB), "ram");
             (handle, admission)
         };
@@ -352,6 +354,7 @@ fn seed_window(
     let admission = ledger
         .register_worker("g/a", item_cost(units), &handle, None)
         .expect("admitted");
+    admission.note_remaining_items(NO_END);
     push_memory_with_total(&handle, 40_000, 0, Some(CPU_RAM_MB), "ram");
     admission
         .request_grant(u64::MAX, None, 1, 0)
@@ -637,6 +640,7 @@ fn an_uncorroborated_collapse_is_discarded_whole() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 0);
     for expected in [4, 8, 16, 32] {
         assert_eq!(measured_window(&handle, &admission, expected), expected);
@@ -1465,6 +1469,7 @@ fn fitted_replica(ledger: &Arc<VramLedger>, model: &str) -> (TelemetryHandle, Ad
     let admission = ledger
         .register_worker(model, item_cost(4), &handle, None)
         .expect("registers");
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 190_000, 0);
     for _ in 0..7 {
         room_window(&handle, &admission, CLEAN);
@@ -1653,6 +1658,7 @@ fn a_pre_fit_out_of_memory_window_leaves_the_pool_margin() {
     let admission = ledger
         .register_worker("g/a", item_cost(64), &handle, None)
         .expect("registers");
+    admission.note_remaining_items(NO_END);
     room(&ledger, &handle, 200 + DEFAULT_RESERVE_CAP_MB);
     let budgets: Vec<(u64, u64, bool)> = (0..3)
         .map(|_| room_window(&handle, &admission, OUT_OF_MEMORY))
@@ -1725,6 +1731,7 @@ fn out_of_memory_windows_raise_the_pool_margin_three_times_at_most() {
     let admission = ledger
         .register_worker("g/wide", item_cost(4), &wide, None)
         .expect("registers");
+    admission.note_remaining_items(NO_END);
     push_memory(&wide, 190_000, 0);
     for _ in 0..7 {
         let token = admission

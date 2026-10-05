@@ -43,6 +43,7 @@ impl Cold {
         let admission = ledger
             .register_worker(model, item_cost(seed), &handle, None)
             .expect("registers");
+        admission.note_remaining_items(NO_END);
         Self {
             model: model.to_owned(),
             device: GPU.to_owned(),
@@ -219,6 +220,7 @@ fn cpu_host(count: u64, headroom: u64, percent: u64) -> (Arc<VramLedger>, Vec<Co
             let admission = ledger
                 .register_worker(&model, item_cost(8), &handle, None)
                 .expect("registers");
+            admission.note_remaining_items(NO_END);
             Cold {
                 model,
                 device: cpu::DEVICE_KEY.to_owned(),
@@ -270,6 +272,7 @@ fn mac(pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>) {
         let admission = ledger
             .register_worker(model, item_cost(8), &handle, Some(device))
             .expect("admitted");
+        admission.note_remaining_items(NO_END);
         let on_mps = device == MPS_GPU;
         replicas.push(Cold {
             model: model.to_owned(),

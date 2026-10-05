@@ -316,6 +316,7 @@ fn a_measured_working_size_caps_the_grant_and_is_persisted() {
     let admission = ledger
         .register_worker("g/a", item_cost(64), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 1000);
     let rate = |units: u64| units.min(64) as f64;
     let budgets: Vec<u64> = (0..40)
@@ -504,6 +505,7 @@ fn a_persisted_knee_seeds_the_next_run() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 1000);
     // The rate doubles with the batch up to 16 units and gains nothing past:
     // probes move the size to 16, and it is stored.
@@ -618,6 +620,7 @@ fn a_late_seed_never_overwrites_a_locally_fitted_knee() {
     let admission = ledger
         .register_worker("g/a", item_cost(64), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 1000);
     for _ in 0..5 {
         window_at_the_rate(&handle, &admission, |units| units.min(64) as f64);
@@ -727,9 +730,11 @@ fn a_knee_shrinks_the_models_contention_appetite() {
     let a = ledger
         .register_worker("g/a", item_cost(1), &a_handle, None)
         .unwrap();
+    a.note_remaining_items(NO_END);
     let b = ledger
         .register_worker("g/b", item_cost(1), &b_handle, None)
         .unwrap();
+    b.note_remaining_items(NO_END);
     push_memory(&a_handle, 8000, 0);
     push_memory(&b_handle, 8000, 0);
     // Both fitted at 1000 MiB/unit, both with a ratchet anchor of 16:

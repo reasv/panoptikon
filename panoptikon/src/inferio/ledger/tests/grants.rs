@@ -363,6 +363,7 @@ fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 50_000, 0);
     for units in [4, 8, 16, 32] {
         measured_window(&handle, &admission, units);
@@ -639,6 +640,7 @@ fn a_degraded_cost_dimension_widens_the_margin_permanently() {
     let admission = ledger
         .register_worker("g/a", CostDimension::fallback(), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 50_000, 0);
     for units in [4, 8, 16, 32, 64] {
         measured_window(&handle, &admission, units);

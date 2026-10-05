@@ -340,6 +340,7 @@ fn post_fit_a_squeeze_is_affordability_not_the_ramp() {
     let admission = roomy
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&idle, 190_000, 1000);
     push_memory(&handle, 190_000, 0);
     roomy.ingest_all_for_test();
@@ -379,6 +380,7 @@ fn post_fit_a_squeeze_is_affordability_not_the_ramp() {
     let admission = tight
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     // footprints = (4000 + 1000) + 4980 = 9980; external = 0; headroom = 20.
     push_memory(&idle, 20, 1000);
     push_memory(&handle, 20, 0);
@@ -967,6 +969,7 @@ fn a_reactive_shrinks_regrow_is_not_reported_as_a_trims() {
     let resident = ledger
         .register_worker("g/self", item_cost(4), &handle, None)
         .unwrap();
+    resident.note_remaining_items(NO_END);
     push_memory(&handle, 6000, 1000);
     ledger.ingest_all_for_test();
 

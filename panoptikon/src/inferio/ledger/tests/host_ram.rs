@@ -85,6 +85,7 @@ fn cold_gpu_replica(
     let admission = ledger
         .register_worker(model, cost, &handle, Some(gpu))
         .expect("admitted on its card");
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 190_000, 1000);
     (handle, admission)
 }
@@ -293,6 +294,7 @@ fn plentiful_host_ram_changes_no_grant() {
     let base_admission = base
         .register_worker("g/plenty", item_cost(8), &base_handle, None)
         .expect("admitted");
+    base_admission.note_remaining_items(NO_END);
     push_memory(&base_handle, 190_000, 1000);
     let ledger = host(&[GPU], None);
     let (handle, admission) = cold_gpu_replica(&ledger, "g/plenty", GPU, item_cost(8));
@@ -1603,8 +1605,7 @@ impl ColdRun {
             .register_worker("g/cold", item_cost(self.seed), &handle, Some(GPU))
             .expect("admitted on its card");
         cpu_free_to_book(&ledger, 45_000);
-        // A job with no end in sight.
-        admission.note_remaining_items(Some(u64::MAX));
+        admission.note_remaining_items(NO_END);
         let mut pool = 0;
         let mut first_only = self.first_only_mb;
         let mut ran = Vec::new();

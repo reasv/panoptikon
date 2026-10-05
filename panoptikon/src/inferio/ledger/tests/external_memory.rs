@@ -288,6 +288,7 @@ fn per_batch_free_readings_obey_the_sample_map_rules() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory_with_total(&handle, 30_000, 0, Some(32_000), "nvml");
     ledger.ingest_all_for_test();
     handle.lock().unwrap().memory = None;

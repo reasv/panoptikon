@@ -12,6 +12,7 @@ fn a_size_that_earns_the_next_doubles_and_the_ratchet_bounds_it() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 0);
     // Each window measures a batch the size of its grant.
     for expected in [4, 8, 16] {
@@ -70,6 +71,7 @@ fn deflation_halves_and_clean_windows_restore() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 0);
     for expected in [4, 8, 16, 32] {
         assert_eq!(measured_window(&handle, &admission, expected), expected);
@@ -160,6 +162,7 @@ fn the_deflation_counter_is_capped_at_what_takes_the_budget_to_one() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 0);
     for expected in [4, 8, 16, 32] {
         assert_eq!(measured_window(&handle, &admission, expected), expected);
@@ -194,6 +197,7 @@ fn deflation_is_also_repaid_by_elapsed_time() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 0);
     for expected in [4, 8, 16, 32] {
         assert_eq!(measured_window(&handle, &admission, expected), expected);
@@ -238,6 +242,7 @@ fn the_window_target_repays_deflation_before_it_reads_the_counter() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 90_000, 0);
     for expected in [4, 8, 16, 32] {
         assert_eq!(measured_window(&handle, &admission, expected), expected);
@@ -615,6 +620,7 @@ fn windows_on_a_card(
     let admission = ledger
         .register_worker("g/a", item_cost(64), &handle, None)
         .expect("registers");
+    admission.note_remaining_items(NO_END);
     let mut held = 0;
     let budgets = (0..windows)
         .map(|window| {
@@ -682,8 +688,7 @@ fn process_start(store: &Arc<CalibrationStore>, windows: usize, rate: Rate) -> V
         .register_worker("g/a", item_cost(64), &handle, None)
         .expect("registers");
     push_memory(&handle, 190_000, 1000);
-    // A job with no end in sight.
-    admission.note_remaining_items(Some(u64::MAX));
+    admission.note_remaining_items(NO_END);
     let budgets = (0..windows)
         .map(|_| window_leaving_warm(&handle, &admission, |_| 2, rate))
         .collect();
@@ -777,8 +782,7 @@ fn run_at(seed: u32, mode: SizingMode, windows: usize, rate: Rate) -> (Vec<u64>,
         .register_worker("g/a", item_cost(seed), &handle, None)
         .expect("registers");
     push_memory(&handle, 390_000, 1000);
-    // A job with no end in sight.
-    admission.note_remaining_items(Some(u64::MAX));
+    admission.note_remaining_items(NO_END);
     let budgets = (0..windows)
         .map(|_| window_at_the_rate(&handle, &admission, rate))
         .collect();
@@ -841,9 +845,11 @@ fn only_throughput_mode_looks_past_a_flat_doubling() {
 
 /// A job that says it has too little left to repay a probe runs at the
 /// working size; one with no end in sight probes. A job that does not say
-/// probes only once it has run as many items since its queue last ran dry.
+/// probes only once it has sent as many requests since its queue last ran
+/// dry.
 #[test]
 fn a_job_too_short_to_repay_a_probe_runs_at_the_working_size() {
+    const REQUESTS: usize = 4;
     let budgets = |left: Option<u64>, dry_every: u64| {
         let (ledger, handle, admission) = ramping_from_seed(64);
         admission.note_remaining_items(left);
@@ -852,16 +858,17 @@ fn a_job_too_short_to_repay_a_probe_runs_at_the_working_size() {
                 if window % dry_every == 0 {
                     admission.note_demand(0);
                 }
-                window_at_the_rate(&handle, &admission, |_| 100.0)
+                queued_window_at_the_rate(&handle, &admission, u64::MAX, REQUESTS, |_| 100.0)
             })
             .collect();
         drop(ledger);
         budgets
     };
     let probes = |budgets: Vec<u64>| budgets.contains(&128);
-    assert!(!probes(budgets(Some(PROBE_PAYBACK_WINDOWS - 1), u64::MAX)));
-    assert!(probes(budgets(Some(u64::MAX), u64::MAX)));
-    // One item a window: the queue runs dry every `dry_every` windows.
+    let payback = PROBE_PAYBACK_WINDOWS * REQUESTS as u64;
+    assert!(!probes(budgets(Some(payback - 1), u64::MAX)));
+    assert!(probes(budgets(NO_END, u64::MAX)));
+    // The queue runs dry every `dry_every` windows.
     assert!(!probes(budgets(None, PROBE_PAYBACK_WINDOWS - 1)));
     assert!(probes(budgets(None, PROBE_PAYBACK_WINDOWS)));
 }
@@ -872,7 +879,6 @@ fn a_job_too_short_to_repay_a_probe_runs_at_the_working_size() {
 #[test]
 fn the_settle_that_starts_a_probe_asks_the_caller_for_its_larger_size() {
     let (ledger, handle, admission) = ramping_from_seed(64);
-    admission.note_remaining_items(Some(u64::MAX));
     let probe_on = || ledger.trial_for_test("g/a", GPU).0.is_some();
     for _ in 0..40 {
         if probe_on() {
@@ -940,6 +946,7 @@ fn a_probe_that_ran_a_larger_size_releases_every_replicas_pool() {
     let first = ledger
         .register_worker("g/a", item_cost(64), &one, None)
         .unwrap();
+    first.note_remaining_items(NO_END);
     let second = ledger
         .register_worker("g/a", item_cost(64), &other, None)
         .unwrap();

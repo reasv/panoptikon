@@ -50,8 +50,7 @@ fn clippable(seed: u32) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
         .register_worker("g/a", item_cost(seed), &handle, None)
         .expect("admitted");
     push_memory(&handle, 190_000, 1000);
-    // A job with no end in sight.
-    admission.note_remaining_items(Some(u64::MAX));
+    admission.note_remaining_items(NO_END);
     (ledger, handle, admission)
 }
 

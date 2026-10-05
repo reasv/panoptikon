@@ -244,6 +244,7 @@ fn a_resident_is_charged_the_pool_it_holds_not_the_peak_it_touched() {
     let admission = mps
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("registers");
+    admission.note_remaining_items(NO_END);
     let available = MAC_RAM_MB - HOG - 1_000 - 100;
     let mut externals = Vec::new();
     for peak in [4_000u64, 12_000, 20_000] {
@@ -672,6 +673,7 @@ fn a_deaths_halved_anchor_never_reaches_the_store() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("admitted");
+    admission.note_remaining_items(NO_END);
     push_memory(&handle, 60_000, 0);
     for units in [4, 8, 16] {
         measured_window(&handle, &admission, units);
@@ -962,10 +964,12 @@ fn a_cpu_replica_is_priced_beside_the_gpus_of_a_cuda_host() {
     let cpu_admission = ledger
         .register_worker("g/cpu", item_cost(4), &cpu_handle, Some("GPU-1a2b"))
         .expect("admitted on the CPU device");
+    cpu_admission.note_remaining_items(NO_END);
     let gpu_handle = loaded_on("GPU-3c4d", Some(1000), Some(0));
     let gpu_admission = ledger
         .register_worker("g/gpu", item_cost(4), &gpu_handle, Some("GPU-3c4d"))
         .expect("admitted on its card");
+    gpu_admission.note_remaining_items(NO_END);
     push_memory_with_total(&cpu_handle, CPU_RAM_MB / 2, 0, Some(CPU_RAM_MB), "ram");
     push_memory(&gpu_handle, 90_000, 0);
 
@@ -1625,6 +1629,7 @@ fn ramped_mac_replica() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("registers");
+    admission.note_remaining_items(NO_END);
     push_ram(&handle, MAC_TOTAL_MB, 90_000, 0, 0);
     let ramped: Vec<u64> = (0..200)
         .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
@@ -1748,7 +1753,7 @@ fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
     push_ram(&handle, MAC_TOTAL_MB, 90_000, 180, 0);
     // A window the queue sized did not fill the size, so it earns no doubling.
-    queued_window_at_the_rate(&handle, &admission, 3, |_| 100.0);
+    queued_window_at_the_rate(&handle, &admission, 3, 1, |_| 100.0);
     assert_eq!(ramp_figures(&ledger).3, 8);
     assert_eq!(ramp_windows(&handle, &admission, 4), [8, 16, 32, 64]);
     assert_eq!(pressure_cap(&ledger), None, "back at the working size");
@@ -1880,7 +1885,7 @@ fn a_reloaded_replica_inherits_the_size_paging_left() {
 fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
     let (ledger, handle, admission) = ramped_mac_replica();
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
-    queued_window_at_the_rate(&handle, &admission, 5, |_| 100.0);
+    queued_window_at_the_rate(&handle, &admission, 5, 1, |_| 100.0);
     assert_eq!(
         pressure_cap(&ledger),
         None,
@@ -1888,7 +1893,7 @@ fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
     );
 
     push_ram(&handle, MAC_TOTAL_MB, 0, 180, 0);
-    let granted = queued_window_at_the_rate(&handle, &admission, 20, |_| 100.0);
+    let granted = queued_window_at_the_rate(&handle, &admission, 20, 1, |_| 100.0);
     assert_eq!(granted, 8, "20 units of work, memory for 8");
     assert_eq!(pressure_cap(&ledger).map(|cap| cap.units), Some(8));
 
