@@ -1705,7 +1705,8 @@ fn the_largest_first_batch_of_two_cold_replicas_is_recorded() {
 }
 
 /// A pixel-priced replica's single-item window holds one image per batch:
-/// its unit budget is the image's pixels, not one pixel.
+/// its unit budget is the image's pixels, not one pixel. A window of more
+/// images than its item cap is priced at the cap's share of their pixels.
 #[test]
 fn a_pixel_priced_single_item_window_is_one_image() {
     const IMAGE: u64 = 1_048_576;
@@ -1738,6 +1739,32 @@ fn a_pixel_priced_single_item_window_is_one_image() {
         }]);
     token.finish(WindowOutcome::Responded { oom: None });
     assert_eq!(item_bound(&admission), usize::MAX);
+
+    // Opened past two images by a stored size, the cap doubles to two: six
+    // images are priced at two.
+    let profiles = Arc::new(FakeProfiles {
+        seed: Some(ProfileSeed {
+            slope_mb_per_unit: 0.001,
+            ..seeded_anchor(8 * IMAGE, true)
+        }),
+        ..FakeProfiles::default()
+    });
+    let ledger = host(&[GPU], Some(profiles));
+    let wide = CostDimension {
+        seed_units: Some(8 * IMAGE as u32),
+        ..cost
+    };
+    let (handle, admission) = cold_gpu_replica(&ledger, "g/pixels-capped", GPU, wide);
+    single_item_window(&handle, &admission, IMAGE, 50);
+    assert_eq!(admission.window_item_bound(), 6);
+    let token = admission
+        .request_grant(6 * IMAGE, None, 6, 0)
+        .expect("granted");
+    let grant = token.grant();
+    assert_eq!(
+        (grant.user_cap_items, grant.unit_budget),
+        (Some(2), 2 * IMAGE)
+    );
 }
 
 /// A cold replica with a RAM side, alone on a card with `room_mb` for its
@@ -2268,7 +2295,10 @@ fn a_first_batch_pinned_then_freed_leaves_no_large_window_under_booked() {
                     .get(&(window, others))
                     .expect("the release before the peak runs first");
                 assert!(
-                    later.iter().zip(before).all(|(after, before)| after >= before),
+                    later
+                        .iter()
+                        .zip(before)
+                        .all(|(after, before)| after >= before),
                     "freed {freed:?}, others {others}: {later:?} against {before:?}"
                 );
             } else {

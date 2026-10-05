@@ -461,7 +461,7 @@ fn a_byte_closed_window_records_its_anchor_without_earning_a_step() {
         push_memory(&handle, 90_000, 0);
         for _ in 0..6 {
             let token = admission
-                .request_grant_byte_bound(4, None, 1, 4, byte_bound)
+                .request_grant_byte_bound(4, 4, None, 1, 4, byte_bound)
                 .expect("granted");
             assert_eq!(
                 token.grant().unit_budget,
