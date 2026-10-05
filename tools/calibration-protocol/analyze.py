@@ -1401,8 +1401,9 @@ def _released_mb(before: Dict[str, Any], after: Dict[str, Any],
                  requester: Set[int]) -> int:
     """Memory freed on a GPU between two oracle rows by processes that are
     neither the requester nor gone by the later row: the fall in `used`, less
-    what vanished processes held, plus the requester's own change. A worker
-    the grant killed, or the requester emptying its cache after an
+    what vanished processes held and both rows' `skew_mb` (how far `used`
+    moved while the processes were read), plus the requester's own change.
+    A worker the grant killed, or the requester emptying its cache after an
     out-of-memory error, is a consequence of the grant, never a release."""
     held = {proc["pid"]: int(proc.get("used_mb") or 0)
             for proc in before.get("procs") or []}
@@ -1410,6 +1411,7 @@ def _released_mb(before: Dict[str, Any], after: Dict[str, Any],
            for proc in after.get("procs") or []}
     released = int(before["used_mb"]) - int(after["used_mb"])
     released -= sum(mb for pid, mb in held.items() if pid not in now)
+    released -= int(before.get("skew_mb") or 0) + int(after.get("skew_mb") or 0)
     released += sum(now[pid] - held.get(pid, 0)
                     for pid in requester if pid in now)
     return released
