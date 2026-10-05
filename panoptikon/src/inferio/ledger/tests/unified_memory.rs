@@ -2224,12 +2224,12 @@ fn while_the_mac_pages_a_grant_with_a_probe_in_flight_reads_nothing_free() {
     ledger.health();
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
     ledger.install_probe_stub(None);
-    ledger
-        .lock()
-        .gpus
-        .get_mut(MPS_GPU)
-        .expect("the Mac")
-        .refreshing = true;
+    {
+        let mut state = ledger.lock();
+        let gpu = state.gpus.get_mut(MPS_GPU).expect("the Mac");
+        gpu.refreshing = true;
+        gpu.free_adjusted_at = Some(Instant::now());
+    }
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
