@@ -102,11 +102,11 @@ change:   a probe's own pairs more than 3.5 standard errors from the doubling's
   past its limit), for `HELD_WINDOWS` (3) windows in a row, `W` halves to
   what memory holds and the pool is released; no evidence takes it back up
   until a larger size is granted in full again.
-- **Short jobs.** A caller may report a job's remaining items
+- **Short jobs.** A caller may report the items its job has not finished
   (`Admission::note_remaining_items`); a probe starts only with
   `PROBE_PAYBACK_WINDOWS` windows of work left. The count arrives as
   predict's `remaining_items`, and a caller that does not say is taken to
-  have the items run since its queue last ran dry. Without a count, a probe
+  have the requests run since its queue last ran dry. Without a count, a probe
   can start too near a job's end to finish; it goes on in the next job, but a
   restart loses it.
 - **Bounded weight.** A doubling's pairs weigh at most 64: past that, older

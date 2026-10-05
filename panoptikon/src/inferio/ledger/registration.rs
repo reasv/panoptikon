@@ -904,9 +904,10 @@ impl Admission {
         self.ledger.note_trim_declined(self.worker);
     }
 
-    /// The items this replica's job has left to send, `None` when unknown: a
-    /// batch size probe starts only in a job long enough to repay it
-    /// ([`PROBE_PAYBACK_WINDOWS`]).
+    /// The items the caller's job has not finished, this request's included;
+    /// `None`: it does not say, and the requests since the queue last ran dry
+    /// stand in. A batch size probe starts only in a job long enough to repay
+    /// it ([`PROBE_PAYBACK_WINDOWS`]).
     pub fn note_remaining_items(&self, items: Option<u64>) {
         let mut state = self.ledger.lock();
         if let Some(entry) = state.workers.get_mut(&self.worker) {

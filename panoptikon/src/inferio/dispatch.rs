@@ -82,9 +82,8 @@ pub(crate) struct DispatchRequest {
     pub inputs: Vec<WorkerInput>,
     /// The user's max batch size: bounds items, never units.
     pub max_batch: Option<u32>,
-    /// Items the caller's whole job has left; `None`: it does not say. The
-    /// payback gate compares it with requests, so an item sent as several
-    /// requests under-reads, which only delays a probe.
+    /// The items the caller's job has not finished, this request's included;
+    /// `None`: it does not say.
     pub remaining_items: Option<u64>,
     pub reply: oneshot::Sender<Result<Vec<WorkerOutput>>>,
 }

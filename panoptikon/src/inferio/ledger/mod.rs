@@ -200,10 +200,10 @@ pub const MAX_PAIRS: f64 = 64.0;
 pub const PROBE_PAIRS: u32 = 4;
 pub const PROBE_WINDOWS: u32 = 16;
 
-/// Windows at the working size a job must have left for a probe to start:
-/// the items its caller says the whole job has left, or else the requests
-/// since its queue last ran dry. The count is compared with requests, so an
-/// item sent as several requests under-reads, which only delays a probe.
+/// Windows at the working size a job must have left for a probe to start: the
+/// items its caller's job has not finished, or else the requests since its
+/// queue last ran dry. The count is compared with requests, so an item sent as
+/// several requests under-reads, and such a job may not probe at all.
 pub const PROBE_PAYBACK_WINDOWS: u64 = 16;
 
 /// Windows at the working size after a probe that left it in place before
@@ -744,7 +744,8 @@ struct WorkerEntry {
     /// after an item-capped window whose batch filled it, `None` once that
     /// would hold a seed batch.
     item_cap: Option<u32>,
-    /// Items its job has left, when the caller says ([`Admission::note_remaining_items`]).
+    /// The items its caller's job has not finished, when it says
+    /// ([`Admission::note_remaining_items`]).
     remaining_items: Option<u64>,
     /// Requests settled since its queue last ran dry with no probe on: what
     /// its job is taken to have left when the caller does not say.
