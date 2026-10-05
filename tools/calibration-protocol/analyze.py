@@ -250,7 +250,8 @@ class Context:
         self.worker_spawns = _worker_spawns(self.log)
         # A worker in a container logs its PID there, which vramrec records as
         # `ns_pid` beside the host PID. A spawn takes the first such process
-        # sighted after it.
+        # to appear on a GPU after it.
+        self._pid_first_seen: Optional[Dict[int, float]] = None
         host_pids: Dict[int, List[Tuple[float, int]]] = {}
         for sample in self.vram_samples:
             for gpu in sample.get("gpus", []):
@@ -260,11 +261,10 @@ class Context:
                             (sample["t_wall"], proc["pid"]))
         for spawn in self.worker_spawns:
             for t_wall, pid in host_pids.get(spawn["pid"], []):
-                if t_wall >= spawn["t_wall"] - SPAWN_CLOCK_SLACK_S:
+                if self.pid_first_seen()[pid] >= spawn["t_wall"] - SPAWN_CLOCK_SLACK_S:
                     spawn["pid"] = pid
                     break
         self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
-        self._pid_first_seen: Optional[Dict[int, float]] = None
         self._release_windows: Dict[str, Tuple[List[Tuple[float, float, int, int]],
                                                List[float], List[float]]] = {}
         # Each worker PID spawned before a death line for its model, to the
@@ -678,7 +678,7 @@ RELEASE_LAG_S_PER_GIB = 0.040
 RELEASE_DRAIN_MAX_S = 2.0
 #: How long a dead worker's PID may stay listed after its death line.
 WORKER_TEARDOWN_MAX_S = 10.0
-#: The ledger's `EXTERNAL_SAMPLE_MAX_AGE`: it refreshes an older reading before a grant.
+#: The ledger's EXTERNAL_SAMPLE_MAX_AGE: an older reading is due a refresh.
 LEDGER_READ_MAX_AGE_S = 10.0
 
 # How long a hog must hold, and how much, before `external_mb` not moving at
@@ -886,7 +886,8 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             ours, _ = ctx.our_pids_mb(oracle)
             oracle_external = max(0, int(oracle["used_mb"]) - ours)
             raw = abs(int(gpu.get("external_mb") or 0) - oracle_external)
-            # The ledger re-reads an older figure before it grants from it.
+            # A reading this old is due a refresh; grant_safety judges any grant
+            # priced from it.
             age = (gpu.get("external_sample_age_ms") or 0) / 1000.0
             if age > LEDGER_READ_MAX_AGE_S:
                 stale += 1
@@ -1549,8 +1550,8 @@ def check_grant_safety(ctx: Context) -> Verdict:
         verdict = "PASS"
     detail = (f"{len(grants)} grants; {len(over_headroom)} exceeded the headroom "
               f"they were priced against; {len(over_free)} exceeded the oracle's "
-              f"live free memory plus their own pool ({no_next} with no next "
-              f"sample within {ctx.vram_tolerance:.2f}s to show a release; "
+              f"live free memory plus their own pool ({no_next} with no usable "
+              f"next sample within {ctx.vram_tolerance:.2f}s to show a release; "
               f"{joined} judged, {undecided} not decidable: no oracle sample "
               f"shortly before; {on_cpu} on the CPU device, which the oracle does not record); "
               f"{zero_mb} were memory-blind (mb=0)")
@@ -2312,12 +2313,13 @@ def _idle_spans(legs: Optional[Dict[str, Any]]) -> List[Tuple[float, float]]:
 def _void_hog_events(legs: Optional[Dict[str, Any]],
                      hog: List[Dict[str, Any]]) -> List[str]:
     """The hog events that asked for more than the hog held (a leave-free
-    target, or a hold at or above what it held) while its `held_mb` rose by
-    less than one chunk before the next event."""
+    level under the free memory the hog last read, or with free unread; or a
+    hold at or above what it held) while its `held_mb`, progress rows
+    included, rose by less than one chunk before the next event."""
     header = next((row for row in hog if row.get("kind") == "header"), {})
     chunk = header.get("chunk_mb") or 1
-    states = [(row["t_wall"], row.get("held_mb") or 0) for row in hog
-              if row.get("kind") in ("state", "final")]
+    states = [(row["t_wall"], row.get("held_mb") or 0, row.get("free_mb"))
+              for row in hog if row.get("kind") in ("state", "progress", "final")]
     requests = []
     for event in (legs or {}).get("events") or []:
         t_wall = _iso_epoch(str(event.get("iso", "")))
@@ -2326,12 +2328,13 @@ def _void_hog_events(legs: Optional[Dict[str, Any]],
     void = []
     for index, (start, event) in enumerate(requests):
         end = requests[index + 1][0] if index + 1 < len(requests) else math.inf
-        held = ([mb for t_wall, mb in states if t_wall <= start] or [0])[-1]
-        rose = max([mb for t_wall, mb in states if start < t_wall <= end],
+        held, free = ([(mb, free) for t_wall, mb, free in states if t_wall <= start]
+                      or [(0, None)])[-1]
+        rose = max([mb for t_wall, mb, _ in states if start < t_wall <= end],
                    default=held) - held
         kind, _, mb = str(event.get("query")).partition("=")
-        asked = kind == "leave_free" or (kind == "mb" and int(mb) > 0
-                                         and int(mb) >= held)
+        asked = (kind == "leave_free" and (free is None or free > int(mb))
+                 or kind == "mb" and int(mb) > 0 and int(mb) >= held)
         if asked and rose < chunk:
             void.append(str(event.get("label") or f"t+{event.get('at_s')}s"))
     return void

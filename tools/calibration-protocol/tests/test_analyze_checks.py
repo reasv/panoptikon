@@ -709,7 +709,7 @@ def test_grant_safety_counts_only_releases_by_other_live_processes():
     """The requester emptying its cache after an out-of-memory error, or a
     worker the grant killed, is no release; another worker's is. A spawn line
     from a container names the PID vramrec records as `ns_pid`: it is the
-    first process with that `ns_pid` sighted from 2 s before the line on."""
+    first process with that `ns_pid` to appear from 2 s before the line on."""
     def verdict(workers, logged):
         rows = [_worker_sample(99.8, {900: 10000, 901: 6000}),
                 _worker_sample(100.1, workers)]
@@ -724,10 +724,11 @@ def test_grant_safety_counts_only_releases_by_other_live_processes():
         assert [verdict(workers, logged) for workers in (
             {900: 4000, 901: 6000}, {900: 10000}, {900: 10000, 901: 500})] == [
             "FAIL", "FAIL", "WARN"]
-    sightings = [_worker_sample(t, {pid: 1000}) for t, pid in (
-        (80.0, 5000), (95.0, 900), (99.0, 901))]
-    for row in sightings:
-        row["gpus"][0]["procs"][0]["ns_pid"] = 17
+    sightings = [_worker_sample(t, workers) for t, workers in (
+        (87.0, {5000: 1000}), (88.5, {5000: 1000, 900: 1000}),
+        (99.0, {5000: 1000, 901: 1000}))]
+    for proc in (proc for row in sightings for proc in row["gpus"][0]["procs"]):
+        proc["ns_pid"] = 17
     assert analyze.Context(
         args=_args(), vramrec=sightings, healthrec=[], hog=[], log=[_spawn(17, MODEL)],
         before=None, after=None, jobs=None, probes=[]).spawned_pids == {900}
@@ -805,23 +806,30 @@ def test_oracle_agreement_skips_the_samples_while_no_job_ran():
 
 
 def test_a_hog_event_the_hog_answered_with_under_a_chunk_is_void_and_warns(tmp_path):
-    """An event that asks for more than the hog held (a leave-free target, or
-    a hold at or above it) is void when `held_mb` rises by less than one chunk
-    before the next event. A step-down or a release asks for nothing more."""
+    """An event that asks for more than the hog held (a leave-free level under
+    the free memory it last read, or a hold at or above it) is void when
+    `held_mb`, progress rows included, rises by less than one chunk before
+    the next request. A step-down or a release asks for nothing more."""
     held = {100.0: 0, 101.0: 0, 105.0: 0, 111.0: 8192, 115.0: 8192, 121.0: 8192,
-            131.0: 8192, 141.0: 4096, 151.0: 4096, 161.0: 4608, 165.0: 4608}
-    (tmp_path / "hog.jsonl").write_text("".join(json.dumps(row) + "\n" for row in [
-        {"kind": "header", "target": "gpu", "gpu_uuid": GPU, "chunk_mb": 512},
-        *({"kind": "state", "t_wall": t, "held_mb": mb} for t, mb in held.items())]))
+            131.0: 8192, 141.0: 4096, 151.0: 4096, 161.0: 4608, 165.0: 4096,
+            171.0: 0}
     (tmp_path / "healthrec.jsonl").write_text(json.dumps(_health_sample(0)) + "\n")
     events = [{"event": "hog_event_request", "iso": f"1970-01-01T00:0{iso}Z",
                "label": label, "query": query} for iso, label, query in (
         ("1:40", "release", "mb=0"), ("1:40.5", "spike", "leave_free=2048"),
         ("1:50", "step up", "mb=8192"), ("2:00", "hold", "mb=8192"),
         ("2:10", "small", "mb=8400"), ("2:20", "step down", "mb=4096"),
-        ("2:40", "refill", "leave_free=20000"))]
-    for logged, verdict, void in ((events, "WARN", ["spike", "hold", "small"]),
-                                  ([], "INFO", [])):
+        ("2:40", "refill", "leave_free=4000"), ("2:50", "ease", "leave_free=20000"))]
+    events.insert(3, {"event": "hog_event_ack", "iso": "1970-01-01T00:01:50.5Z",
+                      "label": "step up"})
+    for target, logged, verdict, void in (
+            ("gpu", events, "WARN", ["spike", "hold", "small"]), ("gpu", [], "INFO", []),
+            ("ram", events, "WARN", ["spike", "hold", "small"])):
+        (tmp_path / "hog.jsonl").write_text("".join(json.dumps(row) + "\n" for row in [
+            {"kind": "header", "target": target, "gpu_uuid": GPU, "chunk_mb": 512},
+            *({"kind": "progress" if t == 161.0 else "state", "t_wall": t,
+               "held_mb": mb, "free_mb": None if t == 100.0 else 10000}
+              for t, mb in held.items())]))
         (tmp_path / "legs.json").write_text(json.dumps({"events": logged}))
         analyze.main(["--scenario", str(tmp_path), "--checks", "hog_tracking",
                       "--json", str(tmp_path / "v.json"), "--quiet"])

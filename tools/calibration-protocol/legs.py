@@ -1267,20 +1267,15 @@ class Leg:
             self.mark("hog_event_request", label=event["label"], query=query,
                       at_s=event["at_s"])
             try:
-                _, reply = request(self.hog_url(f"/set?{query}"),
-                                   method="POST", timeout=10)
+                request(self.hog_url(f"/set?{query}"), method="POST",
+                        timeout=10)
             except HttpError as exc:
                 self.mark("hog_event_failed", label=event["label"],
                           error=str(exc))
                 continue
             self.mark("hog_event_ack", label=event["label"])
-            # A state at the reply's `seq` + 2 has resolved the new target.
-            try:
-                before = json.loads(reply)
-            except ValueError:
-                before = {}
             # Record the fill, so `legs.json` states how long the GPU took
-            # to change and `analyze.py`'s hog_tracking has a wall clock.
+            # to change.
             for _ in range(40):
                 try:
                     state = get_json(self.hog_url("/state"), timeout=5)
@@ -1292,9 +1287,6 @@ class Leg:
                           free_mb=state.get("free_mb"))
                 target = state.get("target_mb") or 0
                 held = state.get("held_mb") or 0
-                if state.get("seq", 0) < before.get("seq", -2) + 2:
-                    time.sleep(1.0)
-                    continue
                 if target == 0 and held == 0:
                     break
                 if target and held >= target - 256:
