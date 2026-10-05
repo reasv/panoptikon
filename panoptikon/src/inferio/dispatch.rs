@@ -428,16 +428,21 @@ pub(crate) fn in_flight_target_units(target: u64, grant: Option<&Grant>) -> u64 
     }
 }
 
-/// A fatal worker death: the message for the manager's death handler and the
-/// dead worker's own requests, and the dead replica's GPU, if known.
+/// A fatal worker death: the message for the manager's death handler, the
+/// dead replica's GPU if known, and the requests it left unsent.
 struct Death {
     message: String,
     gpu: Option<String>,
+    unsent: Vec<DispatchRequest>,
 }
 
 impl From<String> for Death {
     fn from(message: String) -> Self {
-        Self { message, gpu: None }
+        Self {
+            message,
+            gpu: None,
+            unsent: Vec::new(),
+        }
     }
 }
 
@@ -798,7 +803,24 @@ pub(crate) async fn run_dispatcher(
                     "failed the queued predicts of an unloaded model"
                 );
             }
-            drain_in_flight(&ctx, &mut in_flight, &mut free).await;
+            let deaths = drain_in_flight(&ctx, &mut in_flight, &mut free).await;
+            // The handle is gone: this only arms a condemned card's cooldown.
+            let gpus: Vec<&str> = deaths
+                .iter()
+                .filter_map(|death| death.gpu.as_deref())
+                .collect();
+            if let (false, Some(manager)) = (gpus.is_empty(), ctx.manager.upgrade()) {
+                manager.handle_worker_death(
+                    &ctx.inference_id,
+                    ctx.generation,
+                    &deaths[0].message,
+                    &gpus,
+                );
+            }
+            deaths
+                .into_iter()
+                .flat_map(|death| death.unsent)
+                .for_each(hand_back);
             // Then the unload ladder on every replica concurrently.
             let results = join_all(free.into_iter().map(|replica| replica.worker.shutdown())).await;
             for result in results {
@@ -810,25 +832,32 @@ pub(crate) async fn run_dispatcher(
                 }
             }
         }
-        End::Fatal(Death { message, gpu }) => {
+        End::Fatal(death) => {
             // Any replica fatal -> the whole model dies. Stats first, for /health.
             ctx.stats.queue_len.store(0, Relaxed);
             ctx.stats.in_flight_windows.store(0, Relaxed);
             ctx.stats.replicas_free.store(0, Relaxed);
             // The other replicas' windows finish and keep their outputs.
-            drain_in_flight(&ctx, &mut in_flight, &mut free).await;
+            let drained = drain_in_flight(&ctx, &mut in_flight, &mut free).await;
             join_all(free.into_iter().map(|replica| replica.worker.kill())).await;
+            let deaths: Vec<Death> = std::iter::once(death).chain(drained).collect();
             // Before the requests go back, so their callers load a new set.
             if let Some(manager) = ctx.manager.upgrade() {
+                let gpus: Vec<&str> = deaths
+                    .iter()
+                    .filter_map(|death| death.gpu.as_deref())
+                    .collect();
                 manager.handle_worker_death(
                     &ctx.inference_id,
                     ctx.generation,
-                    &message,
-                    gpu.as_deref(),
+                    &deaths[0].message,
+                    &gpus,
                 );
             }
-            take_queued(&mut queue, &mut rx)
+            deaths
                 .into_iter()
+                .flat_map(|death| death.unsent)
+                .chain(take_queued(&mut queue, &mut rx))
                 .for_each(hand_back);
         }
     }
@@ -850,23 +879,27 @@ fn take_queued(
 }
 
 /// Let in-flight windows finish, bounded by `unload_grace`; their live
-/// replicas join `free`. Windows still running then are aborted.
+/// replicas join `free`. Windows still running then are aborted. Returns the
+/// deaths seen meanwhile, each with its replica's GPU when known.
 async fn drain_in_flight(
     ctx: &DispatcherContext,
     in_flight: &mut JoinSet<(Replica, BatchOutcome)>,
     free: &mut Vec<Replica>,
-) {
+) -> Vec<Death> {
+    let mut deaths = Vec::new();
     let drain = async {
         while let Some(finished) = in_flight.join_next().await {
             match finished {
                 Ok((replica, BatchOutcome::Continue | BatchOutcome::Trimmed)) => free.push(replica),
-                Ok((replica, BatchOutcome::Fatal(death))) => {
+                Ok((replica, BatchOutcome::Fatal(mut death))) => {
                     tracing::warn!(
                         model = %ctx.inference_id,
                         "replica died while draining: {}",
                         death.message
                     );
+                    death.gpu = death.gpu.or_else(|| replica.gpu());
                     replica.worker.kill().await;
+                    deaths.push(death);
                 }
                 Err(join_err) => tracing::error!(
                     model = %ctx.inference_id,
@@ -884,6 +917,7 @@ async fn drain_in_flight(
         );
         in_flight.shutdown().await;
     }
+    deaths
 }
 
 /// Act on a [`DispatchMsg::ReapIdle`]: return the first idle replica's death,
@@ -905,6 +939,7 @@ async fn reap_idle_replicas(ctx: &DispatcherContext, free: &mut [Replica]) -> Op
                 ctx.inference_id
             ),
             gpu: replica.gpu(),
+            unsent: Vec::new(),
         });
     }
     None
@@ -1006,6 +1041,7 @@ async fn run_batch(
         Some(verdict) if !matches!(outcome, BatchOutcome::Fatal(_)) => BatchOutcome::Fatal(Death {
             message: verdict.to_string(),
             gpu: Some(verdict.gpu),
+            unsent: Vec::new(),
         }),
         _ => outcome,
     };
@@ -1083,11 +1119,17 @@ async fn run_batch_inner(
                         let message = format!("{individual_err:#}");
                         let _ = request.reply.send(Err(individual_err));
                         if fatal {
-                            for (mut request, count) in remaining {
-                                request.inputs = combined.drain(..count).collect();
-                                hand_back(request);
-                            }
-                            return (BatchOutcome::Fatal(message.into()), settle);
+                            let unsent = remaining
+                                .map(|(mut request, count)| {
+                                    request.inputs = combined.drain(..count).collect();
+                                    request
+                                })
+                                .collect();
+                            let death = Death {
+                                unsent,
+                                ..Death::from(message)
+                            };
+                            return (BatchOutcome::Fatal(death), settle);
                         }
                     }
                 }
@@ -2488,8 +2530,13 @@ mod tests {
         for middle_waits in [true, false] {
             let harness = one_replica(32_768, "dieflag_test", item_cost(8)).await;
             // Queued before the dispatcher task first runs: one merged window.
-            let [first, middle, last] = [json!(0), json!({"die_alone": true}), json!(2)]
-                .map(|data| harness.queue(vec![json_input(data)], None));
+            let first = harness.queue(vec![json_input(json!(0))], None);
+            let middle = harness.queue(vec![json_input(json!({"die_alone": true}))], None);
+            let last = [vec![2, 3], vec![4]].map(|data: Vec<i32>| {
+                let answer =
+                    harness.queue(data.iter().map(|&i| json_input(json!(i))).collect(), None);
+                (data, answer)
+            });
             let middle = if middle_waits {
                 Some(middle)
             } else {
@@ -2500,26 +2547,28 @@ mod tests {
             };
             let first = first.await.expect("replied").expect("retried alone");
             assert_eq!(first, vec![WorkerOutput::Json(json!({"echo": 0}))]);
-            let last = last.await.expect("replied");
-            match middle {
-                Some(middle) => {
-                    let err = middle.await.expect("replied").expect_err("the worker died");
-                    assert!(
-                        err.downcast_ref::<Unsent>().is_none(),
-                        "it was sent: {err:#}"
-                    );
-                    let err = last.expect_err("handed back");
+            if let Some(middle) = middle {
+                let err = middle.await.expect("replied").expect_err("the worker died");
+                assert!(
+                    err.downcast_ref::<Unsent>().is_none(),
+                    "it was sent: {err:#}"
+                );
+            }
+            for (data, answer) in last {
+                let reply = answer.await.expect("replied");
+                if middle_waits {
+                    let err = reply.expect_err("handed back");
                     let Unsent(inputs) = err.downcast::<Unsent>().expect("unsent");
-                    let inputs: Vec<_> = inputs
-                        .into_iter()
-                        .map(|input| (input.data, input.file))
+                    let inputs: Vec<_> = inputs.into_iter().map(|input| input.data).collect();
+                    let own: Vec<_> = data.iter().map(|&i| Some(json!(i))).collect();
+                    assert_eq!(inputs, own);
+                } else {
+                    let echoes: Vec<_> = data
+                        .iter()
+                        .map(|&i| WorkerOutput::Json(json!({"echo": i})))
                         .collect();
-                    assert_eq!(inputs, vec![(Some(json!(2)), None)]);
+                    assert_eq!(reply.expect("the worker lives"), echoes);
                 }
-                None => assert_eq!(
-                    last.expect("the worker lives"),
-                    vec![WorkerOutput::Json(json!({"echo": 2}))]
-                ),
             }
             harness.shutdown().await;
         }

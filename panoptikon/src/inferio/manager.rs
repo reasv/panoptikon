@@ -1170,19 +1170,20 @@ impl ModelManager {
     /// After a fatal worker death: drop the model from all bookkeeping so the
     /// next predict reloads it. The generation guards against a respawn race.
     ///
-    /// A replica the ledger condemned on `gpu` (it did not fit the card) arms
-    /// the load-failure cooldown, so the reload waits instead of respawning on
-    /// the next item; also when the model was unloaded meanwhile.
+    /// A replica the ledger condemned on one of `gpus` (it did not fit the
+    /// card) arms the load-failure cooldown, so the reload waits instead of
+    /// respawning on the next item; also when the model was unloaded meanwhile.
     pub(crate) fn handle_worker_death(
         &self,
         inference_id: &str,
         generation: u64,
         reason: &str,
-        gpu: Option<&str>,
+        gpus: &[&str],
     ) {
         let mut state = self.state.lock().unwrap();
-        let window = gpu
-            .is_some_and(|gpu| self.ledger.was_condemned(inference_id, gpu))
+        let window = gpus
+            .iter()
+            .any(|gpu| self.ledger.was_condemned(inference_id, gpu))
             .then(|| {
                 state
                     .cooldowns
@@ -1201,12 +1202,16 @@ impl ModelManager {
             cooldown_secs = window.map(|window| window.as_secs_f64()),
             "worker died fatally; dropping model from all caches"
         );
-        let handle = state
-            .models
-            .remove(inference_id)
-            .expect("presence checked above");
-        state.draining.push(handle.task);
-        state.cache.remove_everywhere(inference_id);
+        Self::forget_model(&mut state, inference_id);
+    }
+
+    /// Drop a model whose dispatcher is ending from all bookkeeping, keeping
+    /// its task for shutdown to await.
+    fn forget_model(state: &mut ManagerState, inference_id: &str) {
+        if let Some(handle) = state.models.remove(inference_id) {
+            state.draining.push(handle.task);
+            state.cache.remove_everywhere(inference_id);
+        }
     }
 
     /// Sweeper tick: expire TTLs, reap drain tasks, have each dispatcher check
@@ -2184,6 +2189,16 @@ metadata.cost.aggregation = "sum"
 metadata.cost.epoch = 4
 metadata.cost.seed_units = 1000000
 [group.dieledger.inference_ids.test]
+
+# Two replicas; the dispatcher takes the GPU-3333 one first.
+[group.dieledgerpair]
+config.impl_class = "dieflag_test"
+config.devices = ["0", "3"]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.epoch = 4
+metadata.cost.seed_units = 1000000
+[group.dieledgerpair.inference_ids.test]
 
 # Killed for memory on every input, priced; on a GPU inventory the load
 # reports GPU-0000.
@@ -3596,48 +3611,53 @@ metadata.cost.seed_units = 1000000
     /// A death the *ledger* called is a costed load failure: the cooldown
     /// arms with the verdict's sentence, so the reload waits rather than
     /// being respawned by the next item; also when the model was unloaded
-    /// before the death handler ran. Every other fatal death still
-    /// respawns at once (`worker_death_cleans_up_and_next_predict_respawns`).
+    /// before the death handler ran, and when the condemned replica dies
+    /// while the dispatcher drains after a death on the other card. Every
+    /// other fatal death still respawns at once
+    /// (`worker_death_cleans_up_and_next_predict_respawns`).
     #[tokio::test]
     async fn a_condemned_models_death_arms_the_cooldown() {
-        for unloaded_first in [false, true] {
+        for (id, unloaded_first) in [
+            ("dieledger/test", false),
+            ("dieledger/test", true),
+            ("dieledgerpair/test", false),
+        ] {
             let setup = test_manager_with(ManagerOpts {
                 gpus: test_gpus(),
                 ..Default::default()
             });
             let manager = setup.manager.clone();
 
-            load(&manager, "dieledger/test", "k", -1)
+            load(&manager, id, "k", -1)
                 .await
-                .expect("one replica, pinned to the card the condemnation names");
-            let generation = manager.loaded_generation("dieledger/test").expect("loaded");
-            // The card the unpinned replicas were admitted to.
-            manager
-                .ledger
-                .condemn_for_test("dieledger/test", "GPU-0000", 40_000);
+                .expect("replicas pinned to their cards");
+            let generation = manager.loaded_generation(id).expect("loaded");
+            manager.ledger.condemn_for_test(id, "GPU-0000", 40_000);
 
+            let die = || {
+                let manager = manager.clone();
+                async move {
+                    predict_one(&manager, id, "k", -1, Some(1), json!({"die": true}))
+                        .await
+                        .expect_err("the poison request fails with the fatal death")
+                }
+            };
             if unloaded_first {
-                manager
-                    .unload_model("k", "dieledger/test")
-                    .await
-                    .expect("unloaded");
+                manager.unload_model("k", id).await.expect("unloaded");
                 manager.handle_worker_death(
-                    "dieledger/test",
+                    id,
                     generation,
                     "the worker failed fatally",
-                    Some("GPU-0000"),
+                    &["GPU-0000"],
                 );
+            } else if id == "dieledgerpair/test" {
+                // The first death is on GPU-3333; GPU-0000's comes during the drain.
+                let first = tokio::spawn(die());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                die().await;
+                first.await.unwrap();
             } else {
-                predict_one(
-                    &manager,
-                    "dieledger/test",
-                    "k",
-                    -1,
-                    Some(1),
-                    json!({"die": true}),
-                )
-                .await
-                .expect_err("the poison request fails with the fatal death");
+                die().await;
             }
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -3651,7 +3671,7 @@ metadata.cost.seed_units = 1000000
                 .health()
                 .load_cooldowns
                 .into_iter()
-                .find(|entry| entry.inference_id == "dieledger/test")
+                .find(|entry| entry.inference_id == id)
                 .expect("armed");
             assert_eq!(cooldown.failures, 1);
             assert!(
@@ -3659,7 +3679,7 @@ metadata.cost.seed_units = 1000000
                 "the sentence that killed it is what /health says: {}",
                 cooldown.last_error
             );
-            let err = predict_one(&manager, "dieledger/test", "k", -1, Some(1), json!("ok"))
+            let err = predict_one(&manager, id, "k", -1, Some(1), json!("ok"))
                 .await
                 .expect_err("the reload waits for the cooldown");
             assert!(
