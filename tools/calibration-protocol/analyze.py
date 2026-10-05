@@ -228,8 +228,8 @@ class Context:
     jobs: Optional[Any]
     probes: List[Dict[str, Any]]
     fds: List[Dict[str, Any]] = field(default_factory=list)
-    # When no job ran, from `legs.json`: each drained `job_end` to the next
-    # `job_start`, and the hog stop to the end of the recording.
+    # From `legs.json`: each drained `job_end`, or the hog stop, to the next
+    # `job_start`, or to the end of the recording.
     idle_spans: List[Tuple[float, float]] = field(default_factory=list)
     # Labels of the hog events that applied no pressure (`_void_hog_events`).
     void_hog_events: List[str] = field(default_factory=list)
@@ -260,8 +260,9 @@ class Context:
                         host_pids.setdefault(proc["ns_pid"], []).append(
                             (sample["t_wall"], proc["pid"]))
         for spawn in self.worker_spawns:
+            floor = spawn["t_wall"] - SPAWN_CLOCK_SLACK_S
             for t_wall, pid in host_pids.get(spawn["pid"], []):
-                if self.pid_first_seen()[pid] >= spawn["t_wall"] - SPAWN_CLOCK_SLACK_S:
+                if t_wall >= floor and self.pid_first_seen()[pid] >= floor:
                     spawn["pid"] = pid
                     break
         self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
@@ -826,7 +827,8 @@ def _source_counts(sources: Dict[str, int]) -> str:
 def check_oracle_agreement(ctx: Context) -> Verdict:
     """`external_mb` vs (GPU used - our workers' NVML usage): +/-1 GiB or 2%.
 
-    Skipped while no job ran, where GPU used moved past the allowance, or by
+    Skipped from a drained `job_end` (or the hog stop) to the next
+    `job_start`, where GPU used moved past the allowance, or by
     an unknown amount, during the per-process scan, where the ledger's free
     reading is over 10 s old, or while a release or hog move larger than the
     allowance lies between that reading and the oracle sample."""
@@ -2312,13 +2314,12 @@ def _idle_spans(legs: Optional[Dict[str, Any]]) -> List[Tuple[float, float]]:
 
 def _void_hog_events(legs: Optional[Dict[str, Any]],
                      hog: List[Dict[str, Any]]) -> List[str]:
-    """The hog events that asked for more than the hog held (a leave-free
-    level under the free memory the hog last read, or with free unread; or a
-    hold at or above what it held) while its `held_mb`, progress rows
+    """The hog events that asked for pressure (any leave-free level, or a
+    hold at or above what the hog held) while its `held_mb`, progress rows
     included, rose by less than one chunk before the next event."""
     header = next((row for row in hog if row.get("kind") == "header"), {})
     chunk = header.get("chunk_mb") or 1
-    states = [(row["t_wall"], row.get("held_mb") or 0, row.get("free_mb"))
+    states = [(row["t_wall"], row.get("held_mb") or 0)
               for row in hog if row.get("kind") in ("state", "progress", "final")]
     requests = []
     for event in (legs or {}).get("events") or []:
@@ -2328,13 +2329,11 @@ def _void_hog_events(legs: Optional[Dict[str, Any]],
     void = []
     for index, (start, event) in enumerate(requests):
         end = requests[index + 1][0] if index + 1 < len(requests) else math.inf
-        held, free = ([(mb, free) for t_wall, mb, free in states if t_wall <= start]
-                      or [(0, None)])[-1]
-        rose = max([mb for t_wall, mb, _ in states if start < t_wall <= end],
+        held = ([mb for t_wall, mb in states if t_wall <= start] or [0])[-1]
+        rose = max([mb for t_wall, mb in states if start < t_wall <= end],
                    default=held) - held
         kind, _, mb = str(event.get("query")).partition("=")
-        asked = (kind == "leave_free" and (free is None or free > int(mb))
-                 or kind == "mb" and int(mb) > 0 and int(mb) >= held)
+        asked = kind == "leave_free" or kind == "mb" and int(mb) > 0 and int(mb) >= held
         if asked and rose < chunk:
             void.append(str(event.get("label") or f"t+{event.get('at_s')}s"))
     return void
@@ -2524,12 +2523,14 @@ def check_hog_tracking(ctx: Context) -> Verdict:
     `HOG_STALL_SECONDS` while `external_mb` never moved. A hog event that
     applied no pressure makes it WARN. See the README.
     """
-    if not ctx.hog_samples or not ctx.health_samples:
-        return Verdict("hog_tracking", "SKIP", "needs hog.jsonl and healthrec.jsonl")
     void = ctx.void_hog_events
-    void_note = ("; WARN: the hog event(s) " + ", ".join(void) + " asked for more "
-                 "memory and the hog held less than one chunk more before the next "
-                 "event, so they applied no pressure" if void else "")
+    void_note = ("; WARN: the hog event(s) " + ", ".join(void) + " applied no "
+                 "pressure: the hog held less than one chunk more before the next "
+                 "event" if void else "")
+    if not ctx.hog_samples or not ctx.health_samples:
+        return Verdict("hog_tracking", "WARN" if void else "SKIP",
+                       "needs hog.jsonl and healthrec.jsonl" + void_note,
+                       {"void_events": void})
     header = next((row for row in ctx.hog if row.get("kind") == "header"), {})
     gpu_uuid = header.get("gpu_uuid")
     if header.get("target") == "ram":
@@ -2559,8 +2560,9 @@ def check_hog_tracking(ctx: Context) -> Verdict:
                      "gpu_used_mb": oracle_used,
                      "sample_age_ms": gpu.get("external_sample_age_ms")})
     if not rows:
-        return Verdict("hog_tracking", "SKIP",
-                       f"no health sample joined the hog on GPU {gpu_uuid}")
+        return Verdict("hog_tracking", "WARN" if void else "SKIP",
+                       f"no health sample joined the hog on GPU {gpu_uuid}" + void_note,
+                       {"void_events": void})
     ages = [row["sample_age_ms"] for row in rows if row["sample_age_ms"] is not None]
     max_age = max(ages) / 1000.0 if ages else None
     # Track the correlation of the two deltas rather than absolute agreement:
