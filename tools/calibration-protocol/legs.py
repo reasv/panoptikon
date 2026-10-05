@@ -65,10 +65,11 @@ with `--gpu-total-mb` defaulting to the GPU total `vramrec.py` reports for
 `--hog-device`. A `leave-free` figure is then floored at `--min-free-mb`
 (default 1 024) so the model under test still fits on a small card, and a
 `hold` figure is capped at `gpu_total_mb - --min-free-mb` for the same reason.
-Whenever the floor or the cap actually binds, the leg writes a `floor_bound`
-event into `legs.json` and prints a `PRECONDITION:` line: the leg is then
-applying the floor's pressure, not the fraction's, and two legs written to
-different fractions can land on the same level.
+The hog itself takes no more once free is at the floor, which also bounds a
+hold on host RAM. Whenever the floor or the cap actually binds, the leg writes
+a `floor_bound` event into `legs.json` and prints a `PRECONDITION:` line: the
+leg is then applying the floor's pressure, not the fraction's, and two legs
+written to different fractions can land on the same level.
 
 S4c's spike is not a fraction: it squeezes the GPU to about 2 GB free, so it
 is 2 048 MiB on every GPU, not scaled, and raised only by a `--min-free-mb`
@@ -1194,6 +1195,19 @@ class Leg:
     def hog_url(self, path: str) -> str:
         return f"http://127.0.0.1:{self.args.hog_port}{path}"
 
+    def hog_command(self, schedule: List[str]) -> List[str]:
+        args = self.args
+        argv = [self.python, str(HERE / "hog.py"), "--target",
+                args.hog_target, "--port", str(args.hog_port),
+                "--out", str(self.path("hog.jsonl")),
+                "--min-free-mb", str(args.min_free_mb),
+                "--hold-at-end", "--quiet"]
+        if args.hog_target == "gpu":
+            argv += ["--device", str(args.hog_device)]
+        if self.scenario.hog_reeval is not None:
+            argv += ["--reeval", str(self.scenario.hog_reeval)]
+        return argv + schedule
+
     def hog_schedule(self) -> Tuple[List[str], Dict[str, Any]]:
         """The opening schedule in MiB, plus what it was derived from."""
         scenario = self.scenario
@@ -1939,7 +1953,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "--hog-device)")
     parser.add_argument("--min-free-mb", type=int, default=1024,
                         help="floor under a leave-free figure, and what "
-                             "a hold leaves free")
+                             "a hold leaves free; the hog takes no more once "
+                             "free is at it")
     parser.add_argument("--hog-device", type=int, default=0)
     parser.add_argument("--hog-target", choices=("gpu", "mps", "ram"),
                         default="gpu",
@@ -2252,16 +2267,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # 2. the hog, filled before the gateway sees the GPU
         if schedule:
-            hog_argv = [args.python, str(HERE / "hog.py"), "--target",
-                        args.hog_target, "--port", str(args.hog_port),
-                        "--out", str(leg.path("hog.jsonl")),
-                        "--hold-at-end", "--quiet"]
-            if args.hog_target == "gpu":
-                hog_argv += ["--device", str(args.hog_device)]
-            if scenario.hog_reeval is not None:
-                hog_argv += ["--reeval", str(scenario.hog_reeval)]
-            hog_argv += schedule
-            leg.supervisor.start("hog", hog_argv)
+            leg.supervisor.start("hog", leg.hog_command(schedule))
             leg.mark("hog_started", schedule=schedule, detail=schedule_detail)
             if not wait_for(lambda: port_is_open("127.0.0.1", args.hog_port),
                             60.0):

@@ -144,7 +144,7 @@ def test_the_fill_stops_once_free_reaches_the_level():
             return self.free, 24576
 
     args = argparse.Namespace(touch_period=0.0, progress_every=2.0,
-                              reeval=999999.0)
+                              reeval=999999.0, min_free_mb=0)
     for override in (None, "leave_free"):
         backend = _Backend()
         made = hog.Hog(backend, hog.LeaveFree(6000), args)
@@ -168,6 +168,45 @@ def test_the_fill_stops_once_free_reaches_the_level():
     made.override, made.override_mb = "mb", 6144
     made.apply(made.resolve_target(1.0))
     assert made.held_mb == 6144
+
+
+def test_free_is_read_per_quarter_of_the_level_and_the_floor_stops_a_hold():
+    """A leave-free 1 024 MiB re-reads free every 256 MiB taken: with the job
+    taking as much as the hog, the fill stops 84 MiB below the level, not
+    1 620. `--min-free-mb` stops a hold the same way, at its own level."""
+
+    class _Backend(hog.Backend):
+        name = "overcommits"
+
+        def __init__(self, free, job_share):
+            self.free, self.job_share = free, job_share
+
+        def chunk_bytes(self) -> int:
+            return 128 * MIB
+
+        def alloc(self):
+            self.free -= 128 * (1 + self.job_share)
+            return object()
+
+        def free_total_mb(self):
+            return self.free, 24576
+
+    for schedule, floor, free, job_share, held, left in (
+            (hog.LeaveFree(1024), 0, 3500, 1, 1280, 940),
+            (hog.Hold(8192), 2048, 4096, 0, 2048, 2048),
+            (hog.Hold(8192), 0, 4096, 0, 8192, -4096)):
+        backend = _Backend(free, job_share)
+        made = hog.Hog(backend, schedule, argparse.Namespace(
+            touch_period=0.0, progress_every=2.0, reeval=999999.0,
+            min_free_mb=floor))
+        made.apply(made.resolve_target(0.0))
+        assert (made.held_mb, backend.free) == (held, left)
+
+
+def test_free_ram_is_mem_available_less_s_reclaimable(monkeypatch):
+    monkeypatch.setattr(hog, "_meminfo", lambda: {
+        "MemAvailable": 10000, "SReclaimable": 3000, "MemTotal": 32000})
+    assert hog.RamBackend.free_total_mb(None) == (7000, 32000)
 
 
 def test_a_pinned_leave_free_level_is_solved_once():

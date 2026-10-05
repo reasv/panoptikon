@@ -180,7 +180,9 @@ mib = round(fraction × gpu_total_mb)
 with `--gpu-total-mb` defaulting to the GPU total NVML reports for `--hog-device`.
 A `leave-free` figure is then floored at `--min-free-mb` (default 1 024) so
 the model under test still fits on a small card, and a `hold` figure is capped
-at `gpu_total_mb − --min-free-mb` for the same reason. The floor is low on
+at `gpu_total_mb − --min-free-mb` for the same reason. The hog is also given
+the floor and takes no more once free is at it, so a hold on host RAM, which
+the GPU total does not bound, stops there too. The floor is low on
 purpose: at 4 096 it bound S4a, S4c and S4d alike on a 32 GB GPU and made
 three legs defined at different levels apply identical pressure. Whenever it
 does bind, the leg writes a `floor_bound` event into `legs.json` and prints a
@@ -331,8 +333,9 @@ and raising the cadence would silently reintroduce the fault.
 
 ```
 hog.py [--target gpu|ram|mps] [--device N] [--chunk-mb 128] [--tick 0.5]
-       [--reeval 2] [--progress-every 2] [--duration S] [--port N]
-       [--touch-period S] [--out FILE] [--hold-at-end] [--quiet] <schedule>
+       [--reeval 2] [--min-free-mb 0] [--progress-every 2] [--duration S]
+       [--port N] [--touch-period S] [--out FILE] [--hold-at-end] [--quiet]
+       <schedule>
 
   hold MB
   step MB,SECONDS [MB,SECONDS ...]
@@ -348,11 +351,15 @@ Control endpoint on `127.0.0.1:<port>`: `GET /state`, `POST /set?mb=N`,
 `POST /resume`, `POST /stop`. Every allocation is
 touched; every shrink calls `torch.cuda.empty_cache()` so the driver sees the
 release. An allocation failure increments `oom`, records `last_error`, holds
-what it got and keeps serving. A leave-free fill re-reads free once per GiB
-it takes and stops once free is at the level, so it can take less than 1 GiB
-plus one chunk past it. That stop is what ends the fill where allocating past
-physical memory succeeds (WSL, WDDM's system-memory fallback) and no failure
-would.
+what it got and keeps serving. A fill stops once free is at the level: the
+leave-free level or `--min-free-mb`, whichever is higher. It re-reads free
+once it has taken a quarter of the level since the last read (at least one
+chunk, at most 1 GiB), so after a reading above the level the hog takes less
+than that plus one chunk, and what others allocate meanwhile adds to that.
+That stop is what ends the fill where allocating past physical memory
+succeeds (WSL, WDDM's system-memory fallback) and no failure would. On
+`--target ram`, free is `MemAvailable` less `SReclaimable`, as the product
+reads it.
 
 **On macOS the hog stops being counted, and `--touch-period` does not fix
 it.** A page touched once and then left idle is aged onto the inactive queue

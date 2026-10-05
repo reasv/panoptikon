@@ -43,7 +43,8 @@ Samples: {"schema": "hog/1", "kind": "state", "seq", "t_mono", "t_wall",
           "iso", "pid", "chunks", "total_mb", "last_error", "phase",
           "override": "mb"|"leave_free"|null,
           "target_mb" (asked for), "held_mb" (allocated and touched),
-          "free_mb" (GPU, or MemAvailable), "own_mb" (NVML own-PID, or RSS),
+          "free_mb" (GPU, or MemAvailable less SReclaimable),
+          "own_mb" (NVML own-PID, or RSS),
           on ROCm free from amdgpu sysfs and own from KFD or DRM fdinfo,
           "oom" (cumulative failed allocation attempts),
           and with `--touch-period` set: "touched_mb_total", "touch_sweeps"}
@@ -470,8 +471,12 @@ class RamBackend(Backend):
         return int(touched // MIB)
 
     def free_total_mb(self) -> Tuple[Optional[int], Optional[int]]:
+        # MemAvailable less SReclaimable: the free RAM the product reads.
         info = _meminfo()
-        return info.get("MemAvailable"), info.get("MemTotal")
+        available = info.get("MemAvailable")
+        return (None if available is None
+                else max(0, available - info.get("SReclaimable", 0)),
+                info.get("MemTotal"))
 
     def own_mb(self) -> Optional[int]:
         try:
@@ -790,20 +795,25 @@ class Hog:
                 del self.chunks[want_chunks:]
                 self.backend.reclaim()
                 return
-            unread_mb = 1024  # the first chunk reads free
+            # Where allocating past physical memory succeeds (WSL, WDDM's
+            # system-memory fallback) no failure ends the fill; free reaching
+            # the level does, and what is held then is the target. The level
+            # is the leave-free level or `--min-free-mb`, whichever is higher.
+            # Free is re-read once `read_every` MiB has been taken since the
+            # last read, so after a reading above the level the hog takes
+            # less than `read_every` plus one chunk; what others allocate
+            # meanwhile adds to that.
+            level = max(self.leave_mb or 0, self.args.min_free_mb)
+            read_every = min(1024, max(chunk_mb, level // 4))
+            unread_mb = read_every  # the first chunk reads free
             while len(self.chunks) < want_chunks:
                 if _stop.is_set():
                     return
-                if self.leave_mb is not None and unread_mb >= 1024:
-                    # Where allocating past physical memory succeeds (WSL,
-                    # WDDM's system-memory fallback) no failure ends the
-                    # fill; free reaching the level does, and what is held
-                    # then is the target. Free is re-read once 1 GiB has been
-                    # taken since the last read, so the fill stops less than
-                    # 1 GiB plus one chunk past the level.
+                if ((self.leave_mb is not None or level)
+                        and unread_mb >= read_every):
                     unread_mb = 0
                     free_mb, _ = self.backend.free_total_mb()
-                    if free_mb is not None and free_mb <= self.leave_mb:
+                    if free_mb is not None and free_mb <= level:
                         self._leave_free_target = self.target_mb = self.held_mb
                         return
                 try:
@@ -996,6 +1006,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "worse on --target mps -- see default_touch_period")
     parser.add_argument("--reeval", type=float, default=2.0,
                         help="seconds between leave-free re-evaluations")
+    parser.add_argument("--min-free-mb", type=int, default=0,
+                        help="take no more once free is at or below this, "
+                             "whatever the schedule asks")
     parser.add_argument("--progress-every", type=float, default=2.0,
                         help="seconds between `progress` records while a large "
                              "allocation is still in flight")

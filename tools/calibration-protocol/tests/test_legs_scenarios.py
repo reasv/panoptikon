@@ -38,6 +38,21 @@ def _load():
 legs = _load()
 
 
+def test_the_hog_is_given_the_floor():
+    args = legs.argparse.Namespace(hog_target="ram", hog_port=6401,
+                                   min_free_mb=1024, hog_device=0)
+    leg = legs.argparse.Namespace(args=args, python="python",
+                                  path=lambda name: Path(name),
+                                  scenario=legs.SCENARIOS["S2"])
+    argv = legs.Leg.hog_command(leg, ["hold", "0"])
+    spec = importlib.util.spec_from_file_location("_calib_scenarios_hog",
+                                                  LEGS.with_name("hog.py"))
+    hog = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hog)
+    parsed = hog.build_parser().parse_args(argv[2:])
+    assert (parsed.min_free_mb, parsed.schedule, parsed.mb) == (1024, "hold", 0)
+
+
 def test_s14_textembed_runs_the_text_tier_through_an_ocr_chain():
     scenario = legs.SCENARIOS["S14-textembed"]
     assert scenario.corpus == "text"
