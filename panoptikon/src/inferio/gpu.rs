@@ -371,6 +371,14 @@ fn probe_rocm() -> HostGpus {
     )
 }
 
+/// What ROCm lacks under WSL2, logged at startup and printed by
+/// `panoptikon accelerator`.
+pub const ROCM_UNDER_WSL: &str = "ROCm under WSL2 runs through the Windows \
+    display driver, which exposes no GPU name and none of the amdgpu memory \
+    counters this host reads: models on the GPU run without a memory ledger or \
+    batch-size calibration, and a GPU that runs out of memory may move it to \
+    system RAM and slow down instead of failing";
+
 /// This process runs under WSL2, where GPUs are reached through the Windows
 /// display driver.
 pub fn under_wsl() -> bool {
@@ -398,13 +406,7 @@ fn probe_rocm_at(
     let ambient_hip_restriction = rocm::ambient_hip_restriction(ambient);
     // WSL has no amdkfd: ROCm reaches the GPU through /dev/dxg.
     if wsl {
-        tracing::warn!(
-            "ROCm under WSL2 runs through the Windows display driver, which \
-             exposes none of the amdgpu memory counters this host reads: models \
-             on the GPU run without a memory ledger or batch-size calibration, \
-             and a GPU that runs out of memory may move it to system RAM and \
-             slow down instead of failing"
-        );
+        tracing::warn!("{ROCM_UNDER_WSL}");
         return rocm_host(roots, None, ambient_hip_restriction, false);
     }
     let gpus = match rocm::build(roots, ambient) {

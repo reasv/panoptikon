@@ -80,6 +80,8 @@ pub struct AcceleratorReport {
     pub backend_source: BackendSource,
     pub stacks: Vec<GpuStackPresence>,
     pub warnings: Vec<String>,
+    /// This process runs under WSL2.
+    pub under_wsl: bool,
 }
 
 impl AcceleratorReport {
@@ -113,6 +115,8 @@ impl AcceleratorReport {
             } else if stack_id_for_backend(self.backend).is_none() {
                 // Metal is part of macOS; no vendor tool names the device.
                 lines.push("GPU device: the one this OS provides".into());
+            } else if self.backend == Accelerator::Rocm && self.under_wsl {
+                lines.push(crate::inferio::gpu::ROCM_UNDER_WSL.into());
             } else {
                 lines.push("GPU devices: (none detected)".into());
             }
@@ -210,7 +214,7 @@ pub fn build_report(settings: &Settings) -> AcceleratorReport {
 }
 
 /// Pure assembly of warnings + device list (unit-tested). Under WSL a ROCm
-/// GPU has no name to read, and the GPU probe warns about that instead.
+/// GPU has no name to read, so its absence is not warned about.
 pub fn assemble_report(
     backend: Accelerator,
     backend_source: BackendSource,
@@ -240,6 +244,7 @@ pub fn assemble_report(
         backend_source,
         stacks,
         warnings,
+        under_wsl,
     }
 }
 
@@ -442,6 +447,7 @@ fn which(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inferio::gpu::ROCM_UNDER_WSL;
 
     fn empty_stacks() -> Vec<GpuStackPresence> {
         Vec::new()
@@ -555,7 +561,7 @@ mod tests {
             Accelerator::Cuda,
             BackendSource::InstalledVenv,
             empty_stacks(),
-            false,
+            true,
         );
         assert_eq!(report.backend, Accelerator::Cuda);
         assert_eq!(report.warnings.len(), 1);
@@ -573,22 +579,15 @@ mod tests {
         );
         assert_eq!(report.backend, Accelerator::Rocm);
         assert!(report.warnings.iter().any(|w| w.contains("rocm")));
-        let unnamed = GpuStackPresence {
-            stack: "amd-rocm",
-            backend: Accelerator::Rocm,
-            devices: Vec::new(),
-            evidence: "test".into(),
-        };
+        assert!(!report.format_text().contains(ROCM_UNDER_WSL));
         let wsl = assemble_report(
             Accelerator::Rocm,
             BackendSource::InstalledVenv,
-            vec![unnamed],
+            empty_stacks(),
             true,
         );
-        assert!(
-            wsl.warnings.is_empty(),
-            "under WSL the GPU probe warns instead"
-        );
+        assert!(wsl.warnings.is_empty());
+        assert!(wsl.format_text().contains(ROCM_UNDER_WSL));
     }
 
     #[test]
