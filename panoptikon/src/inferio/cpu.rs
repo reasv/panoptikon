@@ -204,13 +204,41 @@ fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     }
 }
 
+/// A process's host RAM in MiB as its worker reports it (`memory.py`,
+/// `_ram_side_bytes`): anonymous plus swapped memory on Linux, private commit
+/// on Windows. `None` where unreadable, and on any other OS.
+pub(super) fn process_ram_mb(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = PathBuf::from(format!("/proc/{pid}/status"));
+        let anon = super::rocm::meminfo_mb(&status, "RssAnon")?;
+        Some(anon + super::rocm::meminfo_mb(&status, "VmSwap").unwrap_or(0))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        sys::private_mb(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod sys {
-    //! `GlobalMemoryStatusEx`.
+    //! `GlobalMemoryStatusEx` and `K32GetProcessMemoryInfo`.
 
     use std::ptr;
 
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+    };
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    };
 
     const MIB: u64 = 1024 * 1024;
 
@@ -233,6 +261,28 @@ mod sys {
 
     pub(super) fn available_mb() -> Option<u64> {
         status().map(|status| status.ullAvailPhys / MIB)
+    }
+
+    /// `pid`'s private commit (`PrivateUsage`) in MiB.
+    pub(super) fn private_mb(pid: u32) -> Option<u64> {
+        // SAFETY: plain call; a null handle is checked below.
+        let process =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
+        if process.is_null() {
+            return None;
+        }
+        // SAFETY: zeroed is a valid `PROCESS_MEMORY_COUNTERS_EX` (plain
+        // integers); `cb` is the only field the API reads.
+        let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        counters.cb = size;
+        // SAFETY: the out-buffer is a whole `PROCESS_MEMORY_COUNTERS_EX` and
+        // `cb` and `size` say so; the handle is open until the close below.
+        let ok =
+            unsafe { K32GetProcessMemoryInfo(process, ptr::from_mut(&mut counters).cast(), size) };
+        // SAFETY: the handle came from `OpenProcess` and is closed once.
+        unsafe { CloseHandle(process) };
+        (ok != 0).then(|| counters.PrivateUsage as u64 / MIB)
     }
 }
 
@@ -528,5 +578,14 @@ mod tests {
         assert_eq!(sample[0].uuid, DEVICE_KEY);
         assert_eq!(sample[0].total_mb, total);
         assert!(sample[0].free_mb <= total);
+    }
+
+    /// A live process's host RAM is read where a reader exists; a process
+    /// that does not exist reads `None`.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn a_live_processs_host_ram_is_read() {
+        assert!(process_ram_mb(std::process::id()).is_some_and(|mb| mb > 0));
+        assert_eq!(process_ram_mb(u32::MAX), None);
     }
 }

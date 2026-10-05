@@ -950,6 +950,11 @@ booked centrally on the CPU device. It is never a throughput signal.
   after a window), that reading is carried forward by the change, once per
   window, as it is credited when a replica departs; otherwise the kept
   memory would read as free until the next probe and be booked twice.
+  Each read of the CPU device's free RAM also reads every such replica's
+  resident set live (by the worker's `pid`, on Linux and Windows), so a
+  reading taken while its batch runs counts that batch once, in its
+  booking: what it grew into is not external usage too, and what it
+  released is not counted free again when the batch reports it.
 - **Grant.** The GPU side is sized as before, then capped at the largest batch
   whose booking fits the room, at least one unit, where room is the CPU
   device's headroom plus the replica's own resident growth no booking claims.

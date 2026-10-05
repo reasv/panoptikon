@@ -315,10 +315,7 @@ impl VramLedger {
         let probed = gpu.clone();
         let handle = tokio::task::spawn_blocking(move || {
             let guard = ProbeGuard::new(&ledger, &probed);
-            // One snapshot of every GPU, so readings share one instant.
-            let gpus = ledger.run_memory_query(&probed);
-            let source = ledger.memory_query_for(&probed).free_source();
-            ledger.record_external_probe(&probed, gpus, source);
+            ledger.probe_now(&probed);
             guard.settled();
         });
         // A task that never ran runs no guard, so the join is watched.
@@ -352,9 +349,7 @@ impl VramLedger {
         if !due || !self.probes_the_host() {
             return;
         }
-        let gpus = self.run_memory_query(cpu::DEVICE_KEY);
-        let source = self.memory_query_for(cpu::DEVICE_KEY).free_source();
-        self.record_external_probe(cpu::DEVICE_KEY, gpus, source);
+        self.probe_now(cpu::DEVICE_KEY);
     }
 
     /// Settle a probe whose blocking task never ran, which would otherwise
@@ -439,9 +434,7 @@ impl VramLedger {
         let probed = gpu.to_owned();
         let probe = move || {
             let guard = ProbeGuard::new(&ledger, &probed);
-            let gpus = ledger.run_memory_query(&probed);
-            let source = ledger.memory_query_for(&probed).free_source();
-            ledger.record_external_probe(&probed, gpus, source);
+            ledger.probe_now(&probed);
             guard.settled();
         };
         if tokio::runtime::Handle::try_current().is_err() {
@@ -479,6 +472,44 @@ impl VramLedger {
         &self.memory_query
     }
 
+    /// Query `device`'s backend now (one snapshot of every GPU on it) and
+    /// record the answer. On the CPU device each replica's live resident set
+    /// is read just before, so the reading nets off what each holds then, a
+    /// batch in flight or memory just released included.
+    fn probe_now(&self, device: &str) {
+        let ram_sides = if device == cpu::DEVICE_KEY {
+            self.read_ram_sides()
+        } else {
+            Vec::new()
+        };
+        let gpus = self.run_memory_query(device);
+        let source = self.memory_query_for(device).free_source();
+        self.record_external_probe(device, gpus, source, ram_sides);
+    }
+
+    /// `(replica, MiB)` for each replica with a RAM side whose process
+    /// answers [`cpu::process_ram_mb`]. Read without the ledger lock held.
+    fn read_ram_sides(&self) -> Vec<(WorkerId, u64)> {
+        let pids: Vec<(WorkerId, u32)> = self
+            .lock()
+            .workers
+            .iter()
+            .filter_map(|(id, entry)| entry.pid.map(|pid| (*id, pid)))
+            .collect();
+        pids.into_iter()
+            .filter_map(|(id, pid)| Some((id, self.process_ram_mb(pid)?)))
+            .collect()
+    }
+
+    /// [`cpu::process_ram_mb`]; in tests the probe stub's answer.
+    fn process_ram_mb(&self, pid: u32) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(stub) = self.lock().probe_stub.as_ref() {
+            return stub.ram_sides.get(&pid).copied();
+        }
+        cpu::process_ram_mb(pid)
+    }
+
     /// One coherent snapshot of the free memory on `device`'s backend.
     fn run_memory_query(&self, device: &str) -> Option<Vec<GpuMemory>> {
         #[cfg(test)]
@@ -501,9 +532,26 @@ impl VramLedger {
 
     /// Record a host probe's answer for every GPU it enumerated, and settle
     /// the in-flight flag and failure backoff of `gpu`, the one it ran for.
-    fn record_external_probe(&self, gpu: &str, gpus: Option<Vec<GpuMemory>>, source: &str) {
+    /// `ram_sides` are the live resident sets read with it
+    /// ([`Self::probe_now`]).
+    fn record_external_probe(
+        &self,
+        gpu: &str,
+        gpus: Option<Vec<GpuMemory>>,
+        source: &str,
+        ram_sides: Vec<(WorkerId, u64)>,
+    ) {
         let at = Instant::now();
         let mut state = self.lock();
+        // Before the reading: an older one is carried across the change.
+        for (worker, mb) in ram_sides {
+            let Some(entry) = state.workers.get_mut(&worker) else {
+                continue;
+            };
+            let before = entry.ram_resident_mb();
+            entry.ram_live = Some((mb, at));
+            Self::shift_free_locked(&mut state, cpu::DEVICE_KEY, before, mb, at);
+        }
         let mut answered = false;
         let mut refreshed = Vec::new();
         let uuids: Vec<String> = state.gpus.keys().cloned().collect();

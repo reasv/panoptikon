@@ -279,7 +279,7 @@ impl VramLedger {
         // What the replica's first batch kept: start-up memory.
         let mut startup_mb: Option<u64> = None;
         let mut first_units = 0u64;
-        let mut ram_before = entry.ram_resident_mb();
+        let mut ram_before = entry.ram_after_batch_mb();
         let mut ram_base = entry.ram_base_mb;
 
         let (load, memory, samples, oldest_retained) = {
@@ -682,15 +682,18 @@ impl VramLedger {
             }
         }
         // One shift for the window, so batches stamped alike cannot skip one.
+        // A live reading taken after the last batch still stands.
         if let Some((rss, at)) = ram_after
             && let Some(entry) = state.workers.get_mut(&worker)
         {
             let before = entry.ram_resident_mb();
             entry.ram_mb = Some(rss);
+            entry.ram_live = entry.ram_live.filter(|(_, read_at)| *read_at > at);
             entry.ram_base_mb = ram_base;
             entry.ram_at_load_mb = ram_at_load;
             entry.ram_started = ram_started;
-            Self::shift_free_locked(state, cpu::DEVICE_KEY, before, rss, at);
+            let after = entry.ram_resident_mb();
+            Self::shift_free_locked(state, cpu::DEVICE_KEY, before, after, at);
         }
         // The response-level reading last: it is taken after the final batch.
         if let Some(stamped) = memory {

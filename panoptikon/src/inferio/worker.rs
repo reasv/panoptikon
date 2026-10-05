@@ -270,6 +270,9 @@ pub struct LoadReport {
     /// A CUDA or ROCm worker's resident set at load end: the baseline its
     /// host RAM per unit is measured over.
     pub rss_at_load_mb: Option<u64>,
+    /// The process that figure describes, read live by
+    /// [`super::cpu::process_ram_mb`].
+    pub pid: Option<u32>,
     pub memory: Option<MemorySample>,
 }
 
@@ -1775,6 +1778,7 @@ impl LoadReport {
             torch_version: field_string(payload, "torch_version"),
             device_kind: field_string(payload, "device_kind"),
             rss_at_load_mb: field_u64(payload, "rss_at_load_mb"),
+            pid: field_u64(payload, "pid").and_then(|pid| u32::try_from(pid).ok()),
             memory: MemorySample::parse(map_get(payload, "memory")),
         };
         (report != Self::default()).then_some(report)
@@ -3422,11 +3426,14 @@ mod tests {
             ("gpu_arch", Value::from(120i64)),
             ("gpu_bdf", Value::from(3i64)), ("gpu_total_mb", Value::from("24576")),
             ("torch_version", Value::from("2.7.1+cu128")),
-            ("rss_at_load_mb", Value::from(2900u64)),
+            ("rss_at_load_mb", Value::from(2900u64)), ("pid", Value::from(4242u64)),
         ];
         let report = parse(mixed).expect("the good fields are kept");
         assert_eq!(report.base_mb, Some(4321));
-        assert_eq!(report.rss_at_load_mb, Some(2900));
+        assert_eq!(
+            (report.rss_at_load_mb, report.pid),
+            (Some(2900), Some(4242))
+        );
         assert_eq!(report.base_method.as_deref(), Some("nvml"));
         assert_eq!(report.allocated_at_load_mb, Some(900));
         assert_eq!(

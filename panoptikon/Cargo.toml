@@ -184,12 +184,15 @@ libc = "0.2"
 # lock serializing concurrent setup runs (setup.rs).
 # Win32_System_SystemInformation: GlobalMemoryStatusEx, the host's RAM total
 # and availability for the CPU admission board (inferio/cpu.rs).
+# Win32_System_ProcessStatus: K32GetProcessMemoryInfo, a GPU worker's private
+# commit for the same board (inferio/cpu.rs).
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

@@ -2067,6 +2067,7 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
         rss = _mb(_ram_side_bytes())
         if rss is not None:
             payload["rss_at_load_mb"] = rss
+            payload["pid"] = os.getpid()
     sample = device_memory_sample()
     if sample is not None:
         payload["memory"] = sample

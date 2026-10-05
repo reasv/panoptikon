@@ -832,6 +832,12 @@ struct WorkerEntry {
     ram_base_mb: Option<u64>,
     /// Its resident set after the last batch.
     ram_mb: Option<u64>,
+    /// Its worker process, whose resident set each host read of the CPU
+    /// device reads live ([`cpu::process_ram_mb`]).
+    pid: Option<u32>,
+    /// That live reading and when it was taken, while newer than the last
+    /// batch's [`Self::ram_mb`].
+    ram_live: Option<(u64, Instant)>,
     /// Host RAM capped its last grant ([`GrantCharge::ram_bound`]).
     ram_bound: bool,
     /// Its first batch ran; what that batch kept is in its load level.
@@ -894,9 +900,17 @@ impl WorkerEntry {
         self.ram_at_load_mb.is_some()
     }
 
-    /// Host RAM held now (the resident set); 0 without a RAM side.
-    fn ram_resident_mb(&self) -> u64 {
+    /// The resident set its last batch left, or at load before one ran; 0
+    /// without a RAM side.
+    fn ram_after_batch_mb(&self) -> u64 {
         self.ram_mb.or(self.ram_at_load_mb).unwrap_or(0)
+    }
+
+    /// Host RAM held now: the live reading when one is newer than the last
+    /// batch, so a batch in flight is counted as it stands.
+    fn ram_resident_mb(&self) -> u64 {
+        self.ram_live
+            .map_or_else(|| self.ram_after_batch_mb(), |(mb, _)| mb)
     }
 
     /// Resident growth since load: the RAM twin of [`Self::pool_growth_mb`].
@@ -1497,6 +1511,9 @@ struct ProbeStub {
     /// A probe that unwinds instead of answering — a panicking driver query,
     /// or a blocking task the runtime tore down mid-flight.
     panics: bool,
+    /// What [`cpu::process_ram_mb`] answers, by pid; absent pids are
+    /// unreadable.
+    ram_sides: HashMap<u32, u64>,
 }
 
 impl LedgerState {

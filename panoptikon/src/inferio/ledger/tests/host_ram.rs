@@ -598,6 +598,68 @@ fn batches_stamped_alike_still_move_the_reading() {
     );
 }
 
+/// A host read taken while a neighbour's batch runs reads that replica's
+/// resident set live, so the batch is counted once, in its booking: memory
+/// it grew into is not external usage too, and memory it released is not
+/// counted free again once its batch reports it.
+#[test]
+fn a_reading_mid_batch_counts_a_neighbours_batch_once() {
+    const OTHER: &str = "GPU-bbbb";
+    const PID: u32 = 4242;
+    // 2 000 MiB to book beyond the reserve with both replicas at load.
+    const OTHERS: u64 = CPU_RAM_MB - RESERVE_MB - 2 * RSS_AT_LOAD_MB - 2_000;
+    let ledger = host(&[GPU, OTHER], None);
+    let (a_handle, a) = gpu_replica(&ledger, "g/mid-a", GPU, 256);
+    let (_b_handle, b) = gpu_replica(&ledger, "g/mid-b", OTHER, 256);
+    let mut state = ledger.lock();
+    let entry = state
+        .workers
+        .values_mut()
+        .find(|entry| entry.inference_id == "g/mid-a");
+    entry.expect("A is resident").pid = Some(PID);
+    drop(state);
+    // The host with A's resident set at `a_mb` and B's at its load level.
+    let host_with_a_at = |a_mb: u64| {
+        host_ram_free(&ledger, CPU_RAM_MB - OTHERS - RSS_AT_LOAD_MB - a_mb);
+        ledger.stub_process_ram(PID, a_mb);
+    };
+    let b_units = || {
+        b.request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .grant()
+            .unit_budget
+    };
+
+    // A keeps 200 MiB from a window, then is granted another.
+    host_with_a_at(RSS_AT_LOAD_MB);
+    let token = a.request_grant(50, None, 1, 0).expect("granted");
+    let kept = RSS_AT_LOAD_MB + 200;
+    a_handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![ram_batch(50, RSS_AT_LOAD_MB + 500, kept)]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    host_with_a_at(kept);
+    let token = a.request_grant(50, None, 1, 0).expect("granted");
+    let beside_booking = b_units();
+    assert!(beside_booking < 200, "RAM caps B beside A's booking");
+
+    host_with_a_at(RSS_AT_LOAD_MB + 450);
+    assert_eq!(b_units(), beside_booking, "A's batch grew into its booking");
+    let released = RSS_AT_LOAD_MB + 50;
+    host_with_a_at(released);
+    assert_eq!(b_units(), beside_booking, "A's batch released memory");
+    // The batch ends 50 MiB above that reading.
+    let after = released + 50;
+    a_handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![ram_batch(50, RSS_AT_LOAD_MB + 450, after)]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(row(&ledger, "g/mid-a").ram_resident_mb, Some(after));
+    assert_eq!(cpu_row(&ledger).external_mb, OTHERS);
+}
+
 /// One-time host growth on the first batch (CUDA and library start-up)
 /// joins the load level, so a model cheap per unit reaches the ceiling its
 /// RAM allows rather than one priced as if every unit carried that growth.

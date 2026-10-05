@@ -101,7 +101,16 @@ impl VramLedger {
             gpus,
             calls: 0,
             panics: false,
+            ram_sides: HashMap::new(),
         });
+    }
+
+    /// Have the installed probe stub read `mb` as process `pid`'s resident set.
+    #[cfg(test)]
+    pub(super) fn stub_process_ram(&self, pid: u32, mb: u64) {
+        if let Some(stub) = self.lock().probe_stub.as_mut() {
+            stub.ram_sides.insert(pid, mb);
+        }
     }
 
     /// Install a counting fake host probe that panics.
@@ -111,6 +120,7 @@ impl VramLedger {
             gpus: None,
             calls: 0,
             panics: true,
+            ram_sides: HashMap::new(),
         });
     }
 

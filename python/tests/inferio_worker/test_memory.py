@@ -2482,6 +2482,7 @@ def test_a_gpu_worker_reports_its_host_ram_beside_the_device_figures(
         report = memory.finish_load(memory.begin_load(), object())
         assert report["device_kind"] == ("rocm" if hip else "cuda")
         assert report["rss_at_load_mb"] == 3_000
+        assert report["pid"] == os.getpid(), "the orchestrator reads it live"
         state = memory.begin_batch()
         cuda.allocate(400, reserved_mb=900)
         ram.grow(700)

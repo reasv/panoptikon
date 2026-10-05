@@ -771,6 +771,8 @@ impl VramLedger {
                 ram_at_load_mb,
                 ram_base_mb: ram_at_load_mb,
                 ram_mb: None,
+                pid: report.pid.filter(|_| ram_at_load_mb.is_some()),
+                ram_live: None,
                 ram_bound: false,
                 ram_started: false,
                 item_cap: ram_at_load_mb.map(|_| 1),
