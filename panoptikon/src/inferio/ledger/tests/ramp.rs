@@ -228,8 +228,8 @@ fn deflation_is_also_repaid_by_elapsed_time() {
     assert_eq!(token.grant().unit_budget, 64, "back to the full budget");
 }
 
-/// Only time with no window granted repays: two failed windows that each
-/// take two intervals deflate twice.
+/// Only time with no window granted repays: two failed windows and a clean
+/// one, each taking two intervals, leave two levels.
 #[test]
 fn time_with_a_window_granted_repays_no_deflation() {
     let ledger = ledger(100_000, no_margin());
@@ -241,12 +241,10 @@ fn time_with_a_window_granted_repays_no_deflation() {
     for expected in [4, 8, 16, 32] {
         assert_eq!(measured_window(&handle, &admission, expected), expected);
     }
-    for _ in 0..2 {
+    for oom in [Some(ErrorFrameOom::Prose), Some(ErrorFrameOom::Prose), None] {
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         ledger.age_deflation_clock_for_test(admission.worker_id(), DEFLATION_REPAY_SECS * 2);
-        token.finish(WindowOutcome::Responded {
-            oom: Some(ErrorFrameOom::Prose),
-        });
+        token.finish(WindowOutcome::Responded { oom });
     }
     assert_eq!(ledger.health()[0].workers[0].deflation, 2);
 }
