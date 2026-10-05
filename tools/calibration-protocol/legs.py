@@ -256,13 +256,11 @@ SMOKE_IMAGES = sum(group.count for group in corpus_tiers.tier_groups("smoke")
 #: Keyed by the inference id with its `_cuda`/`_cpu` suffix stripped: the two
 #: variants differ in whether the ledger prices them, not in what they
 #: inject. The thresholds are per fixture, against the smoke tier; a leg on a
-#: bigger corpus raises them by hand. One flat `--expect-ooms 1` for the whole
-#: table would FAIL every fixture but one for working as designed. A fixture
-#: that OOMs on every batch logs at most one OOM negative per item, and `oom`
-#: runs no clean window, so its deflation does not return to 0 within the
-#: leg's settle, and the model is unloaded when its job ends. An OOM negative
-#: holds at least one predict that OOMed, so `oom_timed` logs at most its
-#: registry `oom_predicts` (20).
+#: bigger corpus raises them by hand. A fixture that OOMs on every batch logs
+#: at most one OOM negative per item, and `oom` runs no clean window, so its
+#: deflation does not return to 0 within the leg's settle, and the model is
+#: unloaded when its job ends. An OOM negative holds at least one predict that
+#: OOMed, so `oom_timed` logs at most its registry `oom_predicts` (20).
 S5_FIXTURES: Dict[str, Fixture] = {
     "oom_second_batch": Fixture(("--expect-ooms", "1")),
     "oom": Fixture(("--expect-ooms", str(SMOKE_IMAGES),
@@ -395,7 +393,6 @@ SCENARIOS: Dict[str, Scenario] = {
         corpus="smoke",
         model="calibfixture/oom_second_batch_cuda",
         checks="all",
-        expect=("--expect-ooms", "1"),
         # A fixture's job can last 0.3 s.
         health_interval=0.1,
         preconditions=(

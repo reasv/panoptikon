@@ -84,12 +84,17 @@ def _leg(model: str) -> "legs.Leg":
                     supervisor=legs.Supervisor(1.0), models=(model,))
 
 
-def test_each_fixture_gets_its_own_expectations_not_the_tables():
-    flat = legs.SCENARIOS["S5"].expect
-    assert _leg("calibfixture/dying_cuda").expectations() != flat
-    assert _leg("calibfixture/oom_second_batch_cuda").expectations() == flat
-    # A real model on S5 (MobileCLIP over `poison`) keeps the scenario's.
-    assert _leg("tags/wd-vit-tagger-v3").expectations() == flat
+def test_each_fixture_gets_its_own_expectations_not_the_tables(tmp_path):
+    assert (_leg("calibfixture/dying_cuda").expectations()
+            == legs.S5_FIXTURES["dying"].expect)
+    assert (_leg("calibfixture/oom_second_batch_cuda").expectations()
+            == legs.S5_FIXTURES["oom_second_batch"].expect)
+    # A real model on S5 declares no fault: an OOM over `poison` is a finding.
+    real = "tags/wd-vit-tagger-v3"
+    expect = _leg(real).expectations()
+    assert expect == ()
+    assert _verdicts(tmp_path / "real", real, expect,
+                     _thresholds(expect))["failures"] == "PASS"
 
 
 def test_the_dies_on_load_leg_declares_its_empty_setter_both_ways():
