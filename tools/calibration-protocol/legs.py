@@ -55,13 +55,13 @@ in `legs.json` under `analyze_command`.
 `--gpu-total-mb`, and the scaling rule
 --------------------------------------
 Every hog figure in the scenario table is a **fraction of the GPU's total**,
-not a number of MiB, because a schedule written for a 97 887 MiB board says
+not a number of MiB, because a schedule written for a 97 887 MiB GPU says
 nothing on a 24 564 MiB one: `leave-free 12288` is comfortable on the first
 and more than the whole model plus corpus on the second. The rule is:
 
     mib = round(fraction x gpu_total_mb)
 
-with `--gpu-total-mb` defaulting to the board `vramrec.py` reports for
+with `--gpu-total-mb` defaulting to the GPU total `vramrec.py` reports for
 `--hog-device`. A `leave-free` figure is then floored at `--min-free-mb`
 (default 1 024) so the model under test still fits on a small card, and a
 `hold` figure is capped at `gpu_total_mb - --min-free-mb` for the same reason.
@@ -78,7 +78,7 @@ Both the fraction and the resolved MiB are recorded in `legs.json`, and the
 reference column in `--list` is the figure this host's runs used, so a
 cross-platform comparison can state what changed.
 
-**On a unified-memory device there is no board for NVML to report**, so a leg
+**On a unified-memory device there is no GPU total for NVML to report**, so a leg
 with a hog refuses to start until `--gpu-total-mb` is given rather than
 scaling against this host's 97 887 MiB reference. The figure to give is the
 total the *worker adopts* -- `recommended_max_memory()`, which `selftest.py`
@@ -145,7 +145,7 @@ sys.path.insert(0, str(HERE))
 import corpus as corpus_tiers  # noqa: E402
 import rocm_sysfs  # noqa: E402
 
-# The board every figure in SCENARIOS was measured against, so `--list` can
+# The GPU total every figure in SCENARIOS was measured against, so `--list` can
 # print what this host actually ran beside the fraction.
 REFERENCE_TOTAL_MB = 97887
 
@@ -214,7 +214,7 @@ class Scenario:
     #: `count`, `ramp`, `ramp8`, `smoke` ... resolved under `results/corpus/`
     corpus: str
     model: str = DEFAULT_MODEL
-    #: the hog's opening schedule, as a fraction of the board
+    #: the hog's opening schedule, as a fraction of the GPU's total
     hog_hold_fraction: Optional[float] = None
     hog_leave_free_fraction: Optional[float] = None
     #: `--reeval` for the hog: 999999 pins it, so a shrinking `free` reading
@@ -298,7 +298,7 @@ SCENARIOS: Dict[str, Scenario] = {
                "grant_safety,failures,job_outcome,ledger_invariant,peak_fds",
         preconditions=(
             "the GPU's other tenant is STILL RUNNING - this is the only leg "
-            "that wants a full board",
+            "that wants a full GPU",
         ),
     ),
     "S2": Scenario(
@@ -329,7 +329,7 @@ SCENARIOS: Dict[str, Scenario] = {
     ),
     "S4a": Scenario(
         key="S4a",
-        note="constant external pressure: the hog holds the board down to a "
+        note="constant external pressure: the hog holds the GPU down to a "
              "fixed free level for the whole job",
         corpus="ramp",
         hog_leave_free_fraction=12288 / REFERENCE_TOTAL_MB,
@@ -343,7 +343,7 @@ SCENARIOS: Dict[str, Scenario] = {
     ),
     "S4b": Scenario(
         key="S4b",
-        note="step up: the hog takes another ~31% of the board 60 s into the "
+        note="step up: the hog takes another ~31% of the GPU 60 s into the "
              "job, between windows",
         corpus="ramp8",
         hog_hold_fraction=0.0,
@@ -359,7 +359,7 @@ SCENARIOS: Dict[str, Scenario] = {
     ),
     "S4c": Scenario(
         key="S4c",
-        note="spike: the hog squeezes the board to ~2 GB free for 10 s at "
+        note="spike: the hog squeezes the GPU to ~2 GB free for 10 s at "
              "t = 90 s, then releases",
         corpus="ramp8",
         hog_hold_fraction=0.0,
@@ -377,7 +377,7 @@ SCENARIOS: Dict[str, Scenario] = {
     ),
     "S4d": Scenario(
         key="S4d",
-        note="step down: the hog starts holding the board and releases "
+        note="step down: the hog starts holding the GPU and releases "
              "everything at t = 120 s; the budget must grow back",
         corpus="ramp8",
         hog_leave_free_fraction=8192 / REFERENCE_TOTAL_MB,
@@ -922,8 +922,8 @@ def derived_text_complaint(models: List[str], corpus: Path) -> Optional[str]:
             f"/text` and run this leg on it")
 
 
-def board_total_mb(device: int) -> Optional[int]:
-    """The board's total, from NVML, for the hog scaling rule.
+def nvml_total_mb(device: int) -> Optional[int]:
+    """The GPU's total, from NVML, for the hog scaling rule.
 
     None on a host with no NVML, which includes every Mac: the unified
     device's total is the worker's adopted recommended-max and only
@@ -1267,7 +1267,7 @@ class Leg:
                 before = json.loads(reply)
             except ValueError:
                 before = {}
-            # Record the fill, so `legs.json` states how long the board took
+            # Record the fill, so `legs.json` states how long the GPU took
             # to change and `analyze.py`'s hog_tracking has a wall clock.
             applied: Optional[Dict[str, Any]] = None
             for _ in range(40):
@@ -1861,7 +1861,7 @@ def print_table() -> None:
         for line in scenario.preconditions:
             print(f"        ! {line}")
     print(f"\nThe hog fractions are of the GPU's total; the MiB column is "
-          f"this host's reference board ({REFERENCE_TOTAL_MB} MiB). "
+          f"this host's reference GPU ({REFERENCE_TOTAL_MB} MiB). "
           f"--gpu-total-mb re-resolves them.")
 
 
@@ -1915,7 +1915,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "the config declares (S14 probes every "
                              "[[server.endpoints]] port and expects 200)")
     parser.add_argument("--gpu-total-mb", type=int, default=None,
-                        help="board total the hog figures scale against "
+                        help="GPU total the hog figures scale against "
                              "(default: NVML's, or amdgpu sysfs', for "
                              "--hog-device)")
     parser.add_argument("--min-free-mb", type=int, default=1024,
@@ -2048,7 +2048,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # the rescan quietly indexes nothing.
     corpus = (Path(args.corpus) if args.corpus
               else Path(args.results) / "corpus" / scenario.corpus).resolve()
-    measured_total_mb = board_total_mb(args.hog_device)
+    measured_total_mb = nvml_total_mb(args.hog_device)
     measured_source = "nvml"
     rocm_host = measured_total_mb is None and bool(rocm_sysfs.inventory())
     if rocm_host:
@@ -2236,7 +2236,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         leg.supervisor.start("vramrec", vram_argv)
         leg.mark("vramrec_started")
 
-        # 2. the hog, filled before the gateway sees the board
+        # 2. the hog, filled before the gateway sees the GPU
         if schedule:
             hog_argv = [args.python, str(HERE / "hog.py"), "--target",
                         args.hog_target, "--port", str(args.hog_port),

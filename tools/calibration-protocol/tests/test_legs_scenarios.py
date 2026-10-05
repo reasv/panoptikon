@@ -99,7 +99,7 @@ def test_a_hog_event_squeezes_during_the_job_on_any_hog_target(capsys,
             legs.main(["--scenario", "S2", "--gpu-total-mb", "24564",
                        "--dry-run", "--hog-event", bad])
 
-    monkeypatch.setattr(legs, "board_total_mb", lambda device: None)
+    monkeypatch.setattr(legs, "nvml_total_mb", lambda device: None)
     monkeypatch.setattr(legs.rocm_sysfs, "inventory", lambda *roots: [])
     with pytest.raises(SystemExit):
         legs.main(["--scenario", "S2", "--no-dotenv", "--dry-run",

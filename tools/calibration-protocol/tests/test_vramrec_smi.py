@@ -40,7 +40,7 @@ def _load():
 vramrec = _load()
 
 # Captured on `gcs` (driver 590.48.01, two RTX PRO 6000 Blackwell) while
-# SGLang held both boards, with the exact command the platform notes name.
+# SGLang held both GPUs, with the exact command the platform notes name.
 CAPTURED_CSV = """pid, used_gpu_memory [MiB]
 80613, 92908 MiB
 80614, 92908 MiB
@@ -171,7 +171,7 @@ def test_a_blind_gpu_is_priced_from_nvidia_smi_and_says_so():
 
 def test_an_empty_nvml_list_on_a_posix_host_never_calls_nvidia_smi():
     """The idle-GPU state of S2 and S3 before the model loads: NVML lists
-    nothing, and on POSIX that is an idle board rather than a hidden answer."""
+    nothing, and on POSIX that is an idle GPU rather than a hidden answer."""
     if vramrec.IS_WINDOWS:  # pragma: no cover - the rule inverts there
         pytest.skip("on Windows an empty list is a hidden answer")
     row, smi = _sample([_gpu([])], {77: 2048})

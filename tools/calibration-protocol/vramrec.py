@@ -52,7 +52,7 @@ Per GPU, **`oracle_source`** says which instrument priced the processes in
 that sample: `"nvml"` (NVML priced *every* process it listed and no
 `nvidia-smi` reading was used), `"nvidia-smi"` (NVML priced none and the
 fallback priced at least one), `"nvml+nvidia-smi"` (some pids priced by each)
-or `"none"` (this GPU has no complete attribution -- an idle board, a
+or `"none"` (this GPU has no complete attribution -- an idle GPU, a
 partly-priced one the fallback was not consulted for, or one where the
 fallback answered and priced nothing, which is the WDDM shape: a null fill is
 not a fill). `oracle_age_ms` is how old the reused `nvidia-smi` reading was,
@@ -1085,7 +1085,7 @@ class SmiOracle:
         self.error: Optional[str] = None
         #: set once a query has priced a GPU NVML listed but could not price,
         #: which is this host's own proof that an empty NVML list may be a
-        #: hidden answer rather than an idle board.
+        #: hidden answer rather than an idle GPU.
         self.proved_nvml_blind = False
         self._cache: Dict[str, Tuple[float, Dict[int, Optional[int]]]] = {}
 
@@ -1134,7 +1134,7 @@ def should_consult_smi(procs: List[Dict[str, Any]],
     """Whether this GPU's NVML answer is worth an `nvidia-smi` subprocess.
 
     An idle GPU lists nothing, and that is the normal state of S2's and S3's
-    board before the model loads, so an empty list only earns a subprocess
+    GPU before the model loads, so an empty list only earns a subprocess
     where NVML is known to hide the answer: on Windows, or once a fallback
     query has already out-answered NVML on this host.
     """

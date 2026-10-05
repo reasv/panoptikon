@@ -554,7 +554,7 @@ def test_legs_rocm_refuses_an_inherited_visibility_variable(tmp_path, monkeypatc
 def test_legs_run_refuses_an_inherited_visibility_variable(monkeypatch):
     _clear_visibility(monkeypatch)
     monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "0")
-    monkeypatch.setattr(legs, "board_total_mb", lambda device: None)
+    monkeypatch.setattr(legs, "nvml_total_mb", lambda device: None)
     monkeypatch.setattr(legs.rocm_sysfs, "inventory", lambda *roots: [])
     with pytest.raises(SystemExit, match="ROCR_VISIBLE_DEVICES is set"):
         legs.main(["--scenario", "S14", "--config", "R1", "--repo",
@@ -579,7 +579,7 @@ def test_legs_totals_a_rocm_gpu_from_sysfs(tmp_path, monkeypatch, capsys):
     (tmp_path / "pci" / BDF_0C / "mem_info_vram_total").write_text(f"{16 * GIB}\n")
     inventory, total = legs.rocm_sysfs.inventory, legs.rocm_total_mb
     _clear_visibility(monkeypatch)
-    monkeypatch.setattr(legs, "board_total_mb", lambda device: None)
+    monkeypatch.setattr(legs, "nvml_total_mb", lambda device: None)
     monkeypatch.setattr(legs.rocm_sysfs, "inventory",
                         lambda *roots: inventory(host.roots))
     monkeypatch.setattr(legs, "rocm_total_mb",

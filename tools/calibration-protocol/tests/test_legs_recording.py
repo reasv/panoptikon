@@ -201,7 +201,7 @@ def mark_then_sigint(self, name, **detail):
         signal.raise_signal(signal.SIGINT)
 legs.Leg.mark = mark_then_sigint
 legs.unsampled = lambda paths, timeout: []
-legs.board_total_mb = lambda device: None
+legs.nvml_total_mb = lambda device: None
 legs.rocm_sysfs.inventory = lambda *roots: []
 directory = tmp / "run" / "S14"
 directory.mkdir(parents=True)

@@ -3,7 +3,7 @@
 `oracle_agreement` subtracts our workers' per-process usage from the GPU's
 total. On WDDM nothing prices a process (NVML and `nvidia-smi` both answer
 `[N/A]` for every PID), so the subtraction returns
-the whole board and the "disagreement" is exactly our own footprint —
+the whole GPU and the "disagreement" is exactly our own footprint —
 a recording gap, not a ledger fault. `slope_accuracy` has the same shape:
 a probe for a model the leg never ran says the harness passed the wrong
 file, not that the ledger learned a wrong slope.
@@ -111,7 +111,7 @@ def test_oracle_agreement_still_fails_a_real_disagreement():
     assert analyze.check_oracle_agreement(ctx).verdict == "FAIL"
 
 
-def test_an_idle_board_counts_as_priced():
+def test_an_idle_gpu_counts_as_priced():
     """Nothing on the GPU is not a missing attribution."""
     assert analyze.oracle_prices_pids({"used_mb": 0, "procs": []}) is True
 
@@ -478,7 +478,7 @@ def test_the_probeless_leg_still_skips_with_a_size_left_in_place():
 # the GPU wired limit and our workers' RSS, because Apple Silicon has no
 # per-process GPU counter for any instrument to read. All three per-process
 # checks must SKIP on it, as they do on WDDM, rather than subtracting a zero
-# attribution from a real board figure and reporting our own workers as the
+# attribution from a real GPU figure and reporting our own workers as the
 # disagreement.
 
 MPS = "GPU-MPS"
@@ -507,7 +507,7 @@ def _mps_health(external_mb=30000, base_mb=None):
 
 
 def test_mps_ram_is_not_a_priced_oracle_even_on_an_idle_device():
-    """The idle-board shortcut must not turn "no counter" into "priced"."""
+    """The idle-GPU shortcut must not turn "no counter" into "priced"."""
     assert analyze.oracle_prices_pids(
         {"oracle_source": "mps-ram", "used_mb": 0, "procs": []}) is False
 

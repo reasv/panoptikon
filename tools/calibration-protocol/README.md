@@ -81,11 +81,11 @@ bites, and this is the one-command check for it. **On
 Windows/WDDM nothing raises**: over-admission there spills to host memory
 through the driver's sysmem fallback and shows up only as a throughput
 collapse, which is what `packing._note_throughput` and `COLLAPSE_RATIO` exist
-to catch. So when the filler exhausts the board without an exception the tool
+to catch. So when the filler exhausts the GPU without an exception the tool
 runs one more real batch and compares its units/sec against the clean one, and
 reports `oom.kind = "throughput_collapse"` with both rates and no `oom_class`.
-The ladder stops 4 096 MiB past the board's total, and the flag is refused
-(exit 2) when no board total resolved — otherwise the WDDM path, the one it
+The ladder stops 4 096 MiB past the GPU's total, and the flag is refused
+(exit 2) when no GPU total resolved — otherwise the WDDM path, the one it
 exists for, would fill host RAM instead of a device. On a CPU-priced host it
 reports `kind: "unavailable"` rather than filling a GPU no section is reading.
 
@@ -115,7 +115,7 @@ instead of `curl`, `subprocess` with an explicit termination protocol instead
 of job control, and no shell anywhere.
 
 In order: `newrun.py` for the results directory and `host.json`; `vramrec.py`;
-`hog.py` filled to its target before the gateway sees the board; `healthrec.py`;
+`hog.py` filled to its target before the gateway sees the GPU; `healthrec.py`;
 a wait of up to 30 s for a sample in both recordings (a
 `recorder_sample_timeout` event if one never comes); the binary with
 `--config <toml> --root <dir>/root --disable-update-check`; `fds.jsonl` sampled
@@ -163,7 +163,7 @@ without starting a process.
 
 **`--gpu-total-mb` and the scaling rule.** Every hog figure in the scenario
 table is a **fraction of the GPU's total**, never a number of MiB, because a
-schedule written for a 97 887 MiB board says nothing on a 24 564 MiB one:
+schedule written for a 97 887 MiB GPU says nothing on a 24 564 MiB one:
 `leave-free 12288` is comfortable on the first and more than the model plus
 its working set on the second. The rule is
 
@@ -171,24 +171,24 @@ its working set on the second. The rule is
 mib = round(fraction × gpu_total_mb)
 ```
 
-with `--gpu-total-mb` defaulting to the board NVML reports for `--hog-device`.
+with `--gpu-total-mb` defaulting to the GPU total NVML reports for `--hog-device`.
 A `leave-free` figure is then floored at `--min-free-mb` (default 1 024) so
 the model under test still fits on a small card, and a `hold` figure is capped
 at `gpu_total_mb − --min-free-mb` for the same reason. The floor is low on
-purpose: at 4 096 it bound S4a, S4c and S4d alike on a 32 GB board and made
+purpose: at 4 096 it bound S4a, S4c and S4d alike on a 32 GB GPU and made
 three legs defined at different levels apply identical pressure. Whenever it
 does bind, the leg writes a `floor_bound` event into `legs.json` and prints a
 `PRECONDITION:` line naming the scaled figure and the level it was moved to,
 because the leg is then measuring the floor and not the fraction. Both the
 fraction and the resolved MiB land in `legs.json`, and `--list`'s MiB column
-is this host's reference board, so a cross-platform comparison can state
+is this host's reference GPU, so a cross-platform comparison can state
 exactly what changed. The fractions come from this host's legs: S4a `leave-free`
 12 288 / 97 887, S4b's step `hold` 30 720 / 97 887 at t+60 s, S4d
 `leave-free` 8 192 / 97 887 released at t+120 s. **S4c's spike is not a
 fraction**: its "~2 GB free" is the defensive clamp's own threshold, the
 number the scenario is defined against, so it is 2 048 MiB on every GPU, not
 scaled, and raised only by a `--min-free-mb` above it, at t+90 s and released
-at t+100 s. On a 32 607 MiB board the four resolve to S4a 4 093, S4b 10 233,
+at t+100 s. On a 32 607 MiB GPU the four resolve to S4a 4 093, S4b 10 233,
 S4c 2 048 and S4d 2 729 MiB. Every event is timed **from the job's POST**,
 not from the leg's start, because what the scenario describes is a change
 during the job. `--hog-event` adds such an event in MiB to any scenario
@@ -290,7 +290,7 @@ pid NVML never listed. Each GPU row then carries:
 | `oracle_source: "nvml"` | NVML priced *every* process it listed; `nvidia-smi` was never used |
 | `oracle_source: "nvidia-smi"` | NVML priced none of them and the fallback priced at least one — a null fill is not a fill, so **on WDDM, where its answer is itself `[N/A]`, this label never appears**: that GPU reads `"none"` |
 | `oracle_source: "nvml+nvidia-smi"` | some by each (a mixed GPU, or `--smi always`) |
-| `oracle_source: "none"` | no complete attribution — an idle board, a partly-priced one the fallback was not consulted for, or one where the fallback ran and priced nothing (the WDDM shape; the `oracle_age_ms` beside it says the query ran) |
+| `oracle_source: "none"` | no complete attribution — an idle GPU, a partly-priced one the fallback was not consulted for, or one where the fallback ran and priced nothing (the WDDM shape; the `oracle_age_ms` beside it says the query ran) |
 | `oracle_age_ms` | how old the reused `nvidia-smi` reading was, recorded whenever that reading was consulted; `null` when NVML answered |
 
 **Never read a `used_mb` without the `oracle_source` beside it.** `--smi never`
@@ -754,7 +754,7 @@ last one closes a hole in `base_accuracy` itself):
 - **`utilization` scores the budget a grant carried, not the published one.**
   `/health`'s `unit_budget` is what the ledger offers; the `issued a memory
   grant` lines say what it admitted, and the two part company on a squeezed
-  board — an S4a leg published 512 while every window ran 1 unit and the check
+  GPU — an S4a leg published 512 while every window ran 1 unit and the check
   read 0.80 PASS, where the largest budget any grant carried was 34 (0.05,
   FAIL). The published figure stands in only for a recording with no grant
   lines, and the detail says so.
@@ -862,7 +862,7 @@ old zero-limit carve-out was unreachable). Each breach is therefore classified
 by cause: `over_grant` — a grant issued in that sample beyond the headroom it
 was priced against, the ledger over-committing — **FAILs**; `limit_fell` — the
 limit dropping under a footprint or reservation already held, external usage
-rising after our pool grew or a placeholder reservation on a squeezed board
+rising after our pool grew or a placeholder reservation on a squeezed GPU
 (closed by commit `ba6708e4`) — is **WARN**. The form that must always hold is
 the one
 `grant_safety` measures, restated inline on this row so the two read together.

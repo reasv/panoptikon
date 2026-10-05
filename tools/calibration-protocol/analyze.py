@@ -757,7 +757,7 @@ def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
 
 
 #: Oracle sources that price no process **by construction**, as opposed to a
-#: board that happens to be idle. `"mps-ram"` is macOS: there is no
+#: GPU that happens to be idle. `"mps-ram"` is macOS: there is no
 #: per-process GPU counter on Apple Silicon at all, so every figure in the row
 #: is host RAM and the only GPU-side self-report is the worker's own
 #: `driver_allocated` in `/health` (`vramrec.py`, "The macOS oracle").
@@ -777,11 +777,11 @@ def oracle_prices_pids(gpu: Dict[str, Any],
     process -- every `used_mb` is null, `oracle_source` is "none" (or
     "nvidia-smi" in a recording predating the rule that a null fill is not a
     fill) with nothing behind it, and a check that subtracts "ours" from the
-    GPU total would report our own workers' VRAM as the disagreement. A board
+    GPU total would report our own workers' VRAM as the disagreement. A GPU
     holding nothing counts as priced: there is no attribution to miss.
 
     A source that prices nothing by construction is judged before that
-    idle-board shortcut: on MPS an idle device is not an absence of
+    idle-GPU shortcut: on MPS an idle device is not an absence of
     attribution to miss, it is a platform with none to have.
 
     On ROCm the row is priced unless a PID whose descriptors could not be read
@@ -2278,7 +2278,7 @@ def check_ledger_invariant(ctx: Context) -> Verdict:
     headroom it was priced against, which is the ledger over-committing and
     the only shape that FAILs. `limit_fell`: the limit dropped under a
     footprint or reservation that already existed -- external usage rose after
-    our pool grew, or a placeholder reservation on a squeezed board (the
+    our pool grew, or a placeholder reservation on a squeezed GPU (the
     second shape is closed by commit ba6708e4) -- which is WARN. The form that
     must always hold is `grant_safety`'s, restated on this row. See the
     README's "Checks".

@@ -78,8 +78,8 @@ real batch and compares its units/sec against the clean batch from section 5:
 below `COLLAPSE_RATIO` the verdict is a **spill**, reported as
 `oom.kind = "throughput_collapse"` with both rates, and no `oom_class`.
 
-The ladder stops 4 096 MiB past the board's own total, and the flag is refused
-outright (exit 2) when no board total resolved: on WDDM nothing raises, so an
+The ladder stops 4 096 MiB past the GPU's own total, and the flag is refused
+outright (exit 2) when no GPU total resolved: on WDDM nothing raises, so an
 unbounded ladder would spill host RAM rather than exhaust a device.
 
 **On MPS the device total *is* host RAM**, so the overshoot is dropped and the
@@ -127,13 +127,13 @@ DEFAULT_BATCH = 8
 DEFAULT_MODEL = "tags/wd-vit-tagger-v3"
 
 # Filler ladder for `--induce-oom`. The chunk is large enough that a 100 GB
-# board is filled in a few dozen allocations and small enough that the last
+# GPU is filled in a few dozen allocations and small enough that the last
 # successful one leaves little unusable slack.
 FILLER_CHUNK_MB = 1024
-# Stop the ladder this far past the board's own total: a device that has taken
+# Stop the ladder this far past the GPU's own total: a device that has taken
 # its whole total and this much again is not going to raise (WDDM's sysmem
 # fallback, or a unified-memory host), so the throughput check takes over. An
-# absolute figure rather than a multiple, so an over-subscribed board spills a
+# absolute figure rather than a multiple, so an over-subscribed GPU spills a
 # bounded amount into host RAM instead of 1.25x its own VRAM.
 FILLER_OVERSHOOT_MB = 4096
 
@@ -144,7 +144,7 @@ MPS_WATERMARK_ENV = ("PYTORCH_MPS_HIGH_WATERMARK_RATIO",
 
 # `--induce-oom` on a unified device: RAM the ladder will not take. The device
 # total *is* host memory here, so a filler that runs past it does not exhaust
-# a board -- it pushes the machine into the compressor and then into jetsam,
+# a GPU -- it pushes the machine into the compressor and then into jetsam,
 # which kills processes that have nothing to do with this test.
 UNIFIED_RAM_FLOOR_MB = 16384
 
@@ -551,7 +551,7 @@ def induce_oom(
     `packing._note_throughput` does inside a real window.
 
     **On MPS the ladder is bounded differently.** The device total is host
-    memory, so `FILLER_OVERSHOOT_MB` past it is not slack on a board but
+    memory, so `FILLER_OVERSHOOT_MB` past it is not slack on a GPU but
     swap on the machine: the overshoot is dropped, and the ladder also stops
     while `UNIFIED_RAM_FLOOR_MB` of RAM is still available (`kind:
     "ram_floor"`), because past that macOS starts killing processes that have
@@ -585,7 +585,7 @@ def induce_oom(
 
     # The currency, not `torch.cuda.is_available()`: with a GPU visible and
     # `INFERIO_DEVICE=cpu`, every other section prices RAM and filling the
-    # board would answer a question about a device under test by nobody.
+    # GPU would answer a question about a device under test by nobody.
     if _safe(memory._ram_currency):
         result["kind"] = "unavailable"
         result["message_head"] = ("RAM is the currency on this host: there is "
@@ -600,7 +600,7 @@ def induce_oom(
         return result
 
     # A unified device's "total" is host RAM: overshooting it swaps the
-    # machine instead of exhausting a board.
+    # machine instead of exhausting a GPU.
     unified = device == "mps" or bool(_safe(memory._unified_gpu))
     cap_mb = total_mb if unified else total_mb + FILLER_OVERSHOOT_MB
     if cap_mb_override:
@@ -665,7 +665,7 @@ def induce_oom(
                 print(f"  {result['message_head']}", file=sys.stderr)
             return result
 
-        # Nothing raised with the board over-subscribed: the WDDM shape. Run
+        # Nothing raised with the GPU over-subscribed: the WDDM shape. Run
         # one real batch against it and let the throughput comparator decide.
         if not quiet:
             print(f"  filler held {held_mb} MiB without an exception; "
@@ -1089,17 +1089,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.induce_oom:
             # A unified ROCm GPU's total is carve-out plus GTT, which HIP's
             # `total_memory` may not report; `free_total_mb` does.
-            board_total = ((total_mb if _safe(memory._unified_gpu) else None)
-                           or document["device"].get("gpu_total_mb") or total_mb)
-            if board_total is None:
-                print("VERDICT: --induce-oom refused: no board total resolved, "
+            gpu_total = ((total_mb if _safe(memory._unified_gpu) else None)
+                         or document["device"].get("gpu_total_mb") or total_mb)
+            if gpu_total is None:
+                print("VERDICT: --induce-oom refused: no GPU total resolved, "
                       "so the filler ladder has no bound")
                 return 2
             if not args.quiet:
                 print("selftest: inducing a failure", file=sys.stderr)
             document["oom"] = induce_oom(
                 memory, packing, run_batch, args.batch,
-                document["batch"].get("units_per_s"), board_total, args.quiet,
+                document["batch"].get("units_per_s"), gpu_total, args.quiet,
                 args.oom_cap_mb,
             )
         else:
