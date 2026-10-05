@@ -2062,7 +2062,8 @@ def _items_per_s(records: List[Dict[str, Any]],
     standing in for a span that is missing or not positive. A clock step of
     1 s or more comes off the summed spans instead (the times are whole
     seconds, so a smaller step is noise); busy time then stands in for all of
-    them when a span is missing or the corrected total is not positive."""
+    them when a span is missing or the corrected total is under 1 s per
+    record."""
     items = sum(float(record.get("total_segments") or 0) for record in records)
     spans = [(_iso_epoch(str(record.get("start_time", "")).replace(" ", "T")),
               _iso_epoch(str(record.get("end_time", "")).replace(" ", "T")),
@@ -2077,7 +2078,7 @@ def _items_per_s(records: List[Dict[str, Any]],
         seconds = 0.0
         if all(start is not None and end is not None for start, end, _ in spans):
             seconds = sum(end - start for start, end, _ in spans) - step
-        if seconds <= 0:
+        if seconds < len(spans):
             seconds = sum(busy for _, _, busy in spans)
     return items / seconds if seconds > 0 else 0.0
 
