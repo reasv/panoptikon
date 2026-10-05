@@ -283,7 +283,10 @@ fn start_following_swapouts() {
             .spawn(|| {
                 follow_swapouts(
                     &SWAPOUTS,
-                    || sys::swapouts().map(|count| (count, sys::pressure_level(), Instant::now())),
+                    || {
+                        let at = Instant::now();
+                        sys::swapouts().map(|count| (count, sys::pressure_level(), at))
+                    },
                     |tick| {
                         std::thread::sleep(tick);
                         false
@@ -454,13 +457,13 @@ mod sys {
     /// `since`.
     pub(super) fn memory_facts(since: Option<Instant>) -> Option<super::MemoryFacts> {
         super::start_following_swapouts();
+        let now = Instant::now();
         let stats = vm_statistics()?;
         // SAFETY: sysconf takes a name and returns a long; no pointers.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page = u64::try_from(page).ok().filter(|page| *page > 0)?;
         let pages = |count: u32| u64::from(count).saturating_mul(page);
         let level = pressure_level();
-        let now = Instant::now();
         let pressure = super::SWAPOUTS.lock().map_or(
             super::MemoryPressure::from_level(level, false),
             |mut swapouts| {
