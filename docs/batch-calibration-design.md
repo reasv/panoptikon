@@ -1961,14 +1961,14 @@ Worker, per batch within its window:
     it can be" and "one more negative just arrived".
   - **Repay one level per 30 s of wall time with no window granted**, in
     addition to the three-clean-windows rule. A window's own time repays
-    nothing, or a failing window longer than 60 s could never deepen it. Clean windows can only repay while windows are
-    flowing, and the expensive case is the one where they are not: the fault
-    storm deflates the replica, the queue drains, and nothing is left to earn
-    the halvings back. 30 s is the idle-resident trim's debounce — the interval
-    at which the machinery that *relieves* a tight GPU can act — so a level
-    survives one full relief cycle before it is handed back. Against the cap
-    the worst case is bounded: an 11-level replica is whole again in five and a
-    half minutes.
+    nothing, or a failing window of 30 s or longer could never deepen it.
+    Clean windows can only repay while windows are flowing, and the expensive
+    case is the one where they are not: the fault storm deflates the replica,
+    the queue drains, and nothing is left to earn the halvings back. 30 s is the
+    idle-resident trim's debounce — the interval at which the machinery that
+    *relieves* a tight GPU can act — so a level survives one full relief cycle
+    before it is handed back. Against the cap the worst case is bounded: an
+    11-level replica is whole again in five and a half minutes.
   - **Cleared on respawn**, which holds by construction: the counter lives on
     the ledger's per-replica entry and the manager builds a fresh one. The
     (model, GPU) ratchet anchor, which is not per replica, survives.

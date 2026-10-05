@@ -7920,7 +7920,7 @@
           "external_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.\nOn unified memory the footprints of every device sharing the RAM\ncount, an APU's only beyond the carve-out it can still use. On a GPU\nthat spills to system RAM, while it reads full or is credited for a\ndeparture, at least its value at the last pool refresh that was\nneither. An APU reports this, the reserve, the limit and the headroom from the side\nthat binds: its VRAM and GTT (its own memory only) or the RAM behind\nit.",
+            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.\nOn unified memory the footprints of every device sharing the RAM\ncount, an APU's only beyond the carve-out it can still use. On a GPU\nthat spills to system RAM, while it reads full or our own memory on it\nchanged since its last reading, at least its value at the last reading\nthat was neither. An APU reports this, the reserve, the limit and the\nheadroom from the side that binds: its VRAM and GTT (its own memory\nonly) or the RAM behind it.",
             "minimum": 0
           },
           "external_sample_age_ms": {
