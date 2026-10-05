@@ -1172,7 +1172,7 @@ impl ModelManager {
     ///
     /// A replica the ledger condemned on `gpu` (it did not fit the card) arms
     /// the load-failure cooldown, so the reload waits instead of respawning on
-    /// the next item.
+    /// the next item; also when the model was unloaded meanwhile.
     pub(crate) fn handle_worker_death(
         &self,
         inference_id: &str,
@@ -1181,13 +1181,6 @@ impl ModelManager {
         gpu: Option<&str>,
     ) {
         let mut state = self.state.lock().unwrap();
-        let matches = state
-            .models
-            .get(inference_id)
-            .is_some_and(|handle| handle.generation == generation);
-        if !matches {
-            return;
-        }
         let window = gpu
             .is_some_and(|gpu| self.ledger.was_condemned(inference_id, gpu))
             .then(|| {
@@ -1196,6 +1189,13 @@ impl ModelManager {
                     .note_failure(inference_id, reason, &self.cfg.loads, Instant::now())
             })
             .flatten();
+        let matches = state
+            .models
+            .get(inference_id)
+            .is_some_and(|handle| handle.generation == generation);
+        if !matches {
+            return;
+        }
         tracing::warn!(
             model = %inference_id,
             cooldown_secs = window.map(|window| window.as_secs_f64()),
@@ -2319,6 +2319,36 @@ metadata.cost.seed_units = 1000000
                 vec![data_input(value)],
             )
             .await
+    }
+
+    /// Waits up to 10 s until `ready` holds for the stats of `inference_id`'s
+    /// set `generation`, which must stay loaded meanwhile.
+    async fn wait_for_stats(
+        manager: &ModelManager,
+        inference_id: &str,
+        generation: u64,
+        ready: impl Fn(&ModelStats) -> bool,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let stats = manager
+                .state
+                .lock()
+                .unwrap()
+                .models
+                .get(inference_id)
+                .filter(|handle| handle.generation == generation)
+                .map(|handle| Arc::clone(&handle.stats))
+                .expect("the set is still loaded");
+            if ready(&stats) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "never ready: {stats:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Batch size reported by a batchsize_test output.
@@ -3456,6 +3486,11 @@ metadata.cost.seed_units = 1000000
                 predict_one(&manager, "dieflag/test", "k", -1, Some(1), json!(i)).await
             }));
         }
+        // Normal #0 runs on replica B before the death.
+        wait_for_stats(&manager, "dieflag/test", generation, |stats| {
+            stats.in_flight_windows.load(Relaxed) == 2
+        })
+        .await;
 
         die.await
             .unwrap()
@@ -3476,65 +3511,164 @@ metadata.cost.seed_units = 1000000
         manager.shutdown().await;
     }
 
+    /// An unload or a shutdown lets the window in flight finish and fails the
+    /// queued requests as never run, without a reload: no ERROR or WARN, at
+    /// most one INFO.
+    #[tokio::test]
+    async fn an_unload_fails_the_queued_requests_as_never_run() {
+        for shutdown in [false, true] {
+            let setup = test_manager(Duration::from_secs(60), 32);
+            let manager = setup.manager.clone();
+            load(&manager, "slow/test", "k", -1).await.expect("load");
+            let generation = manager.loaded_generation("slow/test").expect("loaded");
+            let predict = |value| {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    predict_one(&manager, "slow/test", "k", -1, None, value).await
+                })
+            };
+            let running = predict(json!(0));
+            wait_for_stats(&manager, "slow/test", generation, |stats| {
+                stats.in_flight_windows.load(Relaxed) == 1
+            })
+            .await;
+            let queued: Vec<_> = (1..4).map(|i| predict(json!(i))).collect();
+            wait_for_stats(&manager, "slow/test", generation, |stats| {
+                stats.queue_len.load(Relaxed) == 3
+            })
+            .await;
+            let (logs, _capture) = crate::test_utils::LogCounts::capture();
+            if shutdown {
+                manager.shutdown().await;
+            } else {
+                manager
+                    .unload_model("k", "slow/test")
+                    .await
+                    .expect("unloaded");
+            }
+            let outputs = running
+                .await
+                .unwrap()
+                .expect("the window in flight finishes");
+            assert_eq!(outputs, vec![WorkerOutput::Json(json!({"slow": true}))]);
+            for task in queued {
+                let err = task.await.unwrap().expect_err("never ran");
+                assert!(err.downcast_ref::<Unattempted>().is_some(), "{err:#}");
+            }
+            assert_eq!(manager.loaded_generation("slow/test"), None);
+            assert_eq!(logs.at(tracing::Level::ERROR, "panoptikon::inferio"), 0);
+            assert_eq!(logs.at(tracing::Level::WARN, "panoptikon::inferio"), 0);
+            // The worker's own stderr is relayed at INFO under `::worker`.
+            let info = logs.at(tracing::Level::INFO, "panoptikon::inferio")
+                - logs.at(tracing::Level::INFO, "panoptikon::inferio::worker");
+            assert!(info <= 1, "{info} INFO lines");
+            if !shutdown {
+                manager.shutdown().await;
+            }
+        }
+    }
+
+    /// A model whose dispatcher ended without removing it fails a predict as
+    /// never run instead of retrying on the same closed channel.
+    #[tokio::test]
+    async fn a_closed_channel_the_model_still_maps_to_fails_the_predict() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = setup.manager.clone();
+        load(&manager, "echo/test", "k", -1).await.expect("load");
+        let (closed, _) = mpsc::unbounded_channel();
+        manager
+            .state
+            .lock()
+            .unwrap()
+            .models
+            .get_mut("echo/test")
+            .expect("loaded")
+            .tx = closed;
+        let predict = predict_one(&manager, "echo/test", "k", -1, None, json!(1));
+        let err = tokio::time::timeout(Duration::from_secs(5), predict)
+            .await
+            .expect("no retry loop")
+            .expect_err("the channel is closed");
+        assert!(err.downcast_ref::<Unattempted>().is_some(), "{err:#}");
+        manager.shutdown().await;
+    }
+
     /// A death the *ledger* called is a costed load failure: the cooldown
     /// arms with the verdict's sentence, so the reload waits rather than
-    /// being respawned by the next item. Every other fatal death still
+    /// being respawned by the next item; also when the model was unloaded
+    /// before the death handler ran. Every other fatal death still
     /// respawns at once (`worker_death_cleans_up_and_next_predict_respawns`).
     #[tokio::test]
     async fn a_condemned_models_death_arms_the_cooldown() {
-        let setup = test_manager_with(ManagerOpts {
-            gpus: test_gpus(),
-            ..Default::default()
-        });
-        let manager = setup.manager.clone();
+        for unloaded_first in [false, true] {
+            let setup = test_manager_with(ManagerOpts {
+                gpus: test_gpus(),
+                ..Default::default()
+            });
+            let manager = setup.manager.clone();
 
-        load(&manager, "dieledger/test", "k", -1)
-            .await
-            .expect("one replica, pinned to the card the condemnation names");
-        // The card the unpinned replicas were admitted to.
-        manager
-            .ledger
-            .condemn_for_test("dieledger/test", "GPU-0000", 40_000);
+            load(&manager, "dieledger/test", "k", -1)
+                .await
+                .expect("one replica, pinned to the card the condemnation names");
+            let generation = manager.loaded_generation("dieledger/test").expect("loaded");
+            // The card the unpinned replicas were admitted to.
+            manager
+                .ledger
+                .condemn_for_test("dieledger/test", "GPU-0000", 40_000);
 
-        predict_one(
-            &manager,
-            "dieledger/test",
-            "k",
-            -1,
-            Some(1),
-            json!({"die": true}),
-        )
-        .await
-        .expect_err("the poison request fails with the fatal death");
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while manager.health().load_cooldowns.is_empty() {
-            if tokio::time::Instant::now() > deadline {
-                panic!("the condemned model's death never armed the cooldown");
+            if unloaded_first {
+                manager
+                    .unload_model("k", "dieledger/test")
+                    .await
+                    .expect("unloaded");
+                manager.handle_worker_death(
+                    "dieledger/test",
+                    generation,
+                    "the worker failed fatally",
+                    Some("GPU-0000"),
+                );
+            } else {
+                predict_one(
+                    &manager,
+                    "dieledger/test",
+                    "k",
+                    -1,
+                    Some(1),
+                    json!({"die": true}),
+                )
+                .await
+                .expect_err("the poison request fails with the fatal death");
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let cooldown = manager
-            .health()
-            .load_cooldowns
-            .into_iter()
-            .find(|entry| entry.inference_id == "dieledger/test")
-            .expect("armed");
-        assert_eq!(cooldown.failures, 1);
-        assert!(
-            cooldown.last_error.contains("failed fatally"),
-            "the sentence that killed it is what /health says: {}",
-            cooldown.last_error
-        );
-        let err = predict_one(&manager, "dieledger/test", "k", -1, Some(1), json!("ok"))
-            .await
-            .expect_err("the reload waits for the cooldown");
-        assert!(
-            format!("{err:#}").contains("cooldown"),
-            "and says so: {err:#}"
-        );
 
-        manager.shutdown().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while manager.health().load_cooldowns.is_empty() {
+                if tokio::time::Instant::now() > deadline {
+                    panic!("the condemned model's death never armed the cooldown");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let cooldown = manager
+                .health()
+                .load_cooldowns
+                .into_iter()
+                .find(|entry| entry.inference_id == "dieledger/test")
+                .expect("armed");
+            assert_eq!(cooldown.failures, 1);
+            assert!(
+                cooldown.last_error.contains("failed fatally"),
+                "the sentence that killed it is what /health says: {}",
+                cooldown.last_error
+            );
+            let err = predict_one(&manager, "dieledger/test", "k", -1, Some(1), json!("ok"))
+                .await
+                .expect_err("the reload waits for the cooldown");
+            assert!(
+                format!("{err:#}").contains("cooldown"),
+                "and says so: {err:#}"
+            );
+
+            manager.shutdown().await;
+        }
     }
 
     /// A worker killed for memory on every input condemns its model on the
