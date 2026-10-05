@@ -212,7 +212,6 @@ fn audio_streams(path: &str) -> ApiResult<Vec<u64>> {
     // (a truncated read, a version whose `-of json` shape we do not
     // understand). Transient, so the item is retried rather than suppressed.
     let value: Value = serde_json::from_slice(&output.stdout).map_err(|err| {
-        tracing::error!(error = %err, path, "ffprobe output is unparseable");
         ApiError::internal(format!("ffprobe output for {path} is unparseable: {err}"))
     })?;
     Ok(order_audio_streams(&value))

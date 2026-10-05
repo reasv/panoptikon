@@ -127,8 +127,6 @@ const FD_RESERVE: usize = 256;
 /// by their error so a distinct one is still logged.
 static TRANSIENT_ITEM_FAILURES: LazyLock<LogThrottle> =
     LazyLock::new(|| LogThrottle::new("transient extraction item failures", tracing::Level::ERROR));
-static ITEM_ERRORS: LazyLock<LogThrottle> =
-    LazyLock::new(|| LogThrottle::new("extraction item errors", tracing::Level::ERROR));
 static REQUEUES: LazyLock<LogThrottle> =
     LazyLock::new(|| LogThrottle::new("re-queued predicts", tracing::Level::WARN));
 
@@ -993,7 +991,7 @@ async fn run_extraction_job_inner(
                 let ledger_shas = Arc::clone(&ledger_shas);
                 let abort = Arc::clone(&abort);
                 tasks.spawn(async move {
-                    let result = process_item(
+                    process_item(
                         &index_db,
                         &model,
                         job_id,
@@ -1013,11 +1011,6 @@ async fn run_extraction_job_inner(
                         &abort,
                     )
                     .await;
-                    if let Err(err) = result
-                        && ITEM_ERRORS.admit_for(&format!("{err:?}"))
-                    {
-                        tracing::error!(error = ?err, "extraction item failed");
-                    }
                 });
             }
             if fetched < WORK_CHUNK_ROWS {
@@ -1294,19 +1287,18 @@ async fn process_item(
     ledger_shas: &std::collections::HashSet<String>,
     detect_outros: bool,
     abort: &JobAbort,
-) -> ApiResult<()> {
+) {
     let item_type = item.item_type.clone();
     let sha256 = item.sha256.clone();
     let path = item.path.clone();
-    // A verdict on the item's own media: ledger row, log line, finalisation,
-    // and the error only if recording failed. A recorded verdict returns `Ok`.
+    // A failure on the item's own media: ledger row, log line, finalisation.
     let record_verdict = async |stage: &str,
                                 sha256: &str,
                                 path: &str,
                                 item_type: &str,
                                 segments: i64,
                                 err: ApiError| {
-        let (outcome, returned) =
+        let outcome =
             record_item_failure(index_db, model, job_id, stage, sha256, path, &counters, err).await;
         finalize_item(
             index_db,
@@ -1318,11 +1310,6 @@ async fn process_item(
             total_remaining,
         )
         .await;
-        match returned {
-            Some(err) => Err(err),
-            // Logged and recorded: the item is done and the job continues.
-            None => Ok(()),
-        }
     };
     let load_span = counters.lock().await.data_load_time.start();
     let prepare_result = input_handlers::prepare_item(index_db, model, item, detect_outros).await;
@@ -1330,7 +1317,7 @@ async fn process_item(
     let prepared = match prepare_result {
         Ok(prepared) => prepared,
         Err(err) => {
-            return record_verdict(
+            record_verdict(
                 crate::db::extraction_errors::STAGE_PREPARE,
                 &sha256,
                 &path,
@@ -1339,83 +1326,11 @@ async fn process_item(
                 err,
             )
             .await;
+            return;
         }
     };
-
-    if prepared.inputs.is_empty() {
-        let result =
-            output_handlers::write_placeholder(index_db, model, job_id, &prepared.item).await;
-        if result.is_ok() {
-            clear_ledger_row(index_db, model, &prepared.item.sha256, ledger_shas).await;
-        } else if let Err(err) = &result {
-            note_job_failure(
-                &counters,
-                &model.setter_name,
-                STAGE_OUTPUT,
-                &prepared.item.sha256,
-                false,
-                err.detail().to_string(),
-            )
-            .await;
-        }
-        finalize_item(
-            index_db,
-            job_id,
-            &prepared.item.item_type,
-            0,
-            if result.is_ok() {
-                ItemOutcome::Processed
-            } else {
-                ItemOutcome::Failed
-            },
-            counters,
-            total_remaining,
-        )
-        .await;
-        return result.map(|_| ());
-    }
-
-    let inference_inputs = input_handlers::apply_threshold(prepared.inputs, threshold);
-    // Reserve budget for the loaded data *before* releasing the loader slot:
-    // when the budget is exhausted this parks with the slot still held, so
-    // once every loader slot is parked no new loads start. The clamp lets an
-    // item bigger than the whole budget run alone rather than deadlock.
-    let kib = input_memory_kib(&inference_inputs);
-    let _budget_permits = if kib > 0 {
-        let want = kib.min(budget_capacity);
-        Some(
-            budget_slots
-                .clone()
-                .acquire_many_owned(want)
-                .await
-                .map_err(|_| ApiError::internal("Extraction budget semaphore closed"))?,
-        )
-    } else {
-        None
-    };
-    drop(loader_permit);
-
-    let segments = inference_inputs.len() as i64;
-    // The model is unavailable for a stated window; nothing was attempted.
-    if abort.is_set() {
-        return Ok(());
-    }
-    let mut requeued = false;
-    let inference_result = run_item_inference(
-        &model.setter_name,
-        pool,
-        unit_slots,
-        unit_capacity,
-        batch_cap,
-        &inference_inputs,
-        &counters,
-        abort,
-        &mut requeued,
-    )
-    .await;
-
     // A transient failure: no ledger row, the item stays selectable next run.
-    let note_transient = async |stage: &str, error: String, detail: String| {
+    let note_transient = async |stage: &str, requeued: bool, error: String, detail: String| {
         if TRANSIENT_ITEM_FAILURES.admit_for(&format!("{stage}: {error}")) {
             tracing::error!(
                 path = %prepared.item.path,
@@ -1436,11 +1351,78 @@ async fn process_item(
         )
         .await;
     };
+
+    if prepared.inputs.is_empty() {
+        let result =
+            output_handlers::write_placeholder(index_db, model, job_id, &prepared.item).await;
+        if result.is_ok() {
+            clear_ledger_row(index_db, model, &prepared.item.sha256, ledger_shas).await;
+        } else if let Err(err) = &result {
+            let detail = err.detail().to_string();
+            note_transient(STAGE_OUTPUT, false, detail.clone(), detail).await;
+        }
+        finalize_item(
+            index_db,
+            job_id,
+            &prepared.item.item_type,
+            0,
+            if result.is_ok() {
+                ItemOutcome::Processed
+            } else {
+                ItemOutcome::Failed
+            },
+            counters,
+            total_remaining,
+        )
+        .await;
+        return;
+    }
+
+    let inference_inputs = input_handlers::apply_threshold(prepared.inputs, threshold);
+    // Reserve budget for the loaded data *before* releasing the loader slot:
+    // when the budget is exhausted this parks with the slot still held, so
+    // once every loader slot is parked no new loads start. The clamp lets an
+    // item bigger than the whole budget run alone rather than deadlock.
+    let kib = input_memory_kib(&inference_inputs);
+    let _budget_permits = if kib > 0 {
+        let want = kib.min(budget_capacity);
+        Some(
+            budget_slots
+                .clone()
+                .acquire_many_owned(want)
+                .await
+                .expect("the job never closes its budget semaphore"),
+        )
+    } else {
+        None
+    };
+    drop(loader_permit);
+
+    let segments = inference_inputs.len() as i64;
+    // The model is unavailable for a stated window; nothing was attempted.
+    if abort.is_set() {
+        return;
+    }
+    let mut requeued = false;
+    let inference_result = run_item_inference(
+        &model.setter_name,
+        pool,
+        unit_slots,
+        unit_capacity,
+        batch_cap,
+        &inference_inputs,
+        &counters,
+        abort,
+        &mut requeued,
+    )
+    .await;
+
     // Only a typed worker verdict may call a payload bad; the rest is retried.
-    let fail_inference = async |error: String, detail: String| -> ApiError {
+    let fail_inference = async |error: String, detail: String| {
         note_transient(
             crate::db::extraction_errors::STAGE_INFERENCE,
-            error.clone(),
+            requeued,
+            error,
             detail,
         )
         .await;
@@ -1454,13 +1436,12 @@ async fn process_item(
             total_remaining,
         )
         .await;
-        ApiError::internal(format!("Inference failed: {error}"))
     };
 
     let inference = match inference_result {
         Ok(Some(inference)) => inference,
         // This item's request raised the abort: nothing counted.
-        Ok(None) => return Ok(()),
+        Ok(None) => return,
         Err(err) => {
             // Too large to send even alone: a `resource` limit of this host.
             if let Some(verdict) = oversize_input_verdict(&err) {
@@ -1474,7 +1455,7 @@ async fn process_item(
                 )
                 .await;
             }
-            return Err(fail_inference(err.to_string(), format!("{err:#}")).await);
+            return fail_inference(err.to_string(), format!("{err:#}")).await;
         }
     };
 
@@ -1502,7 +1483,7 @@ async fn process_item(
             inference.outputs
         }
         SlotVerdict::Transient(detail) => {
-            return Err(fail_inference(detail.clone(), detail).await);
+            return fail_inference(detail.clone(), detail).await;
         }
         SlotVerdict::InputMedia(detail) => {
             // The worker — the component that actually decoded the bytes —
@@ -1533,12 +1514,8 @@ async fn process_item(
     if let Err(err) = &result {
         // Storing the output is the gateway's own DB work: never a verdict on
         // the media, so it is counted and retried like any other transient.
-        note_transient(
-            STAGE_OUTPUT,
-            err.detail().to_string(),
-            err.detail().to_string(),
-        )
-        .await;
+        let detail = err.detail().to_string();
+        note_transient(STAGE_OUTPUT, requeued, detail.clone(), detail).await;
     }
     if result.is_ok() {
         clear_ledger_row(index_db, model, &prepared.item.sha256, ledger_shas).await;
@@ -1557,7 +1534,6 @@ async fn process_item(
         total_remaining,
     )
     .await;
-    result.map(|_| ())
 }
 
 /// The verdict on an item whose inference produced typed per-slot errors.
@@ -1652,9 +1628,9 @@ fn targets_text_entity(model: &ModelMetadata) -> bool {
 }
 
 /// Logs an item failure and, when its class is one the ledger stores, records
-/// it against `stage`. Returns the outcome to count and the error the item
-/// task should return, if any. A failed ledger write counts as systemic, so a
-/// DB outage never soft-completes a job as "all corrupt media".
+/// it against `stage`. Returns the outcome to count. A failed ledger write
+/// counts as systemic, so a DB outage never soft-completes a job as "all
+/// corrupt media".
 #[allow(clippy::too_many_arguments)]
 async fn record_item_failure(
     index_db: &str,
@@ -1665,7 +1641,7 @@ async fn record_item_failure(
     path: &str,
     counters: &Arc<Mutex<JobCounters>>,
     err: ApiError,
-) -> (ItemOutcome, Option<ApiError>) {
+) -> ItemOutcome {
     let class = err.persisted_class();
     tracing::error!(
         path,
@@ -1688,7 +1664,7 @@ async fn record_item_failure(
             err.detail().to_string(),
         )
         .await;
-        return (ItemOutcome::Failed, Some(err));
+        return ItemOutcome::Failed;
     }
 
     let record = failure_record(model, job_id, stage, sha256, &err);
@@ -1700,17 +1676,14 @@ async fn record_item_failure(
     })
     .await
     {
-        Ok(()) => (
-            ItemOutcome::InputFailed {
-                blocker: err.blocker(),
-            },
-            None,
-        ),
+        Ok(()) => ItemOutcome::InputFailed {
+            blocker: err.blocker(),
+        },
         Err(write_err) => {
             tracing::error!(
                 path,
                 sha256,
-                error = ?write_err,
+                error = %write_err.detail(),
                 "failed to record an extraction failure; counting it as systemic"
             );
             note_job_failure(
@@ -1722,7 +1695,7 @@ async fn record_item_failure(
                 write_err.detail().to_string(),
             )
             .await;
-            (ItemOutcome::Failed, Some(write_err))
+            ItemOutcome::Failed
         }
     }
 }
@@ -3286,6 +3259,56 @@ mod tests {
         assert_eq!(logs.at(tracing::Level::INFO, target), 1);
     }
 
+    /// An item failure is logged once, by the item task itself: it returns
+    /// nothing for a second line to come from.
+    #[tokio::test]
+    async fn an_item_failure_is_logged_once() {
+        use crate::config::InferenceEndpointConfig;
+        let _test_env = test_data_dir();
+        let files = [(1, "sha_one", "C:/data/1.png")];
+        let index_db = ledger_test_db("extraction_item_failure_log", &files).await;
+        let model = image_model();
+        let job_id = data_log_job(index_db, &model).await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("gone.png");
+        let pool = InferencePool::new(vec![InferenceEndpointConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            weight: 1.0,
+            use_for_jobs: true,
+        }])
+        .expect("pool builds");
+        let loader_permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let counters = Arc::new(Mutex::new(JobCounters::default()));
+        let (logs, _capture) = crate::test_utils::LogCounts::capture();
+
+        let () = process_item(
+            index_db,
+            &model,
+            job_id,
+            image_item(1, "sha_one", missing.to_string_lossy().as_ref()),
+            None,
+            &pool,
+            loader_permit,
+            &Arc::new(Semaphore::new(1_024)),
+            1_024,
+            &Arc::new(UnitBudget::new(1_000)),
+            1_000,
+            None,
+            Arc::clone(&counters),
+            1,
+            &std::collections::HashSet::new(),
+            false,
+            &JobAbort::default(),
+        )
+        .await;
+        assert_eq!(
+            counters.lock().await.errors,
+            1,
+            "a missing file fails the item"
+        );
+        assert_eq!(logs.at(tracing::Level::ERROR, "panoptikon::jobs"), 1);
+    }
+
     fn clip_model() -> ModelMetadata {
         let mut model = test_model("items", true);
         model.group = "clip".to_string();
@@ -4753,7 +4776,7 @@ mod tests {
         // No `setters` row for this name, so the upsert matches nothing.
         let mut model = image_model();
         model.setter_name = "test/never-registered".to_string();
-        let (outcome, returned) = record_item_failure(
+        let outcome = record_item_failure(
             index_db,
             &model,
             1,
@@ -4769,10 +4792,6 @@ mod tests {
             ItemOutcome::Failed,
             "an unrecorded failure is not an input verdict"
         );
-        assert!(
-            returned.is_some(),
-            "the item task must propagate the write failure"
-        );
     }
 
     // A missing dependency is input-side, but it is also the one input-side
@@ -4785,7 +4804,7 @@ mod tests {
         let model = image_model();
         let job_id = data_log_job(index_db, &model).await;
 
-        let (outcome, returned) = record_item_failure(
+        let outcome = record_item_failure(
             index_db,
             &model,
             job_id,
@@ -4803,7 +4822,6 @@ mod tests {
             },
             "a blocked verdict is input-side and carries its dependency"
         );
-        assert!(returned.is_none(), "the job continues past a blocked item");
 
         let counters = Arc::new(Mutex::new(JobCounters::default()));
         finalize_item(
@@ -5040,7 +5058,7 @@ mod tests {
         ) else {
             panic!("expected an input-media verdict");
         };
-        let (outcome, returned) = record_item_failure(
+        let outcome = record_item_failure(
             index_db,
             &model,
             job_id,
@@ -5052,7 +5070,6 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, ItemOutcome::InputFailed { blocker: None });
-        assert!(returned.is_none(), "the job continues past bad media");
 
         let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
             .await

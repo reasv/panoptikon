@@ -140,8 +140,7 @@ pub(super) async fn load_base_frames(
     }
     if item.item_type.starts_with("image") {
         let buffer = tokio::fs::read(&item.path).await.map_err(|err| {
-            tracing::error!(error = %err, path = %item.path, "failed to read image");
-            ApiError::internal("Failed to read image")
+            ApiError::internal(format!("Failed to read image {}: {err}", item.path))
         })?;
         // The header's own dimensions, not the item's — read from the same
         // bytes the models will see, so a file that changed on disk after
@@ -254,12 +253,10 @@ fn ensure_image_readable(buffer: &[u8], path: &str) -> ApiResult<(u32, u32)> {
     let mut decoder = image::ImageReader::new(std::io::Cursor::new(buffer))
         .with_guessed_format()
         .map_err(|err| {
-            tracing::error!(error = %err, path, "image format detection failed");
             ApiError::input(format!("Image {path} has an unrecognizable format: {err}"))
         })?
         .into_decoder()
         .map_err(|err| {
-            tracing::error!(error = %err, path, "image is not readable");
             classify_image_error(err, format!("Image {path} has an unreadable header"))
         })?;
     let coded = decoder.dimensions();
@@ -460,10 +457,7 @@ fn encode_slice(image: &DynamicImage, format: image::ImageFormat) -> ApiResult<V
     let mut buffer = std::io::Cursor::new(Vec::new());
     image
         .write_to(&mut buffer, image::ImageFormat::Png)
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to encode image slice");
-            ApiError::internal("Failed to encode image slice")
-        })?;
+        .map_err(|err| ApiError::internal(format!("Failed to encode image slice: {err}")))?;
     Ok(buffer.into_inner())
 }
 
@@ -500,10 +494,8 @@ fn slice_image_grid(image_bytes: &[u8], rows: usize, cols: usize) -> ApiResult<V
 /// sideways — a whole-file send keeps its EXIF and inferio's loader applies
 /// it instead.
 fn load_dynamic_image(buffer: &[u8]) -> ApiResult<DynamicImage> {
-    let mut image = crate::jobs::files::decode_image_bytes(buffer).map_err(|err| {
-        tracing::error!(error = %err, "failed to decode image");
-        ApiError::internal("Failed to decode image")
-    })?;
+    let mut image = crate::jobs::files::decode_image_bytes(buffer)
+        .map_err(|err| ApiError::internal(format!("Failed to decode image: {err}")))?;
     image.apply_orientation(buffer_orientation(buffer));
     Ok(image)
 }
@@ -532,20 +524,15 @@ fn encode_jpeg(image: &DynamicImage) -> ApiResult<Vec<u8>> {
             rgb.height(),
             image::ColorType::Rgb8.into(),
         )
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to encode image");
-            ApiError::internal("Failed to encode image")
-        })?;
+        .map_err(|err| ApiError::internal(format!("Failed to encode image: {err}")))?;
     Ok(buffer)
 }
 
 fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     // The read itself is the gateway's own I/O: a vanished file or an SMB
     // hiccup says nothing about the payload, so it stays transient.
-    let buffer = std::fs::read(path).map_err(|err| {
-        tracing::error!(error = %err, path, "failed to open gif");
-        ApiError::internal(format!("Failed to open gif {path}: {err}"))
-    })?;
+    let buffer = std::fs::read(path)
+        .map_err(|err| ApiError::internal(format!("Failed to open gif {path}: {err}")))?;
     // Everything below decodes bytes already in memory, so every failure is a
     // confirmed verdict on the payload.
     //
@@ -554,7 +541,6 @@ fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     // single still frame instead of failing the item.
     if !matches!(image::guess_format(&buffer), Ok(image::ImageFormat::Gif)) {
         let mut image = crate::jobs::files::decode_image_bytes(&buffer).map_err(|err| {
-            tracing::error!(error = %err, path, "failed to decode mis-named gif");
             classify_image_error(err, format!("Failed to decode mis-named gif {path}"))
         })?;
         // Oriented like every other decode headed for the models: the JPEG
@@ -564,12 +550,9 @@ fn gif_to_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
         image.apply_orientation(buffer_orientation(&buffer));
         return Ok(vec![BaseFrame::sized_by_item(encode_jpeg(&image)?)]);
     }
-    let decoder = GifDecoder::new(std::io::Cursor::new(&buffer)).map_err(|err| {
-        tracing::error!(error = %err, path, "failed to decode gif");
-        classify_image_error(err, format!("Failed to decode gif {path}"))
-    })?;
+    let decoder = GifDecoder::new(std::io::Cursor::new(&buffer))
+        .map_err(|err| classify_image_error(err, format!("Failed to decode gif {path}")))?;
     let frames = decoder.into_frames().collect_frames().map_err(|err| {
-        tracing::error!(error = %err, path, "failed to collect gif frames");
         classify_image_error(err, format!("Failed to collect gif frames of {path}"))
     })?;
     if frames.is_empty() {
@@ -613,8 +596,7 @@ fn extract_video_frames(
     let interval = window / num_frames as f64;
     let temp_dir = temp_dir_path();
     std::fs::create_dir_all(&temp_dir).map_err(|err| {
-        tracing::error!(error = %err, "failed to create temp dir");
-        ApiError::internal("Failed to extract frames")
+        ApiError::internal(format!("Failed to create the frame directory: {err}"))
     })?;
     let result = extract_video_frames_into(
         path,
@@ -663,13 +645,9 @@ fn extract_video_frames_into(
     let output = crate::media_tools::ffmpeg_output_with_input_retry(&args, |command| {
         command.stdout(std::process::Stdio::null());
     })
-    .map_err(|err| {
-        tracing::error!(error = %err, path, "ffmpeg failed to start");
-        crate::media_tools::spawn_error("ffmpeg", &err)
-    })?;
+    .map_err(|err| crate::media_tools::spawn_error("ffmpeg", &err))?;
     if !output.status.success() {
         let stderr = stderr_tail(&output.stderr);
-        tracing::error!(path, stderr = %stderr, "ffmpeg failed to extract frames");
         // ffmpeg opened the file itself, so a corrupt video and a transient
         // mount hiccup look identical here; the ambiguous threshold is what
         // keeps a single NAS blip from suppressing a healthy file.
@@ -726,16 +704,13 @@ async fn render_pdf_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     })
     .await
     .map_err(|_| ApiError::internal("PDF render task failed"))?
-    .map_err(|err| {
-        tracing::error!(error = %err, path, "failed to render PDF");
-        match err {
-            crate::jobs::files::PdfRenderError::Unavailable => ApiError::blocked(
-                Blocker::Pdfium,
-                format!("pdfium is not available to render {path}"),
-            ),
-            crate::jobs::files::PdfRenderError::Document(detail) => {
-                ApiError::input_unconfirmed(format!("Failed to render PDF {path}: {detail}"))
-            }
+    .map_err(|err| match err {
+        crate::jobs::files::PdfRenderError::Unavailable => ApiError::blocked(
+            Blocker::Pdfium,
+            format!("pdfium is not available to render {path}"),
+        ),
+        crate::jobs::files::PdfRenderError::Document(detail) => {
+            ApiError::input_unconfirmed(format!("Failed to render PDF {path}: {detail}"))
         }
     })?;
     let mut frames = Vec::with_capacity(pages.len());
@@ -761,19 +736,16 @@ async fn render_html_frames(path: &str) -> ApiResult<Vec<BaseFrame>> {
     })
     .await
     .map_err(|_| ApiError::internal("HTML render task failed"))?
-    .map_err(|err| {
-        tracing::error!(error = %err, path, "failed to render HTML page");
-        match err {
-            crate::jobs::files::HtmlRenderError::NoBrowser => ApiError::blocked(
-                Blocker::HtmlRenderer,
-                format!("no headless browser is available to render {path}"),
-            ),
-            crate::jobs::files::HtmlRenderError::Io(detail) => {
-                ApiError::internal(format!("Failed to render HTML page {path}: {detail}"))
-            }
-            crate::jobs::files::HtmlRenderError::Render(detail) => {
-                ApiError::input_unconfirmed(format!("Failed to render HTML page {path}: {detail}"))
-            }
+    .map_err(|err| match err {
+        crate::jobs::files::HtmlRenderError::NoBrowser => ApiError::blocked(
+            Blocker::HtmlRenderer,
+            format!("no headless browser is available to render {path}"),
+        ),
+        crate::jobs::files::HtmlRenderError::Io(detail) => {
+            ApiError::internal(format!("Failed to render HTML page {path}: {detail}"))
+        }
+        crate::jobs::files::HtmlRenderError::Render(detail) => {
+            ApiError::input_unconfirmed(format!("Failed to render HTML page {path}: {detail}"))
         }
     })?;
     Ok(vec![BaseFrame {
