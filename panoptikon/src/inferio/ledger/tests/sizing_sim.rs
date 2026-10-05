@@ -459,10 +459,10 @@ fn budget(mode: &str) -> VramBudget {
     }
 }
 
-/// Hand the ledger the items the job has not sent, as the dispatcher does,
-/// unless the scenario's job does not say.
-fn remaining_work(sc: &Scenario, admission: &Admission, unsent: u64) {
-    admission.note_remaining_items(sc.count.then_some(unsent));
+/// Hand the ledger the items the job has not finished, unless the scenario's
+/// job does not say; a job with no item limit says [`DEEP_QUEUE`].
+fn remaining_work(sc: &Scenario, admission: &Admission, items_left: Option<u64>) {
+    admission.note_remaining_items(sc.count.then(|| items_left.unwrap_or(DEEP_QUEUE)));
 }
 
 /// `(window, value)` pairs from `w:v,w:v`.
@@ -1139,9 +1139,7 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
             let token = match sc.fixed {
                 Some(_) => None,
                 None => {
-                    let sent = (window.len() + queued) as u64;
-                    let unsent = items_left.map_or(DEEP_QUEUE, |left| left.saturating_sub(sent));
-                    remaining_work(&sc, &admission, unsent);
+                    remaining_work(&sc, &admission, items_left);
                     let token = admission
                         .request_grant(window_units, sc.cap, window.len(), queued)
                         .expect("granted");
