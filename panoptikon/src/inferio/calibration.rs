@@ -495,7 +495,7 @@ impl CalibrationStore {
         let disk = match read_file(&self.paths.local_path) {
             Ok(disk) => disk,
             Err(err) => {
-                if let Some(reason) = self.new_failure_locked(state, err.to_string()) {
+                if let Some(reason) = self.new_failure_locked(state, err.to_string(), false) {
                     tracing::warn!(
                         error = %err,
                         path = %self.paths.local_path.display(),
@@ -548,12 +548,24 @@ impl CalibrationStore {
     }
 
     /// The cause of a failed read or write of the local half, or `None` when
-    /// it was the last one logged: another user owning the store or its
-    /// folder, a read-only filesystem, or else `error`.
-    fn new_failure_locked(&self, state: &mut StoreState, error: String) -> Option<String> {
+    /// it was the last one logged: another user owning the store (on a read;
+    /// a write replaces it by rename) or its folder, a read-only filesystem,
+    /// or else `error`.
+    fn new_failure_locked(
+        &self,
+        state: &mut StoreState,
+        error: String,
+        write: bool,
+    ) -> Option<String> {
         let path = &self.paths.local_path;
         let folder = path.parent().unwrap_or(Path::new("."));
-        let cause = crate::ownership::create_problem(folder, path).unwrap_or(error);
+        // A name not in the folder checks the folder alone.
+        let checked = if write {
+            path.with_extension("new")
+        } else {
+            path.clone()
+        };
+        let cause = crate::ownership::create_problem(folder, &checked).unwrap_or(error);
         if state.warned.as_ref() == Some(&cause) {
             return None;
         }
@@ -845,7 +857,8 @@ impl CalibrationStore {
                 let mut state = self.lock();
                 // Keep the change in memory so the next trigger retries.
                 state.pending = true;
-                let reason = self.new_failure_locked(&mut state, err.root_cause().to_string());
+                let reason =
+                    self.new_failure_locked(&mut state, err.root_cause().to_string(), true);
                 if let Some(reason) = reason {
                     tracing::warn!(
                         error = %format!("{err:#}"),
@@ -2463,7 +2476,8 @@ sample_delta_mb = [80, 160]
 
     /// A store folder another user owns is warned about once, naming it and
     /// its owner, however many writes fail, again after a write succeeds, and
-    /// once for a new cause; the update stays in memory.
+    /// once for a new cause; the update stays in memory. A store file another
+    /// user owns is no cause of a failed write, which replaces it.
     #[cfg(unix)]
     #[test]
     fn a_store_folder_another_user_owns_is_warned_about_once() {
@@ -2502,6 +2516,7 @@ sample_delta_mb = [80, 160]
         store.record(update("clip/vit", "fp16", 0.9));
         let own = tempfile::tempdir().unwrap();
         fs::create_dir_all(own.path().join("share/inferio")).unwrap();
+        symlink(folder, own.path().join("share/inferio/calibration.toml")).unwrap();
         let read_only = fs::Permissions::from_mode(0o555);
         fs::set_permissions(own.path().join("share/inferio"), read_only).unwrap();
         relink(own.path());
@@ -2511,8 +2526,8 @@ sample_delta_mb = [80, 160]
         let share = data.join("share");
         let expected = Some(not_writable_by_current_user(&share, owner));
         assert_eq!(reasons[..2], [expected.clone(), expected]);
-        assert_eq!(reasons.len(), 3);
-        assert_ne!(reasons[2], reasons[1]);
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
+        assert_eq!(reasons[2..], [Some(denied)]);
     }
 
     /// A local entry with no fit of its own — what the ledger writes while it
