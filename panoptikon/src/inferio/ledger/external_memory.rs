@@ -409,15 +409,47 @@ impl VramLedger {
     /// from an older reading: host RAM another process or a RAM-domain peer
     /// may have taken since the last grant, or any device of a Mac while it
     /// pages. Synchronous: RAM statistics and amdgpu's sysfs counters are a
-    /// cheap read, unlike a GPU driver query. Only when [`may_probe`].
+    /// cheap read, unlike a GPU driver query. Only when [`may_probe`];
+    /// otherwise [`Self::record_paging_free_locked`].
     pub(super) fn refresh_host_ram_now(&self, device: &str) {
         let due = self.lock().gpus.get(device).is_some_and(may_probe);
         if !due || !self.probes_the_host() {
+            Self::record_paging_free_locked(&mut self.lock(), device);
             return;
         }
         let gpus = self.run_memory_query(device);
         let source = self.memory_query_for(device).free_source();
         self.record_external_probe(device, gpus, source);
+    }
+
+    /// While a Mac pages, record `device`'s stored reading again at the
+    /// current time, which [`Self::record_free_locked`] records as 0 free:
+    /// a grant or load whose re-read was skipped (a probe of the device is
+    /// in flight or backing off) never prices from a reading taken before
+    /// the paging.
+    fn record_paging_free_locked(state: &mut LedgerState, device: &str) {
+        if !state.metal_allocator || !Self::paging_locked(state) {
+            return;
+        }
+        let Some((source, ram, gtt)) = state
+            .gpus
+            .get(device)
+            .and_then(|gpu| gpu.free.as_ref())
+            .map(|sample| (sample.source.clone(), sample.ram, sample.gtt))
+        else {
+            return;
+        };
+        Self::record_free_locked(
+            state,
+            device,
+            0,
+            source,
+            Instant::now(),
+            None,
+            None,
+            ram,
+            gtt,
+        );
     }
 
     /// Settle a probe whose blocking task never ran, which would otherwise
@@ -477,6 +509,7 @@ impl VramLedger {
             };
             let due = refresh_due(gpu_ledger);
             if !due && !(paging && may_probe(gpu_ledger)) {
+                Self::record_paging_free_locked(&mut state, gpu);
                 return;
             }
             let reason = if !due {

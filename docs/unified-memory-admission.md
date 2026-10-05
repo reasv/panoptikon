@@ -288,9 +288,10 @@ Single synthetic device:
   grant after an idle time dates a rise just before it within one tick.
   While the gateway reads paging, a grant or a load re-reads the device
   from the host instead of pricing from the worker's last report, which
-  may predate the paging, and every free reading it records, a worker's
-  included, is 0. `MemoryPressure` is the two facts together: `Normal`,
-  `Warning`, `Paging` (warning while paging), `Critical`.
+  may predate the paging; with a probe of the device already in flight, it
+  records the device's free as 0 at that time instead. Every free reading
+  it records, a worker's included, is 0. `MemoryPressure` is the two facts
+  together: `Normal`, `Warning`, `Paging` (warning while paging), `Critical`.
   - **Paging or critical: `ram_available` is 0.** macOS keeps file-backed
     pages while it swaps — about 9 GiB on the M3 Max while it swapped
     20–38 GiB — so the formula still offered 8–10 GiB that did not exist.

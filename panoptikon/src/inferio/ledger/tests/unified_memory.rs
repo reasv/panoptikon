@@ -2215,16 +2215,39 @@ fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
     }
 }
 
+/// A grant while the Mac pages and a probe of it is already in flight is
+/// priced against 0 free, not the reading taken before the paging.
+#[test]
+fn while_the_mac_pages_a_grant_with_a_probe_in_flight_reads_nothing_free() {
+    let (ledger, handle, admission) = ramped_mac_replica();
+    push_ram(&handle, MAC_TOTAL_MB, 90_000, 180, 0);
+    ledger.health();
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
+    ledger.install_probe_stub(None);
+    ledger
+        .lock()
+        .gpus
+        .get_mut(MPS_GPU)
+        .expect("the Mac")
+        .refreshing = true;
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!((token.grant().unit_budget, token.grant().mb), (8, 180));
+    assert_eq!(ledger.probe_calls(), 0);
+}
+
 /// While the Mac pages, a load re-reads the host too, and is priced against
-/// what it reads rather than a reading taken before the paging, unless a
-/// probe of the device is already in flight. A worker's reading recorded
-/// while it pages is 0.
+/// what it reads rather than a reading taken before the paging; with a probe
+/// of the device already in flight, against 0 free. A worker's reading
+/// recorded while it pages is 0.
 #[tokio::test]
 async fn while_the_mac_pages_a_load_is_priced_from_a_fresh_reading() {
     for (pressure, refreshing, over_headroom, probes) in [
         (mps::MemoryPressure::Normal, false, false, 0),
+        (mps::MemoryPressure::Normal, true, false, 0),
         (mps::MemoryPressure::Paging, false, true, 1),
-        (mps::MemoryPressure::Paging, true, false, 0),
+        (mps::MemoryPressure::Paging, true, true, 0),
     ] {
         let ledger = mps_ledger();
         ledger.record_free_for_test(MPS_GPU, 90_000);
