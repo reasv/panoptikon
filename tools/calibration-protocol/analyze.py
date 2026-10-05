@@ -853,10 +853,10 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                 continue
             allowance = allowance_mb(gpu.get("total_mb") or oracle.get("total_mb"))
             # `used` moved by up to `skew_mb` while the processes were read:
-            # past the allowance the sample is skipped, below it the true
-            # difference is at least the measured one less the skew.
-            skew = oracle.get("skew_mb") or 0
-            if skew > allowance:
+            # past the allowance, or unknown, the sample is skipped; below it
+            # the true difference is at least the measured one less the skew.
+            skew = oracle.get("skew_mb", 0)
+            if skew is None or skew > allowance:
                 skewed += 1
                 continue
             ours, _ = ctx.our_pids_mb(oracle)

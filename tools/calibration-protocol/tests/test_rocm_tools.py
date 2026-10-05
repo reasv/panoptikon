@@ -332,7 +332,8 @@ def test_used_that_moves_during_the_process_scan_is_flagged_and_not_judged(
     gpu = ctx.health_samples[0]["health"]["vram"][0]
     row = ctx.vram_samples[0]["gpus"][0]
     for external, skew, verdict in ((0, 1024, "FAIL"), (2000, 1024, "PASS"),
-                                    (5000, 1024, "PASS"), (0, 1025, "SKIP")):
+                                    (5000, 1024, "PASS"), (0, 1025, "SKIP"),
+                                    (0, None, "SKIP")):
         gpu["external_mb"], row["skew_mb"] = external, skew
         result = analyze.check_oracle_agreement(ctx)
         assert result.verdict == verdict, (external, skew)
