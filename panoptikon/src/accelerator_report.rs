@@ -284,6 +284,40 @@ pub fn log_report(settings: &Settings) {
     for w in &report.warnings {
         tracing::warn!("{w}");
     }
+    // The ROCm wheels are x86_64 only.
+    let kfd_gpus = if cfg!(target_arch = "x86_64") {
+        crate::inferio::gpu::rocm_topology_gpus(false)
+    } else {
+        Vec::new()
+    };
+    let configured = settings.inference_local.python_env.accelerator;
+    if let Some(gfx) = rocm_gpu_beside_a_cpu_venv(configured, &report, &kfd_gpus) {
+        tracing::info!(
+            gfx,
+            "the managed venv holds the CPU build of torch, and a re-sync \
+             keeps it, but this host has a GPU the ROCm build supports; run \
+             `panoptikon setup --accelerator rocm` to use it"
+        );
+    }
+}
+
+/// A KFD GPU the ROCm wheel has kernels for, when the managed venv holds the
+/// CPU build and the config does not ask for the CPU.
+fn rocm_gpu_beside_a_cpu_venv<'a>(
+    configured: Accelerator,
+    report: &AcceleratorReport,
+    kfd_gpus: &'a [(String, bool)],
+) -> Option<&'a str> {
+    if configured == Accelerator::Cpu
+        || report.backend != Accelerator::Cpu
+        || report.backend_source != BackendSource::InstalledVenv
+    {
+        return None;
+    }
+    kfd_gpus
+        .iter()
+        .map(|(gfx, _)| gfx.as_str())
+        .find(|gfx| crate::inferio::gpu::ROCM_WHEEL_GFX.contains(gfx))
 }
 
 /// Print to stdout (`panoptikon accelerator`).
@@ -656,6 +690,33 @@ mod tests {
             is_gpu_backend(Accelerator::Mps),
             "a GPU with no stack to probe"
         );
+    }
+
+    /// A CPU venv on a host with a GPU the ROCm wheel supports names the GPU,
+    /// unless the config asks for the CPU or the venv is not the CPU build.
+    #[test]
+    fn a_cpu_venv_beside_a_supported_rocm_gpu_is_reported() {
+        use Accelerator::{Auto, Cpu, Rocm};
+        let venv = BackendSource::InstalledVenv;
+        let probed = BackendSource::ConfigOrProbe {
+            evidence: String::new(),
+        };
+        let gpus = [("gfx1036".to_owned(), false), ("gfx1100".to_owned(), false)];
+        // (configured, backend, its source, KFD GPUs) -> the GPU named.
+        #[rustfmt::skip]
+        let cases = [
+            (Auto, Cpu, &venv, &gpus[..], Some("gfx1100")),
+            (Rocm, Cpu, &venv, &gpus[..], Some("gfx1100")),
+            (Auto, Cpu, &venv, &gpus[..1], None),
+            (Cpu, Cpu, &venv, &gpus[..], None),
+            (Auto, Rocm, &venv, &gpus[..], None),
+            (Auto, Cpu, &probed, &gpus[..], None),
+        ];
+        for (configured, backend, source, kfd_gpus, expected) in cases {
+            let report = assemble_report(backend, source.clone(), empty_stacks(), false);
+            let found = rocm_gpu_beside_a_cpu_venv(configured, &report, kfd_gpus);
+            assert_eq!(found, expected, "{configured:?} {backend:?} {source:?}");
+        }
     }
 
     /// An Apple Silicon host is not a CPU host, and the absence of a vendor
