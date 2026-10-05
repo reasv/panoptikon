@@ -1371,8 +1371,8 @@ def run_window(
     # The smallest priced units of a batch that failed on a shape ceiling.
     split_from: int | None = None
     # The one clamp this window reports for its splits: `to_units` is the
-    # largest batch that ran at the halved size, `from_units` the smallest
-    # that failed.
+    # largest batch that ran whole after a split, below the smallest batch that
+    # failed; `from_units` is that smallest failed batch.
     split_clamp: dict[str, Any] | None = None
 
     def record(measurement: dict[str, Any]) -> dict[str, Any]:
@@ -1488,6 +1488,12 @@ def run_window(
                 if split:
                     if split_from is None or priced < split_from:
                         split_from = priced
+                    # 0: no batch has yet run below it (the ledger ignores 0).
+                    if (
+                        split_clamp is not None
+                        and split_clamp["to_units"] >= split_from
+                    ):
+                        split_clamp["to_units"] = 0
                     cap_items = len(batch) // 2
                     logger.warning(
                         "a batch of %d inputs exceeded a kernel's size limit "
@@ -1543,7 +1549,8 @@ def run_window(
                 )
             split_ran = (
                 split_from is not None
-                and len(batch) == cap_items
+                and clamped is None
+                and priced < split_from
                 and priceable
                 and not absorbed_ooms
             )
@@ -1552,8 +1559,8 @@ def run_window(
             )
             if impl_cut or (split_ran and split_clamp is None):
                 # A shape ceiling, not a memory event: the impl cut this batch
-                # itself, or it is the first to run at the size a split halved
-                # the window to.
+                # itself, or it is the first to run whole after a split, below
+                # the smallest batch that failed.
                 clamped = executed_clamp(
                     clamped, batch, executed, units, aggregation, priced,
                     live.free_mb,

@@ -2544,7 +2544,8 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
     # A ceiling the impl raises without cutting the batch itself (an MPS array
     # over 2^32 bytes before macOS 15): the harness halves the batch and the
     # window's other items run. The clamp is carried by the first batch that
-    # ran at half the size; a window that fails on the error reports none.
+    # ran whole after a split, below the smallest batch that failed; a window
+    # that fails on the error reports none.
     class Raising:
         def __init__(self, fails):
             self.fails = fails
@@ -2598,17 +2599,48 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
     assert "reason" not in payload["measurements"][1]["clamped"]
 
     # Items of different sizes: the one clamp runs from the smallest batch
-    # that failed to the largest that ran at the halved size.
-    impl = Raising(lambda inputs: sum(item.data for item in inputs) > 30000)
-    mixed = [
-        PredictionInput(data=100 * width, file=png_bytes(width, 100))
-        for width in [1] * 4 + [120] * 4
-    ]
-    payload = packing.run_window(
-        impl, mixed, grant(unit_budget=48400, unit="pixel", aggregation="sum")
+    # that failed to the largest that ran below it, here not the last.
+    def pixel_window(widths, fails, budget):
+        impl = Raising(fails)
+        mixed = [
+            PredictionInput(data=100 * width, file=png_bytes(width, 100))
+            for width in widths
+        ]
+        payload = packing.run_window(
+            impl, mixed, grant(unit_budget=budget, unit="pixel", aggregation="sum")
+        )
+        return impl.batches, clamps(payload["measurements"])
+
+    def over(limit):
+        return lambda inputs: sum(item.data for item in inputs) > limit
+
+    assert pixel_window([120] * 4 + [1] * 4, over(30000), 48400) == (
+        [8, 4, 2, 2, 2, 2],
+        [(2, (48000, 24000))],
     )
+    # A batch below the halved item count counts as well.
+    assert pixel_window([1] * 6 + [290], over(29000), 40000) == (
+        [7, 3, 3, 1],
+        [(1, (29600, 29000))],
+    )
+    # A padded batch fails on items times its largest item, so one that ran
+    # can price above one that failed; it does not count.
+    def padded(inputs):
+        return len(inputs) * max(item.data for item in inputs) > 30000
+
+    assert pixel_window([1, 1, 1, 120, 120, 120], padded, 24000) == (
+        [4, 2, 2, 2],
+        [(1, (12300, 12100))],
+    )
+
+    # A batch that ran at a size that later failed is not below it.
+    impl = Raising(
+        lambda inputs: len(inputs) > 4
+        or (len(inputs) > 2 and any(item.data >= 4 for item in inputs))
+    )
+    payload = packing.run_window(impl, items(8), grant(unit_budget=8))
     assert impl.batches == [8, 4, 4, 2, 2]
-    assert clamps(payload["measurements"]) == [(1, (48000, 24000))]
+    assert clamps(payload["measurements"]) == [(1, (4, 2))]
 
     # A batch the impl's own OOM halving touched did not run at the size.
     def fails_then_halves(inputs):
