@@ -1010,7 +1010,8 @@ const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// batch may take: a working peer answers them while it infers.
 const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// A predict with no response head is logged after this long, and again each
-/// time the wait doubles; it is cut off only if the peer is declared frozen.
+/// time the wait doubles, while the server's last health check missed; it is
+/// cut off only if the peer is declared frozen.
 const STALL_WARN_AFTER: Duration = Duration::from_secs(120);
 /// A frozen server is declared after 30 + 2 × 10 = 50 s, the keep-alive's
 /// own bound (30 + 20 s). `/health` reads in-memory state and touches no
@@ -1531,14 +1532,7 @@ impl InferenceApiClient {
             let send = clients.raw.post(&url).query(&query).multipart(form).send();
             let send = self.until_answered(send);
             let response = await_warning_while_stalled(send, STALL_WARN_AFTER, |waited| {
-                if self.endpoint.stall_log.admit() {
-                    warn!(
-                        %url,
-                        waited_secs = waited.as_secs(),
-                        transport = self.endpoint.label(Some(transport)),
-                        "inference predict has no response yet; still waiting"
-                    );
-                }
+                self.report_stall(&url, transport, waited)
             })
             .await;
             let response = match response {
@@ -1678,6 +1672,20 @@ impl InferenceApiClient {
                         .context("inference predict request failed");
                 }
             }
+        }
+    }
+
+    /// Logs a predict still waiting after `waited` when the server's last
+    /// health check missed; a server that answers is busy, not stuck.
+    fn report_stall(&self, url: &str, transport: Transport, waited: Duration) {
+        if self.endpoint.health_checks.lock().misses > 0 && self.endpoint.stall_log.admit() {
+            warn!(
+                %url,
+                waited_secs = waited.as_secs(),
+                transport = self.endpoint.label(Some(transport)),
+                "inference predict has no response yet and its server missed its last \
+                 health check; still waiting"
+            );
         }
     }
 
@@ -3085,7 +3093,8 @@ pub(crate) mod tests {
     }
 
     /// A request with no answer is reported each time its wait doubles and
-    /// awaited to its end.
+    /// awaited to its end; a predict's report is logged only while the
+    /// server's last health check missed.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_request_is_reported_and_never_cut_off() {
         let every = Duration::from_secs(60);
@@ -3104,6 +3113,23 @@ pub(crate) mod tests {
         let mut calls = 0;
         await_warning_while_stalled(async {}, every, |_| calls += 1).await;
         assert_eq!(calls, 0);
+
+        let client =
+            InferenceApiClient::new_with_metadata_cache("http://stall-report-test", false).unwrap();
+        for (misses, warnings) in [(0, 0), (1, 3)] {
+            client.endpoint.health_checks.lock().misses = misses;
+            let (logs, _guard) = crate::test_utils::LogCounts::capture();
+            let wait = tokio::time::sleep(Duration::from_secs(500));
+            await_warning_while_stalled(wait, STALL_WARN_AFTER, |waited| {
+                client.report_stall("predict", Transport::H2c, waited)
+            })
+            .await;
+            assert_eq!(
+                logs.at(tracing::Level::WARN, "panoptikon"),
+                warnings,
+                "{misses} misses"
+            );
+        }
     }
 
     /// What this thread logs at INFO and above while `body` runs.

@@ -484,7 +484,9 @@ health check when the connection cannot see it.
   answers the check, so a busy server is declared frozen only when no request
   is answered during two checks in a row; the README says how to avoid it.
 - A predict with no response head also logs a WARN after `STALL_WARN_AFTER`
-  (120 s) and again each time the wait doubles (240 s, 480 s, …).
+  (120 s) and again each time the wait doubles (240 s, 480 s, …), when the
+  server's last health check missed. A server that answers its checks is
+  busy, and its long batches log nothing.
 
 ### Repeated log lines
 
