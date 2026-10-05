@@ -891,7 +891,11 @@ impl EndpointClients {
 static ENDPOINTS: OnceLock<std::sync::Mutex<HashMap<String, Arc<EndpointRuntime>>>> =
     OnceLock::new();
 
-fn endpoint_runtime(base_url: &str, checks: HealthCheckTiming) -> Result<Arc<EndpointRuntime>> {
+fn endpoint_runtime(
+    base_url: &str,
+    checks: HealthCheckTiming,
+    soft_nofile: u64,
+) -> Result<Arc<EndpointRuntime>> {
     let registry = ENDPOINTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = registry
         .lock()
@@ -901,7 +905,7 @@ fn endpoint_runtime(base_url: &str, checks: HealthCheckTiming) -> Result<Arc<End
     }
     // Only lane 0 is built here; `pick_lane` recruits the rest.
     let tls = is_tls_endpoint(base_url);
-    let h1_ceiling = http1_gate_ceiling(crate::rlimit::soft_nofile_limit());
+    let h1_ceiling = http1_gate_ceiling(soft_nofile);
     let seed = EndpointClients::build(h2_client_builder, 1)?;
     let negotiating = if tls {
         Some(
@@ -1031,7 +1035,8 @@ impl InferenceApiClient {
     ) -> Result<Self> {
         let base_url = base_url.into();
         let api_url = normalize_base_url(base_url.clone());
-        let endpoint = endpoint_runtime(&api_url, HEALTH_CHECKS)?;
+        let endpoint =
+            endpoint_runtime(&api_url, HEALTH_CHECKS, crate::rlimit::soft_nofile_limit())?;
         Ok(Self {
             base_url,
             api_url,
@@ -2587,7 +2592,7 @@ pub(crate) mod tests {
     /// clear. When ALPN picks h2, a burst costs one connection per recruited
     /// lane: a lane that negotiated per connection dialed once per request of
     /// a cold burst. When the front speaks only HTTP/1.1, an admitted request
-    /// is one socket and no more, so the fixed gate
+    /// is one socket and no more, so the gate
     /// (`both_transports_take_a_concurrency_permit`) is the bound; a burst past
     /// the gate would cost this process a thousand descriptors.
     #[cfg(target_os = "linux")]
@@ -2645,6 +2650,42 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(health.transport, label);
         }
+    }
+
+    /// Under HTTP/1.1 the server sees more than 256 predicts at once, and a
+    /// second window reuses the first's connections.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_http1_window_past_256_reuses_its_connections() {
+        use std::sync::atomic::Ordering::SeqCst;
+        const WINDOW: usize = 300;
+        let _sockets = SOCKET_HEAVY.lock().await;
+
+        let probe = ConcurrencyProbe::new();
+        let url = spawn_blocking_stub(Arc::clone(&probe), crate::MAX_CONCURRENT_STREAMS).await;
+        endpoint_runtime(&normalize_base_url(url.clone()), HEALTH_CHECKS, 8448).unwrap();
+        let client = InferenceApiClient::new_with_metadata_cache(url, false).unwrap();
+        *client.endpoint.transport.write().await = Some(Remembered {
+            transport: Transport::Http11,
+            expires: None,
+        });
+        client.observe_desired_in_flight(WINDOW as u64);
+        for wave in 0..2 {
+            probe.release(false);
+            let mut inflight = tokio::task::JoinSet::new();
+            for _ in 0..WINDOW {
+                inflight.spawn(predict_one(client.clone()));
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while probe.in_flight.load(SeqCst) < WINDOW && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(probe.in_flight.load(SeqCst), WINDOW, "wave {wave}");
+            probe.release(true);
+            while let Some(result) = inflight.join_next().await {
+                result.expect("no panic").expect("the stub answers");
+            }
+        }
+        assert_eq!(probe.sockets(), WINDOW);
     }
 
     /// A relay to the cleartext `backend` that stops passing bytes either way
@@ -2755,6 +2796,7 @@ pub(crate) mod tests {
         endpoint_runtime(
             &normalize_base_url(base_url.to_owned()),
             SHORT_HEALTH_CHECKS,
+            crate::rlimit::soft_nofile_limit(),
         )
         .unwrap();
         let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
@@ -3069,7 +3111,15 @@ pub(crate) mod tests {
                 .build()
                 .unwrap()
         };
-        for polled in [false, true] {
+        let timeout = SHORT_HEALTH_CHECKS.timeout;
+        for dropped_after in [
+            // Never polled.
+            None,
+            // In the first check.
+            Some(timeout / 4),
+            // In the second check. One check has missed.
+            Some(3 * timeout / 2),
+        ] {
             // Never accepts: its connections wait in the backlog, so checks miss.
             let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", silent.local_addr().unwrap());
@@ -3077,9 +3127,8 @@ pub(crate) mod tests {
             let client = first.block_on(async {
                 let client = health_checked_client(&url, Transport::Http11).await;
                 assert!(client.start_health_checks());
-                if polled {
-                    // The task is in its first check.
-                    tokio::time::sleep(SHORT_HEALTH_CHECKS.timeout / 4).await;
+                if let Some(running) = dropped_after {
+                    tokio::time::sleep(running).await;
                 }
                 client
             });
@@ -3088,13 +3137,14 @@ pub(crate) mod tests {
                 let mut verdict = client.endpoint.health_checks.verdict.subscribe();
                 let seen = verdict.borrow_and_update().checks;
                 let stalled = spawn_unanswered(&client);
-                tokio::time::timeout(
-                    4 * SHORT_HEALTH_CHECKS.timeout,
-                    verdict.wait_for(|now| now.checks > seen),
-                )
-                .await
-                .unwrap_or_else(|_| panic!("polled {polled}: the stall starts a check"))
-                .unwrap();
+                let frozen_since =
+                    tokio::time::timeout(4 * timeout, verdict.wait_for(|now| now.checks > seen))
+                        .await
+                        .unwrap_or_else(|_| panic!("{dropped_after:?}: the stall starts a check"))
+                        .unwrap()
+                        .frozen_since;
+                // A miss before the drop does not count toward the verdict.
+                assert!(frozen_since.is_none(), "{dropped_after:?}");
                 stalled.abort();
             });
         }
@@ -3116,7 +3166,9 @@ pub(crate) mod tests {
         first.abort();
         let resent = spawn_unanswered(&client);
         assert!(resent.await.unwrap().is_err(), "cut off by the verdict");
-        let bound = HEALTH_CHECKS.after + (HEALTH_CHECK_MISSES + 1) * HEALTH_CHECKS.timeout;
+        let bound = HEALTH_CHECKS.after
+            + HEALTH_CHECK_MISSES * HEALTH_CHECKS.timeout
+            + HEALTH_CHECKS.timeout / 2;
         assert!(started.elapsed() <= bound, "{:?}", started.elapsed());
         checks_ended(&client).await;
     }
@@ -3790,8 +3842,9 @@ pub(crate) mod tests {
     /// take what is available, so the deficit is repaid on the release path.
     #[tokio::test]
     async fn a_gate_shrink_lands_through_releases_not_only_through_free_permits() {
-        let client =
-            InferenceApiClient::new_with_metadata_cache("http://gate-shrink-test", false).unwrap();
+        let url = "http://gate-shrink-test";
+        endpoint_runtime(&normalize_base_url(url.to_owned()), HEALTH_CHECKS, 1024).unwrap();
+        let client = InferenceApiClient::new_with_metadata_cache(url, false).unwrap();
         let runtime = Arc::clone(&client.endpoint);
         *runtime.transport.write().await = Some(Remembered {
             transport: Transport::H2c,
@@ -3807,12 +3860,11 @@ pub(crate) mod tests {
         // figure can never throttle one.
         client.observe_desired_in_flight(1_632);
         assert_eq!(permits(), 1_632);
-        let h1_ceiling = http1_gate_ceiling(crate::rlimit::soft_nofile_limit());
-        assert_eq!(runtime.h1_gate.ceiling, h1_ceiling);
-        assert_eq!(h1_permits(), 1_632.min(h1_ceiling));
+        // The HTTP/1.1 ceiling at a soft limit of 1024.
+        assert_eq!(h1_permits(), 384);
         client.observe_desired_in_flight(u64::MAX);
         assert_eq!(permits(), INFERENCE_MAX_CONCURRENT_STREAMS);
-        assert_eq!(h1_permits(), h1_ceiling);
+        assert_eq!(h1_permits(), 384);
         client.observe_desired_in_flight(1);
         assert_eq!(permits(), INFERENCE_MAX_CONCURRENT_REQUESTS);
         assert_eq!(h1_permits(), INFERENCE_MAX_CONCURRENT_REQUESTS);
