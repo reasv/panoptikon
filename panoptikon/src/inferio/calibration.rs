@@ -2438,8 +2438,9 @@ sample_delta_mb = [80, 160]
         approx(stored("clip/vit"), 0.79); // the pending update was never dropped
         approx(stored("clip/other"), 0.5); // and the unseen entry was not truncated
 
-        // After the flush, a new failure is warned about again. The directory's
-        // mtime is stamped past the write's, which can share its timestamp tick.
+        // After a write or a read succeeds, a failure is warned about again.
+        // The directory's mtime is stamped past the write's, which can share
+        // its timestamp tick.
         #[cfg(unix)]
         {
             fs::remove_file(&path).unwrap();
@@ -2448,6 +2449,15 @@ sample_delta_mb = [80, 160]
             fs::File::open(&path).unwrap().set_modified(later).unwrap();
             let _ = lookup(&store, "clip/vit");
             assert_eq!(reasons.lock().unwrap().len(), 2);
+            fs::remove_dir(&path).unwrap();
+            fs::write(&path, "schema = 3\n").unwrap();
+            let _ = lookup(&store, "clip/vit");
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            let later = SystemTime::now() + Duration::from_secs(10);
+            fs::File::open(&path).unwrap().set_modified(later).unwrap();
+            let _ = lookup(&store, "clip/vit");
+            assert_eq!(reasons.lock().unwrap().len(), 3);
         }
     }
 
