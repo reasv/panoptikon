@@ -335,8 +335,9 @@ busy, and nginx's 60 s `proxy_read_timeout` then answers 504: set
 
 Over HTTP/1.1 every request in flight is a connection of its own: the
 gateway opens up to 256, more when the server asks for more, up to 4096 or
-(soft `nofile` limit - 256) / 2, whichever is lower (see "File descriptors"
-below).
+(hard `nofile` limit - 256) / 2, whichever is lower (see "File descriptors"
+below). A proxy in front must accept twice that many connections (nginx
+counts both sides against `worker_connections`).
 
 A server that stops answering (a frozen process) is noticed through the
 proxy too: once a request has waited 30 s, the gateway checks the server's
@@ -349,8 +350,9 @@ The check goes through the proxy on a connection of its own, over HTTP/2 or
 HTTP/1.1 as the requests are. A proxy that caps its connections to the
 server (HAProxy `maxconn`, nginx `max_conns`) can queue the check behind
 predictions until it times out. A busy server is then taken for frozen when
-no prediction completes during two checks in a row (about 20 s). Raise the
-cap well above the requests the gateway keeps in flight, or exempt
+no request from this gateway is answered during two checks in a row (about
+20 s): with batches longer than that, or another gateway keeping the server
+busy, raise the cap well above the requests in flight, or exempt
 `/api/inference/health`.
 
 See the configuration reference in

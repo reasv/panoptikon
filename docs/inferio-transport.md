@@ -219,10 +219,10 @@ Under **HTTP/1.1** an admitted request *is* a socket, two descriptors with
 local inference (both ends are in this process), and queued requests hold
 none. The ceiling is therefore also what the descriptor budget holds:
 `http1_gate_ceiling` = (soft `RLIMIT_NOFILE` - `FD_RESERVE` 256) / 2, read
-when the endpoint is first used and kept between the floor and 4096. At the
-shipped container's soft limit of 1024 that is 384; from 8448 up it is 4096,
-the same depth as h2c. It is the bound `in_flight_unit_ceiling` puts on a
-job's window over HTTP/1.1, so the gate is never the tighter of the two.
+when the endpoint is first used and kept between the floor and 4096. The
+startup raise lifts the soft limit to the hard one, so a hard limit of 1024
+gives 384; from 8448 up it is 4096, the same depth as h2c. Up to 4096 it is
+the same bound `in_flight_unit_ceiling` puts on a job's window over HTTP/1.1.
 Below a soft limit of 768 the floor's 256 sockets exceed the budget, and the
 job's window, which may go lower, is the bound. An image model sends one item
 per request, so over HTTP/1.1 the gate is the most items the server can hold
@@ -463,10 +463,10 @@ health check when the connection cannot see it.
   One task per base URL runs them. Besides a waiting request, a request to a
   server declared frozen starts one, and so does a proxied health report that
   missed its deadline (see "Health"). A check misses on its deadline or on a
-  502, 503 or 504, a proxy saying the server behind it did not answer. Any other outcome, a refused connection or
-  a failed TLS handshake included, is no evidence of a freeze, and neither is
-  a missed check when a response other than those came from the base URL
-  since the previous check. `/health` reads in-memory state and touches no
+  502, 503 or 504, a proxy saying the server behind it did not answer. Any
+  other outcome, a refused connection or a failed TLS handshake included, is
+  no evidence of a freeze, and neither is a missed check when a response
+  other than those came from the base URL since the previous check. `/health` reads in-memory state and touches no
   model, so a busy server answers it and a long batch is never cut off.
 - `HEALTH_CHECK_MISSES` (2) checks in a row without an answer declare the
   server frozen, about 50 s into the stall, and log one WARN. Every request

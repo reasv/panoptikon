@@ -685,10 +685,9 @@ concurrent requests and a ceiling of 4096. That is not a duplicate of the
 work budget: a work budget that admits more requests than the transport will
 carry produces exactly the failure measured on a wd-vit cold ramp, where the
 surplus waits invisibly inside HTTP/2 and the server's own ramp never sees it.
-On the
-HTTP/1.1 path the gate stays fixed at 256, because there an admitted request
-is a socket and a model's batching advice must never move a process's
-descriptor usage.
+On the HTTP/1.1 path the same figure moves the gate between 256 and
+`http1_gate_ceiling` (the descriptor budget, at most 4096), because there an
+admitted request is a socket.
 
 **A caller must bound the figure by its own file-descriptor budget.** The
 figure is sized by the *server's* memory picture and the server cannot see the
@@ -699,8 +698,8 @@ costs a second for the accepted end, so N items in flight cost up to 2N
 descriptors in one descriptor table on top of databases, listeners and worker
 pipes. The gateway therefore raises its own soft limit to the hard limit at
 startup and caps the ceiling above at
-`(soft_nofile - 256) / 2` (`jobs/extraction.rs`, `FD_RESERVE` and
-`FDS_PER_IN_FLIGHT_ITEM`). Ignoring a published figure — downward, never
+`(soft_nofile - 256) / 2` (`rlimit::http1_requests_within`, with `FD_RESERVE`
+and `FDS_PER_HTTP1_REQUEST` in `rlimit.rs`). Ignoring a published figure — downward, never
 upward — is always allowed.
 
 **A server that publishes a figure must be able to carry it, and the

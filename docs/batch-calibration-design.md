@@ -2723,9 +2723,9 @@ Implementation: `UnitBudget` and `in_flight_unit_ceiling` in
   4 was one socket and why predicts queued invisibly behind the peer's limit.
   The ceiling
   is computed once, before the item loop, so an endpoint that flips to HTTP/1.1
-  mid-job keeps a window sized for multiplexing; the fixed HTTP/1.1 request
-  gate (`INFERENCE_MAX_CONCURRENT_REQUESTS`, 256) is what stops that window
-  from becoming sockets.
+  mid-job keeps a window sized for multiplexing; the HTTP/1.1 request gate,
+  bounded by the descriptor budget (`http1_gate_ceiling`), is what stops that
+  window from becoming sockets.
 
 The same published figure also moves the *client's* transport gate, per
 endpoint — the endpoint that published it is the endpoint it is about, and a
