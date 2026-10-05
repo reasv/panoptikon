@@ -789,17 +789,18 @@ BIOS-configurable carve-out, and the `unified` flag that turns on the ledger's
 death-as-negative-sample (DP-2) and the worker's GTT-inclusive arithmetic
 (DP-5, `PANOPTIKON_UNIFIED_GPU=<the gpu's PCI address>`, which the worker only
 acts on when it is the address it resolved for itself). The positive KFD
-detection survived unchanged (since replaced: unified-memory-admission.md "What
-counts as an APU") — and so did the all-or-nothing rule: an APU node whose GTT
-total or whose `MemTotal` cannot be read still takes the whole probe unknown,
-because pricing such a GPU against its carve-out is precisely the batch-1
-collapse the decline existed to prevent. Two consequences worth stating here
-rather than only in the other doc: a **dGPU+APU host is no longer sunk** (both
-GPUs become rows, and the row indices still cover the whole openable set, so
-they are still HIP device indices), and default placement compares the APU's
-*carve-out* (floored at an eighth of its unified budget) rather than its
-carve+GTT total, so the discrete GPU stays the default unless the operator gave
-the iGPU that memory outright in the BIOS.
+detection survived into that design (since replaced:
+unified-memory-admission.md "What counts as an APU") — and so did the
+all-or-nothing rule: an APU node whose GTT total or whose `MemTotal` cannot be
+read still takes the whole probe unknown, because pricing such a GPU against
+its carve-out is precisely the batch-1 collapse the decline existed to
+prevent. Two consequences worth stating here rather than only in the other
+doc: a **dGPU+APU host is no longer sunk** (both GPUs become rows, and the row
+indices still cover the whole openable set, so they are still HIP device
+indices), and default placement compares the APU's *carve-out* (floored at an
+eighth of its unified budget) rather than its carve+GTT total, so the discrete
+GPU stays the default unless the operator gave the iGPU that memory outright
+in the BIOS.
 
 **One consequence of that worth naming, because it is a behaviour change on
 hardware nobody thought of as an APU host:** a desktop with an AMD dGPU and a

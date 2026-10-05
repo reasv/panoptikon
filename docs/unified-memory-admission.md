@@ -483,11 +483,11 @@ cores. So: APU flag, or CPU cores on the GPU node. CPU cores alone are not
 enough: amdkfd builds every GPU node from a virtual CRAT
 (`kfd_topology_add_device` → `kfd_create_vcrat_image_gpu`, which sets only
 `CRAT_CU_FLAGS_GPU_PRESENT`), the only path since the ACPI CRAT reader was
-removed with IOMMUv2 support (c99a2e7ae291, Linux 6.7),
-so a current APU's GPU node reports `cpu_cores_count 0` beside a separate CPU
-node. The fixture is built from that source, not from a hardware dump. If the
-query fails the inventory is left unknown. The worker reports torch's
-`is_integrated`, and the ledger logs one WARN per GPU when it disagrees.
+removed with IOMMUv2 support (c99a2e7ae291, Linux 6.7), so a current APU's GPU
+node reports `cpu_cores_count 0` beside a separate CPU node. The fixture is
+built from that source, not from a hardware dump. If the query fails the
+inventory is left unknown. The worker reports torch's `is_integrated`, and the
+ledger logs one WARN per GPU when it disagrees.
 
 ### Readings
 
