@@ -1201,26 +1201,48 @@ fn a_transient_dip_below_the_load_level_does_not_over_commit() {
     }
 }
 
-/// A cheaper window at a size already measured does not replace the
-/// costlier one: the booking still covers the costliest input measured.
+/// One window of `batches`, each `(units, growth)` over the load level and
+/// handed back after.
+fn growth_window(handle: &TelemetryHandle, admission: &Admission, batches: &[(u64, u64)]) {
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    handle.lock().unwrap().record_measurements(
+        batches
+            .iter()
+            .map(|&(units, growth)| ram_batch(units, RSS_AT_LOAD_MB + growth, RSS_AT_LOAD_MB))
+            .collect(),
+    );
+    token.finish(WindowOutcome::Responded { oom: None });
+}
+
+/// The ring holds one RAM sample per size for the last [`FIT_RING`] sizes:
+/// a cheaper batch at a size does not replace the costlier one but renews
+/// it, so it outlives the sizes run before, and a size run over and over
+/// pushes out no other.
 #[test]
 fn the_costliest_batch_at_a_size_is_kept() {
+    const SIZE: u64 = 1_000;
     let ledger = host(&[GPU], None);
-    let (handle, admission) = cold_gpu_replica(&ledger, "g/costliest", GPU, item_cost(64));
-    measure_ram_cost(&handle, &admission, 0, 55);
     ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
-    for (run, per_unit) in [(64, 55), (128, 55), (64, 45), (128, 45)] {
-        let token = admission
-            .request_grant(u64::MAX, None, 1, 0)
-            .expect("granted");
-        let peak = RSS_AT_LOAD_MB + per_unit * run;
-        handle
-            .lock()
-            .unwrap()
-            .record_measurements(vec![ram_batch(run, peak, RSS_AT_LOAD_MB)]);
-        token.finish(WindowOutcome::Responded { oom: None });
-    }
-    assert_eq!(row(&ledger, "g/costliest").ram_mb_per_unit, Some(55.0));
+    let (a, a_admission) = cold_gpu_replica(&ledger, "g/ring", GPU, item_cost(64));
+    let (b, b_admission) = cold_gpu_replica(&ledger, "g/ring", GPU, item_cost(64));
+    let newer = SIZE + 1..SIZE + FIT_RING as u64;
+    // Each replica's first batch is start-up.
+    growth_window(&a, &a_admission, &[(1, 0), (SIZE, 55 * SIZE)]);
+    let b_sizes: Vec<_> = newer.clone().map(|units| (units, 50 * units)).collect();
+    growth_window(&b, &b_admission, &[&[(1, 0)], &b_sizes[..]].concat());
+    growth_window(&a, &a_admission, &[(SIZE, 45 * SIZE)]);
+    growth_window(&b, &b_admission, &[(newer.end, 50 * newer.end); FIT_RING]);
+    let state = ledger.lock();
+    let ring = &state.calibration[&("g/ring".to_owned(), GPU.to_owned())].ram_samples;
+    assert!(
+        ring.contains(&FitSample {
+            units: SIZE,
+            delta_mb: 55 * SIZE
+        }),
+        "{ring:?}"
+    );
 }
 
 /// A failed host read is not retried at every grant: it backs off like the
