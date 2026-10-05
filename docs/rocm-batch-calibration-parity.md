@@ -797,10 +797,9 @@ its carve-out is precisely the batch-1 collapse the decline existed to
 prevent. Two consequences worth stating here rather than only in the other
 doc: a **dGPU+APU host is no longer sunk** (both GPUs become rows, and the row
 indices still cover the whole openable set, so they are still HIP device
-indices), and default placement compares the APU's *carve-out* (floored at an
-eighth of its unified budget) rather than its carve+GTT total, so the discrete
-GPU stays the default unless the operator gave the iGPU that memory outright
-in the BIOS.
+indices), and default placement compares the APU's *carve-out* rather than
+its carve+GTT total, so the discrete GPU stays the default unless the operator
+gave the iGPU that memory outright in the BIOS.
 
 **One consequence of that worth naming, because it is a behaviour change on
 hardware nobody thought of as an APU host:** a desktop with an AMD dGPU and a

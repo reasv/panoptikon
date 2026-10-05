@@ -577,10 +577,9 @@ the review that followed:
   ranking by it would hand default placement to the slower GPU on
   essentially every dGPU+APU host, since a Strix Halo's nominal budget dwarfs
   any consumer card's VRAM. `GpuInfo::placement_total_mb` therefore ranks a
-  unified-memory device by `max(carve-out, total / 8)`: the carve-out is the memory
-  the operator gave the iGPU outright, and the eighth is a deliberately
-  pessimistic floor so a 128 GB machine left at the 512 MB BIOS default does
-  not lose to a 2 GB display card. This is placement only: the APU is fully
+  unified-memory device by its carve-out, the memory the operator gave the
+  iGPU outright, so a 128 GB machine left at the 512 MB BIOS default ranks
+  below any larger discrete card. This is placement only: the APU is fully
   priced against carve+GTT either way, and a `devices` pin still selects it.
 - **The name's RAM figure is `MemTotal` + the carve-out, rounded up to 4 GiB.**
   Firmware reserves the UMA carve-out before the kernel counts memory, so it

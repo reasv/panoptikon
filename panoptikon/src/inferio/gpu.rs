@@ -114,14 +114,11 @@ impl GpuInfo {
         self.unified_ram_mb.is_some()
     }
 
-    /// Capacity used to rank GPUs for default placement: `max(carve-out,
-    /// total / 8)` on a unified ROCm GPU, `total_mb` otherwise. Not used for
-    /// pricing. See docs/unified-memory-admission.md "Backend B".
+    /// Capacity used to rank GPUs for default placement: the carve-out on a
+    /// unified ROCm GPU, whose GTT is host RAM, `total_mb` otherwise. Not used
+    /// for pricing. See docs/unified-memory-admission.md "Backend B".
     pub fn placement_total_mb(&self) -> u64 {
-        match self.vram_carveout_mb {
-            Some(carveout) => carveout.max(self.total_mb / 8),
-            None => self.total_mb,
-        }
+        self.vram_carveout_mb.unwrap_or(self.total_mb)
     }
 
     /// `major * 10 + minor`, or `None` when unknown (never 0, so unknown is
@@ -2089,9 +2086,9 @@ mod tests {
         }
     }
 
-    /// Default placement on a dGPU+APU host compares carve-outs, not
-    /// budgets, with an eighth-of-budget floor.
-    /// See docs/unified-memory-admission.md "Backend B: AMD APUs (ROCm)".
+    /// Default placement on a dGPU+APU host compares the APU's carve-out, not
+    /// its budget. See docs/unified-memory-admission.md "Backend B: AMD APUs
+    /// (ROCm)".
     #[test]
     fn default_placement_compares_an_apus_carve_out_not_its_budget() {
         const DGPU: &str = "AMD gfx1100 (24 GB)";
@@ -2103,7 +2100,7 @@ mod tests {
         let cases = [
             (512, GTT, 24_576, DGPU, "1", "a 64.5 GB budget loses to 24 GB VRAM"),
             (96 * 1024, 16 * 1024, 24_576, APU, "0", "a real carve-out wins"),
-            (512, GTT, 2048, APU, "0", "an eighth still beats a token card"),
+            (512, GTT, 2048, DGPU, "1", "GTT never outranks a card's VRAM"),
         ];
         for (carveout, gtt, dgpu_mb, name, pin, label) in cases {
             let host = GpuInventory::known_rocm(vec![
@@ -2116,14 +2113,26 @@ mod tests {
     }
 
     /// A GPU the ROCm wheel has no kernels for ranks last, however large,
-    /// unless the gfx override makes HIP run another target's kernels.
+    /// unless the gfx override makes HIP run another target's kernels. An
+    /// iGPU ranks by its carve-out either way.
     #[test]
     fn default_placement_ranks_a_gpu_the_wheel_lacks_last() {
         let mut igpu = amd_apu(0, "0000:0e:00.0", 512, 65_536, 128 * 1024);
         igpu.gfx_target_version = Some(100_306);
-        let gpus = [igpu, amd_gpu(1, "0000:03:00.0", 8176)];
-        assert_eq!(default_gpu_with(&gpus, false).map(|gpu| gpu.index), Some(1));
-        assert_eq!(default_gpu_with(&gpus, true).map(|gpu| gpu.index), Some(0));
+        let mut card = amd_gpu(0, "0000:0e:00.0", 12_272);
+        card.gfx_target_version = Some(100_301);
+        // (the GPU at index 0, gfx override set) -> the index placement picks.
+        let cases = [
+            (&igpu, false, 1),
+            (&igpu, true, 1),
+            (&card, false, 1),
+            (&card, true, 0),
+        ];
+        for (first, gfx_override, expected) in cases {
+            let gpus = [first.clone(), amd_gpu(1, "0000:03:00.0", 8176)];
+            let picked = default_gpu_with(&gpus, gfx_override).map(|gpu| gpu.index);
+            assert_eq!(picked, Some(expected), "{} {gfx_override}", first.total_mb);
+        }
     }
 
     /// The refresh interface follows the inventory, so a ROCm host never asks
