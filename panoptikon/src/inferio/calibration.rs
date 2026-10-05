@@ -504,6 +504,7 @@ impl CalibrationStore {
                          lookup tries again, and writes wait for it"
                     );
                 }
+                state.local_loaded = false;
                 state.local_mtime = None;
                 return;
             }
@@ -1059,13 +1060,14 @@ fn torch_major_minor(version: &str) -> String {
 
 /// Parse one store file. An invalid or other-schema file reads as empty, and
 /// a malformed entry is skipped. `Err` only when the file could not be read;
-/// a missing file is empty.
+/// a missing file is empty, and a file that is not UTF-8 is invalid.
 fn read_file(path: &Path) -> std::io::Result<Vec<CalibrationProfile>> {
-    let source = match fs::read_to_string(path) {
+    let parsed = match fs::read_to_string(path) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        source => source?,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => Err(err.to_string()),
+        source => toml::from_str::<toml::Value>(&source?).map_err(|err| err.to_string()),
     };
-    let raw: toml::Value = match toml::from_str(&source) {
+    let raw = match parsed {
         Ok(raw) => raw,
         Err(err) => {
             tracing::warn!(
@@ -1902,15 +1904,17 @@ sample_delta_mb = [80, 160]
             assert!(lookup(&store, id).is_none(), "{id} is not loadable");
         }
 
-        // A corrupt *local* store is equally non-fatal, and writing over it
-        // works.
+        // A corrupt *local* store, not TOML or not UTF-8, is equally
+        // non-fatal, and writing over it works.
         let local = root.path().join("data/inferio/calibration.toml");
         fs::create_dir_all(local.parent().unwrap()).unwrap();
-        fs::write(&local, "[[profile]\nbroken").unwrap();
-        let store = self::store(root.path());
-        assert!(store.local_entries().is_empty());
-        store.record(update("clip/vit", "fp16", 0.79));
-        assert_eq!(self::store(root.path()).local_entries().len(), 1);
+        for corrupt in [b"[[profile]\nbroken".as_slice(), &[0xff]] {
+            fs::write(&local, corrupt).unwrap();
+            let store = self::store(root.path());
+            assert!(store.local_entries().is_empty());
+            store.record(update("clip/vit", "fp16", 0.79));
+            assert_eq!(self::store(root.path()).local_entries().len(), 1);
+        }
     }
 
     /// The pre-load tiers: no torch and no dtype still answer a base, and it
@@ -2453,9 +2457,9 @@ sample_delta_mb = [80, 160]
         approx(stored("clip/vit"), 0.79); // the pending update was never dropped
         approx(stored("clip/other"), 0.5); // and the unseen entry was not truncated
 
-        // After a write or a read succeeds, a failure is warned about again.
-        // The directory's mtime is stamped past the write's, which can share
-        // its timestamp tick.
+        // After a write or a read succeeds, a failure is warned about again,
+        // and a write after a failed read waits for a read. The directory's
+        // mtime is stamped past the write's, which can share its timestamp tick.
         #[cfg(unix)]
         {
             fs::remove_file(&path).unwrap();
@@ -2468,19 +2472,24 @@ sample_delta_mb = [80, 160]
             fs::write(&path, "schema = 3\n").unwrap();
             let _ = lookup(&store, "clip/vit");
             fs::remove_file(&path).unwrap();
-            fs::create_dir(&path).unwrap();
+            std::os::unix::fs::symlink(root.path(), &path).unwrap();
             let later = SystemTime::now() + Duration::from_secs(10);
             fs::File::open(&path).unwrap().set_modified(later).unwrap();
             let _ = lookup(&store, "clip/vit");
             assert_eq!(reasons.lock().unwrap().len(), 3);
+            store.record(update("clip/vit", "fp16", 0.8));
+            assert!(
+                path.is_symlink(),
+                "nothing was written over the unread store"
+            );
         }
     }
 
     /// A store folder another user owns is warned about once, naming it and
     /// its owner, however many writes fail, again after a write succeeds, and
     /// once for a new cause; the update stays in memory. A store file another
-    /// user owns is no cause of a failed write, which replaces it, but is the
-    /// cause of a failed read.
+    /// user owns is no cause of a failed write, which replaces it, but is
+    /// named on a failed read.
     #[cfg(unix)]
     #[test]
     fn a_store_folder_another_user_owns_is_warned_about_once() {
