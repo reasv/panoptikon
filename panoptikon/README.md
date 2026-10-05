@@ -804,17 +804,17 @@ explicit error instead of silently assuming the wrong schema. Freshly created
 DBs get the alembic head revision stamped into `alembic_version` so they
 remain manageable by the Python server during the transition.
 
-On Linux and macOS, before migrating, the server checks that it can write every
-database in `data_folder` (with its `-wal` and `-shm` files and its folder) and
-the folders it still has to create databases in, inside Docker too. After a run
-as another user (`sudo panoptikon`), the next start stops with an error naming a
-file that user created and its owner. Change the owner of the folder the error
-names back (`sudo chown -R "$USER" <folder>`; Docker volumes: "Running as
-another user" in the [root README](../README.md#docker)); behind a symlink, that
-folder is the link's target, since `chown -R` does not follow links. For an
-archive another user owns, the error offers moving out a linked index folder's
-link or a `user_data` database file with its `-wal` and `-shm`. The check lets a
-read-only filesystem through; it is named when a migration then fails on it.
+On Linux and macOS, in Docker or not, before migrating, the server checks that
+it can write every database in `data_folder` (with its `-wal`, `-shm` and
+folder) and the folders it still has to create databases in. After a run as
+another user (`sudo panoptikon`) that created a database, the next start stops
+with an error naming it and its owner. Change the owner of the folder the error
+names (a symlink's target, when there is one) with `sudo chown -R "$USER" <folder>`
+(Docker volumes: "Running as another user" in the [root README](../README.md#docker)).
+For an archive another user owns, the error offers moving it out: an index
+folder as root, or its link from a writable `index/`; a `user_data` database
+file with its `-wal` and `-shm`, or its link. The check lets a read-only
+filesystem through; it is named when a migration fails on it.
 
 ## Production UI
 
