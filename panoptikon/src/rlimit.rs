@@ -2,15 +2,32 @@
 //!
 //! Local inference is loopback HTTP inside one process, so an in-flight
 //! predict costs two sockets in one descriptor table. The soft limit is raised
-//! to the hard limit at startup, and `jobs::extraction` bounds its in-flight
-//! work by [`soft_nofile_limit`], so a host with a small hard limit cannot
-//! exhaust its table (a container's default soft limit of 1024 otherwise
-//! failed long jobs with `Too many open files`).
+//! to the hard limit at startup, and `jobs::extraction` and the inference
+//! client's HTTP/1.1 gate bound their in-flight work by [`soft_nofile_limit`],
+//! so a host with a small hard limit cannot exhaust its table (a container's
+//! default soft limit of 1024 otherwise failed long jobs with `Too many open
+//! files`).
 
 use std::sync::OnceLock;
 
 /// [`soft_nofile_limit`] where there is no limit to read (Windows); never binds.
 pub const NOFILE_LIMIT_UNKNOWN: u64 = u64::MAX;
+
+/// Descriptors kept back for everything else the process has open
+/// (databases, listeners, worker pipes, logs).
+pub const FD_RESERVE: usize = 256;
+
+/// Descriptors per in-flight HTTP/1.1 request: with local inference both
+/// ends of the loopback socket are in this process.
+pub const FDS_PER_HTTP1_REQUEST: usize = 2;
+
+/// HTTP/1.1 requests that fit in `soft_nofile` descriptors after the reserve.
+pub fn http1_requests_within(soft_nofile: u64) -> usize {
+    usize::try_from(soft_nofile)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(FD_RESERVE)
+        / FDS_PER_HTTP1_REQUEST
+}
 
 /// Ceiling on the startup raise: a `RLIM_INFINITY` hard limit is rejected
 /// outright on some systems.

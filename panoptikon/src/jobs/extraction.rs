@@ -43,6 +43,7 @@ use crate::pql::model::{
     PqlQuery, ProcessedBy, QueryElement,
 };
 use crate::pql::{build_query_preprocessed, preprocess_query_async};
+use crate::rlimit::{FD_RESERVE, FDS_PER_HTTP1_REQUEST};
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -93,10 +94,6 @@ const MIN_IN_FLIGHT_UNITS: usize = REQUEST_UNIT_BUDGET;
 /// Deliberately small; the byte budget is what bounds memory.
 const NOMINAL_UNIT_KIB: u32 = 256;
 
-/// Descriptors per in-flight unit over HTTP/1.1: with local inference both
-/// ends of the loopback socket are in this process.
-const FDS_PER_IN_FLIGHT_ITEM: usize = 2;
-
 /// Descriptors per pooled connection over HTTP/2 cleartext.
 const FDS_PER_POOLED_CONNECTION: usize = 2;
 
@@ -118,10 +115,6 @@ impl InFlightTransport {
         }
     }
 }
-
-/// Descriptors kept back for everything else the process has open
-/// (databases, listeners, worker pipes, logs).
-const FD_RESERVE: usize = 256;
 
 /// Per-item lines an inference outage repeats for every item in flight, keyed
 /// by their error so a distinct one is still logged.
@@ -166,12 +159,12 @@ fn in_flight_unit_ceiling(
             wanted
         }
         InFlightTransport::PerRequest => {
-            let by_fds = budget.saturating_sub(FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM;
+            let by_fds = crate::rlimit::http1_requests_within(soft_nofile);
             if by_fds < MIN_IN_FLIGHT_UNITS {
                 tracing::warn!(
                     soft_nofile,
                     reserve = FD_RESERVE,
-                    fds_per_item = FDS_PER_IN_FLIGHT_ITEM,
+                    fds_per_item = FDS_PER_HTTP1_REQUEST,
                     floor = MIN_IN_FLIGHT_UNITS,
                     "the open file descriptor limit is below what one job's minimum \
                      in-flight window needs; the job runs at the floor anyway and may \
@@ -3423,8 +3416,8 @@ mod tests {
         const MB: u32 = 1024 * 1024;
         const AMPLE: u64 = 524_288;
         const UNKNOWN: u64 = crate::rlimit::NOFILE_LIMIT_UNKNOWN;
-        let need = (MIN_IN_FLIGHT_UNITS * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE) as u64;
-        let fds = (1024 - FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM;
+        let need = (MIN_IN_FLIGHT_UNITS * FDS_PER_HTTP1_REQUEST + FD_RESERVE) as u64;
+        let fds = (1024 - FD_RESERVE) / FDS_PER_HTTP1_REQUEST;
         let bytes = MB as usize / 256;
         let loaders = 8 * REQUEST_UNIT_BUDGET;
         let floor = MIN_IN_FLIGHT_UNITS;
@@ -3456,7 +3449,7 @@ mod tests {
         want(MB, 8, need, H1, floor, "the floor at the boundary");
         want(MB, 8, 0, H1, floor, "the floor at zero");
         assert!(
-            fds * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE <= 1024,
+            fds * FDS_PER_HTTP1_REQUEST + FD_RESERVE <= 1024,
             "the window's sockets plus the reserve must fit under the limit"
         );
     }
@@ -3493,13 +3486,13 @@ mod tests {
     /// interesting ones, since the term floors a division.
     #[test]
     fn the_descriptor_clamp_always_fits_and_never_regresses() {
-        let need = MIN_IN_FLIGHT_UNITS * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE;
+        let need = MIN_IN_FLIGHT_UNITS * FDS_PER_HTTP1_REQUEST + FD_RESERVE;
         let mut previous = 0usize;
         for soft in (need..need + 512).chain([4096usize, 8447, 65_536, 524_288]) {
             let ceiling =
                 in_flight_unit_ceiling(1024 * 1024, 8, soft as u64, InFlightTransport::PerRequest);
             assert!(
-                ceiling * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE <= soft,
+                ceiling * FDS_PER_HTTP1_REQUEST + FD_RESERVE <= soft,
                 "a window of {ceiling} units does not fit under {soft} descriptors"
             );
             assert!(

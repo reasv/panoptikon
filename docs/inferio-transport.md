@@ -113,8 +113,8 @@ peer that was merely slow once.
 | --- | --- | --- |
 | `INFERENCE_CONNECTION_LANES` | 64 | independent h2 connections (sockets) per endpoint |
 | `H2_STREAMS_PER_CONNECTION` | 64 | streams offered one lane before the next is recruited |
-| `INFERENCE_MAX_CONCURRENT_REQUESTS` | 256 | h2c gate floor; the fixed HTTP/1.1 gate |
-| `INFERENCE_MAX_CONCURRENT_STREAMS` | 4096 | h2c gate ceiling (lanes x streams) |
+| `INFERENCE_MAX_CONCURRENT_REQUESTS` | 256 | gate floor on both transports |
+| `INFERENCE_MAX_CONCURRENT_STREAMS` | 4096 | gate ceiling (lanes x streams); HTTP/1.1 also within the descriptor budget |
 
 A "lane" is its own `reqwest::Client` with its own pool, which is the only way
 to make the number real: for HTTP/2 hyper-util's pool hands every caller the
@@ -203,28 +203,34 @@ each lane is its own pool and therefore its own connection.
 Every admitted request holds a semaphore permit; queued requests hold none, so
 a queued request costs nothing where an admitted HTTP/1.1 one costs a socket.
 
-Under **HTTP/1.1** the gate is fixed at `INFERENCE_MAX_CONCURRENT_REQUESTS`
-forever and must never follow a model's batching advice: there an admitted
-request *is* a descriptor. 256 is four connections' worth. It is also the
-socket bound per HTTP/1.1 peer (an admitted request uses one connection and
-no more; queued requests use none), and it is not lowered towards what h2
-costs: an image model sends one item per request, so over HTTP/1.1 the gate
-is also the most items the server can hold for batching, and the server's
-own desired-in-flight figure runs well past 256. The gate is taken
-on both transports because HTTP/1.1 is reachable *after* a job has sized its
-window for multiplexing — `in_flight_unit_ceiling` is evaluated once, before
-the item loop, so a peer restarted mid-job into a build without HTTP/2 flips
-the transport under a window sized for h2c.
+Both gates follow the endpoint's desired-in-flight figure
+(`DESIRED_IN_FLIGHT_HEADER`, see `docs/inferio-worker-protocol.md`):
+`set_in_flight_target` sets each, clamped between
+`INFERENCE_MAX_CONCURRENT_REQUESTS` and the gate's ceiling. The floor means
+this can only ever *raise* a gate above what every existing deployment
+already runs at.
 
-Under **h2c** the constant is only the floor. The endpoint publishes a
-desired-in-flight figure (`DESIRED_IN_FLIGHT_HEADER`, see
-`docs/inferio-worker-protocol.md`) and `set_in_flight_target` follows it,
-clamped to `[INFERENCE_MAX_CONCURRENT_REQUESTS,
-INFERENCE_MAX_CONCURRENT_STREAMS]`. The floor means this can only ever *raise*
-the gate above what every existing deployment already runs at; the ceiling
-means a published figure can never make the client offer a lane more streams
-than it was designed to, and never moves the descriptor cost at all (bounded
-by the lane count, not the gate).
+Under **h2c** the ceiling is `INFERENCE_MAX_CONCURRENT_STREAMS`: a published
+figure can never make the client offer a lane more streams than it was
+designed to, and never moves the descriptor cost at all (bounded by the lane
+count, not the gate).
+
+Under **HTTP/1.1** an admitted request *is* a socket, two descriptors with
+local inference (both ends are in this process), and queued requests hold
+none. The ceiling is therefore also what the descriptor budget holds:
+`http1_gate_ceiling` = (soft `RLIMIT_NOFILE` - `FD_RESERVE` 256) / 2, read
+when the endpoint is first used and kept between the floor and 4096. At the
+shipped container's soft limit of 1024 that is 384; from 8448 up it is 4096,
+the same depth as h2c. It is the bound `in_flight_unit_ceiling` puts on a
+job's window over HTTP/1.1, so the gate is never the tighter of the two.
+Below a soft limit of 768 the floor's 256 sockets exceed the budget, and the
+job's window, which may go lower, is the bound. An image model sends one item
+per request, so over HTTP/1.1 the gate is the most items the server can hold
+for batching; a fixed 256 held it well below the server's own figure. The
+gate is taken on both transports because HTTP/1.1 is reachable *after* a job
+has sized its window for multiplexing — `in_flight_unit_ceiling` is evaluated
+once, before the item loop, so a peer restarted mid-job into a build without
+HTTP/2 flips the transport under a window sized for h2c.
 
 A fixed 256 was justified as "four times a job's in-flight budget (4096 units
 at 64 units per request)", which only holds for a model whose items carry 64
@@ -235,13 +241,13 @@ for exactly the models the feature exists for.
 The published figure is in *items* and the gate counts *requests*. Using it
 directly is conservative in the safe direction: for the models that matter one
 item is one request, and for a model packing several units per item it
-over-provisions a bound whose only cost is permits, never sockets. The job's
+over-provisions a bound whose only cost is permits. The job's
 own `UnitBudget` remains the throttle. Several models share one endpoint, so
 this is last-writer-wins, which is acceptable exactly because of the floor: the
 worst a small model can do to a large one is put the gate back to the constant.
 
 A **shrink never takes a permit away from a request already in flight** — it
-withholds permits as they come back (`release_h2_permit`), the same rule as
+withholds permits as they come back (`Gate::release`), the same rule as
 `jobs::extraction::UnitBudget`. Dropping the permit would not do: `Semaphore`
 hands a released permit straight to a waiter and a saturated job always has
 waiters, so `forget_permits` alone can never land a shrink. `/health`

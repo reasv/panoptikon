@@ -382,12 +382,22 @@ pub(crate) const INFERENCE_CONNECTION_LANES: usize = 64;
 /// Streams per lane before the next is recruited; below common server limits.
 const H2_STREAMS_PER_CONNECTION: usize = 64;
 
-/// The floor of the h2c concurrency gate, and the fixed HTTP/1.1 gate.
+/// The floor of the concurrency gate on both transports.
 pub(crate) const INFERENCE_MAX_CONCURRENT_REQUESTS: usize = 4 * H2_STREAMS_PER_CONNECTION;
 
-/// The ceiling of the h2c gate.
+/// The ceiling of the concurrency gate on both transports; the HTTP/1.1 one
+/// is lowered to the descriptor budget.
 pub(crate) const INFERENCE_MAX_CONCURRENT_STREAMS: usize =
     INFERENCE_CONNECTION_LANES * H2_STREAMS_PER_CONNECTION;
+
+/// The HTTP/1.1 gate's ceiling: under HTTP/1.1 an admitted request is a
+/// socket, so at most what `soft_nofile` holds, never below the floor.
+fn http1_gate_ceiling(soft_nofile: u64) -> usize {
+    crate::rlimit::http1_requests_within(soft_nofile).clamp(
+        INFERENCE_MAX_CONCURRENT_REQUESTS,
+        INFERENCE_MAX_CONCURRENT_STREAMS,
+    )
+}
 
 /// One HTTP/2 connection and its current load; the client is built lazily.
 #[derive(Debug)]
@@ -396,12 +406,95 @@ struct Lane {
     in_flight: AtomicUsize,
 }
 
-/// The h2c gate's target and the shrink not yet applied: a shrink withholds
-/// permits as they come back.
+/// A concurrency gate that follows a target between
+/// [`INFERENCE_MAX_CONCURRENT_REQUESTS`] and its ceiling. A shrink withholds
+/// permits as they come back, so permits in existence are
+/// `target + pending_shrink`.
+#[derive(Debug)]
+struct Gate {
+    permits: Arc<tokio::sync::Semaphore>,
+    ceiling: usize,
+    state: std::sync::Mutex<GateState>,
+}
+
 #[derive(Debug)]
 struct GateState {
     target: usize,
     pending_shrink: usize,
+}
+
+impl Gate {
+    fn new(ceiling: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(
+                INFERENCE_MAX_CONCURRENT_REQUESTS,
+            )),
+            ceiling,
+            state: std::sync::Mutex::new(GateState {
+                target: INFERENCE_MAX_CONCURRENT_REQUESTS,
+                pending_shrink: 0,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Follow a desired-in-flight figure, clamped to the floor and ceiling.
+    fn set_target(&self, requests: u64) {
+        let wanted = usize::try_from(requests)
+            .unwrap_or(usize::MAX)
+            .clamp(INFERENCE_MAX_CONCURRENT_REQUESTS, self.ceiling);
+        let mut state = self.lock();
+        match wanted.cmp(&state.target) {
+            std::cmp::Ordering::Greater => {
+                let grow = wanted - state.target;
+                // Growth first cancels a pending shrink.
+                let cancelled = state.pending_shrink.min(grow);
+                state.pending_shrink -= cancelled;
+                if grow > cancelled {
+                    self.permits.add_permits(grow - cancelled);
+                }
+                state.target = wanted;
+            }
+            std::cmp::Ordering::Less => {
+                state.pending_shrink += state.target - wanted;
+                state.target = wanted;
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        let removed = self.permits.forget_permits(state.pending_shrink);
+        state.pending_shrink -= removed;
+    }
+
+    /// Return a permit, retiring it while a shrink is pending (`Semaphore`
+    /// hands a released permit straight to a waiter).
+    fn release(&self, permit: tokio::sync::OwnedSemaphorePermit) {
+        let mut state = self.lock();
+        if state.pending_shrink > 0 {
+            state.pending_shrink -= 1;
+            permit.forget();
+        } else {
+            drop(permit);
+        }
+    }
+
+    /// The target and the permits held.
+    fn snapshot(&self) -> (usize, usize) {
+        let (target, pending) = {
+            let state = self.lock();
+            (state.target, state.pending_shrink)
+        };
+        (
+            target,
+            target
+                .saturating_add(pending)
+                .saturating_sub(self.permits.available_permits()),
+        )
+    }
 }
 
 /// When health checks start and how long one may take. One starts at most
@@ -520,11 +613,9 @@ struct EndpointRuntime {
     /// Probes finished and the last verdict, memoized or not, so a caller that
     /// waited out a probe takes its answer.
     last_probe: std::sync::Mutex<(u64, Transport)>,
-    /// Resized by [`Self::set_in_flight_target`].
-    h2_gate: Arc<tokio::sync::Semaphore>,
-    h2_gate_state: std::sync::Mutex<GateState>,
-    /// Fixed: under HTTP/1.1 a request is a socket.
-    h1_gate: Arc<tokio::sync::Semaphore>,
+    /// Both resized by [`Self::set_in_flight_target`].
+    h2_gate: Gate,
+    h1_gate: Gate,
     probe_log: LogThrottle,
     predict_log: LogThrottle,
     stall_log: LogThrottle,
@@ -587,75 +678,18 @@ impl EndpointRuntime {
         best
     }
 
-    /// Follow the endpoint's desired-in-flight figure, clamped to the gate's
-    /// floor and ceiling. Items used as requests only over-provisions permits.
+    /// Follow the endpoint's desired-in-flight figure on both gates. Items
+    /// used as requests only over-provisions permits.
     fn set_in_flight_target(&self, requests: u64) {
-        let wanted = usize::try_from(requests).unwrap_or(usize::MAX).clamp(
-            INFERENCE_MAX_CONCURRENT_REQUESTS,
-            INFERENCE_MAX_CONCURRENT_STREAMS,
-        );
-        let mut state = self
-            .h2_gate_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match wanted.cmp(&state.target) {
-            std::cmp::Ordering::Greater => {
-                let grow = wanted - state.target;
-                // Growth first cancels a pending shrink.
-                let cancelled = state.pending_shrink.min(grow);
-                state.pending_shrink -= cancelled;
-                if grow > cancelled {
-                    self.h2_gate.add_permits(grow - cancelled);
-                }
-                state.target = wanted;
-            }
-            std::cmp::Ordering::Less => {
-                state.pending_shrink += state.target - wanted;
-                state.target = wanted;
-            }
-            std::cmp::Ordering::Equal => {}
-        }
-        let removed = self.h2_gate.forget_permits(state.pending_shrink);
-        state.pending_shrink -= removed;
+        self.h2_gate.set_target(requests);
+        self.h1_gate.set_target(requests);
     }
 
-    /// Return a permit, retiring it while a shrink is pending (`Semaphore`
-    /// hands a released permit straight to a waiter).
-    fn release_h2_permit(&self, permit: tokio::sync::OwnedSemaphorePermit) {
-        let mut state = self
-            .h2_gate_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.pending_shrink > 0 {
-            state.pending_shrink -= 1;
-            permit.forget();
-        } else {
-            drop(permit);
-        }
-    }
-
-    fn gate_snapshot(&self, transport: Option<Transport>) -> (usize, usize) {
+    /// The gate of `transport`; an unknown one reads as h2c.
+    fn gate(&self, transport: Option<Transport>) -> &Gate {
         match transport {
-            Some(Transport::Http11) => (
-                INFERENCE_MAX_CONCURRENT_REQUESTS,
-                INFERENCE_MAX_CONCURRENT_REQUESTS.saturating_sub(self.h1_gate.available_permits()),
-            ),
-            _ => {
-                // Permits in existence are `target + pending_shrink`.
-                let (target, pending) = {
-                    let state = self
-                        .h2_gate_state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    (state.target, state.pending_shrink)
-                };
-                (
-                    target,
-                    target
-                        .saturating_add(pending)
-                        .saturating_sub(self.h2_gate.available_permits()),
-                )
-            }
+            Some(Transport::Http11) => &self.h1_gate,
+            _ => &self.h2_gate,
         }
     }
 
@@ -666,7 +700,7 @@ impl EndpointRuntime {
             .ok()
             .and_then(|guard| *guard)
             .and_then(Remembered::in_force);
-        let (target, in_flight) = self.gate_snapshot(transport);
+        let (target, in_flight) = self.gate(transport).snapshot();
         let multiplexed = !matches!(transport, Some(Transport::Http11));
         InferenceTransportHealth {
             base_url: base_url.to_owned(),
@@ -727,7 +761,7 @@ struct EndpointLease {
     endpoint: Arc<EndpointRuntime>,
     lane: Option<usize>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    multiplexed: bool,
+    transport: Transport,
 }
 
 impl Drop for EndpointLease {
@@ -736,11 +770,7 @@ impl Drop for EndpointLease {
             self.endpoint.h2[lane].in_flight.fetch_sub(1, Relaxed);
         }
         if let Some(permit) = self.permit.take() {
-            if self.multiplexed {
-                self.endpoint.release_h2_permit(permit);
-            } else {
-                drop(permit);
-            }
+            self.endpoint.gate(Some(self.transport)).release(permit);
         }
     }
 }
@@ -883,16 +913,8 @@ fn endpoint_runtime(base_url: &str, checks: HealthCheckTiming) -> Result<Arc<End
         announced: std::sync::Mutex::new(None),
         probe_lock: tokio::sync::Mutex::new(()),
         last_probe: std::sync::Mutex::new((0, Transport::Http11)),
-        h2_gate: Arc::new(tokio::sync::Semaphore::new(
-            INFERENCE_MAX_CONCURRENT_REQUESTS,
-        )),
-        h2_gate_state: std::sync::Mutex::new(GateState {
-            target: INFERENCE_MAX_CONCURRENT_REQUESTS,
-            pending_shrink: 0,
-        }),
-        h1_gate: Arc::new(tokio::sync::Semaphore::new(
-            INFERENCE_MAX_CONCURRENT_REQUESTS,
-        )),
+        h2_gate: Gate::new(INFERENCE_MAX_CONCURRENT_STREAMS),
+        h1_gate: Gate::new(http1_gate_ceiling(crate::rlimit::soft_nofile_limit())),
         probe_log: LogThrottle::new(
             format!("could not reach the inference endpoint {base_url}"),
             tracing::Level::WARN,
@@ -1368,7 +1390,7 @@ impl InferenceApiClient {
         let transport = self.transport().await;
         match transport {
             Transport::H2c => {
-                let permit = Arc::clone(&self.endpoint.h2_gate)
+                let permit = Arc::clone(&self.endpoint.h2_gate.permits)
                     .acquire_owned()
                     .await
                     .ok();
@@ -1383,12 +1405,12 @@ impl InferenceApiClient {
                         endpoint: Arc::clone(&self.endpoint),
                         lane: Some(lane),
                         permit,
-                        multiplexed: true,
+                        transport,
                     },
                 )
             }
             Transport::Http11 => {
-                let permit = Arc::clone(&self.endpoint.h1_gate)
+                let permit = Arc::clone(&self.endpoint.h1_gate.permits)
                     .acquire_owned()
                     .await
                     .ok();
@@ -1399,14 +1421,14 @@ impl InferenceApiClient {
                         endpoint: Arc::clone(&self.endpoint),
                         lane: None,
                         permit,
-                        multiplexed: false,
+                        transport,
                     },
                 )
             }
         }
     }
 
-    /// Apply a desired-in-flight figure this endpoint published (h2c only).
+    /// Apply a desired-in-flight figure this endpoint published.
     pub fn observe_desired_in_flight(&self, items: u64) {
         self.endpoint.set_in_flight_target(items);
     }
@@ -3506,8 +3528,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// The gate admits at most [`INFERENCE_MAX_CONCURRENT_REQUESTS`] requests
-    /// in **both** transports, asserted on the permit itself.
+    /// A request takes a gate permit on **both** transports, from a gate that
+    /// starts at [`INFERENCE_MAX_CONCURRENT_REQUESTS`], asserted on the permit
+    /// itself.
     #[tokio::test]
     async fn both_transports_take_a_concurrency_permit() {
         for transport in [Transport::H2c, Transport::Http11] {
@@ -3523,10 +3546,7 @@ pub(crate) mod tests {
                 expires: None,
             });
 
-            let gate = match transport {
-                Transport::H2c => Arc::clone(&runtime.h2_gate),
-                Transport::Http11 => Arc::clone(&runtime.h1_gate),
-            };
+            let gate = Arc::clone(&runtime.gate(Some(transport)).permits);
             let before = gate.available_permits();
             assert_eq!(before, INFERENCE_MAX_CONCURRENT_REQUESTS);
             let (resolved, _clients, lease) = client.active().await;
@@ -3549,10 +3569,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// The h2c gate follows the endpoint's published figure between its floor
-    /// and its ceiling, the HTTP/1.1 gate never moves, and a shrink lands even
-    /// while every permit is out: `forget_permits` can only take what is
-    /// available, so the deficit is repaid on the release path.
+    /// Both gates follow the endpoint's published figure between the floor and
+    /// their ceilings, the HTTP/1.1 one within the descriptor budget, and a
+    /// shrink lands even while every permit is out: `forget_permits` can only
+    /// take what is available, so the deficit is repaid on the release path.
     #[tokio::test]
     async fn a_gate_shrink_lands_through_releases_not_only_through_free_permits() {
         let client =
@@ -3562,23 +3582,39 @@ pub(crate) mod tests {
             transport: Transport::H2c,
             expires: None,
         });
-        let permits = || runtime.h2_gate.available_permits();
+        let permits = || runtime.h2_gate.permits.available_permits();
+        let h1_permits = || runtime.h1_gate.permits.available_permits();
         assert_eq!(permits(), INFERENCE_MAX_CONCURRENT_REQUESTS);
+        assert_eq!(h1_permits(), INFERENCE_MAX_CONCURRENT_REQUESTS);
 
         // Growth up to the ceiling and no further, then back to the floor —
         // the constant every deployment already runs at, so a small published
         // figure can never throttle one.
         client.observe_desired_in_flight(1_632);
         assert_eq!(permits(), 1_632);
+        let h1_ceiling = http1_gate_ceiling(crate::rlimit::soft_nofile_limit());
+        assert_eq!(h1_permits(), 1_632.min(h1_ceiling));
         client.observe_desired_in_flight(u64::MAX);
         assert_eq!(permits(), INFERENCE_MAX_CONCURRENT_STREAMS);
+        assert_eq!(h1_permits(), h1_ceiling);
         client.observe_desired_in_flight(1);
         assert_eq!(permits(), INFERENCE_MAX_CONCURRENT_REQUESTS);
-        assert_eq!(
-            runtime.h1_gate.available_permits(),
+        assert_eq!(h1_permits(), INFERENCE_MAX_CONCURRENT_REQUESTS);
+        // The HTTP/1.1 ceiling: two descriptors a request after the reserve,
+        // between the floor and the h2c ceiling.
+        let (floor, ceiling) = (
             INFERENCE_MAX_CONCURRENT_REQUESTS,
-            "HTTP/1.1 is a different semaphore and never moves"
+            INFERENCE_MAX_CONCURRENT_STREAMS,
         );
+        let unknown = crate::rlimit::NOFILE_LIMIT_UNKNOWN;
+        for (soft_nofile, expected) in [
+            (512, floor),
+            (1024, 384),
+            (8448, ceiling),
+            (unknown, ceiling),
+        ] {
+            assert_eq!(http1_gate_ceiling(soft_nofile), expected, "{soft_nofile}");
+        }
 
         // Saturate: every permit held by an in-flight request.
         client.observe_desired_in_flight(512);
@@ -3595,7 +3631,7 @@ pub(crate) mod tests {
         client.observe_desired_in_flight(u64::from(INFERENCE_MAX_CONCURRENT_REQUESTS as u32));
         assert_eq!(permits(), 0);
         assert_eq!(
-            runtime.gate_snapshot(Some(Transport::H2c)),
+            runtime.h2_gate.snapshot(),
             (INFERENCE_MAX_CONCURRENT_REQUESTS, 512),
             "in flight is permits in existence minus what is free"
         );
@@ -3610,7 +3646,7 @@ pub(crate) mod tests {
         assert_eq!(permits(), INFERENCE_MAX_CONCURRENT_REQUESTS);
         assert!(runtime.h2.iter().all(|l| l.in_flight.load(Relaxed) == 0));
         assert_eq!(
-            runtime.gate_snapshot(Some(Transport::H2c)),
+            runtime.h2_gate.snapshot(),
             (INFERENCE_MAX_CONCURRENT_REQUESTS, 0),
             "the two expressions agree again once the deficit is repaid"
         );
@@ -3665,7 +3701,7 @@ pub(crate) mod tests {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(attempts.load(SeqCst), 1, "sampled between the two attempts");
-        let (_target, in_flight) = runtime.gate_snapshot(Some(Transport::H2c));
+        let (_target, in_flight) = runtime.h2_gate.snapshot();
         assert_eq!(in_flight, 0, "a waiting retry holds no gate permit");
         assert_eq!(runtime.lanes_in_use(), 0, "and no lane claim either");
 

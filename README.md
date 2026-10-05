@@ -333,6 +333,11 @@ busy, and nginx's 60 s `proxy_read_timeout` then answers 504: set
 `proxy_read_timeout` and `proxy_send_timeout` to a large value such as
 `1h`.
 
+Over HTTP/1.1 every request in flight is a connection of its own: the
+gateway opens up to 256, more when the server asks for more, up to 4096 or
+(soft `nofile` limit - 256) / 2, whichever is lower (see "File descriptors"
+below).
+
 A server that stops answering (a frozen process) is noticed through the
 proxy too: once a request has waited 30 s, the gateway checks the server's
 `/api/inference/health`, and after two checks go unanswered (about 50 s) it
