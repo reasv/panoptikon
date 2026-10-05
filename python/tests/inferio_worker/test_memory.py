@@ -2293,8 +2293,8 @@ def test_a_deep_mps_window_does_not_ratchet_the_next_batchs_fit_sample() -> None
 
 
 def test_the_mps_sampler_runs_on_mps_alone() -> None:
-    # A CPU-priced host samples its RSS instead, even on a Mac whose torch has
-    # MPS.
+    # A CPU-priced host runs the RSS sampler, not the MPS one, even on a Mac
+    # whose torch has MPS.
     with cpu_host(torch_module=fake_mps_torch_module(FakeMpsAllocator())):
         state = memory.begin_batch()
         assert state["mps_sampler"] is None
