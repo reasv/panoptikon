@@ -971,12 +971,13 @@ def _learning_context(seed, queue_bound=7):
     return ctx
 
 
-def test_calibration_learned_cannot_judge_a_seed_no_window_reached():
-    """Only when every window was short of the budget for want of work."""
+def test_calibration_learned_cannot_judge_when_every_window_was_queue_bound():
+    """Only when every window formed short of the window target."""
     for seed in (64, 120000):
         verdict = analyze.check_calibration_learned(_learning_context(seed))
         assert verdict.verdict == "INFO"
-        assert "no window reached the seed" in verdict.detail
+        assert "every window formed short of the window target" in \
+            verdict.detail
     stuck = _learning_context(120000, queue_bound=6)
     assert analyze.check_calibration_learned(stuck).verdict == "FAIL"
 

@@ -2543,10 +2543,10 @@ def check_calibration_learned(ctx: Context) -> Verdict:
         measured = {model for model, row in rows.items() if row["measured"]}
         flat = [model for model, row in rows.items()
                 if row["peak"] <= row["first"] and model not in measured]
-        # The budget steps up only after a window measured at it: a window
-        # is queue-bound when it ran under its budget, so a flat model whose
-        # every window was queue-bound never had a window reach the seed and
-        # cannot show it rising.
+        # The budget steps up only after a window measured at it. A window is
+        # queue-bound when it formed short of the ledger's window target
+        # (three batches at the budget); a flat model whose every window was
+        # queue-bound is not decidable.
         counts: Dict[str, Tuple[int, int]] = {}
         for sample in ctx.health_samples:
             for entry in (sample.get("health") or {}).get("models") or []:
@@ -2557,10 +2557,10 @@ def check_calibration_learned(ctx: Context) -> Verdict:
                  if 0 < total == bound}
         job_bound = {model for model in flat if model in short}
         unreached = sorted(f"{model} (seed {rows[model]['first']}, all "
-                           f"{short[model]} windows short of the budget)"
-                           for model in job_bound)
+                           f"{short[model]} windows)" for model in job_bound)
         if unreached:
-            notes.append("not decidable, no window reached the seed: "
+            notes.append("not decidable, every window formed short of the "
+                         "window target (three batches at the budget): "
                          + ", ".join(unreached))
         stuck = sorted(f"{model} (seed {rows[model]['first']}, peak "
                        f"{rows[model]['peak']})"

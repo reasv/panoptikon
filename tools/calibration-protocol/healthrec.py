@@ -150,7 +150,7 @@ MODEL_KEYS = (
     "last_grant_units", "last_window_items", "total_predict_requests",
     "total_batches",
     # What the server publishes to callers, and how often a window was formed
-    # short of the budget the ledger allowed.
+    # short of the ledger's window target (three batches at the budget).
     "desired_in_flight_items", "queue_bound_windows",
 )
 

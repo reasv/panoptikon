@@ -775,15 +775,14 @@ last one closes a hole in `base_accuracy` itself):
   by naming `calibration_learned` in `--checks`; `--checks all` declares
   nothing). Under that declaration `calibration_learned` FAILs on any of:
   `fit samples == 0`, no `[[profile]]` in `calibration.after.toml`, or a peak
-  `unit_budget` that never rose above the first value recorded **and no
-  local size this leg measured** (a budget held where a trial left it is
-  learning, not a stall). A budget the job itself never filled (every window
-  formed short of it for want of queued work, `queue_bound_windows ==
-  total_batches`) cannot rise, and reads INFO, not FAIL.
-  The three numbers are exactly the ones
-  `ramp_progress` prints as INFO — the check only promotes them to a verdict,
-  which is what closes the whole class of "the instrument stopped reporting"
-  faults. Undeclared, the row is report-only.
+  `unit_budget` that never rose above the first value recorded **and no local
+  size this leg measured** (a budget held where a trial left it is learning,
+  not a stall). A model whose every window formed short of the ledger's
+  window target, three batches at the budget (`queue_bound_windows ==
+  total_batches`), is not decidable and reads INFO, not FAIL. The three
+  numbers are exactly the ones `ramp_progress` prints as INFO — the check only
+  promotes them to a verdict, which is what closes the whole class of "the
+  instrument stopped reporting" faults. Undeclared, the row is report-only.
   Pass `--learning` on every S2/S3 cold-ramp leg.
 - **`hog_tracking` is INFO with one FAIL form.** `external` is a
   window-boundary quantity with a real staleness, so a GPU that
