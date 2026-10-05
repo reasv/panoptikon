@@ -508,11 +508,15 @@ impl VramLedger {
                     ram_at_load = ram_at_load.map(|at_load| at_load.max(level));
                     ram_base = Some(level);
                 }
+                // Memory released below the load level stays charged until a
+                // batch run from below it ends no higher: then it did not come
+                // back, and the load level follows it down.
+                if !first_batch {
+                    ram_at_load = ram_at_load.map(|level| level.min(rss.max(ram_before)));
+                }
                 ram_before = rss;
                 // Below the baseline the replica released memory (load-time,
-                // or only for now): samples are measured from there on. Its
-                // resident growth stays measured over the load level, so a
-                // dip that comes back cannot inflate its own credit.
+                // or only for now): samples are measured from there on.
                 ram_base = ram_base.map(|base| base.min(rss));
             }
             // A collapse verdict counts only from a window with the GPU to

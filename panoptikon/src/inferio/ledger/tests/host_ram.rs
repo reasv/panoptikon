@@ -1244,8 +1244,31 @@ fn a_resident_set_below_its_load_level_lowers_the_baseline() {
     assert!(per_unit.expect("a cost") >= PER_UNIT_MB as f64);
 }
 
+/// Memory released below the load level is charged until a batch run from
+/// below it ends no higher, then no longer.
+#[test]
+fn memory_released_below_the_load_level_is_credited_once_it_stays_released() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/released-for-good", GPU, 64);
+    cpu_free_to_book(&ledger, 45_000);
+    let low = RSS_AT_LOAD_MB - 500;
+    for expected in [RSS_AT_LOAD_MB, low] {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let units = token.grant().unit_budget;
+        handle.lock().unwrap().record_measurements(vec![ram_batch(
+            units,
+            low + RAM_PER_UNIT_MB * units,
+            low,
+        )]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(cpu_row(&ledger).charges_mb, expected);
+    }
+}
+
 /// A resident set that dips below its load level and comes back with the
-/// next batch (pages reclaimed under pressure) lowers the sample baseline but
+/// next batch (memory released, then rebuilt) lowers the sample baseline but
 /// not the replica's own credit: no grant needs more new RAM than is free.
 #[test]
 fn a_transient_dip_below_the_load_level_does_not_over_commit() {

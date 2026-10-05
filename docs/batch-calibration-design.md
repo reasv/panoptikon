@@ -941,9 +941,9 @@ booked centrally on the CPU device. It is never a throughput signal.
   device, held until the grant settles. There the replica's resident set
   counts as our footprint, not as external usage, and its charge is
   `max(resident, resident at load) + max(0, bookings − resident growth since
-  load)`: the GPU pool formula, with memory below the load level still
-  charged because it may come back (over-charging by what was released for
-  good, at most the resident set at load, for the replica's life). The CPU
+  load)`: the GPU pool formula. Memory released below the load level stays
+  charged until a batch run from below it ends no higher, since the next
+  batch may rebuild it; then the load level follows it down. The CPU
   device's cap fraction, reserve and other processes' usage therefore
   apply, and two GPU replicas or a CPU replica cannot claim the same RAM. A GPU worker sends no host free reading, so when its resident
   set changes after the CPU device's last reading (its load, memory it kept
