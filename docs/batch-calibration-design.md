@@ -104,7 +104,9 @@ change:   a probe's own pairs more than 3.5 standard errors from the doubling's
   until a larger size is granted in full again.
 - **Short jobs.** A caller may report a job's remaining items
   (`Admission::note_remaining_items`); a probe starts only with
-  `PROBE_PAYBACK_WINDOWS` windows of work left. Unknown is long enough.
+  `PROBE_PAYBACK_WINDOWS` windows of work left. The count arrives as
+  predict's `remaining_items`, and a caller that does not say is taken to
+  have the items run since its queue last ran dry.
 - **Bounded weight.** A doubling's pairs weigh at most 64: past that, older
   pairs count for less. A rate that changes (new inputs, a rate that rises
   late in a job) is caught by the change test at the next re-test, at most

@@ -82,8 +82,9 @@ pub(crate) struct DispatchRequest {
     pub inputs: Vec<WorkerInput>,
     /// The user's max batch size: bounds items, never units.
     pub max_batch: Option<u32>,
-    /// Items the caller has left to send after this request; `None`: it
-    /// does not say.
+    /// Items the caller's whole job has left; `None`: it does not say. The
+    /// payback gate compares it with requests, so an item sent as several
+    /// requests under-reads, which only delays a probe.
     pub remaining_items: Option<u64>,
     pub reply: oneshot::Sender<Result<Vec<WorkerOutput>>>,
 }
@@ -1935,6 +1936,24 @@ mod tests {
             answer.await.expect("the dispatcher replied")
         }
 
+        /// Queue `inputs` with the caller's count of items left.
+        fn send(
+            &self,
+            inputs: Vec<WorkerInput>,
+            remaining_items: Option<u64>,
+        ) -> oneshot::Receiver<Result<Vec<WorkerOutput>>> {
+            let (reply, answer) = oneshot::channel();
+            self.tx
+                .send(DispatchMsg::Predict(DispatchRequest {
+                    inputs,
+                    max_batch: None,
+                    remaining_items,
+                    reply,
+                }))
+                .expect("queued");
+            answer
+        }
+
         async fn shutdown(self) {
             self.tx.send(DispatchMsg::Shutdown).expect("shutdown");
             self.dispatcher.await.expect("dispatcher exits");
@@ -2196,23 +2215,26 @@ mod tests {
         );
     }
 
-    /// The figure is published at the grant, before the window's replies go
-    /// out: the first reply after the working size changed carries the new
-    /// size's figure, not the one before it.
+    /// The first reply after a probe starts carries the probe's in-flight
+    /// figure, while that window's grant is still the working size.
     #[tokio::test]
     async fn the_first_reply_after_a_size_change_carries_its_in_flight_figure() {
         let harness = one_replica(32_768, "batchsize_test", item_cost(8)).await;
-        let figure_after_one_window = async || {
+        let window = async || {
             harness
-                .predict(json_inputs(1), None)
+                .predict(json_inputs(16), None)
                 .await
                 .expect("succeeded");
-            harness.stats.desired_in_flight_items.load(Relaxed)
+            let stats = &harness.stats;
+            let grant = stats.last_grant_units.load(Relaxed);
+            (grant, stats.desired_in_flight_items.load(Relaxed))
         };
         let per_unit = WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK;
-        assert_eq!(figure_after_one_window().await, 8 * per_unit);
-        harness.ledger.set_knee_for_test("test/batch", TEST_GPU, 32);
-        assert_eq!(figure_after_one_window().await, 32 * per_unit);
+        assert_eq!(window().await, (8, 8 * per_unit));
+        harness
+            .ledger
+            .start_probe_for_test("test/batch", TEST_GPU, 8);
+        assert_eq!(window().await, (8, 16 * per_unit));
         harness.shutdown().await;
     }
 
@@ -2222,20 +2244,11 @@ mod tests {
     #[tokio::test]
     async fn the_largest_count_of_items_left_reaches_the_ledger() {
         let harness = one_replica(32_768, "batchsize_test", item_cost(8)).await;
-        let send = |left: Option<u64>| {
-            let (reply, answer) = oneshot::channel();
-            harness
-                .tx
-                .send(DispatchMsg::Predict(DispatchRequest {
-                    inputs: json_inputs(1),
-                    max_batch: None,
-                    remaining_items: left,
-                    reply,
-                }))
-                .expect("queued");
-            answer
-        };
-        let answers: Vec<_> = [Some(5), Some(900), None].into_iter().map(send).collect();
+        let send = |left: Option<u64>| harness.send(json_inputs(1), left);
+        let answers: Vec<_> = [Some(5), Some(900), Some(7), None]
+            .into_iter()
+            .map(send)
+            .collect();
         for answer in answers {
             answer.await.expect("replied").expect("succeeded");
         }

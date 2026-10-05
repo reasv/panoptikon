@@ -187,7 +187,7 @@ impl VramLedger {
 
     /// Install a working size as measured here.
     #[cfg(test)]
-    pub(in crate::inferio) fn set_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {
+    pub(super) fn set_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {
         let mut state = self.lock();
         let cal = state
             .calibration
@@ -196,6 +196,31 @@ impl VramLedger {
         cal.knee_units = Some(knee);
         cal.knee_is_local = true;
         cal.probe = None;
+    }
+
+    /// Start a probe of the doubling above working size `knee`, as the settle
+    /// that starts one leaves it: the next window still runs `knee`.
+    #[cfg(test)]
+    pub(in crate::inferio) fn start_probe_for_test(
+        &self,
+        inference_id: &str,
+        gpu: &str,
+        knee: u64,
+    ) {
+        self.set_knee_for_test(inference_id, gpu, knee);
+        let mut state = self.lock();
+        let key = (inference_id.to_owned(), gpu.to_owned());
+        let cal = state.calibration.get_mut(&key).expect("installed");
+        cal.probe = Some(Probe {
+            lo: knee,
+            run: knee,
+            open: None,
+            pairs: 0,
+            windows: 0,
+            fresh: SizeEvidence::default(),
+            largest: knee,
+            before: ramp::Verdict::Unsure,
+        });
     }
 
     /// The gain rule's state: `(the size a probe runs next, windows before

@@ -2669,6 +2669,40 @@ metadata.cost.seed_units = 1000000
         );
     }
 
+    /// The caller's count of items left reaches the dispatcher with its
+    /// request.
+    #[tokio::test]
+    async fn predict_hands_the_dispatcher_the_callers_count_of_items_left() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = &setup.manager;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        manager.state.lock().unwrap().models.insert(
+            "echo/test".to_owned(),
+            ModelHandle {
+                tx,
+                task: tokio::spawn(async {}),
+                generation: 1,
+                stats: Arc::new(ModelStats::default()),
+                cost: CostDimension::fallback(),
+                telemetry: Vec::new(),
+            },
+        );
+        let inputs = vec![data_input(json!(1))];
+        let predict = manager.predict("echo/test", "k", 10, -1, None, None, Some(7), inputs);
+        let dispatcher = async {
+            let Some(DispatchMsg::Predict(request)) = rx.recv().await else {
+                panic!("no request reached the dispatcher");
+            };
+            assert_eq!(request.remaining_items, Some(7));
+            request
+                .reply
+                .send(Ok(Vec::new()))
+                .expect("the caller waits");
+        };
+        let (answer, ()) = tokio::join!(predict, dispatcher);
+        answer.expect("answered");
+    }
+
     /// A worker that dies mid-predict drops the model everywhere and respawns.
     #[tokio::test]
     async fn worker_death_cleans_up_and_next_predict_respawns() {
