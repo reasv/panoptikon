@@ -120,13 +120,18 @@ def test_healthrec_keeps_the_clients_of_a_gateway_that_answered_504(
     assert (health["ok"], health["status_code"]) == (False, 504)
     assert health["inference_clients"] == clients
     assert health["detail"] == "frozen"
+    assert "raw" not in health
+    assert healthrec.flatten_health(
+        {**result, "payload": {"detail": "x"}}, full=False)[
+            "inference_clients"] is None
     assert healthrec.flatten_health(result, full=True)["raw"] == json.loads(body)
     assert "running" not in healthrec.flatten_queue(result)
 
 
 # Every child legs starts is logged and replaced by one that exits once the
 # driver is gone, or after 60 s. The teardown's stop_all starts 1 s late, so a
-# signal can land inside it.
+# signal can land inside it. A second Ctrl-C lands while the interrupt is
+# being handled.
 DRIVER = """
 import json, os, signal, subprocess, sys, time
 from pathlib import Path
@@ -227,6 +232,8 @@ def test_a_stop_signal_tears_the_leg_down_and_records_it(tmp_path, first,
         remote = started["healthrec-remote"]
         assert remote[remote.index("--base") + 1] == REMOTE
         assert "--no-queue" in remote
+        gateway = started["healthrec"]
+        assert float(gateway[gateway.index("--timeout") + 1]) > 10
         (written,) = (tmp_path / "run" / "S14").glob("server-*.toml")
         document = tomllib.loads(written.read_text())
         assert document["inference_local"]["enabled"] is False

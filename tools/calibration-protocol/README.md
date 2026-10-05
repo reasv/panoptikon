@@ -129,9 +129,8 @@ snapshot jobs / failures / metadata / health and `calibration.after.toml`;
 stop everything in reverse; copy `panoptikon.log`. Then `legs.json`: every
 resolved parameter, every event with its wall clock and monotonic `t_mono`,
 every process and its exit code, and the `analyze.py` command line for this
-scenario. SIGTERM, SIGHUP (an ssh drop), unless it is ignored (nohup), or
-SIGBREAK ends a leg as Ctrl-C does: the same teardown, and the outcome
-`interrupted`.
+scenario. SIGTERM, SIGHUP (an ssh drop; not under nohup) or SIGBREAK ends a
+leg as Ctrl-C does: the same teardown, and the outcome `interrupted`.
 
 **S14 probes every listener the config declares.** A config can name more
 than the gateway port — `[[server.endpoints]]` puts the same routes on

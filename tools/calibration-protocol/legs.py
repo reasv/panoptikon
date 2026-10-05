@@ -109,9 +109,9 @@ The recorders handle `SIGBREAK` for exactly this reason, so a Windows
 teardown flushes its last samples instead of losing them. `hog.py` is asked to
 release over its own HTTP endpoint first, on every platform, because that is
 the only stop that is observably complete before the process exits.
-SIGTERM, SIGHUP (an ssh drop), unless it is ignored (nohup), or SIGBREAK
-sent to `legs.py` itself ends the leg as Ctrl-C does: the same teardown, and
-`legs.json` with the outcome `interrupted`.
+SIGTERM, SIGHUP (an ssh drop; not under nohup) or SIGBREAK sent to `legs.py`
+itself ends the leg as Ctrl-C does: the same teardown, and `legs.json` with
+the outcome `interrupted`.
 """
 
 from __future__ import annotations
@@ -978,8 +978,10 @@ class Leg:
         try:
             print(f"[{record['iso']}] {name}"
                   + (f" {json.dumps(detail)}" if detail else ""), flush=True)
-        except OSError:  # a hung-up terminal or a closed pipe: the echo only
-            pass
+        except OSError:
+            # a hung-up terminal or a closed pipe: the rest of the console
+            # output is dropped, so the exit status stays the leg's
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
     def path(self, name: str) -> Path:
         return self.directory / name
@@ -2264,6 +2266,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     else args.health_interval), "--quiet"]
             if url != base:
                 health_argv.append("--no-queue")
+            elif args.inference_url:
+                # The gateway answers for a server that does not answer only
+                # after its 10 s health deadline.
+                health_argv += ["--timeout", "15"]
             if args.health_full:
                 health_argv.append("--full")
             leg.supervisor.start(name, health_argv)
@@ -2357,6 +2363,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         leg.mark("error", error=str(exc))
     finally:
         ignore_stop_signals()
+        leg.mark("stopping", stop_grace_s=args.stop_grace)
         if fds is not None:
             fds.stop()
         # The hog is asked to release over HTTP first: that is the only stop

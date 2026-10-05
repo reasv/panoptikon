@@ -171,7 +171,7 @@ def flatten_health(result: Dict[str, Any], full: bool) -> Dict[str, Any]:
         # A gateway whose inference server did not answer still reports its
         # own clients, and whether it declared that server frozen.
         out["detail"] = payload.get("detail")
-        out["inference_clients"] = payload.get("inference_clients") or []
+        out["inference_clients"] = payload.get("inference_clients")
         return out
     out["status"] = payload.get("status")
     out["shutting_down"] = payload.get("shutting_down")
