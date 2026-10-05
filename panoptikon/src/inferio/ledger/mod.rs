@@ -904,8 +904,7 @@ impl WorkerEntry {
                 .is_none_or(|at| at.elapsed() >= quiet)
     }
 
-    /// Reusable pool no outstanding grant claims: room a further grant can
-    /// use at no cost to the GPU.
+    /// Reusable pool no outstanding grant claims: what a trim can release.
     fn free_pool_mb(&self) -> u64 {
         self.reusable_pool_mb().saturating_sub(self.grants_mb())
     }
