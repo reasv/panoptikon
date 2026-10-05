@@ -869,7 +869,7 @@ booked centrally on the CPU device. It is never a throughput signal.
     less the slope per unit short of it; from one size, its growth. A fit
     that reads the fixed part low has a slope above the true per-unit cost,
     and there books up to `(smallest − u) × (slope − true per-unit cost)`
-    less than the batch adds.
+    less than the batch adds, when that batch read its true cost.
   - from two sizes, the fit: the Theil–Sen intercept (the growth that does
     not scale with units) plus per unit the largest cost above it among the
     batches within `RATCHET_FACTOR` of the largest, or the slope if higher.
