@@ -2971,11 +2971,13 @@ mod tests {
     /// nothing was parsed. The chunk is halved and both halves are sent, so
     /// no item is charged for a body this end built too big — and an input
     /// still refused alone fails once, with the limit named. The same holds
-    /// for an untyped 413, which is a reverse proxy's body limit.
+    /// for an untyped 413, which is a reverse proxy's body limit. Each half
+    /// carries the job's count.
     #[tokio::test]
     async fn a_413_splits_the_chunk_and_an_oversize_input_fails_alone() {
         use crate::config::InferenceEndpointConfig;
         use axum::Router;
+        use axum::extract::RawQuery;
         use axum::routing::post;
         use std::sync::Mutex as StdMutex;
 
@@ -3004,10 +3006,12 @@ mod tests {
             let handler_seen = Arc::clone(&seen);
             let app = Router::new().route(
                 "/api/inference/predict/{group}/{model}",
-                post(move |body: axum::body::Bytes| {
+                post(move |RawQuery(query): RawQuery, body: axum::body::Bytes| {
                     let seen = Arc::clone(&handler_seen);
                     async move {
                         let ids = ids_in(&body);
+                        let query = query.unwrap_or_default();
+                        assert!(query.split('&').any(|p| p == "remaining_items=8"));
                         seen.lock().unwrap().push(ids.len());
                         let json = [(axum::http::header::CONTENT_TYPE, "application/json")];
                         if ids.len() > accepts && !typed {
@@ -3066,7 +3070,11 @@ mod tests {
             )
         };
         let budget = Arc::new(UnitBudget::new(1_000));
-        let counters = Arc::new(Mutex::new(JobCounters::default()));
+        let counters = Arc::new(Mutex::new(JobCounters {
+            total: 10,
+            processed: 2,
+            ..Default::default()
+        }));
 
         for typed in [true, false] {
             // Eight inputs, one chunk, a server that takes two: 8 -> 4,4 -> 2,2.
