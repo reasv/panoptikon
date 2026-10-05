@@ -1304,15 +1304,13 @@ def _log_spill(
     persists = after_mb is not None and after_mb > SPILL_TOLERANCE_MB
     level = logging.DEBUG if persists and _spill_persists else logging.WARNING
     _spill_persists = _spill_persists or persists
-    if not released:
-        action = "left the pool as it is"
-    elif halved:
-        action = (
-            "released the pool and halved the batch size for the rest of this "
-            "window"
-        )
-    else:
+    halve = "halved the batch size for the rest of this window"
+    if released and halved:
+        action = "released the pool and " + halve
+    elif released:
         action = "released the pool"
+    else:
+        action = halve if halved else "left the pool as it is"
     logger.log(
         level,
         "the %s MiB allocator pool is %d MiB more than NVML reports in use on "
@@ -1611,8 +1609,9 @@ def run_window(
             reserved_mb = sample["reserved_mb"]
             released = _release_spilled_pool()
             before = budget
-            if released:
+            if released or _spill_persists:
                 budget = max(1, min(budget, priced // 2))
+            if released:
                 sample = memory.device_memory_sample()
             after_mb = pool_off_device_mb(sample)
             halved = budget < before and bool(pending)

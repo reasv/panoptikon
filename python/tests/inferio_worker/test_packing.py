@@ -3070,8 +3070,8 @@ def test_a_spill_that_outlives_its_release_releases_nothing_until_one_fits(
     spill_host, caplog
 ):
     """Live memory past the card: the first release gives nothing back, so
-    later spills release nothing and log at debug, until a batch that fits
-    re-arms the release and the warning."""
+    later spills release nothing and log at debug, still halving, until a
+    batch that fits re-arms the release and the warning."""
     live_mb = [8192 + 1000]
 
     def predict(inputs):
@@ -3081,20 +3081,21 @@ def test_a_spill_that_outlives_its_release_releases_nothing_until_one_fits(
 
     impl = SimpleNamespace(predict=predict)
     with caplog.at_level(logging.DEBUG, logger="inferio_worker.packing"):
-        first = packing.run_window(impl, items(7), grant(unit_budget=4, mb=0))
+        first = packing.run_window(impl, items(8), grant(unit_budget=4, mb=0))
         second = packing.run_window(impl, items(2), grant(unit_budget=1, mb=0))
+        packing.run_grantless_window(impl, items(1))
         live_mb[0] = 100
-        packing.run_window(impl, items(1), grant(unit_budget=1, mb=0))
+        packing.run_grantless_window(impl, items(1))
         live_mb[0] = 8192 + 1000
         packing.run_window(impl, items(1), grant(unit_budget=1, mb=0))
     measurements = first["measurements"] + second["measurements"]
-    assert [m["items"] for m in measurements] == [4, 2, 1, 1, 1]
+    assert [m["items"] for m in measurements] == [4, 2, 1, 1, 1, 1]
     assert all(m["spilled"] for m in measurements)
     assert [m.get("regrow_after") for m in measurements] == [
-        None, memory.SPILL_RELEASE, None, None, None
+        None, memory.SPILL_RELEASE, None, None, None, None
     ]
     assert spill_host.empty_cache_calls == 2, "the first spill, and the last"
     spills = [r for r in caplog.records if "system memory" in r.getMessage()]
     assert [r.levelno for r in spills] == (
-        [logging.WARNING] + [logging.DEBUG] * 4 + [logging.WARNING]
+        [logging.WARNING] + [logging.DEBUG] * 6 + [logging.WARNING]
     )
