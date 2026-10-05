@@ -1735,8 +1735,8 @@ fn a_pixel_priced_single_item_window_is_one_image() {
     assert_eq!(item_bound(&admission), usize::MAX);
 
     // Opened past two images by a stored size, the cap doubles to two: six
-    // images are priced at two, and a 4-image item among five 1-image ones
-    // at eight.
+    // images are priced at two. A window of smaller inputs is priced at the
+    // cap times its largest, at most the window's units.
     let profiles = Arc::new(FakeProfiles {
         seed: Some(ProfileSeed {
             slope_mb_per_unit: 0.001,
@@ -1761,10 +1761,16 @@ fn a_pixel_priced_single_item_window_is_one_image() {
         (Some(2), 2 * IMAGE)
     );
     drop(token);
-    let token = admission
-        .request_grant_byte_bound(9 * IMAGE, 4 * IMAGE, None, 6, 0, false)
-        .expect("granted");
-    assert_eq!(token.grant().unit_budget, 8 * IMAGE);
+    const PART: u64 = IMAGE / 4;
+    for (units, largest, requests, want) in [
+        (8 * PART, 3 * PART, 6, 6 * PART),
+        (3 * PART, 2 * PART, 2, 3 * PART),
+    ] {
+        let token = admission
+            .request_grant_byte_bound(units, largest, None, requests, 0, false)
+            .expect("granted");
+        assert_eq!(token.grant().unit_budget, want);
+    }
 }
 
 /// A cold replica with a RAM side, alone on a card with `room_mb` for its

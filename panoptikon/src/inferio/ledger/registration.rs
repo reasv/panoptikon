@@ -938,8 +938,8 @@ impl Admission {
         cal.trial = None;
     }
 
-    /// [`Self::request_grant_byte_bound`] for requests of equal units, with
-    /// `byte_bound = false`.
+    /// [`Self::request_grant_byte_bound`] for single-input requests of equal
+    /// units, with `byte_bound = false`.
     #[cfg(test)]
     pub fn request_grant(
         &self,
@@ -958,14 +958,14 @@ impl Admission {
         )
     }
 
-    /// Reserve headroom for one window whose largest request has
-    /// `largest_request_units`. Demand is `window_requests + queued_behind`;
+    /// Reserve headroom for one window whose largest input has
+    /// `largest_input_units`. Demand is `window_requests + queued_behind`;
     /// the window's own requests retire when it settles. `byte_bound`: the
     /// byte limit, not the queue, closed the window.
     pub fn request_grant_byte_bound(
         &self,
         window_units: u64,
-        largest_request_units: u64,
+        largest_input_units: u64,
         user_cap_items: Option<u32>,
         window_requests: usize,
         queued_behind: usize,
@@ -974,7 +974,7 @@ impl Admission {
         self.ledger.request_grant(
             self.worker,
             window_units,
-            largest_request_units,
+            largest_input_units,
             user_cap_items,
             window_requests,
             queued_behind,

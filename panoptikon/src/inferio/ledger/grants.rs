@@ -64,15 +64,15 @@ impl VramLedger {
     }
 
     /// Reserve headroom for one window and hand back the grant.
-    /// `window_units` and `largest_request_units` (its largest request's)
-    /// are the dispatcher's estimates; safety does not depend on them, since
-    /// the worker packs within the grant using exact counts.
+    /// `window_units` and `largest_input_units` (its largest input's) are
+    /// the dispatcher's estimates; the worker packs within the grant by its
+    /// own estimates, and an input it prices above the grant runs alone.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn request_grant(
         self: &Arc<Self>,
         worker: WorkerId,
         window_units: u64,
-        largest_request_units: u64,
+        largest_input_units: u64,
         user_cap_items: Option<u32>,
         window_requests: usize,
         queued_behind: usize,
@@ -103,7 +103,7 @@ impl VramLedger {
         // The batch size, and what of it the window's content asks for. An
         // item cap (the user's included) limits the content like a short
         // queue: for a count-priced model it is a unit count, else the cap
-        // times the largest request's units, which no batch of at most `cap`
+        // times the largest input's units, which no batch of at most `cap`
         // items exceeds.
         let (size_asked, capped, wanted, item_cap) = {
             let entry = state.workers.get(&worker)?;
@@ -112,7 +112,7 @@ impl VramLedger {
                 .map(|cap| user_cap_items.map_or(cap, |user| cap.min(user)));
             let content = match item_cap.map(u64::from) {
                 Some(cap) if entry.aggregation == CostAggregation::Count => window_units.min(cap),
-                Some(cap) => window_units.min(cap.saturating_mul(largest_request_units)),
+                Some(cap) => window_units.min(cap.saturating_mul(largest_input_units)),
                 _ => window_units,
             };
             (

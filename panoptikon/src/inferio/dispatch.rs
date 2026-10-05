@@ -94,6 +94,7 @@ struct Queued {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct WindowItem {
     pub units: u64,
+    pub largest_input_units: u64,
     pub bytes: usize,
     pub items: usize,
     /// Normalised by [`effective_cap`].
@@ -220,14 +221,18 @@ fn text_bytes(input: &WorkerInput) -> usize {
     }
 }
 
-/// The request's priced units; `max-times-count` is approximated by the sum.
-fn request_units(inputs: &[WorkerInput], cost: &CostDimension) -> u64 {
-    let per_item = inputs.iter().map(|input| estimate_input_units(input, cost));
+/// The request's priced units and its largest input's; `max-times-count` is
+/// approximated by the sum.
+fn request_units(inputs: &[WorkerInput], cost: &CostDimension) -> (u64, u64) {
+    let (sum, largest) = inputs
+        .iter()
+        .map(|input| estimate_input_units(input, cost))
+        .fold((0u64, 0u64), |(sum, largest), units| {
+            (sum.saturating_add(units), largest.max(units))
+        });
     match cost.aggregation {
-        Some(CostAggregation::Count) | None => inputs.len() as u64,
-        Some(CostAggregation::Sum) | Some(CostAggregation::MaxTimesCount) => {
-            per_item.fold(0u64, u64::saturating_add)
-        }
+        Some(CostAggregation::Count) | None => (inputs.len() as u64, largest),
+        Some(CostAggregation::Sum) | Some(CostAggregation::MaxTimesCount) => (sum, largest),
     }
 }
 
@@ -567,10 +572,10 @@ pub(crate) async fn run_dispatcher(
             let take = window_take_count(&shapes, bounds);
             let window: Vec<Queued> = queue.drain(..take).collect();
             let (mut window_units, mut window_items, mut window_bytes) = (0u64, 0usize, 0usize);
-            let mut largest_request_units = 0u64;
+            let mut largest_input_units = 0u64;
             for queued in &window {
                 window_units = window_units.saturating_add(queued.shape.units);
-                largest_request_units = largest_request_units.max(queued.shape.units);
+                largest_input_units = largest_input_units.max(queued.shape.largest_input_units);
                 window_items = window_items.saturating_add(queued.shape.items);
                 window_bytes = window_bytes.saturating_add(queued.shape.bytes);
             }
@@ -588,7 +593,7 @@ pub(crate) async fn run_dispatcher(
                 Some(admission) => {
                     let grant = admission.request_grant_byte_bound(
                         window_units,
-                        largest_request_units,
+                        largest_input_units,
                         cap,
                         window.len(),
                         queue.len(),
@@ -895,8 +900,10 @@ async fn run_trim(
 }
 
 fn enqueue(request: DispatchRequest, cost: &CostDimension) -> Queued {
+    let (units, largest_input_units) = request_units(&request.inputs, cost);
     let shape = WindowItem {
-        units: request_units(&request.inputs, cost),
+        units,
+        largest_input_units,
         bytes: request_bytes(&request.inputs),
         items: request.inputs.len(),
         cap: effective_cap(request.max_batch),
@@ -1189,6 +1196,7 @@ mod tests {
     fn shape(units: u64, items: usize, cap: Option<u32>) -> WindowItem {
         WindowItem {
             units,
+            largest_input_units: units,
             bytes: 0,
             items,
             cap,
@@ -1352,6 +1360,7 @@ mod tests {
         let exact = [plain(2), plain(3), plain(3)];
         let fat = |bytes| WindowItem {
             units: 1,
+            largest_input_units: 1,
             bytes,
             items: 1,
             cap: None,
@@ -1497,9 +1506,13 @@ mod tests {
             max_tokens: None,
         };
         for (aggregation, want, label) in [
-            (Some(CostAggregation::Count), 3, "one unit per item"),
-            (Some(CostAggregation::Sum), 300, "summed"),
-            (Some(CostAggregation::MaxTimesCount), 300, "sum for depth"),
+            (Some(CostAggregation::Count), (3, 100), "one unit per item"),
+            (Some(CostAggregation::Sum), (300, 100), "summed"),
+            (
+                Some(CostAggregation::MaxTimesCount),
+                (300, 100),
+                "sum for depth",
+            ),
         ] {
             assert_eq!(request_units(&inputs, &token(aggregation)), want, "{label}");
         }
@@ -1565,8 +1578,8 @@ mod tests {
         }
         // The window the ledger is asked to fund is priced at the canvas too.
         let inputs = vec![big.clone(), big.clone(), big];
-        assert_eq!(request_units(&inputs, &capped), 3 * 1_835_008);
-        assert_eq!(request_units(&inputs, &uncapped), 3 * 48_000_000);
+        assert_eq!(request_units(&inputs, &capped).0, 3 * 1_835_008);
+        assert_eq!(request_units(&inputs, &uncapped).0, 3 * 48_000_000);
         assert_eq!(
             seed_units_per_item(&tight),
             262_144,
@@ -1629,8 +1642,8 @@ mod tests {
             assert_eq!(estimate_input_units(input, dimension), want, "{label}");
         }
         let inputs = vec![long.clone(), long.clone(), long];
-        assert_eq!(request_units(&inputs, &capped), 3 * 256);
-        assert_eq!(request_units(&inputs, &uncapped), 3 * 2048);
+        assert_eq!(request_units(&inputs, &capped).0, 3 * 256);
+        assert_eq!(request_units(&inputs, &uncapped).0, 3 * 2048);
         assert_eq!(
             seed_units_per_item(&capped),
             256,
@@ -1864,8 +1877,13 @@ mod tests {
         Replica::new(worker, admission, None)
     }
 
-    /// One dispatcher task over one priced replica on a synthetic GPU of
-    /// `total_mb`.
+    /// A synthetic GPU, and the CPU device on which a replica books host RAM.
+    const WITH_CPU: &[(&str, &str, u64)] = &[
+        (TEST_GPU, "TEST 9000", 32_768),
+        (super::super::cpu::DEVICE_KEY, "CPU", 65_536),
+    ];
+
+    /// One dispatcher task over one priced replica on synthetic devices.
     struct Harness {
         tx: mpsc::UnboundedSender<DispatchMsg>,
         dispatcher: tokio::task::JoinHandle<()>,
@@ -1875,17 +1893,18 @@ mod tests {
     }
 
     async fn one_replica(total_mb: u64, impl_class: &str, cost: CostDimension) -> Harness {
-        one_replica_with(total_mb, impl_class, cost, false).await
+        let devices = [(TEST_GPU, "TEST 9000", total_mb)];
+        one_replica_with(&devices, impl_class, cost, false).await
     }
 
     async fn one_replica_with(
-        total_mb: u64,
+        devices: &[(&str, &str, u64)],
         impl_class: &str,
         cost: CostDimension,
         refuses_trim: bool,
     ) -> Harness {
         let ledger = VramLedger::for_test(
-            &[(TEST_GPU, "TEST 9000", total_mb)],
+            devices,
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
@@ -1911,11 +1930,13 @@ mod tests {
     }
 
     impl Harness {
-        async fn predict(
+        /// Requests queued before the dispatcher task first runs are all
+        /// waiting when it forms its first window.
+        fn queue(
             &self,
             inputs: Vec<WorkerInput>,
             max_batch: Option<u32>,
-        ) -> Result<Vec<WorkerOutput>> {
+        ) -> oneshot::Receiver<Result<Vec<WorkerOutput>>> {
             let (reply, answer) = oneshot::channel();
             self.tx
                 .send(DispatchMsg::Predict(DispatchRequest {
@@ -1924,7 +1945,17 @@ mod tests {
                     reply,
                 }))
                 .expect("queued");
-            answer.await.expect("the dispatcher replied")
+            answer
+        }
+
+        async fn predict(
+            &self,
+            inputs: Vec<WorkerInput>,
+            max_batch: Option<u32>,
+        ) -> Result<Vec<WorkerOutput>> {
+            self.queue(inputs, max_batch)
+                .await
+                .expect("the dispatcher replied")
         }
 
         async fn shutdown(self) {
@@ -2244,37 +2275,9 @@ mod tests {
     /// reports no host RAM, so the next window holds two items in one batch.
     #[tokio::test]
     async fn the_first_window_after_load_runs_one_item() {
-        let cost = item_cost(8);
-        let ledger = VramLedger::for_test(
-            &[
-                (TEST_GPU, "TEST 9000", 32_768),
-                (super::super::cpu::DEVICE_KEY, "CPU", 65_536),
-            ],
-            VramBudget {
-                margin: Some(0.0),
-                cap_fraction: None,
-                knee_max_bucket_dispersion: None,
-            },
-        );
-        let replica = priced_replica(&ledger, TEST_GPU, "batchsize_test", cost, false).await;
-        let (tx, rx) = mpsc::unbounded_channel();
-        let dispatcher = tokio::spawn(run_dispatcher(
-            dispatcher_ctx(cost, Arc::new(ModelStats::default())),
-            vec![replica],
-            rx,
-        ));
-        // Queued before the dispatcher task first runs.
+        let harness = one_replica_with(WITH_CPU, "batchsize_test", item_cost(8), false).await;
         let answers: Vec<_> = (0..3)
-            .map(|_| {
-                let (reply, answer) = oneshot::channel();
-                tx.send(DispatchMsg::Predict(DispatchRequest {
-                    inputs: json_inputs(1),
-                    max_batch: None,
-                    reply,
-                }))
-                .expect("queued");
-                answer
-            })
+            .map(|_| harness.queue(json_inputs(1), None))
             .collect();
         let mut sizes = Vec::new();
         for answer in answers {
@@ -2282,61 +2285,36 @@ mod tests {
             sizes.extend(batch_sizes(&outputs));
         }
         assert_eq!(sizes, [1, 2, 2]);
-        tx.send(DispatchMsg::Shutdown).expect("shutdown");
-        dispatcher.await.expect("dispatcher exits");
+        harness.shutdown().await;
     }
 
     /// A capped window of a token-priced replica is priced at the cap times
-    /// its largest request: no batch of at most two items holds more.
+    /// its largest input: no batch of at most two items holds more.
     #[tokio::test]
-    async fn a_capped_window_is_priced_at_the_cap_times_its_largest_request() {
+    async fn a_capped_window_is_priced_at_the_cap_times_its_largest_input() {
         let cost = CostDimension {
             unit: CostUnit::Token,
             aggregation: Some(CostAggregation::Sum),
             seed_units: Some(4_096),
             ..item_cost(0)
         };
-        let ledger = VramLedger::for_test(
-            &[
-                (TEST_GPU, "TEST 9000", 32_768),
-                (super::super::cpu::DEVICE_KEY, "CPU", 65_536),
-            ],
-            VramBudget {
-                margin: Some(0.0),
-                cap_fraction: None,
-                knee_max_bucket_dispersion: None,
-            },
-        );
-        let replica = priced_replica(&ledger, TEST_GPU, "batchsize_test", cost, false).await;
-        let stats = Arc::new(ModelStats::default());
-        let (tx, rx) = mpsc::unbounded_channel();
-        let dispatcher = tokio::spawn(run_dispatcher(
-            dispatcher_ctx(cost, Arc::clone(&stats)),
-            vec![replica],
-            rx,
-        ));
-        // A first window of one item doubles the cap to two; the next holds a
-        // 100-token request and five of 30 tokens.
-        let answers: Vec<_> = [40, 400, 120, 120, 120, 120, 120]
+        let harness = one_replica_with(WITH_CPU, "batchsize_test", cost, false).await;
+        let texts = |tokens: &[usize]| {
+            let text = |count: &usize| json_input(json!("x".repeat(4 * count)));
+            tokens.iter().map(text).collect()
+        };
+        // A first window of one item doubles the cap to two. The next holds a
+        // 30-token request, then one of 220 tokens whose largest input is 100.
+        let answers: Vec<_> = [&[10][..], &[30], &[30, 30, 100, 30, 30]]
             .into_iter()
-            .map(|bytes| {
-                let (reply, answer) = oneshot::channel();
-                tx.send(DispatchMsg::Predict(DispatchRequest {
-                    inputs: vec![json_input(json!("x".repeat(bytes)))],
-                    max_batch: None,
-                    reply,
-                }))
-                .expect("queued");
-                answer
-            })
+            .map(|tokens| harness.queue(texts(tokens), None))
             .collect();
         for answer in answers {
             answer.await.expect("replied").expect("succeeded");
         }
-        assert_eq!(stats.last_window_items.load(Relaxed), 6);
-        assert_eq!(stats.last_grant_units.load(Relaxed), 200);
-        tx.send(DispatchMsg::Shutdown).expect("shutdown");
-        dispatcher.await.expect("dispatcher exits");
+        assert_eq!(harness.stats.last_window_items.load(Relaxed), 6);
+        assert_eq!(harness.stats.last_grant_units.load(Relaxed), 200);
+        harness.shutdown().await;
     }
 
     /// A [`DispatchMsg::Trim`] naming a free replica is delivered to it and
@@ -2348,7 +2326,8 @@ mod tests {
     #[tokio::test]
     async fn a_trim_leaves_a_free_replica_serving() {
         for refuses_trim in [false, true] {
-            let harness = one_replica_with(32_768, "echo_test", item_cost(4), refuses_trim).await;
+            let devices = [(TEST_GPU, "TEST 9000", 32_768)];
+            let harness = one_replica_with(&devices, "echo_test", item_cost(4), refuses_trim).await;
             harness
                 .tx
                 .send(DispatchMsg::Trim {
