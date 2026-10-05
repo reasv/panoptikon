@@ -981,7 +981,7 @@ booked centrally on the CPU device. It is never a throughput signal.
   until a second size gives the slope, when capping ends. So a one-size
   estimate that is wrong for costlier inputs costs at most one capped batch
   per window, however many batches deep: the window peaks at its costliest
-  batch, whether the worker hands memory back or keeps it.
+  batch, assuming a worker that keeps memory reuses it for its next batch.
   The cost lives as long as the process, so a reload books from it at once,
   plus the start-up its first batch will add; of what that batch keeps, up to
   the start-up measured before joins its load level. The cap never ends by
