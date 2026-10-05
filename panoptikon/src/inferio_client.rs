@@ -1362,8 +1362,9 @@ impl InferenceApiClient {
             let answer = self.health_check().await;
             // A response since the previous check answers this one too: the
             // check may wait behind requests at a proxy capping connections.
-            let answered = answer.is_ok() || checks.answers.load(Relaxed) != answers;
-            answers = checks.answers.load(Relaxed);
+            let answers_now = checks.answers.load(Relaxed);
+            let answered = answer.is_ok() || answers_now != answers;
+            answers = answers_now;
             let misses = {
                 let mut state = checks.lock();
                 state.misses = if answered {
