@@ -197,9 +197,10 @@ S4c 2 048 and S4d 2 729 MiB. Every event is timed **from the job's POST**,
 not from the leg's start, because what the scenario describes is a change
 during the job. `--hog-event` adds such an event in MiB to any scenario
 (`at=60,leave_free=4096`, `at=120,release`), with any `--hog-target`; its
-figures are not scaled, but bounded like every figure. On a scenario without
-a hog of its own, one starts holding 0 with its leave-free level pinned, as
-S4a's, so the job's own pool does not move it after the event.
+figures are not scaled, but bounded like every figure. Its leave-free level
+is solved once, at the event, and then held, as S4a's, so the job's own pool
+does not move it afterwards; a scenario's own events keep their re-solve. On
+a scenario without a hog of its own, one starts holding 0.
 
 **Descriptors.** `fds.jsonl` is written here, in the JSONL form
 `analyze.py::read_fds` accepts — which closes, for the bare-host case, the gap
@@ -342,7 +343,8 @@ hog.py [--target gpu|ram|mps] [--device N] [--chunk-mb 128] [--tick 0.5]
 ```
 
 Control endpoint on `127.0.0.1:<port>`: `GET /state`, `POST /set?mb=N`,
-`POST /set?leave_free=N`, `POST /resume`, `POST /stop`. Every allocation is
+`POST /set?leave_free=N` (with `&pin=1`, solved once and then held),
+`POST /resume`, `POST /stop`. Every allocation is
 touched; every shrink calls `torch.cuda.empty_cache()` so the driver sees the
 release. An allocation failure increments `oom`, records `last_error`, holds
 what it got and keeps serving. A leave-free fill re-reads free once per GiB

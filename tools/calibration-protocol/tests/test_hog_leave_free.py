@@ -21,6 +21,9 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import sys
+import threading
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 HOG = Path(__file__).resolve().parents[1] / "hog.py"
@@ -165,3 +168,36 @@ def test_the_fill_stops_once_free_reaches_the_level():
     made.override, made.override_mb = "mb", 6144
     made.apply(made.resolve_target(1.0))
     assert made.held_mb == 6144
+
+
+def test_a_pinned_leave_free_level_is_solved_once():
+    """`/set?leave_free=N&pin=1` keeps its first solve; without `pin` the
+    level is re-solved every `--reeval` (0 s here)."""
+
+    class _Backend(hog.Backend):
+        name = "fake"
+        free = 10000
+
+        def chunk_bytes(self) -> int:
+            return 128 * MIB
+
+        def free_total_mb(self):
+            return self.free, 24576
+
+    backend = _Backend()
+    args = argparse.Namespace(touch_period=0.0, progress_every=2.0, reeval=0.0)
+    made = hog.Hog(backend, hog.Idle(), args)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), hog.make_handler(made))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        for query, solves in (("leave_free=4096", [5904, 3904]),
+                              ("leave_free=4096&pin=1", [5904, 5904])):
+            backend.free = 10000
+            urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/set?{query}",
+                method="POST")).close()
+            first = made.resolve_target(0.0)
+            backend.free = 8000
+            assert [first, made.resolve_target(1.0)] == solves
+    finally:
+        server.shutdown()

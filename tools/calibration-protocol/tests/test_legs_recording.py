@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import tomllib
 import types
 import urllib.error
@@ -282,6 +283,21 @@ def test_a_signal_while_a_child_starts_is_raised_once_it_is_registered(
     (child,) = supervisor.children
     supervisor.stop_all()
     assert child.popen.returncode == -signal.SIGTERM
+
+
+def test_a_hog_event_from_the_command_line_asks_for_a_pinned_level(
+        monkeypatch):
+    sent = []
+    monkeypatch.setattr(legs, "request", lambda url, **kw: sent.append(url))
+    monkeypatch.setattr(legs, "get_json",
+                        lambda url, **kw: {"target_mb": 0, "held_mb": 0})
+    leg = types.SimpleNamespace(events=[], hog_url=lambda path: path)
+    leg.mark = lambda name, **detail: legs.Leg.mark(leg, name, **detail)
+    legs.Leg.drive_hog(leg, [
+        {"at_s": 0.0, "label": "cli", "leave_free_mb": 4096, "pinned": True},
+        {"at_s": 0.0, "label": "own", "leave_free_mb": 2048, "pinned": False},
+    ], time.monotonic())
+    assert sent == ["/set?leave_free=4096&pin=1", "/set?leave_free=2048"]
 
 
 def test_job_start_is_marked_before_the_post(monkeypatch, tmp_path):

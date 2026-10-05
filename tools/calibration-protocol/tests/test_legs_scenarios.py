@@ -69,7 +69,7 @@ def test_a_hog_event_squeezes_during_the_job_on_any_hog_target(capsys,
     assert argv[argv.index("--checks") + 1] == "all"
     hog = plan["hog"]
     assert (hog["target"], hog["schedule"], hog["reeval"]) == (
-        "ram", ["hold", "0"], 999999)
+        "ram", ["hold", "0"], None)
     assert [(row["at_s"], row.get("leave_free_mb"), row.get("mb"))
             for row in plan["hog_events"]] == [
         (30.0, None, 2048), (60.0, 4096, None), (120.0, None, 0),
@@ -84,7 +84,8 @@ def test_a_hog_event_squeezes_during_the_job_on_any_hog_target(capsys,
                       "--no-dotenv", "--dry-run",
                       "--hog-event", "at=95,leave_free=1024"]) == 0
     plan = json.loads(capsys.readouterr().out)
-    assert [row["at_s"] for row in plan["hog_events"]] == [90.0, 95.0, 100.0]
+    assert [(row["at_s"], row["pinned"]) for row in plan["hog_events"]] == [
+        (90.0, False), (95.0, True), (100.0, False)]
     assert plan["hog"]["reeval"] is None
 
     # A scenario with its own check list is judged on the hog too.

@@ -29,7 +29,8 @@ Usage
     hog.py idle                             # allocate nothing; drive it over HTTP
 
 Common options are in `--help`; `--port N` adds an HTTP control endpoint on
-127.0.0.1 (`GET /state`, `POST /set?mb=N|leave_free=N`, `/resume`, `/stop`).
+127.0.0.1 (`GET /state`, `POST /set?mb=N|leave_free=N[&pin=1]`, `/resume`,
+`/stop`; `pin=1` solves a leave-free level once, then holds).
 
 Output schema (JSONL)
 ---------------------
@@ -731,6 +732,8 @@ class Hog:
         self._leave_free_target: Optional[int] = None
         #: the free level a leave-free target was solved for, else None
         self.leave_mb: Optional[int] = None
+        #: a `/set` with `pin=1`: its leave-free target is solved once
+        self.pinned = False
         # Re-touch bookkeeping (see `touch`).
         self.touch_period = float(getattr(args, "touch_period", 0.0) or 0.0)
         self._touch_cursor = 0
@@ -882,9 +885,8 @@ class Hog:
 
     def _leave_free(self, leave_mb: int) -> int:
         now = time.monotonic()
-        if (
-            self._leave_free_target is not None
-            and now - self._last_free_eval < self.args.reeval
+        if self._leave_free_target is not None and (
+            self.pinned or now - self._last_free_eval < self.args.reeval
         ):
             return self._leave_free_target
         free_mb, _ = self.backend.free_total_mb()
@@ -939,9 +941,10 @@ def make_handler(hog: Hog):  # noqa: ANN201
                 else:
                     self._reply(400, {"error": "need ?mb= or ?leave_free="})
                     return
+                hog.pinned = "pin" in query
                 self._reply(200, hog.state())
             elif path == "/resume":
-                hog.override = None
+                hog.override, hog.pinned = None, False
                 hog._leave_free_target = None
                 hog._last_free_eval = -1e9
                 self._reply(200, hog.state())

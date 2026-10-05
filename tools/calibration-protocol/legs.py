@@ -179,6 +179,9 @@ class HogEvent:
     leave_free_mb: Optional[int] = None
     hold_mb: Optional[int] = None
     label: str = ""
+    #: a `--hog-event`: a leave-free level is solved once, at the event, and
+    #: then held, on any scenario
+    pinned: bool = False
 
 
 def parse_hog_event(text: str) -> HogEvent:
@@ -197,9 +200,10 @@ def parse_hog_event(text: str) -> HogEvent:
         mib = int(value)
         if math.isfinite(at_s) and at_s >= 0 and mib >= 0:
             if key == "leave_free":
-                return HogEvent(at_s, leave_free_mb=mib, label=text)
+                return HogEvent(at_s, leave_free_mb=mib, label=text,
+                                pinned=True)
             if key == "hold":
-                return HogEvent(at_s, hold_mb=mib, label=text)
+                return HogEvent(at_s, hold_mb=mib, label=text, pinned=True)
     except (KeyError, ValueError):
         pass
     raise argparse.ArgumentTypeError(
@@ -1241,7 +1245,8 @@ class Leg:
         out: List[Dict[str, Any]] = []
         for event in self.scenario.events:
             at = event.label or f"t+{event.at_s:g}s"
-            row: Dict[str, Any] = {"at_s": event.at_s, "label": event.label}
+            row: Dict[str, Any] = {"at_s": event.at_s, "label": event.label,
+                                   "pinned": event.pinned}
             if (event.leave_free_mb is not None
                     or event.leave_free_fraction is not None):
                 fraction = event.leave_free_fraction
@@ -1278,10 +1283,11 @@ class Leg:
             query = ("leave_free=%d" % event["leave_free_mb"]
                      if "leave_free_mb" in event else "mb=%d" % event["mb"])
             self.mark("hog_event_request", label=event["label"], query=query,
-                      at_s=event["at_s"])
+                      at_s=event["at_s"], pinned=event["pinned"])
             try:
-                request(self.hog_url(f"/set?{query}"), method="POST",
-                        timeout=10)
+                request(self.hog_url(f"/set?{query}"
+                                     + ("&pin=1" if event["pinned"] else "")),
+                        method="POST", timeout=10)
             except HttpError as exc:
                 self.mark("hog_event_failed", label=event["label"],
                           error=str(exc))
@@ -1937,9 +1943,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         type=parse_hog_event,
                         metavar="at=S,leave_free=MIB|hold=MIB|release",
                         help="a hog change S seconds after the job is posted, "
-                             "beside the scenario's own (repeatable); on a "
-                             "scenario without a hog, one starts holding 0 "
-                             "and keeps what each event solved for")
+                             "beside the scenario's own (repeatable); a "
+                             "leave-free level is solved once, at the event, "
+                             "and then held; on a scenario without a hog, one "
+                             "starts holding 0")
     parser.add_argument("--hog-port", type=int, default=6401)
     parser.add_argument("--seed-calibration",
                         help="calibration.toml copied into the fresh root "
@@ -2077,10 +2084,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if wants_hog:
             scenario = replace(scenario, events=timed)
         else:
-            # Pinned: the job's own pool changing `free` after an event does
-            # not move the hog.
-            scenario = replace(scenario, events=timed, hog_hold_fraction=0.0,
-                               hog_reeval=999999)
+            scenario = replace(scenario, events=timed, hog_hold_fraction=0.0)
             if scenario.checks != "all":
                 scenario = replace(scenario, checks=scenario.checks
                                    + ",hog_tracking,deflation_recovery")
