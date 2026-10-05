@@ -152,6 +152,9 @@ def test_a_unified_gpu_totals_and_prices_its_gtt(tmp_path):
     (tmp_path / "proc/meminfo").write_text(
         "MemAvailable: 1048576 kB\nSReclaimable: 2097152 kB\n")
     assert rocm_sysfs.memory_mb(host.roots, gpu) == (512 + 65536, 256 + 0)
+    # Without an SReclaimable row, MemAvailable alone.
+    (tmp_path / "proc/meminfo").write_text("MemAvailable: 2097152 kB\n")
+    assert rocm_sysfs.memory_mb(host.roots, gpu) == (512 + 65536, 256 + 2048)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
         "fdinfo", {700: 1224}, [])
     assert legs.rocm_total_mb(0, host.roots) == 66048

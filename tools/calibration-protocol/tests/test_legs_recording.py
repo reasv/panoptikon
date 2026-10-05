@@ -294,3 +294,16 @@ def test_an_ignored_sighup_stays_ignored():
     finally:
         for sig, handler in saved.items():
             signal.signal(sig, handler)
+
+
+def test_job_start_is_marked_before_the_post(monkeypatch, tmp_path):
+    leg = types.SimpleNamespace(
+        db="cal", base="http://gw", events=[], path=lambda name: tmp_path / name,
+        args=types.SimpleNamespace(job_cap=None),
+        wait_for_queue=lambda cap: "drained", job_items=lambda model, tag: 1)
+    leg.mark = lambda name, **detail: legs.Leg.mark(leg, name, **detail)
+    seen = []
+    monkeypatch.setattr(legs, "save", lambda url, path, method="GET": seen.append(
+        (method, [event["event"] for event in leg.events])) or 200)
+    legs.Leg.run_job(leg, "m", "")
+    assert seen[0] == ("POST", ["job_start"])
