@@ -588,6 +588,13 @@ pub(crate) async fn run_dispatcher(
                     }
                 }
             }
+            // A request whose caller has gone is never sent. The bounds hold
+            // for the cap they were computed for.
+            queue.retain(|queued| !queued.request.reply.is_closed());
+            if queue.front().is_none_or(|front| front.shape.cap != cap) {
+                free.push(replica);
+                continue;
+            }
             let shapes: Vec<WindowItem> = queue.iter().map(|queued| queued.shape).collect();
             let take = window_take_count(&shapes, bounds);
             let window: Vec<Queued> = queue.drain(..take).collect();
@@ -2344,6 +2351,34 @@ mod tests {
         assert_eq!(sizes, [1, 2, 2]);
         tx.send(DispatchMsg::Shutdown).expect("shutdown");
         dispatcher.await.expect("dispatcher exits");
+    }
+
+    /// A request whose caller has gone is never sent: here it would kill the
+    /// worker and fail the request queued with it.
+    #[tokio::test]
+    async fn a_request_whose_caller_has_gone_is_never_sent() {
+        let harness = one_replica(32_768, "dieflag_test", item_cost(8)).await;
+        // Queued before the dispatcher task first runs.
+        let mut answers: Vec<_> = [json!(0), json!({"die": true}), json!(2)]
+            .into_iter()
+            .map(|data| {
+                let (reply, answer) = oneshot::channel();
+                harness
+                    .tx
+                    .send(DispatchMsg::Predict(DispatchRequest {
+                        inputs: vec![json_input(data)],
+                        max_batch: None,
+                        reply,
+                    }))
+                    .expect("queued");
+                answer
+            })
+            .collect();
+        drop(answers.remove(1));
+        for answer in answers {
+            answer.await.expect("replied").expect("the worker lives");
+        }
+        harness.shutdown().await;
     }
 
     /// A [`DispatchMsg::Trim`] naming a free replica is delivered to it and
