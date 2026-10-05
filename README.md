@@ -456,6 +456,8 @@ environment, and in `/etc/environment` for login sessions (SSH on a rented GPU
 host). A shell with neither starts an empty root in its own directory and
 reports no Python environment; pass both there:
 `panoptikon --root /app --config /app/config/server/docker.toml accelerator`.
+`PANOPTIKON_*` values you override with `-e` reach `docker exec` but not SSH
+sessions, which read `/etc/environment`: pass `--root`/`--config` there too.
 
 **File descriptors.** Local inference is served over loopback HTTP by the same
 process that calls it, so each batch item in flight costs about two sockets;

@@ -102,7 +102,11 @@ RUN mkdir -p data && chown -R ubuntu:ubuntu /app
 # inherit ENV; they read /etc/environment.
 ENV PANOPTIKON_ROOT=/app
 ENV PANOPTIKON_CONFIG_PATH=/app/config/server/docker.toml
-RUN env | grep '^PANOPTIKON_' >> /etc/environment
+# uv hardlinks from its cache by default, which fails on some storage drivers
+# (overlay2 on ZFS); copying always works. Set so a `panoptikon setup` re-run
+# inside the container, login sessions included, inherits it.
+ENV UV_LINK_MODE=copy
+RUN env | grep -E '^(PANOPTIKON_|UV_LINK_MODE=)' >> /etc/environment
 USER ubuntu
 # The NVIDIA container runtime injects driver libraries per this list; its
 # default when unset is compute,utility, which OMITS libnvidia-encode — video
@@ -119,11 +123,6 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 # same layer: the uv wheel cache (the venv keeps its own copies) and the
 # ffmpeg/ffprobe binaries setup's static-ffmpeg prefetch downloads — the
 # image wires the apt ffmpeg via [jobs] in docker.toml instead.
-#
-# uv hardlinks from its cache by default, which fails on some storage drivers
-# (overlay2 on ZFS); copying always works. An ENV so a `panoptikon setup`
-# re-run inside the container inherits it.
-ENV UV_LINK_MODE=copy
 ARG ACCELERATOR=cpu
 RUN panoptikon setup --accelerator ${ACCELERATOR} \
     && cp /app/runtime/venv/lib/python*/site-packages/pypdfium2_raw/libpdfium.so \
