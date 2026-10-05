@@ -1800,7 +1800,9 @@ metadata.description = "echo fixture"
                 .send(Ok(Vec::new()))
                 .expect("the caller waits");
         };
-        let (answer, ()) = tokio::join!(predict, dispatcher);
+        let both = async { tokio::join!(predict, dispatcher) };
+        let joined = tokio::time::timeout(Duration::from_secs(10), both).await;
+        let (answer, ()) = joined.expect("predict reached the dispatcher");
         answer.expect("answered");
     }
 
