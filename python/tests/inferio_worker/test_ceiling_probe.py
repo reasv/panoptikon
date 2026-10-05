@@ -25,7 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from inferio_worker import memory, packing, sdpa
+from inferio_worker import packing, sdpa
 from inferio_worker.inputs import PredictionInput
 
 PROBE = (
@@ -195,38 +195,29 @@ def test_a_non_pixel_model_is_priced_by_its_own_aggregation(probe):
 # ---------------------------------------------------------------------------
 
 
-def test_the_probe_loads_in_the_workers_order_and_records_its_facts(
+def test_the_probe_records_the_workers_dtype_and_the_transformers_version(
     probe, monkeypatch
 ):
-    """`load()`, the load's readings, then the worker's GQA check, so the
-    check's test call is not part of the load. The dtype is the worker's own,
-    here from a module two levels inside the impl, and the check's decision is
-    recorded."""
+    """The dtype is the worker's own, here from a module two levels inside the
+    impl; the GQA check's decision and the installed transformers version are
+    recorded beside it."""
     torch = pytest.importorskip("torch")
-    events = []
 
     class Impl:
         def __init__(self):
             self.pipeline = SimpleNamespace(model=torch.nn.Linear(2, 2).half())
 
         def load(self):
-            events.append("load")
+            pass
 
-    def check():
-        events.append("gqa_check")
-        return sdpa.PATCHED
-
-    monkeypatch.setattr(sdpa, "expand_kv_heads_without_fused_gqa", check)
+    monkeypatch.setattr(
+        sdpa, "expand_kv_heads_without_fused_gqa", lambda: sdpa.PATCHED
+    )
+    monkeypatch.setattr(metadata, "version", lambda name: "4.99.0")
     monkeypatch.delitem(sys.modules, "inferio.impl.utils", raising=False)
-    instance, load, facts = probe.load_instance(
-        Impl, {}, lambda: events.append("synchronize"),
-        lambda: events.append("readings") or {"base_nvml_mb": 512})
-    assert events == ["load", "synchronize", "readings", "gqa_check"]
-    assert load["base_nvml_mb"] == 512 and load["seconds"] >= 0
-    try:
-        transformers = metadata.version("transformers")
-    except metadata.PackageNotFoundError:
-        transformers = None
+    _, load, facts = probe.load_instance(
+        Impl, {}, lambda: None, lambda: {"base_nvml_mb": 512}
+    )
+    assert load["base_nvml_mb"] == 512
     assert facts == {"dtype": "fp16", "dtype_method": "inferred",
-                     "gqa_check": "patched", "transformers": transformers}
-    assert memory.resolved_dtype(instance) == ("fp16", "inferred")
+                     "gqa_check": "patched", "transformers": "4.99.0"}

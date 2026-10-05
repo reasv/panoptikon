@@ -16,10 +16,12 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from functools import lru_cache
 from types import ModuleType
 from typing import Any, NamedTuple
+
+from inferio_worker import sdpa
 
 logger = logging.getLogger("inferio_worker.memory")
 
@@ -1957,6 +1959,19 @@ def finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("base measurement failed: %s", exc)
         return {}
+
+
+def after_load(price: Callable[[], Any]) -> tuple[Any, str]:
+    """The step after `instance.load()`, shared by the worker and the ceiling
+    probe: refuse a pin that named nothing (RuntimeError), price the load with
+    `price()`, then run the GQA check, after the pricing so its test call is
+    not part of the load. Returns `price()`'s result and the check's decision.
+    """
+    problem = pinned_device_missing()
+    if problem is not None:
+        raise RuntimeError(problem)
+    priced = price()
+    return priced, sdpa.expand_kv_heads_without_fused_gqa()
 
 
 def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:

@@ -721,20 +721,24 @@ def _boundary_key(record: Dict[str, Any]) -> str:
 
 def load_instance(impl_cls: Any, config: Dict[str, Any], synchronize: Any,
                   readings: Any) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
-    """Construct and load the impl in the worker's order: `load()`, the load's
-    `readings()`, then the worker's post-load GQA check, whose test call is
-    not part of the load. Returns the instance, the `load` block and the
-    worker's facts about the load: `dtype`/`dtype_method`, the check's
-    decision (`gqa_check`) and the installed transformers version."""
+    """Construct and `load()` the impl, then the worker's own post-load step
+    (`memory.after_load`) with the load priced by `synchronize()` and
+    `readings()`. Returns the instance, the `load` block and the worker's
+    facts about the load: `dtype`/`dtype_method`, the GQA check's decision
+    (`gqa_check`) and the installed transformers version."""
     from importlib import metadata
 
-    from inferio_worker import memory, sdpa
+    from inferio_worker import memory
 
     started = time.monotonic()
     instance = impl_cls(**config)
     instance.load()
-    synchronize()
-    load = {"seconds": round(time.monotonic() - started, 3), **readings()}
+
+    def price() -> Dict[str, Any]:
+        synchronize()
+        return {"seconds": round(time.monotonic() - started, 3), **readings()}
+
+    load, gqa_check = memory.after_load(price)
     dtype, dtype_method = memory.resolved_dtype(instance)
     try:
         transformers = metadata.version("transformers")
@@ -742,8 +746,7 @@ def load_instance(impl_cls: Any, config: Dict[str, Any], synchronize: Any,
         transformers = None
     return instance, load, {
         "dtype": dtype, "dtype_method": dtype_method,
-        "gqa_check": sdpa.expand_kv_heads_without_fused_gqa(),
-        "transformers": transformers,
+        "gqa_check": gqa_check, "transformers": transformers,
     }
 
 
