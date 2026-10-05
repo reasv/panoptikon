@@ -1226,8 +1226,11 @@ def test_deflation_still_listed_after_its_repay_time_fails():
     behind a sample came after the previous sample's stamp."""
     key = f"{MODEL}@{GPU}"
 
-    def negative(level, t_wall):
-        return {**_deflation(level, "negative"), "t_wall": t_wall}
+    def negative(level, t_wall, outcome="negative", reason="oom"):
+        line = {**_deflation(level, outcome), "t_wall": t_wall,
+                "level": "WARN"}
+        line["fields"]["reason"] = reason
+        return line
 
     def judge(*samples, declared=False, log=None):
         ctx = _utilization_context(
@@ -1259,14 +1262,28 @@ def test_deflation_still_listed_after_its_repay_time_fails():
     assert judge(*late[:1], (160.5, _deflated_health(0))).verdict == "PASS"
     assert judge((129.0, refused), (130.0, _deflated_health(1)),
                  (160.5, _deflated_health(0))).verdict == "PASS"
-    # A later negative restarts the clock; one logged after the sample does
-    # not; neither does a clean window.
+    # A later negative restarts the clock; one logged 9.5 s after the sample
+    # does not; neither does a clean window.
     assert judge(*late, log=[negative(2, 100.0),
                              negative(2, 140.0)]).verdict == "WARN"
     assert judge(*late, log=[negative(2, 100.0),
                              negative(2, 170.0)]).verdict == "FAIL"
     assert judge(*late, log=[negative(2, 100.0),
                              {**_deflation(2), "t_wall": 150.0}]).verdict == "FAIL"
+    # A death on a unified-memory device restarts it; a discrete one carries
+    # no reason and does not.
+    assert judge(*late, log=[negative(2, 100.0), negative(
+        2, 140.0, "worker_died", "unified_device_death")]).verdict == "WARN"
+    assert judge(*late, log=[negative(2, 100.0), {
+        **_deflation(2, "worker_died"), "t_wall": 140.0}]).verdict == "FAIL"
+    # A settle line stamped just after a read that already saw its level.
+    assert judge((159.95, refused), (160.05, _deflated_health(2)),
+                 log=[negative(1, 100.0),
+                      negative(2, 160.06)]).verdict != "FAIL"
+    # One logged between the two stamps restarts it too.
+    assert judge((160.0, refused), (163.0, _deflated_health(2)),
+                 log=[negative(2, 100.0),
+                      negative(2, 162.5)]).verdict == "WARN"
     # Two replicas on one GPU: the one at 3 is due at 190, not when the other
     # one's level 1 is.
     replicas = _deflated_health(2)

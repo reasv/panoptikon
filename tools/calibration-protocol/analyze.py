@@ -1626,6 +1626,10 @@ CLEAN_WINDOWS_TO_RESTORE = 3
 #: on a `/health` read (the ledger's `DEFLATION_REPAY_SECS`).
 DEFLATION_REPAY_S = 30
 
+#: A settle line is logged after the ledger lock drops, so it can be stamped
+#: after a health read that already saw its level.
+SETTLE_LOG_SLACK_S = 2.0
+
 
 def check_deflation_recovery(ctx: Context) -> Verdict:
     """Deflation must be repaid: one level per `CLEAN_WINDOWS_TO_RESTORE`
@@ -1639,7 +1643,8 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
 
     FAIL: a level outlasted `CLEAN_WINDOWS_TO_RESTORE` clean windows, or a
     worker is still deflated in a health sample read `DEFLATION_REPAY_S` per
-    level after its last negative (time alone repays it by then). WARN:
+    level after the negative that set it (the latest due time on the model
+    and GPU): time alone repays it by then. WARN:
     still deflated when the recording ended.
     `--expect-deflated` declares a model that OOMs on every batch: ending
     deflated is then its result, and never deflating FAILs."""
@@ -1692,27 +1697,29 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
     peak = max(row["peak"] for row in rows.values())
     held = {key: row["held"] for key, row in rows.items() if row["held"]}
     stuck = {key: row for key, row in rows.items() if row["final"] > 0}
-    # A negative starts the repay clock, and each /health read repays one
-    # level per whole DEFLATION_REPAY_S since it: by time alone, the levels a
-    # negative left are repaid by `t + level * DEFLATION_REPAY_S`. Replicas
-    # share a key, so a key is due at the latest of its negatives' due times.
+    # A settle line with a `reason` (a negative, or a death on a unified-
+    # memory device) restarts the repay clock, and each /health read repays
+    # one level per whole DEFLATION_REPAY_S since it: by time alone, the
+    # levels it left are repaid by `t + level * DEFLATION_REPAY_S`. Replicas
+    # share a key, so a key is due at the latest of those due times.
     # healthrec reads one sample at a time and stamps it after the read, so
     # the read behind a sample came after the previous sample's stamp.
-    negatives: Dict[str, List[Tuple[float, float]]] = {}
+    restarts: Dict[str, List[Tuple[float, float]]] = {}
     for event in ctx.log_events(settle):
         fields = event["fields"]
-        if (fields.get("outcome") == "negative" and "deflation" in fields
+        if ("reason" in fields and "deflation" in fields
                 and event["t_wall"] is not None):
-            negatives.setdefault(f"{fields.get('model')}@{fields.get('gpu')}",
-                                 []).append((event["t_wall"], event["t_wall"]
-                                             + int(fields["deflation"])
-                                             * DEFLATION_REPAY_S))
+            restarts.setdefault(f"{fields.get('model')}@{fields.get('gpu')}",
+                                []).append((event["t_wall"], event["t_wall"]
+                                            + int(fields["deflation"])
+                                            * DEFLATION_REPAY_S))
     unrepaid: Dict[str, float] = {}
     for previous, sample in zip(ctx.health_samples, ctx.health_samples[1:]):
         for worker in (sample.get("health") or {}).get("workers") or []:
             key = f"{worker['inference_id']}@{worker.get('gpu_uuid')}"
-            due = max((repaid for logged, repaid in negatives.get(key, [])
-                       if logged <= sample["t_wall"]), default=math.inf)
+            due = max((repaid for logged, repaid in restarts.get(key, [])
+                       if logged <= sample["t_wall"] + SETTLE_LOG_SLACK_S),
+                      default=math.inf)
             if (not declared and int(worker.get("deflation") or 0)
                     and previous["t_wall"] >= due):
                 unrepaid[key] = max(unrepaid.get(key, 0.0),
