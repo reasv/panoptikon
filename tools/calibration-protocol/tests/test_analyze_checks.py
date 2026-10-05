@@ -444,7 +444,10 @@ def test_the_denominator_is_bounded_by_the_room_a_hog_leaves():
     assert utilization(trial=True) == ("PASS", 64)
     # The least grant reserve comes off too: 512 - (3800 + 200 + 1024) / 20.
     assert utilization(budget=70) == ("FAIL", 312)
-    assert utilization(budget=70, reserves=(1100, 1024)) == ("PASS", 260)
+    assert utilization(budget=70, reserves=(1024, 1100)) == ("PASS", 260)
+    # With no hog held, the boundary stands.
+    assert utilization(states=[(10.0, 0)],
+                       reserves=(1024, 1024)) == ("FAIL", 512)
     assert utilization(gpus=(GPU, "GPU-1111")) == ("FAIL", 512)
     assert utilization(hog_gpu="GPU-1111") == ("FAIL", 512)
     assert utilization(target="ram") == ("FAIL", 512)
