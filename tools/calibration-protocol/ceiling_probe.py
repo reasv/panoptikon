@@ -1010,6 +1010,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     def empty_cache() -> None:
         (torch.mps if mps else torch.cuda).empty_cache()
 
+    free_before = device_free_mb()
     if not mps:
         import torch
 
@@ -1019,8 +1020,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise SystemExit(
                 f"ceiling_probe: pinned NVML GPU {gpu['uuid']}, but torch "
                 f"{torch.__version__} is a ROCm build")
-
-    free_before = device_free_mb()
 
     def load_readings() -> Dict[str, Any]:
         free_after = device_free_mb()

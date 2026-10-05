@@ -645,23 +645,30 @@ def test_the_tools_pin_like_the_spawner(tmp_path, monkeypatch, capsys):
         assert (plan["backend"], plan["device"]) == (backend, device)
 
 
-@pytest.mark.parametrize("hip,bdf,nvml_gpus", [
-    ("6.4.43482", BDF_03, []), (None, BDF_03, []), ("6.4.43482", None, []),
-    ("6.4.43482", BDF_03, [{"index": 0, "uuid": "GPU-1"}])],
-    ids=["ok", "hip None", "BDF mismatch", "hip on NVML"])
-def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(tmp_path, monkeypatch,
-                                                         hip, bdf, nvml_gpus):
+@pytest.mark.parametrize("hip,bdf,nvml_gpus,count,exit_calls", [
+    ("6.4.43482", BDF_03, [], 1, None), (None, BDF_03, [], 1, []),
+    ("6.4.43482", BDF_03, [], 2, []),
+    ("6.4.43482", BDF_03, [{"index": 0, "uuid": "GPU-1"}], 1, []),
+    ("6.4.43482", None, [], 1, ["synchronize"]),
+    ("6.4.43482", BDF_0C, [], 1, ["synchronize"])],
+    ids=["ok", "hip None", "count 2", "hip on NVML", "BDF mismatch",
+         "another GPU"])
+def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(
+        tmp_path, monkeypatch, hip, bdf, nvml_gpus, count, exit_calls):
     """A run to the JSON on a fixture ROCm host, with a stand-in torch and an
-    impl that allocates nothing. The probe exits unless torch is a ROCm build
-    and the model loaded on the pinned GPU (`memory.device_bdf()`), and exits
-    on a ROCm torch pinned to an NVML GPU."""
+    impl that allocates nothing. The probe exits before the load unless torch
+    is a ROCm build that sees one device, and exits on a ROCm torch pinned to
+    an NVML GPU; it exits after the priced load, before any batch, unless the
+    model loaded on the pinned GPU (`memory.device_bdf()`). `exit_calls` is
+    the torch.cuda calls made before the exit, None for a full run."""
     host = Host(tmp_path / "host").gpu(1, 0x0300)
     host.kfd(os.getpid(), 1, 300 * MIB)
     pinned = probe.Rocm.pinned
     monkeypatch.setattr(probe.Rocm, "pinned", lambda device, environ: pinned(
         device, environ, host.roots))
     monkeypatch.setattr(probe, "Nvml", lambda: types.SimpleNamespace(
-        gpus=lambda: nvml_gpus, error=None, handle_for_uuid=lambda uuid: None))
+        gpus=lambda: nvml_gpus, error=None, handle_for_uuid=lambda uuid: None,
+        free_mb=lambda handle: None))
     _clear_visibility(monkeypatch)
     monkeypatch.setattr(sys, "path", [str(HERE.parents[1] / "python"), *sys.path])
     (tmp_path / "item.txt").write_text("a caption")
@@ -670,11 +677,14 @@ def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(tmp_path, monkeypatch,
     (tmp_path / "registry.toml").write_text(
         '[group.probe.inference_ids.echo]\nconfig.impl_class = "echo_test"\n')
     zero = lambda *args: 0  # noqa: E731
+    calls = []
     cuda = types.SimpleNamespace(
-        device_count=lambda: 1, get_device_name=lambda index: "AMD Radeon",
+        device_count=lambda: count, get_device_name=lambda index: "AMD Radeon",
         is_available=lambda: True, is_initialized=lambda: False,
-        synchronize=lambda: None, empty_cache=lambda: None,
-        reset_peak_memory_stats=lambda: None, memory_reserved=zero,
+        synchronize=lambda: calls.append("synchronize"),
+        empty_cache=lambda: None,
+        reset_peak_memory_stats=lambda: calls.append("reset_peak_memory_stats"),
+        memory_reserved=zero,
         memory_allocated=zero, max_memory_reserved=zero,
         max_memory_allocated=zero)
     torch = types.SimpleNamespace(
@@ -692,9 +702,10 @@ def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(tmp_path, monkeypatch,
         from inferio_worker import memory
 
         monkeypatch.setattr(memory, "device_bdf", lambda: bdf)
-        if hip is None or bdf is None or nvml_gpus:
+        if exit_calls is not None:
             with pytest.raises(SystemExit):
                 probe.main(argv)
+            assert calls == exit_calls
             return
         assert probe.main(argv) == 0
         assert (os.environ["HIP_VISIBLE_DEVICES"],

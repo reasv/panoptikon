@@ -1712,7 +1712,6 @@ def test_the_pin_tripwire_fires_only_on_our_own_placement(monkeypatch) -> None:
             assert (memory.pinned_device_missing() is not None) is fires
 
 
-
 @pytest.mark.parametrize("problem", [None, "pinned to a device torch lacks"])
 def test_after_load_checks_the_pin_then_prices_then_checks_gqa(
     monkeypatch, problem
@@ -1741,6 +1740,7 @@ def test_after_load_checks_the_pin_then_prices_then_checks_gqa(
         with pytest.raises(RuntimeError):
             memory.after_load(price)
         assert events == ["pin"]
+
 
 def test_the_unified_signal_is_an_address_the_worker_verifies(
     tmp_path, monkeypatch
