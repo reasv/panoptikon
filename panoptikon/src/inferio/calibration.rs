@@ -2522,6 +2522,8 @@ sample_delta_mb = [80, 160]
         relink(own.path());
         store.record(update("clip/vit", "fp16", 1.0));
         store.record(update("clip/vit", "fp16", 1.1));
+        let own_mode = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(own.path().join("share/inferio"), own_mode).unwrap();
         let reasons = reasons.lock().unwrap();
         let share = data.join("share");
         let expected = Some(not_writable_by_current_user(&share, owner));
