@@ -1219,22 +1219,59 @@ def test_deflation_that_never_recovers_passes_only_when_declared():
 
 def test_deflation_still_listed_after_its_repay_time_fails():
     """A negative left the worker at 2 at t=100: time alone repays both
-    levels by t=160, and a sample interval later it must be listed at 0."""
-    def judge(t_wall, interval=0.5, declared=False, log=None):
-        ctx = _utilization_context(
-            [{"kind": "header", "interval_s": interval},
-             {**_deflated_health(1), "t_wall": t_wall}],
-            log=[_deflation(2, "negative")] if log is None else log)
-        ctx.args.expect_deflated = declared
-        return analyze.check_deflation_recovery(ctx).verdict
+    levels by t=160. healthrec stamps a sample after its read, so the read
+    behind a sample came after the previous sample's stamp."""
+    key = f"{MODEL}@{GPU}"
 
-    assert judge(160.5) == "FAIL"
-    assert judge(160.4) == "WARN"
-    assert judge(160.5, interval=1.0) == "WARN"
-    assert judge(160.5, declared=True) == "PASS"
-    assert judge(160.5, log=[]) == "WARN"
-    later = {**_deflation(2, "negative"), "t_wall": 140.0}
-    assert judge(160.5, log=[_deflation(2, "negative"), later]) == "WARN"
+    def negative(level, t_wall):
+        return {**_deflation(level, "negative"), "t_wall": t_wall}
+
+    def judge(*samples, declared=False, log=None):
+        ctx = _utilization_context(
+            [{**sample, "t_wall": t_wall} for t_wall, sample in samples],
+            log=[negative(2, 100.0)] if log is None else log)
+        ctx.args.expect_deflated = declared
+        return analyze.check_deflation_recovery(ctx)
+
+    refused = {"kind": "sample", "health": {"ok": False}}
+    unloaded = {"kind": "sample", "health": {"ok": True, "workers": []}}
+    late = ((160.0, refused), (160.5, _deflated_health(1)))
+    verdict = judge(*late)
+    assert (verdict.verdict, verdict.numbers["unrepaid_s"]) == (
+        "FAIL", {key: 0.0})
+    # Not only the last sample: the model unloads, or the gateway stops first.
+    for end in (unloaded, refused):
+        assert judge(*late, (161.0, end)).verdict == "FAIL"
+    # The worst lateness: a level-1 negative at 180 is due at 210.
+    verdict = judge(*late, (165.0, _deflated_health(1)),
+                    (170.0, _deflated_health(1)), (210.0, refused),
+                    (210.5, _deflated_health(1)),
+                    log=[negative(2, 100.0), negative(1, 180.0)])
+    assert verdict.numbers["unrepaid_s"] == {key: 5.0}
+    # Read before t=160, though stamped after it.
+    assert judge((159.9, refused), (160.5, _deflated_health(1))).verdict == "WARN"
+    assert judge(*late, declared=True).verdict == "PASS"
+    assert judge(*late, log=[]).verdict == "WARN"
+    # Listed at 0 once repaid, after a sample deflated in time.
+    assert judge(*late[:1], (160.5, _deflated_health(0))).verdict == "PASS"
+    assert judge((129.0, refused), (130.0, _deflated_health(1)),
+                 (160.5, _deflated_health(0))).verdict == "PASS"
+    # A later negative restarts the clock; one logged after the sample does
+    # not; neither does a clean window.
+    assert judge(*late, log=[negative(2, 100.0),
+                             negative(2, 140.0)]).verdict == "WARN"
+    assert judge(*late, log=[negative(2, 100.0),
+                             negative(2, 170.0)]).verdict == "FAIL"
+    assert judge(*late, log=[negative(2, 100.0),
+                             {**_deflation(2), "t_wall": 150.0}]).verdict == "FAIL"
+    # Two replicas on one GPU: the one at 3 is due at 190, not when the other
+    # one's level 1 is.
+    replicas = _deflated_health(2)
+    replicas["health"]["workers"].append(
+        {"inference_id": MODEL, "gpu_uuid": GPU, "deflation": 0})
+    verdict = judge((139.9, refused), (140.0, replicas),
+                    log=[negative(3, 100.0), negative(1, 101.0)])
+    assert verdict.numbers["unrepaid_s"] == {}
 
 
 # --- job_outcome and legs.json -------------------------------------------------

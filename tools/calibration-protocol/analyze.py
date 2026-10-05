@@ -1635,10 +1635,10 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
     restarts at 0, as its replacement registers undeflated without a line.
     A worker that left keeps its last value.
 
-    FAIL: a level outlasted `CLEAN_WINDOWS_TO_RESTORE` clean windows, or the
-    last health sample lists a worker deflated at least `DEFLATION_REPAY_S`
-    per level its last negative left, plus one sample interval, after that
-    negative. WARN: still deflated when the recording ended.
+    FAIL: a level outlasted `CLEAN_WINDOWS_TO_RESTORE` clean windows, or a
+    worker is still deflated in a health sample read `DEFLATION_REPAY_S` per
+    level after its last negative (time alone repays it by then). WARN:
+    still deflated when the recording ended.
     `--expect-deflated` declares a model that OOMs on every batch: ending
     deflated is then its result, and never deflating FAILs."""
     settle = "settled a granted window"
@@ -1692,27 +1692,29 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
     stuck = {key: row for key, row in rows.items() if row["final"] > 0}
     # A negative starts the repay clock, and each /health read repays one
     # level per whole DEFLATION_REPAY_S since it: by time alone, the levels a
-    # negative left are repaid that many DEFLATION_REPAY_S after it. One
-    # sample interval (healthrec's default without a header) covers the read.
-    negatives: Dict[str, Tuple[float, int]] = {}
+    # negative left are repaid by `t + level * DEFLATION_REPAY_S`. Replicas
+    # share a key, so a key is due at the latest of its negatives' due times.
+    # healthrec reads one sample at a time and stamps it after the read, so
+    # the read behind a sample came after the previous sample's stamp.
+    negatives: Dict[str, List[Tuple[float, float]]] = {}
     for event in ctx.log_events(settle):
         fields = event["fields"]
         if (fields.get("outcome") == "negative" and "deflation" in fields
                 and event["t_wall"] is not None):
-            negatives[f"{fields.get('model')}@{fields.get('gpu')}"] = (
-                event["t_wall"], int(fields["deflation"]))
-    header = next((row for row in ctx.healthrec
-                   if row.get("kind") == "header"), {})
-    interval = float(header.get("interval_s") or 0.5)
-    last = ctx.health_samples[-1] if ctx.health_samples else {}
+            negatives.setdefault(f"{fields.get('model')}@{fields.get('gpu')}",
+                                 []).append((event["t_wall"], event["t_wall"]
+                                             + int(fields["deflation"])
+                                             * DEFLATION_REPAY_S))
     unrepaid: Dict[str, float] = {}
-    for worker in (last.get("health") or {}).get("workers") or []:
-        key = f"{worker['inference_id']}@{worker.get('gpu_uuid')}"
-        since, level = negatives.get(key, (last["t_wall"], 0))
-        if (not declared and int(worker.get("deflation") or 0)
-                and last["t_wall"] - since
-                >= level * DEFLATION_REPAY_S + interval):
-            unrepaid[key] = round(last["t_wall"] - since, 1)
+    for previous, sample in zip(ctx.health_samples, ctx.health_samples[1:]):
+        for worker in (sample.get("health") or {}).get("workers") or []:
+            key = f"{worker['inference_id']}@{worker.get('gpu_uuid')}"
+            due = max((repaid for logged, repaid in negatives.get(key, [])
+                       if logged <= sample["t_wall"]), default=math.inf)
+            if (not declared and int(worker.get("deflation") or 0)
+                    and previous["t_wall"] >= due):
+                unrepaid[key] = max(unrepaid.get(key, 0.0),
+                                    round(previous["t_wall"] - due, 1))
     if held or unrepaid or (declared and not peak):
         verdict = "FAIL"
     else:
@@ -1722,9 +1724,8 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
         + ", ".join(f"{key}={row['peak']}" for key, row in rows.items()) + ")"
         + "".join(f"; {key} held {level} through {CLEAN_WINDOWS_TO_RESTORE} "
                   f"clean windows" for key, level in held.items())
-        + "".join(f"; {key} still deflated {age} s after its last negative, "
-                  f"past the time that repays it" for key, age in
-                  unrepaid.items())
+        + "".join(f"; {key} still deflated {late} s after time alone "
+                  f"repays it" for key, late in unrepaid.items())
         + f"; at the end {len(stuck)} worker(s) still deflated"
         + "".join(f"; {key} at {row['final']}"
                   + (f" after {row['clean']} clean window(s) at that level"
