@@ -1252,12 +1252,11 @@ impl's own kernels have said they cannot execute at this corpus's shapes.
   the model is resident its footprint is *ours*, `external` falls, and the card
   reports a nominal few hundred MiB of share — 292 MiB against a base of 31 150
   on the 5090, where all 8 002 out-of-memory lines were priced windows. A
-  one-item out-of-memory with room to spare stays the backstop's
-  ordinary business. Where the driver spills instead of failing (WDDM's
-  sysmem fallback), a one-unit window whose batch spilled right after a pool
-  release is live memory that does not fit, and counts as such an
-  out-of-memory window does, against the same room. Unpriced (`none`) models have no admission, are outside this rule
-  and still run, releasing the pool once per window.
+  one-item out-of-memory with room to spare stays the backstop's ordinary
+  business. Where the driver spills instead of failing (WDDM's sysmem fallback),
+  a one-unit window whose batch spilled counts as such an out-of-memory window
+  does, against the same room. Unpriced (`none`) models have no admission, are
+  outside this rule and still run, releasing the pool once per window.
 
   **The pre-fit price of one item.** With no slope there is no measured
   price for one item, and both obvious stand-ins fail. The whole base

@@ -348,7 +348,6 @@ impl VramLedger {
         let mut saw_oom = false;
         let mut saw_collapse = false;
         let mut saw_spill = false;
-        let mut saw_spill_after_release = false;
         let mut new_watermark = watermark;
         let mut fit_samples: Vec<FitSample> = Vec::new();
         let mut ram_samples: Vec<FitSample> = Vec::new();
@@ -564,9 +563,6 @@ impl VramLedger {
                 saw_oom |= oom;
                 saw_collapse |= collapse;
                 saw_spill |= measurement.spilled;
-                // Started from a released pool: the spill is live memory.
-                saw_spill_after_release |=
-                    measurement.spilled && measurement.regrow_after.is_some();
                 continue;
             }
             if collapse_suppressed || uncorroborated {
@@ -905,7 +901,6 @@ impl VramLedger {
             oom: saw_oom,
             throughput_collapse: saw_collapse,
             spill: saw_spill,
-            spill_after_release: saw_spill_after_release,
             oom_evidence: trusted_oom,
             oom_samples: trusted_ooms,
             clamps,

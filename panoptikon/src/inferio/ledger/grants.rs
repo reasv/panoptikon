@@ -557,14 +557,13 @@ impl VramLedger {
         {
             Self::raise_pool_margin_locked(&mut state, worker, charge);
         }
-        // A one-item OOM, or a batch that spilled right after a pool release
-        // (live memory that does not fit), with less room than one item
+        // A one-item OOM or spill to system RAM, with less room than one item
         // costs; see [`OOM_WINDOWS_AT_FLOOR`].
         let unrunnable = self.note_floor_oom_locked(
             &mut state,
             worker,
             charge,
-            frame_oom.is_some() || ingested.oom || ingested.spill_after_release || died,
+            frame_oom.is_some() || ingested.oom || ingested.spill || died,
             died,
             matches!(outcome, WindowOutcome::Responded { .. }) && !responded_negative,
         );

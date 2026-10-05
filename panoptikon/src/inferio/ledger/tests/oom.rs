@@ -591,10 +591,9 @@ fn a_one_item_oom_with_room_to_spare_condemns_nothing() {
 }
 
 /// Where a full GPU spills to system RAM, a model too big for it never runs
-/// out of memory: a one-item window whose batch spilled right after a pool
-/// release is a strike as a one-item out-of-memory window is, with less room
-/// than one item costs and not with room to spare. A spill with no release
-/// before it is no strike.
+/// out of memory: a one-item window whose batch spilled is a strike as a
+/// one-item out-of-memory window is, with less room than one item costs and
+/// not with room to spare.
 #[test]
 fn one_item_windows_that_spill_with_no_room_for_one_condemn_the_replica() {
     for (total_mb, base_mb, free_mb, condemned) in
@@ -621,11 +620,16 @@ fn one_item_windows_that_spill_with_no_room_for_one_condemn_the_replica() {
                 }]);
             token.finish(WindowOutcome::Responded { oom: None })
         };
-        assert!(window(None).is_none(), "no release before it");
-        for _ in 1..OOM_WINDOWS_AT_FLOOR {
-            assert!(window(Some("spill")).is_none());
+        // What the worker sends: the first spill releases the pool, only the
+        // next batch carries the re-grow, and a spill that persists releases
+        // nothing more.
+        let regrow_after = [None, Some("spill"), None];
+        assert_eq!(regrow_after.len(), OOM_WINDOWS_AT_FLOOR as usize);
+        let (last, earlier) = regrow_after.split_last().unwrap();
+        for regrow_after in earlier {
+            assert!(window(*regrow_after).is_none());
         }
-        let verdict = window(Some("spill"));
+        let verdict = window(*last);
         assert_eq!(verdict.is_some(), condemned, "{total_mb} MiB card");
         if let Some(verdict) = verdict {
             assert_eq!(verdict.base_mb, base_mb);
