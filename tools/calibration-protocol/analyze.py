@@ -1563,7 +1563,8 @@ def check_grant_safety(ctx: Context) -> Verdict:
 def check_failures(ctx: Context) -> Verdict:
     """OOM negatives, worker deaths and merged-window fallbacks in the log.
 
-    Counts within `--expect-ooms` / `--expect-deaths` PASS. Where the log
+    Counts within `--expect-ooms` / `--expect-deaths` PASS; a declared
+    count with none seen FAILs, as the fault never fired. Where the log
     names the tier that classified each negative, it is tallied as
     `source/trust`; a recording predating that line carries none, and the
     clause is then omitted rather than reported empty."""
@@ -1600,7 +1601,8 @@ def check_failures(ctx: Context) -> Verdict:
             tier_clause += f", {unnamed} unnamed"
     expected_ooms = ctx.args.expect_ooms
     expected_deaths = ctx.args.expect_deaths
-    bad = ooms > expected_ooms or deaths > expected_deaths
+    unfired = (expected_ooms and not ooms) or (expected_deaths and not deaths)
+    bad = ooms > expected_ooms or deaths > expected_deaths or unfired
     return Verdict(
         "failures", "FAIL" if bad else "PASS",
         f"{ooms} OOM negatives (expected <= {expected_ooms}), "
@@ -1608,7 +1610,7 @@ def check_failures(ctx: Context) -> Verdict:
         f"{unified_deaths} unified-memory-device death negatives, "
         f"{deaths} fatal worker deaths (expected <= {expected_deaths}), "
         f"{len(fallbacks)} merged-window fallbacks ({oom_fallbacks} OOM)"
-        f"{tier_clause}",
+        f"{tier_clause}" + ("; declared, none seen" if unfired else ""),
         {"negative_reasons": reasons, "worker_deaths": deaths,
          "fallbacks": len(fallbacks), "oom_fallbacks": oom_fallbacks,
          **({"oom_tiers": tiers} if tiers else {}),

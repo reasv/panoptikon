@@ -166,6 +166,12 @@ def test_each_fixture_passes_at_its_thresholds_and_fails_one_past(tmp_path,
         over = _verdicts(tmp_path / flag, model, expect,
                          {**at, flag: at[flag] + 1})
         assert over[check] == "FAIL", flag
+    # A declared fault that never fired.
+    for flag in ("--expect-ooms", "--expect-deaths"):
+        if at[flag]:
+            none = _verdicts(tmp_path / f"none{flag}", model, expect,
+                             {**at, flag: 0})
+            assert none["failures"] == "FAIL", flag
 
 
 def test_a_job_that_did_not_drain_fails_job_outcome(tmp_path):
