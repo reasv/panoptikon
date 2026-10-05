@@ -1201,10 +1201,28 @@ fn validate_new_database_name(name: &str) -> Result<(), ApiError> {
     responses((status = 200, body = DesktopSetupCompleteResponse))
 )]
 pub(crate) async fn complete_setup(
-    mut conn: DbConnection<ReadOnly>,
+    conn: DbConnection<ReadOnly>,
     Json(request): Json<DesktopSetupCompleteRequest>,
 ) -> Result<Json<DesktopSetupCompleteResponse>, ApiError> {
     ensure_desktop_managed()?;
+    let (index_db, user_data_db) = configure_setup(conn, request).await?;
+    let _ = continuous_scan::notify_config_change(&index_db).await;
+    let _ = cron::notify_config_change(&index_db).await;
+    let jobs = match cron::run_initial_cronjob(&index_db, &user_data_db).await? {
+        cron::CronRunOutcome::Enqueued(jobs) => jobs,
+        cron::CronRunOutcome::Skipped => Vec::new(),
+    };
+
+    Ok(Json(DesktopSetupCompleteResponse { index_db, jobs }))
+}
+
+/// Validates the setup, creates the new index database if one is named, and
+/// saves the index database's config. Returns the index and user-data
+/// database names.
+async fn configure_setup(
+    mut conn: DbConnection<ReadOnly>,
+    request: DesktopSetupCompleteRequest,
+) -> Result<(String, String), ApiError> {
     // Setup writes throughout (and may run migration DDL), so refuse up front
     // in readonly mode.
     crate::db::ensure_migrations_allowed()?;
@@ -1318,14 +1336,7 @@ pub(crate) async fn complete_setup(
     config.enable_cron_job = request.enable_cron_job;
     config.cron_schedule = request.cron_schedule;
     store.save(&index_db, &config)?;
-    let _ = continuous_scan::notify_config_change(&index_db).await;
-    let _ = cron::notify_config_change(&index_db).await;
-    let jobs = match cron::run_initial_cronjob(&index_db, &user_data_db).await? {
-        cron::CronRunOutcome::Enqueued(jobs) => jobs,
-        cron::CronRunOutcome::Skipped => Vec::new(),
-    };
-
-    Ok(Json(DesktopSetupCompleteResponse { index_db, jobs }))
+    Ok((index_db, user_data_db))
 }
 
 /// Carries existing per-model batch caps across a wizard rerun, which no longer
@@ -1344,6 +1355,43 @@ fn merge_cron_batch_caps(incoming: Vec<CronJob>, existing: &[CronJob]) -> Vec<Cr
             job
         })
         .collect()
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+
+    /// Setup with a new index database creates it with the selected
+    /// user-data database and saves the chosen folder in its config.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setup_creates_a_new_index_database_with_the_selected_user_data() {
+        use sqlx::Connection as _;
+        let env = crate::test_utils::test_data_dir();
+        let folder = tempfile::tempdir().unwrap();
+        let folder = folder.path().to_string_lossy().into_owned();
+        let conn = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let conn = DbConnection::for_tests(conn, "default", "setup_user");
+        let request = serde_json::from_value(json!({
+            "included_folders": [folder],
+            "new_index_db": "setup_index",
+        }))
+        .unwrap();
+        let names = configure_setup(conn, request).await.unwrap();
+        let user_data = env.path().join("user_data/setup_user.db");
+        let created = user_data.is_file();
+        let config = SystemConfigStore::from_env().load("setup_index").unwrap();
+        std::fs::remove_dir_all(env.path().join("index/setup_index")).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", user_data.display()));
+        }
+        let expected = ("setup_index".to_owned(), "setup_user".to_owned());
+        assert_eq!(names, expected);
+        assert!(created);
+        let folders = crate::db::system_config::normalize_folder_list(&[folder]);
+        assert_eq!(config.included_folders, folders);
+    }
 }
 
 #[cfg(test)]
