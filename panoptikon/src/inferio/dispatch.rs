@@ -82,6 +82,9 @@ pub(crate) struct DispatchRequest {
     pub inputs: Vec<WorkerInput>,
     /// The user's max batch size: bounds items, never units.
     pub max_batch: Option<u32>,
+    /// Items the caller has left to send after this request; `None`: it
+    /// does not say.
+    pub remaining_items: Option<u64>,
     pub reply: oneshot::Sender<Result<Vec<WorkerOutput>>>,
 }
 
@@ -584,6 +587,11 @@ pub(crate) async fn run_dispatcher(
             // Granted before hand-off, so no headroom is promised twice.
             let plan = match &replica.admission {
                 Some(admission) => {
+                    admission.note_remaining_items(
+                        (window.iter().chain(&queue))
+                            .filter_map(|queued| queued.request.remaining_items)
+                            .max(),
+                    );
                     let grant = admission.request_grant_byte_bound(
                         window_units,
                         cap,
@@ -1418,6 +1426,7 @@ mod tests {
             DispatchRequest {
                 inputs: Vec::new(),
                 max_batch: Some(0),
+                remaining_items: None,
                 reply,
             },
             &item_cost(8),
@@ -1919,6 +1928,7 @@ mod tests {
                 .send(DispatchMsg::Predict(DispatchRequest {
                     inputs,
                     max_batch,
+                    remaining_items: None,
                     reply,
                 }))
                 .expect("queued");
@@ -1964,6 +1974,7 @@ mod tests {
                     let request = DispatchRequest {
                         inputs: vec![input],
                         max_batch: None,
+                        remaining_items: None,
                         reply,
                     };
                     enqueue(request, &cost)
@@ -2040,6 +2051,7 @@ mod tests {
                                 file: None,
                             }],
                             max_batch: None,
+                            remaining_items: None,
                             reply,
                         }))
                         .is_err()
@@ -2108,6 +2120,7 @@ mod tests {
             tx.send(DispatchMsg::Predict(DispatchRequest {
                 inputs,
                 max_batch: None,
+                remaining_items: None,
                 reply,
             }))
             .expect("queued");
@@ -2181,6 +2194,36 @@ mod tests {
             (4 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK, 4, true),
             "the same grant, published against the GPU's own memory"
         );
+    }
+
+    /// Before each grant the ledger is told the largest count of items left
+    /// that a request in the window or the queue carries, and `None` once no
+    /// request carries one.
+    #[tokio::test]
+    async fn the_largest_count_of_items_left_reaches_the_ledger() {
+        let harness = one_replica(32_768, "batchsize_test", item_cost(8)).await;
+        let send = |left: Option<u64>| {
+            let (reply, answer) = oneshot::channel();
+            harness
+                .tx
+                .send(DispatchMsg::Predict(DispatchRequest {
+                    inputs: json_inputs(1),
+                    max_batch: None,
+                    remaining_items: left,
+                    reply,
+                }))
+                .expect("queued");
+            answer
+        };
+        let answers: Vec<_> = [Some(5), Some(900), None].into_iter().map(send).collect();
+        for answer in answers {
+            answer.await.expect("replied").expect("succeeded");
+        }
+        let left = || harness.ledger.remaining_items_for_test(harness.worker_id);
+        assert_eq!(left(), Some(900));
+        send(None).await.expect("replied").expect("succeeded");
+        assert_eq!(left(), None);
+        harness.shutdown().await;
     }
 
     /// End to end on the priced path: `max_batch` becomes the grant's
@@ -2268,6 +2311,7 @@ mod tests {
                 tx.send(DispatchMsg::Predict(DispatchRequest {
                     inputs: json_inputs(1),
                     max_batch: None,
+                    remaining_items: None,
                     reply,
                 }))
                 .expect("queued");
@@ -2425,6 +2469,7 @@ mod tests {
                         file: None,
                     }],
                     max_batch: None,
+                    remaining_items: None,
                     reply,
                 }))
                 .expect("queued");
@@ -2469,6 +2514,7 @@ mod tests {
                     file: None,
                 }],
                 max_batch: None,
+                remaining_items: None,
                 reply,
             }))
             .expect("queued");
@@ -2512,6 +2558,7 @@ mod tests {
                     file: None,
                 }],
                 max_batch: None,
+                remaining_items: None,
                 reply,
             },
             answer,

@@ -895,6 +895,7 @@ async fn embed_text_query(
                 // No prewarm opinion either (absent = true): search-driven
                 // loads are exactly what the warm pool exists for.
                 None,
+                None,
                 &inputs,
             )
             .await
@@ -932,6 +933,7 @@ async fn embed_image_query(
                 None,
                 // No prewarm opinion either (absent = true): search-driven
                 // loads are exactly what the warm pool exists for.
+                None,
                 None,
                 &inputs,
             )

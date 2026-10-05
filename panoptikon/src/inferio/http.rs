@@ -425,6 +425,9 @@ struct PredictParams {
     max_batch: Option<u32>,
     /// Additive: lazy prewarm hint, as on load (absent = true).
     prewarm: Option<bool>,
+    /// Additive: items the caller has left to send after this request; a
+    /// batch size probe starts only while they repay it.
+    remaining_items: Option<u64>,
 }
 
 // Doc-only OpenAPI shapes; the handlers do not (de)serialize them.
@@ -882,6 +885,7 @@ async fn predict(
             params.ttl_seconds,
             params.max_batch,
             params.prewarm,
+            params.remaining_items,
             inputs,
         )
         .await
@@ -1682,7 +1686,7 @@ metadata.description = "echo fixture"
             .expect("client builds");
         let predict = async |inputs: &[InferenceInput]| {
             client
-                .predict("echo/test", "key", 10, -1, None, None, inputs)
+                .predict("echo/test", "key", 10, -1, None, None, None, inputs)
                 .await
                 .expect("predict")
         };
@@ -1961,6 +1965,7 @@ metadata.description = "kills its worker on predict"
                 60,
                 None,
                 Some(false),
+                None,
                 &[InferenceInput::new(json!({"text": "hi"}), None)],
             )
             .await
@@ -2038,6 +2043,7 @@ metadata.description = "batch size reporter"
                         10,
                         -1,
                         max_batch,
+                        None,
                         None,
                         &[InferenceInput::new(json!(index), None)],
                     )
@@ -2227,6 +2233,7 @@ config.impl_class = "echo_test"
                 -1,
                 None,
                 Some(false),
+                None,
                 &[InferenceInput::new(json!(1), None)],
             )
             .await

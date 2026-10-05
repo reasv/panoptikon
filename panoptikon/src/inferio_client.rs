@@ -1432,6 +1432,7 @@ impl InferenceApiClient {
         ttl_seconds: i64,
         max_batch: Option<u32>,
         prewarm: Option<bool>,
+        remaining_items: Option<u64>,
         inputs: &[InferenceInput],
     ) -> Result<PredictResponse> {
         let url = format!("{}/predict/{}", self.api_url, inference_id);
@@ -1447,6 +1448,10 @@ impl InferenceApiClient {
         // Lazy prewarm hint (design doc §8); absent means true.
         if let Some(prewarm) = prewarm {
             query.push(("prewarm", prewarm.to_string()));
+        }
+        // Items the caller has left to send after this request.
+        if let Some(items) = remaining_items {
+            query.push(("remaining_items", items.to_string()));
         }
         let mut attempts: u32 = 0;
         loop {
@@ -2321,7 +2326,16 @@ pub(crate) mod tests {
             // One round trip first, so first-contact allocations are paid.
             probe.release(true);
             client
-                .predict("g/model", "k", 1, 60, None, None, &[text_input("warm")])
+                .predict(
+                    "g/model",
+                    "k",
+                    1,
+                    60,
+                    None,
+                    None,
+                    None,
+                    &[text_input("warm")],
+                )
                 .await
                 .expect("the stub answers");
             probe.release(false);
@@ -2340,7 +2354,7 @@ pub(crate) mod tests {
                 // below what we offer is a *wait*, not an error.
                 inflight.spawn(async move {
                     client
-                        .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+                        .predict("g/model", "k", 1, 60, None, None, None, &[text_input("x")])
                         .await
                         .expect("the stub answers");
                 });
@@ -2525,7 +2539,7 @@ pub(crate) mod tests {
                 let client = client.clone();
                 inflight.spawn(async move {
                     client
-                        .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+                        .predict("g/model", "k", 1, 60, None, None, None, &[text_input("x")])
                         .await
                         .expect("the stub answers");
                 });
@@ -2683,7 +2697,7 @@ pub(crate) mod tests {
 
     async fn predict_one(client: InferenceApiClient) -> Result<PredictResponse> {
         client
-            .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+            .predict("g/model", "k", 1, 60, None, None, None, &[text_input("x")])
             .await
     }
 
@@ -3654,7 +3668,7 @@ pub(crate) mod tests {
         let runtime = Arc::clone(&client.endpoint);
         let predicting = tokio::spawn(async move {
             client
-                .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+                .predict("g/model", "k", 1, 60, None, None, None, &[text_input("x")])
                 .await
         });
 
@@ -3818,7 +3832,7 @@ pub(crate) mod tests {
 
         let started = std::time::Instant::now();
         let err = client
-            .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+            .predict("g/model", "k", 1, 60, None, None, None, &[text_input("x")])
             .await
             .expect_err("nothing is listening");
         let elapsed = started.elapsed();
@@ -3878,7 +3892,7 @@ pub(crate) mod tests {
 
         let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
         let err = client
-            .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+            .predict("g/model", "k", 1, 60, None, None, None, &[text_input("x")])
             .await
             .expect_err("the answer never arrives whole");
 
@@ -3971,11 +3985,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// `max_batch` and `prewarm` appear as query params exactly when the
-    /// caller passes `Some`, on both predict and load, never as empty values.
-    /// Captured off a stub because the client builds the URLs internally.
+    /// `max_batch`, `prewarm` and `remaining_items` appear as query params
+    /// exactly when the caller passes `Some`, on both predict and load, never
+    /// as empty values. Captured off a stub because the client builds the
+    /// URLs internally.
     #[tokio::test]
-    async fn urls_carry_max_batch_and_prewarm_only_when_some() {
+    async fn urls_carry_the_optional_params_only_when_some() {
         let captured: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink = |captured: &Arc<StdMutex<Vec<String>>>, body: Value| {
             let captured = Arc::clone(captured);
@@ -4006,9 +4021,18 @@ pub(crate) mod tests {
         let client = InferenceApiClient::new_with_metadata_cache(format!("http://{addr}"), false)
             .expect("client builds");
         let inputs = [InferenceInput::new(json!({"text": "x"}), None)];
-        for (max_batch, prewarm) in [(Some(7), Some(false)), (None, None)] {
+        for (max_batch, prewarm, left) in [(Some(7), Some(false), Some(30)), (None, None, None)] {
             client
-                .predict("group/model", "key", 10, -1, max_batch, prewarm, &inputs)
+                .predict(
+                    "group/model",
+                    "key",
+                    10,
+                    -1,
+                    max_batch,
+                    prewarm,
+                    left,
+                    &inputs,
+                )
                 .await
                 .expect("predict");
         }
@@ -4027,11 +4051,13 @@ pub(crate) mod tests {
         for (index, fragment, present) in [
             (0usize, "max_batch=7", true),
             (0, "prewarm=false", true),
+            (0, "remaining_items=30", true),
             (0, "cache_key=key", true),
             (0, "lru_size=10", true),
             (0, "ttl_seconds=-1", true),
             (1, "max_batch", false),
             (1, "prewarm", false),
+            (1, "remaining_items", false),
             (2, "prewarm=false", true),
             (3, "prewarm", false),
         ] {

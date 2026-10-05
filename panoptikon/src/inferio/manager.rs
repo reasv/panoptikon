@@ -914,6 +914,7 @@ impl ModelManager {
         ttl_seconds: i64,
         max_batch: Option<u32>,
         prewarm_hint: Option<bool>,
+        remaining_items: Option<u64>,
         inputs: Vec<WorkerInput>,
     ) -> Result<Vec<WorkerOutput>> {
         let (tx, pin) = self
@@ -931,6 +932,7 @@ impl ModelManager {
         let request = DispatchRequest {
             inputs,
             max_batch,
+            remaining_items,
             reply: reply_tx,
         };
         // Both arms are [`Unattempted`]: the request never ran.
@@ -2288,6 +2290,7 @@ metadata.cost.seed_units = 1000000
                 ttl_seconds,
                 max_batch,
                 None,
+                None,
                 vec![data_input(value)],
             )
             .await
@@ -3307,6 +3310,7 @@ metadata.cost.seed_units = 1000000
                 "k",
                 10,
                 -1,
+                None,
                 None,
                 None,
                 vec![data_input(json!(1)), data_input(json!(2))],

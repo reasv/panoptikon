@@ -409,7 +409,11 @@ struct PreparedItem {
 
 #[derive(Default)]
 struct JobCounters {
+    /// Items the job set out to process.
+    total: i64,
     processed: i64,
+    /// Items whose inference is under way.
+    inferring: i64,
     image_files: i64,
     video_files: i64,
     other_files: i64,
@@ -875,7 +879,10 @@ async fn run_extraction_job_inner(
     })
     .await?;
 
-    let counters = Arc::new(Mutex::new(JobCounters::default()));
+    let counters = Arc::new(Mutex::new(JobCounters {
+        total: total_remaining,
+        ..JobCounters::default()
+    }));
     let abort = Arc::new(JobAbort::default());
     // From here on the job owns a `data_log` row, and every way out finalizes
     // it: the block's result on both paths, and the drop guard on cancellation.
@@ -1398,6 +1405,7 @@ async fn process_item(
         return Ok(());
     }
     let mut requeued = false;
+    counters.lock().await.inferring += 1;
     let inference_result = run_item_inference(
         &model.setter_name,
         pool,
@@ -1410,6 +1418,7 @@ async fn process_item(
         &mut requeued,
     )
     .await;
+    counters.lock().await.inferring -= 1;
 
     // A transient failure: no ledger row, the item stays selectable next run.
     let note_transient = async |stage: &str, error: String, detail: String| {
@@ -2063,7 +2072,12 @@ async fn predict_units(
     inputs: &[InferenceInput],
 ) -> anyhow::Result<PredictResponse> {
     let permits = unit_slots.acquire(inputs.len() as u32).await?;
-    let inference_span = counters.lock().await.inference_time.start();
+    // The items the job has not finished, less those in inference.
+    let (inference_span, remaining) = {
+        let counters = counters.lock().await;
+        let remaining = counters.total - counters.processed - counters.inferring;
+        (counters.inference_time.start(), remaining.max(0) as u64)
+    };
     let response = pool
         .predict(
             setter_name,
@@ -2073,6 +2087,7 @@ async fn predict_units(
             max_batch,
             // Batch jobs opt out of lazy prewarming (design doc §8).
             Some(false),
+            Some(remaining),
             inputs,
         )
         .await;
@@ -3446,6 +3461,49 @@ mod tests {
             );
             previous = ceiling;
         }
+    }
+
+    /// A predict tells the server how many items the job has left to send:
+    /// those it has not finished, less those in inference, this one's
+    /// included.
+    #[tokio::test]
+    async fn a_predict_carries_the_items_the_job_has_left_to_send() {
+        use crate::config::InferenceEndpointConfig;
+        use axum::extract::RawQuery;
+        use axum::routing::post;
+        use std::sync::Mutex as StdMutex;
+
+        let seen = Arc::new(StdMutex::new(String::new()));
+        let handler_seen = Arc::clone(&seen);
+        let app = axum::Router::new().route(
+            "/api/inference/predict/{group}/{model}",
+            post(move |RawQuery(query): RawQuery| {
+                *handler_seen.lock().unwrap() = query.unwrap_or_default();
+                async { axum::Json(serde_json::json!({"outputs": [{"ok": true}]})) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let pool = InferencePool::new(vec![InferenceEndpointConfig {
+            base_url: format!("http://{addr}"),
+            weight: 1.0,
+            use_for_jobs: true,
+        }])
+        .expect("pool builds");
+        let counters = Arc::new(Mutex::new(JobCounters {
+            total: 10,
+            processed: 3,
+            inferring: 2,
+            ..JobCounters::default()
+        }));
+        let input = InferenceInput::new(serde_json::json!({"i": 0}), None);
+        let budget = Arc::new(UnitBudget::new(1_000));
+        predict_units("group/model", &pool, &budget, None, &counters, &[input])
+            .await
+            .expect("answered");
+        let query = seen.lock().unwrap().clone();
+        assert!(query.contains("remaining_items=5"), "{query}");
     }
 
     /// The budget tracks the server's figure in both directions, bounded by

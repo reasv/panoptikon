@@ -905,8 +905,7 @@ impl Admission {
 
     /// The items this replica's job has left to send, `None` when unknown: a
     /// batch size probe starts only in a job long enough to repay it
-    /// ([`PROBE_PAYBACK_WINDOWS`]). No caller reports it yet.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// ([`PROBE_PAYBACK_WINDOWS`]).
     pub fn note_remaining_items(&self, items: Option<u64>) {
         let mut state = self.ledger.lock();
         if let Some(entry) = state.workers.get_mut(&self.worker) {

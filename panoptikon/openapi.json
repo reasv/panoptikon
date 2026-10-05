@@ -1631,6 +1631,17 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "name": "remaining_items",
+            "in": "query",
+            "description": "Additive: items the caller has left to send after this request; a\nbatch size probe starts only while they repay it.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
           }
         ],
         "requestBody": {

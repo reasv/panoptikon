@@ -179,6 +179,12 @@ impl VramLedger {
         self.lock().workers.get(&worker)?.last_trim_at
     }
 
+    /// The items `worker`'s job has left, as the caller last said.
+    #[cfg(test)]
+    pub(in crate::inferio) fn remaining_items_for_test(&self, worker: u64) -> Option<u64> {
+        self.lock().workers.get(&worker)?.remaining_items
+    }
+
     /// Install a working size as measured here.
     #[cfg(test)]
     pub(super) fn set_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {

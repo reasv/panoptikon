@@ -693,6 +693,7 @@ config.devices = ["cpu"]
                 -1,
                 None,
                 None,
+                None,
                 vec![data_input(json!(1))],
             )
             .await
@@ -730,6 +731,7 @@ config.devices = ["cpu"]
                 "k",
                 10,
                 -1,
+                None,
                 None,
                 None,
                 vec![data_input(json!(1))],
@@ -782,6 +784,7 @@ config.devices = ["cpu"]
                 "k",
                 10,
                 -1,
+                None,
                 None,
                 None,
                 vec![data_input(json!(1))],
@@ -864,6 +867,7 @@ config.devices = ["cpu"]
                 -1,
                 None,
                 None,
+                None,
                 vec![data_input(json!(1))],
             )
             .await
@@ -898,6 +902,7 @@ config.devices = ["cpu"]
                 "k",
                 10,
                 -1,
+                None,
                 None,
                 None,
                 vec![data_input(json!(1))],
@@ -960,6 +965,7 @@ config.devices = ["cpu"]
                 -1,
                 None,
                 None,
+                None,
                 vec![data_input(json!(1))],
             )
             .await
@@ -991,6 +997,7 @@ config.devices = ["cpu"]
                 "k",
                 10,
                 -1,
+                None,
                 None,
                 None,
                 vec![data_input(json!(1))],
@@ -1035,6 +1042,7 @@ config.devices = ["cpu"]
                 -1,
                 None,
                 None,
+                None,
                 vec![data_input(json!(1))],
             )
             .await
@@ -1070,6 +1078,7 @@ config.devices = ["cpu"]
                 "k",
                 10,
                 -1,
+                None,
                 None,
                 None,
                 vec![data_input(json!(1))],
@@ -1113,6 +1122,7 @@ config.devices = ["cpu"]
                 "k",
                 10,
                 -1,
+                None,
                 None,
                 None,
                 vec![data_input(json!(1))],

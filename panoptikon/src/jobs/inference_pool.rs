@@ -78,6 +78,7 @@ impl InferencePool {
         ttl_seconds: i64,
         max_batch: Option<u32>,
         prewarm: Option<bool>,
+        remaining_items: Option<u64>,
         inputs: &[InferenceInput],
     ) -> Result<PredictResponse> {
         let mut tried = Vec::new();
@@ -98,6 +99,7 @@ impl InferencePool {
                     ttl_seconds,
                     max_batch,
                     prewarm,
+                    remaining_items,
                     inputs,
                 )
                 .await
