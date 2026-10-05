@@ -1226,10 +1226,9 @@ mod tests {
         );
     }
 
-    /// While its writer holds it open, a cache folder the current user cannot
-    /// write opens with a warning and still serves the artifacts it holds.
-    /// Read-only modes stand in for a folder another user owns, since a test
-    /// cannot put a cache database in one.
+    /// While its writer holds it open, a cache folder another user owns opens
+    /// with a warning and still serves the artifacts it holds. Read-only modes
+    /// stand in for that folder, since a test cannot put a cache database in one.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_cache_folder_it_cannot_write_still_serves_its_artifacts() {
