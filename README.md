@@ -435,16 +435,17 @@ on your client (see above).
 
 **Running as another user.** The container runs as the image's `ubuntu` user
 (uid 1000). `/app` and `/home/ubuntu` belong to that user and to group 0 with
-the same permissions, and `HOME` is `/home/ubuntu` for every user, so root
-(`--user 0`, `user: "0"`, or a host that only runs containers as root) and any
-other uid (`--user 1234`, which Docker runs in group 0) work too, with models
-on the cache volume.
+the same permissions, and `HOME` is `/home/ubuntu` in every process the
+container starts, so root (`--user 0`, `user: "0"`, or a host that only runs
+containers as root) and any other uid in group 0 (`--user 1234`, or
+`--user <uid>:0` when you give a group or the uid exists in the image) work
+too, with models on the cache volume.
 
-What one user writes to the volumes belongs to that user: once that includes a
-database, a start as another user stops with an error naming the owner. The
-same happens to a uid other than 1000 on volumes created by an older image,
-which group 0 cannot write. Hand the volumes to the user that will run the
-container first (here the default user; `1234:0` for `--user 1234`):
+What one user writes to the volumes belongs to that user, and another user
+cannot write to it: a start on another user's database stops with an error
+naming the owner, and model downloads into another user's cache fail. Hand the
+volumes to the user that will run the container first (here the default user;
+`1234:0` for `--user 1234`):
 
 ```bash
 docker compose run --rm --user 0 --entrypoint chown panoptikon \

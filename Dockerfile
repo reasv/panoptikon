@@ -103,8 +103,8 @@ ENV PANOPTIKON_CONFIG_PATH=/app/config/server/docker.toml
 # inside the container, login sessions included, inherits it.
 ENV UV_LINK_MODE=copy
 RUN env | grep -E '^(PANOPTIKON_|UV_LINK_MODE=)' >> /etc/environment
-# HOME is fixed so every user, root included, keeps its model, EasyOCR and
-# Chrome caches under /home/ubuntu (the cache volume).
+# HOME is the same for every process the container starts, root included, so
+# models download to the cache volume (/home/ubuntu/.cache).
 ENV HOME=/home/ubuntu
 # The NVIDIA container runtime injects driver libraries per this list; its
 # default when unset is compute,utility, which OMITS libnvidia-encode — video
