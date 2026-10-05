@@ -331,11 +331,11 @@ impl VramLedger {
     /// only such a window moves it. A batch began the paging when its window
     /// was granted before it, ran a batch at its budget (`ran_full`), and
     /// grew our pool past the largest pool a paging window of the episode
-    /// left; on the CPU device, when instead its unit budget was at least
-    /// the smaller of the bound and the size asked, and it was granted after
-    /// the last such window. So paging another program began while our
-    /// batches ran inside the pool they held, or refilled it, leaves the
-    /// bound.
+    /// left; on the CPU device, or without pool figures, when instead its
+    /// unit budget was at least the smaller of the bound and the size asked,
+    /// and it was granted after the last such window. So paging another
+    /// program began while our batches ran inside the pool they held, or
+    /// refilled it, leaves the bound.
     ///
     /// Otherwise a clean window that ran full doubles the cap: above normal up
     /// to that bound, at normal until it reaches the batch size admitted,

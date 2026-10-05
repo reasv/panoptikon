@@ -264,7 +264,6 @@ impl VramLedger {
             let held = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
             ram_mb.saturating_sub(held)
         });
-        let memory_cut = unit_budget < wanted;
         let grant_id = state.next_id();
         state
             .workers
@@ -282,7 +281,7 @@ impl VramLedger {
                     units_asked,
                     granted_at,
                     squeezed,
-                    memory_cut,
+                    memory_cut: unit_budget < wanted,
                     room_bound,
                     peak_occupants: 0,
                     queue_bound,

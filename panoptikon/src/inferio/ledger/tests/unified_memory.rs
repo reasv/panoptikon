@@ -2411,6 +2411,9 @@ fn a_grant_paging_cuts_warns_once_per_model_and_episode() {
         runtime.block_on(load).expect("a reservation");
     };
     assert_eq!(warnings(&load), 1, "the load");
+    ledger.set_memory_pressure_for_test(Paging);
+    push_ram(&handle, MAC_TOTAL_MB, 90_000, 1_400, 0);
+    assert_eq!(warnings(&|| clean_window(&admission)), 0, "not cut");
     // Cut to the 180 MiB pool, then to a 100 MiB one.
     let cut_twice = || {
         paging_windows(&ledger, &handle, &admission, Paging, 1);
@@ -2561,9 +2564,10 @@ fn only_an_episode_our_batch_began_lowers_the_bound() {
 /// three grew the pool; a second replica asking less, granted after the
 /// paging began and settled first, beside two windows granted before it; a
 /// window right after a halving that ran inside its pool; a window whose
-/// batches ran below its budget; memory that cut the batch below the bound;
-/// a window that refilled a pool released after a paging cut; a batch whose
-/// throughput collapse the pressure suppressed.
+/// batches ran below its budget, one collapsing; memory that cut the batch
+/// below the bound; a window that refilled a pool released after a paging
+/// cut; a batch at the budget whose throughput collapse the pressure
+/// suppressed, then one below it.
 #[test]
 fn paging_our_batch_began_lowers_the_bound_to_half_its_budget() {
     use mps::MemoryPressure::{Paging, Warning};
@@ -2659,10 +2663,13 @@ fn paging_our_batch_began_lowers_the_bound_to_half_its_budget() {
             .expect("granted");
         ledger.set_paging_rise_for_test(ledger.pressure_read_at_for_test());
         assert_eq!(token.grant().unit_budget, 128);
-        handle
-            .lock()
-            .unwrap()
-            .record_measurements(vec![measurement(64, 0, 740)]);
+        handle.lock().unwrap().record_measurements(vec![
+            measurement(64, 0, 740),
+            BatchMeasurement {
+                throughput_collapse: true,
+                ..measurement(64, 740, 1_000)
+            },
+        ]);
         token.finish(WindowOutcome::Responded { oom: None });
     };
     let below_the_bound: Setup = |ledger, handle, admission| {
@@ -2680,12 +2687,19 @@ fn paging_our_batch_began_lowers_the_bound_to_half_its_budget() {
     };
     let collapsed: Setup = |ledger, handle, admission| {
         ledger.set_memory_pressure_for_test(Warning);
-        let ran =
-            window_that_began_paging_ran(ledger, handle, admission, |units| BatchMeasurement {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        ledger.set_paging_rise_for_test(ledger.pressure_read_at_for_test());
+        assert_eq!(token.grant().unit_budget, 64);
+        handle.lock().unwrap().record_measurements(vec![
+            BatchMeasurement {
                 throughput_collapse: true,
-                ..measurement(units, 0, 10 * units + 100)
-            });
-        assert_eq!(ran, 64);
+                ..measurement(64, 0, 740)
+            },
+            inside_its_pool(32),
+        ]);
+        token.finish(WindowOutcome::Responded { oom: None });
     };
     for (setup, regrow_to, regrowth) in [
         (room_cut, 32, [8, 16, 32, 32, 32]),
@@ -2733,8 +2747,8 @@ fn ramped_mac_cpu_replica() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
 /// On the CPU device, whose pool figure is the peak resident set since
 /// start, a window granted before the paging that ran a batch at its budget
 /// lowers the bound when that budget was at least the smaller of the bound
-/// and the size asked, and it was granted after the last window that lowered
-/// it, whether or not its batch raised that peak.
+/// and the size asked, and it was granted after the last window our batch
+/// began.
 #[test]
 fn on_the_cpu_device_a_window_at_the_bound_lowers_it() {
     let regrow_to = |ledger: &Arc<VramLedger>| {

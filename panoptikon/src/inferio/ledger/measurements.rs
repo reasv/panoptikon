@@ -588,13 +588,13 @@ impl VramLedger {
                 measurement.units.is_some_and(|units| units >= floor)
                     || measurement.next_over_budget
             });
-            // A batch whose collapse memory pressure suppressed still ran:
-            // its pool, and while paging its size, count for the
+            // While paging, a batch whose collapse the pressure suppressed
+            // still ran: its pool growth and its size count for the
             // [`PressureCap`].
-            if measurement.throughput_collapse && pressure {
+            if measurement.throughput_collapse && paging {
                 window_grew_pool = window_grew_pool.max(grew_pool);
                 window_pool = window_pool.max(pool_after);
-                ran_full |= paging && full;
+                ran_full |= full;
             }
             if collapse_suppressed || uncorroborated {
                 continue;

@@ -333,9 +333,9 @@ Single synthetic device:
     pool past the largest pool a paging window of the episode left.** Growth
     up to that pool refills memory the replica released, and is not new
     memory. On the CPU device, whose pool figure is the peak resident set
-    since start, its unit budget must instead be at least the smaller of the
-    bound and the size its grant asked, and it must have been granted after
-    the last window our batch began. After the first lowering only such a
+    since start, or without pool figures, its unit budget must instead be at
+    least the smaller of the bound and the size its grant asked, and it must
+    have been granted after the last window our batch began. After the first lowering only such a
     window moves the bound. The size asked is read at the grant, so a
     deflation the settle repays or adds does not change it. So a batch size
     whose memory growth began the paging is not returned to above normal,
