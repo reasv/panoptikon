@@ -437,6 +437,15 @@ struct JobCounters {
 const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl JobCounters {
+    /// The failure audit and its dropped count, taken once: a second ending
+    /// finds nothing to report.
+    fn take_failures(&mut self) -> (Vec<JobItemFailureRecord>, i64) {
+        (
+            std::mem::take(&mut self.failures),
+            std::mem::take(&mut self.failures_dropped),
+        )
+    }
+
     /// Whether this item may write a progress row (the first item always may).
     fn progress_write_due(&mut self, now: Instant) -> bool {
         let due = self
@@ -666,10 +675,7 @@ impl Drop for CancelledJobStamp {
         let counters = Arc::clone(&self.counters);
         // `Drop` cannot await, so the (uncontended) lock is taken in the task.
         tokio::spawn(async move {
-            let (failures, dropped) = {
-                let mut guard = counters.lock().await;
-                (std::mem::take(&mut guard.failures), guard.failures_dropped)
-            };
+            let (failures, dropped) = counters.lock().await.take_failures();
             // Before the stamp, as on the normal end path.
             write_job_failures(&index_db, job_id, failures, dropped).await;
             let result = call_index_db_writer(&index_db, |reply| {
@@ -683,7 +689,8 @@ impl Drop for CancelledJobStamp {
     }
 }
 
-/// Writes a job's item-failure audit rows; warns when the cap dropped some.
+/// Writes a job's item-failure audit rows; reports at INFO when the cap
+/// dropped some: those items are counted in `data_log` and retried next run.
 async fn write_job_failures(
     index_db: &str,
     job_id: i64,
@@ -691,7 +698,7 @@ async fn write_job_failures(
     dropped: i64,
 ) {
     if dropped > 0 {
-        tracing::warn!(
+        tracing::info!(
             job_id,
             recorded = records.len(),
             dropped,
@@ -722,10 +729,7 @@ async fn finalize_finished_job(
     counters: &Arc<Mutex<JobCounters>>,
     update: &DataLogUpdate,
 ) {
-    let (failures, dropped) = {
-        let mut guard = counters.lock().await;
-        (std::mem::take(&mut guard.failures), guard.failures_dropped)
-    };
+    let (failures, dropped) = counters.lock().await.take_failures();
     write_job_failures(index_db, job_id, failures, dropped).await;
     let _ = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
         job_id,
@@ -745,8 +749,7 @@ async fn finalize_unfinished_job(
 ) {
     let (update, failures, dropped) = {
         let mut guard = counters.lock().await;
-        let failures = std::mem::take(&mut guard.failures);
-        let dropped = guard.failures_dropped;
+        let (failures, dropped) = guard.take_failures();
         // Stopped before re-running its work query: the rest was never reached.
         let update = guard.data_log_update(
             total_remaining.saturating_sub(guard.processed),
@@ -3249,6 +3252,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recorded, 1, "the ending hands over the failure records too");
+    }
+
+    /// The items past the failure audit's cap are owed, not lost: the cap is
+    /// reported once per job, at INFO, although the cancel guard also runs at
+    /// every job's end.
+    #[tokio::test]
+    async fn the_audit_cap_is_reported_once_per_job_at_info() {
+        let _test_env = test_data_dir();
+        let index_db = ledger_test_db("extraction_audit_cap", &[]).await;
+        let model = image_model();
+        let job_id = data_log_job(index_db, &model).await;
+        let (logs, _capture) = crate::test_utils::LogCounts::capture();
+
+        let counters = Arc::new(Mutex::new(JobCounters::default()));
+        let update = {
+            let mut guard = counters.lock().await;
+            guard.failures_dropped = 3;
+            guard.data_log_update(0, true, OUTCOME_COMPLETED, None)
+        };
+        finalize_finished_job(index_db, job_id, &counters, &update).await;
+        drop(CancelledJobStamp {
+            index_db: index_db.to_string(),
+            job_id,
+            counters: Arc::clone(&counters),
+        });
+        // The guard's work happens on a spawned task.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let target = "panoptikon::jobs::extraction";
+        assert_eq!(logs.at(tracing::Level::WARN, target), 0);
+        assert_eq!(logs.at(tracing::Level::INFO, target), 1);
     }
 
     fn clip_model() -> ModelMetadata {
