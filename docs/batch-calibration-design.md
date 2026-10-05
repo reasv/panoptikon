@@ -1256,7 +1256,8 @@ impl's own kernels have said they cannot execute at this corpus's shapes.
   business. Where the driver spills instead of failing (WDDM's sysmem fallback),
   a one-unit window whose batch spilled counts as such an out-of-memory window
   does, against the same room. Unpriced (`none`) models have no admission, are
-  outside this rule and still run, releasing the pool once per window.
+  outside this rule and still run, with the grantless path's release and spill
+  handling ("Windows display driver: the pool outgrows the card").
 
   **The pre-fit price of one item.** With no slope there is no measured
   price for one item, and both obvious stand-ins fail. The whole base
@@ -2124,12 +2125,11 @@ startup.
   - The worker also releases the pool and runs the rest of the window at
     half that batch's size (never above the grant), instead of more spilled
     batches until settle.
-    A spill that the release does not clear is live memory that does not
-    fit (weights larger than the card): it is warned of once, then logged at
-    debug, and still flagged each batch. Its later spills release nothing,
-    since the next batch would only regrow the pool, but still halve the rest
-    of the window, until a batch that does not spill re-arms the release and
-    the warning.
+    A spill that the release does not clear (for example weights larger than the
+    card) is warned of once, then logged at debug, and still flagged each batch.
+    Its later spills release nothing, since the next batch would only regrow the
+    pool, but still halve the rest of the window, until a batch that does not
+    spill re-arms the release and the warning.
   - A spilled batch never becomes the throughput-collapse comparator.
   - P and U must come from the same sample. A remembered P paired with a
     later NVML reading was wrong by up to 58 GB around a release.

@@ -137,9 +137,9 @@ SHRINK_WINDOWS = 2
 # a squeeze. Mirrors the host's `TRIM_SLACK_MB`.
 SHRINK_BLIND_SLACK_MB = 256
 
-# Set once a spill outlived its release, or had no release: the live memory
-# itself does not fit, so later spills release nothing and are logged at
-# debug. A batch that does not spill clears it.
+# Set once a spill outlived its release, or had no release: later spills
+# release nothing (the next batch would only regrow the pool) and are logged
+# at debug. A batch that does not spill clears it.
 _spill_persists = False
 
 # Consecutive granted windows below `SHRINK_RATIO` × the releasable slack.
@@ -969,8 +969,9 @@ def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]
     Where a full GPU spills to system RAM, the pool is released before a
     window whose size (its largest input, times its input count when the impl
     batches) is larger than any since the last release (as `run_window` does
-    before a growing batch), and a window whose pool ends above NVML's used
-    memory is flagged `spilled` and the pool released.
+    before a growing batch), and a window whose pool ends more than
+    `SPILL_TOLERANCE_MB` above NVML's used memory is flagged `spilled`, and
+    the pool is released unless a spill persists.
     """
     spill_host = memory.spill_capable()
     size = 0
@@ -1609,8 +1610,7 @@ def run_window(
             reserved_mb = sample["reserved_mb"]
             released = _release_spilled_pool()
             before = budget
-            if released or _spill_persists:
-                budget = max(1, min(budget, priced // 2))
+            budget = max(1, min(budget, priced // 2))
             if released:
                 sample = memory.device_memory_sample()
             after_mb = pool_off_device_mb(sample)
