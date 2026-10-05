@@ -3235,28 +3235,36 @@ mod tests {
         let _test_env = test_data_dir();
         let index_db = ledger_test_db("extraction_audit_cap", &[]).await;
         let model = image_model();
-        let job_id = data_log_job(index_db, &model).await;
-        let (logs, _capture) = crate::test_utils::LogCounts::capture();
+        for finished in [true, false] {
+            let job_id = data_log_job(index_db, &model).await;
+            let (logs, _capture) = crate::test_utils::LogCounts::capture();
 
-        let counters = Arc::new(Mutex::new(JobCounters::default()));
-        let update = {
-            let mut guard = counters.lock().await;
-            guard.failures_dropped = 3;
-            guard.data_log_update(0, true, OUTCOME_COMPLETED, None)
-        };
-        finalize_finished_job(index_db, job_id, &counters, &update).await;
-        drop(CancelledJobStamp {
-            index_db: index_db.to_string(),
-            job_id,
-            counters: Arc::clone(&counters),
-        });
-        // The guard's work happens on a spawned task.
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
+            let counters = Arc::new(Mutex::new(JobCounters::default()));
+            let update = {
+                let mut guard = counters.lock().await;
+                guard.failures_dropped = 3;
+                guard.data_log_update(0, true, OUTCOME_COMPLETED, None)
+            };
+            if finished {
+                finalize_finished_job(index_db, job_id, &counters, &update).await;
+            } else {
+                finalize_unfinished_job(index_db, job_id, &counters, 0, "the process stopped")
+                    .await;
+            }
+            drop(CancelledJobStamp {
+                index_db: index_db.to_string(),
+                job_id,
+                counters: Arc::clone(&counters),
+            });
+            // The guard's work happens on a spawned task.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            let target = "panoptikon::jobs::extraction";
+            let (warn, info) = (tracing::Level::WARN, tracing::Level::INFO);
+            let counts = (logs.at(warn, target), logs.at(info, target));
+            assert_eq!(counts, (0, 1), "finished: {finished}");
         }
-        let target = "panoptikon::jobs::extraction";
-        assert_eq!(logs.at(tracing::Level::WARN, target), 0);
-        assert_eq!(logs.at(tracing::Level::INFO, target), 1);
     }
 
     /// An item failure is logged once, by the item task itself: it returns
