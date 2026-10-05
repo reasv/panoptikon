@@ -998,7 +998,7 @@ def test_an_unreadable_allocator_keeps_what_the_caller_already_knew(
         raise RuntimeError("the allocator query failed")
 
     monkeypatch.setattr(memory, "_allocator_stats", exploding)
-    monkeypatch.setattr(memory, "_rss_bytes", lambda: 3_000 * MIB)
+    monkeypatch.setattr(memory, "_ram_side_bytes", lambda: 3_000 * MIB)
     measurement = memory.measure_batch(
         memory.begin_batch(),
         items=4,
@@ -2472,11 +2472,11 @@ def test_the_rss_sampler_runs_on_cpu_and_gpu_workers_not_mps() -> None:
 def test_a_gpu_worker_reports_its_host_ram_beside_the_device_figures(
     hip, monkeypatch
 ) -> None:
-    # The orchestrator books a CUDA or ROCm worker's resident set on the CPU
+    # The orchestrator books a CUDA or ROCm worker's host RAM on the CPU
     # device: the baseline at load, the in-batch peak and the level after.
     # The device figures stay the allocator's.
     ram = FakeRam(rss_mb=3_000)
-    monkeypatch.setattr(memory, "_rss_bytes", lambda: ram.rss_mb * MIB)
+    monkeypatch.setattr(memory, "_ram_side_bytes", lambda: ram.rss_mb * MIB)
     cuda = FakeCuda()
     with isolated(fake_torch_module(cuda, hip=hip)):
         report = memory.finish_load(memory.begin_load(), object())
@@ -2573,7 +2573,7 @@ def test_freed_host_memory_is_returned_before_the_resident_readings(
         ram.release(retained["mb"])
         retained["mb"] = 0
 
-    monkeypatch.setattr(memory, "_rss_bytes", lambda: ram.rss_mb * MIB)
+    monkeypatch.setattr(memory, "_ram_side_bytes", lambda: ram.rss_mb * MIB)
     monkeypatch.setattr(memory, "_malloc_trim", lambda: trim)
     with isolated(fake_torch_module(FakeCuda())):
         before = memory.begin_load()
@@ -2976,6 +2976,31 @@ def test_the_process_high_water_is_read_in_the_right_unit() -> None:
             assert memory._rusage_peak_bytes() == 4096, "macOS reports bytes"
         with mock.patch.object(sys, "platform", "linux"):
             assert memory._rusage_peak_bytes() == 4096 * 1024, "elsewhere, KiB"
+
+
+def test_a_gpu_workers_host_ram_is_anonymous_plus_swapped_memory(
+    tmp_path, monkeypatch
+) -> None:
+    # Reclaimed file pages and swapped-out pages do not lower it; memory the
+    # worker released does.
+    status = tmp_path / "status"
+    monkeypatch.setattr(memory, "PROC_STATUS", str(status))
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    def read(anon_mb: int, file_mb: int, swap_mb: int) -> int | None:
+        status.write_text(
+            f"VmRSS:\t{(anon_mb + file_mb) * 1024} kB\n"
+            f"RssAnon:\t{anon_mb * 1024} kB\nRssFile:\t{file_mb * 1024} kB\n"
+            f"VmSwap:\t{swap_mb * 1024} kB\n"
+        )
+        return memory._ram_side_bytes()
+
+    assert read(3_000, 900, 0) == 3_000 * MIB
+    assert read(3_000, 100, 0) == 3_000 * MIB, "file pages reclaimed"
+    assert read(2_000, 100, 1_000) == 3_000 * MIB, "swapped out"
+    assert read(2_500, 900, 0) == 2_500 * MIB, "released"
+    assert memory.parse_ram_side("RssAnon:\t 2048 MB\n") is None
+    assert memory.parse_ram_side("VmRSS:\t 2048 kB\n") is None
 
 
 @contextmanager

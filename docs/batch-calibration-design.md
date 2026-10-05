@@ -849,11 +849,15 @@ booked centrally on the CPU device. It is never a throughput signal.
 
 - **Measurement.** A CUDA or ROCm worker reports its resident set at load
   (`rss_at_load_mb`) and, per batch, its in-batch maximum and the level after
-  (`peak_rss_mb`, `rss_after_mb`). The ledger keeps the samples
+  (`peak_rss_mb`, `rss_after_mb`). Here the resident set is counted as
+  anonymous plus swapped memory (Linux `RssAnon + VmSwap`, Windows private
+  commit): reclaimed file pages (mapped libraries and weights, which the free
+  reading counts as available) do not lower it, so a fall is memory the
+  worker released. The ledger keeps the samples
   `(units, peak_rss − baseline)` in the same ring as a GPU fit's; the
   baseline is the resident set at load, lowered to any lower level a batch
   leaves it at, whether load-time memory was released for good or only for
-  now (pages reclaimed under pressure that come back with the next batch).
+  now (a cache the next batch rebuilds).
   That batch gives no sample, since it may have released the memory before
   or after its peak; the next one is measured from the lower level.
   No sample is taken from a batch that peaked no higher than the resident

@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from functools import lru_cache
 from types import ModuleType
 from typing import Any, NamedTuple
@@ -100,7 +100,8 @@ MPS_SAMPLE_SECONDS = 0.02
 MPS_SAMPLE_MAX_SECONDS = 900
 _MPS_SAMPLE_JOIN_SECONDS = 1.0
 
-# Where Linux publishes this process's peak resident set.
+# Where Linux publishes this process's peak resident set and its anonymous
+# and swapped memory.
 PROC_STATUS = "/proc/self/status"
 
 # Where Linux publishes the machine's memory statistics.
@@ -1165,8 +1166,9 @@ def _ram_currency() -> bool:
 
 
 def _books_host_ram() -> bool:
-    """Whether the orchestrator books this worker's resident set as host RAM
-    beside its GPU memory: a CUDA or ROCm worker. MPS memory is RAM already.
+    """Whether the orchestrator books this worker's host RAM
+    (`_ram_side_bytes`) beside its GPU memory: a CUDA or ROCm worker. MPS
+    memory is RAM already.
     """
     return device_kind() in ("cuda", "rocm")
 
@@ -1304,6 +1306,44 @@ def _rss_bytes() -> int | None:
         return int(_psutil_process(os.getpid()).memory_info().rss)
     except Exception:
         return None
+
+
+def parse_ram_side(text: str) -> int | None:
+    """`RssAnon + VmSwap` from `/proc/<pid>/status` in bytes, or None without a
+    `RssAnon` row in `kB`; a missing `VmSwap` row counts as 0.
+    """
+    rows: dict[str, int] = {}
+    for line in text.splitlines():
+        key, separator, rest = line.partition(":")
+        fields = rest.split()
+        if separator and key.strip() in ("RssAnon", "VmSwap") and len(fields) == 2:
+            if fields[1] != "kB" or not fields[0].isdigit():
+                return None
+            rows[key.strip()] = int(fields[0]) * 1024
+    if "RssAnon" not in rows:
+        return None
+    return rows["RssAnon"] + rows.get("VmSwap", 0)
+
+
+def _ram_side_bytes() -> int | None:
+    """A CUDA or ROCm worker's host RAM in bytes, or None: anonymous plus
+    swapped memory on Linux, private commit on Windows, the resident set
+    elsewhere. Reclaimed file pages leave it unchanged, so a fall is memory
+    the worker released. The orchestrator reads the same figure for this
+    process (`cpu.rs`).
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            with open(PROC_STATUS, encoding="utf-8", errors="replace") as status:
+                return parse_ram_side(status.read())
+        except Exception:
+            return None
+    if sys.platform == "win32":
+        try:
+            return int(_psutil_process(os.getpid()).memory_info().private)
+        except Exception:
+            return None
+    return _rss_bytes()
 
 
 def parse_vm_high_water(text: str) -> int | None:
@@ -2024,7 +2064,7 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     if kind is not None:
         payload["device_kind"] = kind
     if _books_host_ram():
-        rss = _mb(_rss_bytes())
+        rss = _mb(_ram_side_bytes())
         if rss is not None:
             payload["rss_at_load_mb"] = rss
     sample = device_memory_sample()
@@ -2356,24 +2396,28 @@ class _MpsPeakSampler(_PeakSampler):
 
 
 class _RssPeakSampler(_PeakSampler):
-    """The highest live RSS seen while a batch runs, on a RAM-priced or GPU
-    worker. The OS high-water mark cannot be reset, so it would hide the
-    batch's cost behind the load's own peak.
+    """The highest reading of `read` seen while a batch runs: the RSS on a
+    RAM-priced worker, `_ram_side_bytes` on a GPU worker. The OS high-water
+    mark cannot be reset, so it would hide the batch's cost behind the load's
+    own peak.
     """
 
     _thread_name = "inferio-rss-peak"
 
-    def __init__(self, interval: float = MPS_SAMPLE_SECONDS) -> None:
-        self._peak = _rss_bytes() or 0
+    def __init__(
+        self, read: Callable[[], int | None], interval: float = MPS_SAMPLE_SECONDS
+    ) -> None:
+        self._read = read
+        self._peak = read() or 0
         super().__init__(interval)
 
     def observe(self) -> None:
-        rss = _rss_bytes()
+        rss = self._read()
         if rss is not None and rss > self._peak:
             self._peak = rss
 
     def stop(self) -> int | None:
-        """The in-batch RSS maximum in MiB, None if RSS was never readable."""
+        """The in-batch maximum in MiB, None if it was never readable."""
         self._finish()
         return _mb(self._peak) if self._peak else None
 
@@ -2394,7 +2438,7 @@ def _rss_peak_sampler() -> _RssPeakSampler | None:
     if not (_ram_currency() or _books_host_ram()):
         return None
     try:
-        return _RssPeakSampler()
+        return _RssPeakSampler(_ram_side_bytes if _books_host_ram() else _rss_bytes)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("the RSS peak sampler did not start: %s", exc)
         return None
@@ -2540,7 +2584,7 @@ def measure_batch(
     # The level the batch left: a GPU worker's host RAM, and a RAM-priced
     # worker's footprint (its `reserved` is a peak that never falls).
     if state.get("host_ram") or _ram_currency():
-        rss_after = _mb(_rss_bytes())
+        rss_after = _mb(_ram_side_bytes() if state.get("host_ram") else _rss_bytes())
         if rss_after is not None:
             measurement["rss_after_mb"] = rss_after
     if units is not None:
