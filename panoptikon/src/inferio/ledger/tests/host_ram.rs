@@ -198,8 +198,7 @@ fn ram_window_costing(
     per_unit_mb: u64,
 ) -> Grant {
     let rising = |units| ladder_rate(&RISING, units);
-    let clean = WindowOutcome::Responded { oom: None };
-    let grant = ram_window_ending(handle, admission, (fixed_mb, per_unit_mb), rising, clean);
+    let grant = ram_window_at(handle, admission, (fixed_mb, per_unit_mb), rising, u64::MAX);
     if !grant.squeezed {
         admission.earn_next_size();
     }
@@ -207,13 +206,14 @@ fn ram_window_costing(
 }
 
 /// One window of batches that peak `fixed_mb + per_unit_mb` per unit
-/// (`cost`) and run at `rate_at` units a second, ending in `outcome`.
-fn ram_window_ending(
+/// (`cost`) and run at `rate_at` units a second, from a worker that dies
+/// running more than `dies_above` units.
+fn ram_window_at(
     handle: &TelemetryHandle,
     admission: &Admission,
     (fixed_mb, per_unit_mb): (u64, u64),
     rate_at: impl Fn(u64) -> f64,
-    outcome: WindowOutcome,
+    dies_above: u64,
 ) -> Grant {
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
@@ -232,7 +232,10 @@ fn ram_window_ending(
     })];
     batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| host_ram(warm_batch(units, rate))));
     handle.lock().unwrap().record_measurements(batches);
-    token.finish(outcome);
+    token.finish(match units > dies_above {
+        true => WindowOutcome::WorkerDied,
+        false => WindowOutcome::Responded { oom: None },
+    });
     grant
 }
 
@@ -733,64 +736,66 @@ fn a_death_in_a_booked_item_capped_window_caps() {
 
 /// The cap a death left is re-tested like any other size. The working size
 /// comes down to the cap and waits as after a failed probe; then a probe of
-/// the doubling from the cap runs the size that died. A death there caps
-/// again and doubles the wait; two clean windows there lift the cap.
+/// the doubling from the cap runs the size that died. Two clean windows of
+/// it lift the cap; a death in it caps again and doubles the wait.
 #[test]
 fn a_death_cap_is_re_tested_once_the_wait_of_a_failed_probe_has_run_out() {
-    let ledger = host(&[GPU], None);
-    let (handle, admission) = gpu_replica(&ledger, "g/died", GPU, 64);
-    cpu_free_to_book(&ledger, 45_000);
-    let window = |outcome| {
-        let rate = |units: u64| units.min(256) as f64;
-        ram_window_ending(&handle, &admission, (0, RAM_PER_UNIT_MB), rate, outcome).unit_budget
-    };
-    let clean = WindowOutcome::Responded { oom: None };
-    let died = WindowOutcome::WorkerDied;
-    let state = || {
-        let row = row(&ledger, "g/died");
-        (row.knee_units, row.death_cap_units)
-    };
-    let climb: Vec<u64> = (0..100)
-        .map(|_| window(clean))
-        .take_while(|_| state().0 != Some(256))
-        .collect();
-    assert_eq!(window(died), 256, "{climb:?}");
-    assert_eq!(state(), (Some(128), Some(128)));
+    for retest_dies_above in [u64::MAX, 128] {
+        let ledger = host(&[GPU], None);
+        let (handle, admission) = gpu_replica(&ledger, "g/died", GPU, 64);
+        cpu_free_to_book(&ledger, 45_000);
+        let window = |dies_above| {
+            let rate = |units: u64| units.min(256) as f64;
+            ram_window_at(&handle, &admission, (0, RAM_PER_UNIT_MB), rate, dies_above).unit_budget
+        };
+        let state = || {
+            let row = row(&ledger, "g/died");
+            let wait = ledger.trial_for_test("g/died", GPU).1;
+            (row.knee_units, row.death_cap_units, wait)
+        };
+        let climb: Vec<u64> = (0..100)
+            .map(|_| window(u64::MAX))
+            .take_while(|_| state().0 != Some(256))
+            .collect();
+        assert_eq!(window(128), 256, "{climb:?}");
+        assert_eq!(state(), (Some(128), Some(128), RETEST_WINDOWS));
 
-    for (wait, outcome) in [(RETEST_WINDOWS, died), (2 * RETEST_WINDOWS, clean)] {
         // The wait, then the probe's lead-in and first window at the cap.
-        let held: Vec<u64> = (0..wait + 2).map(|_| window(clean)).collect();
+        let held: Vec<u64> = (0..RETEST_WINDOWS + 2).map(|_| window(u64::MAX)).collect();
         assert!(held.iter().all(|units| *units == 128), "{held:?}");
-        assert_eq!(window(outcome), 256);
-        assert_eq!(state(), (Some(128), Some(128)));
+        assert_eq!(window(retest_dies_above), 256);
+        if retest_dies_above == 128 {
+            assert_eq!(state(), (Some(128), Some(128), 2 * RETEST_WINDOWS));
+            continue;
+        }
+        assert_eq!(state().1, Some(128), "one clean window");
+        assert_eq!(window(u64::MAX), 256);
+        let (working, cap, _) = state();
+        assert_eq!((working, cap), (Some(256), None));
     }
-    assert_eq!(window(clean), 256);
-    assert_eq!(state(), (Some(256), None));
 }
 
-/// A replica a death's cap holds below its seed opens at the cap, probes
-/// below it, and steps down on a flat rate; nothing runs above the cap.
+/// A replica a death's cap holds below its seed opens at the cap. Its probes
+/// re-test the cap and step down from it in turn: a worker that dies above
+/// 32 units dies again only in the re-test, and a flat rate takes the
+/// working size below the cap.
 #[test]
 fn a_replica_a_death_cap_holds_below_its_seed_opens_there_and_steps_down() {
     let ledger = host(&[GPU], None);
     let (handle, admission) = gpu_replica(&ledger, "g/died", GPU, 64);
     cpu_free_to_book(&ledger, 45_000);
-    let window = |outcome| {
-        ram_window_ending(
-            &handle,
-            &admission,
-            (0, RAM_PER_UNIT_MB),
-            |_| 100.0,
-            outcome,
-        )
-        .unit_budget
-    };
-    assert_eq!(window(WindowOutcome::WorkerDied), 64);
-    let budgets: Vec<u64> = (0..60)
-        .map(|_| window(WindowOutcome::Responded { oom: None }))
+    let budgets: Vec<u64> = (0..100)
+        .map(|_| {
+            ram_window_at(&handle, &admission, (0, RAM_PER_UNIT_MB), |_| 100.0, 32).unit_budget
+        })
         .collect();
-    assert_eq!(budgets[0], 32);
-    assert!(budgets.iter().all(|units| *units <= 32), "{budgets:?}");
+    assert_eq!(
+        budgets[..2],
+        [64, 32],
+        "died at the seed, opened at the cap"
+    );
+    let deaths: Vec<&u64> = budgets.iter().filter(|units| **units > 32).collect();
+    assert_eq!(deaths, [&64, &64], "{budgets:?}");
     let working = row(&ledger, "g/died").knee_units;
     assert!(working.is_some_and(|units| units < 32), "{budgets:?}");
 }

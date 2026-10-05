@@ -346,18 +346,6 @@ impl VramLedger {
         }
         if failed || charge.pressure != mps::MemoryPressure::Normal {
             let over = if failed { Over::Failed } else { Over::PutOff };
-            // A death's cap below the working size takes it there, and a
-            // death outside a probe waits as a failed probe does.
-            if let Some(cap) = cal
-                .death_cap_units
-                .filter(|cap| cal.knee_units > Some(*cap))
-            {
-                cal.knee_units = Some(cap);
-                cal.store_due = true;
-                if cal.probe.is_none() {
-                    cal.retest_after = Self::back_off(cal);
-                }
-            }
             if Self::end_probe(cal, &key, over, false) {
                 Self::flag_trial_trims_locked(state, &key);
             }
@@ -574,12 +562,8 @@ impl VramLedger {
             return false;
         };
         let mut working = from;
-        let fits = |units: u64| {
-            [cal.memory_cap, cal.death_cap_units]
-                .iter()
-                .flatten()
-                .all(|cap| units <= *cap)
-        };
+        let caps = [cal.memory_cap, cal.death_cap_units];
+        let fits = |units: u64| caps.iter().flatten().all(|cap| units <= *cap);
         // Each step is a verdict the next cannot undo; the bound is a guard.
         for _ in 0..64 {
             let up = (cal.evidence_at(working), bar(working));
@@ -623,20 +607,15 @@ impl VramLedger {
     /// The undecided doubling the next probe measures, as its smaller size:
     /// the one above the working size, then the one below it (until the
     /// working size has earned its place), then in throughput mode the one
-    /// past a flat one. None whose larger size is above a death's cap: that
-    /// one is measured again only in turn ([`Self::next_probe`]).
+    /// past a flat one, unless its larger size is above a death's cap.
     fn undecided(
         cal: &ModelCalibration,
         mode: SizingMode,
         bar: &impl Fn(u64) -> f64,
     ) -> Option<u64> {
         let working = cal.knee_units?;
-        let under_cap = |lo: u64| {
-            cal.death_cap_units
-                .is_none_or(|cap| lo.saturating_mul(2) <= cap)
-        };
         let up = (cal.evidence_at(working), bar(working));
-        if under_cap(working) && verdict(&[up]) == Verdict::Unsure {
+        if verdict(&[up]) == Verdict::Unsure {
             return Some(working);
         }
         let down = working / 2;
@@ -645,29 +624,30 @@ impl VramLedger {
         }
         let twice = working.saturating_mul(2);
         let ahead = (cal.evidence_at(twice), bar(twice));
-        (mode == SizingMode::Throughput
-            && under_cap(twice)
-            && verdict(&[up, ahead]) == Verdict::Unsure)
+        let past_cap = cal
+            .death_cap_units
+            .is_some_and(|cap| twice.saturating_mul(2) > cap);
+        (mode == SizingMode::Throughput && !past_cap && verdict(&[up, ahead]) == Verdict::Unsure)
             .then_some(twice)
     }
 
     /// The doubling the next probe measures: [`Self::undecided`], or once
     /// all are decided, the ones above and below the working size in turn, to
-    /// keep the evidence current; only the one above while it runs past a
-    /// death's cap.
+    /// keep the evidence current. At a death's cap they take turns whatever
+    /// their verdicts, so the one above re-tests the cap.
     pub(super) fn next_probe(
         cal: &mut ModelCalibration,
         mode: SizingMode,
         bar: &impl Fn(u64) -> f64,
     ) -> Option<u64> {
         let working = cal.knee_units?;
-        if let Some(lo) = Self::undecided(cal, mode, bar) {
-            return Some(lo);
-        }
         let capped = cal
             .death_cap_units
             .is_some_and(|cap| working.saturating_mul(2) > cap);
-        cal.retest_below = !cal.retest_below && working > 1 && !capped;
+        if !capped && let Some(lo) = Self::undecided(cal, mode, bar) {
+            return Some(lo);
+        }
+        cal.retest_below = !cal.retest_below && working > 1;
         Some(if cal.retest_below {
             working / 2
         } else {
@@ -697,6 +677,20 @@ impl VramLedger {
             Self::flag_trial_trim_locked(state, worker);
         }
         true
+    }
+
+    /// A death capped the batch at `cap`: the working size comes down to it,
+    /// a death outside a probe waits as a failed probe does, and after the
+    /// `first` death the first probe at the cap re-tests it.
+    pub(super) fn note_death_cap(cal: &mut ModelCalibration, cap: u64, first: bool) {
+        cal.retest_below |= first;
+        if cal.knee_units > Some(cap) {
+            cal.knee_units = Some(cap);
+            cal.store_due = true;
+        }
+        if cal.probe.is_none() {
+            cal.retest_after = Self::back_off(cal);
+        }
     }
 
     /// The wait after a probe that left the working size in place:

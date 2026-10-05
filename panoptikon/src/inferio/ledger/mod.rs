@@ -1245,15 +1245,13 @@ fn shape_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Opt
 
 /// The largest batch this replica may run whatever memory allows: the
 /// smaller of its shape ceiling ([`shape_ceiling_for`]) and the cap a death
-/// left ([`ModelCalibration::death_cap_units`]), if either stands. A probe of
-/// the doubling from the cap runs its larger size: at most the size that died.
+/// left ([`ModelCalibration::death_cap_units`]), if either stands. A probe's
+/// size runs past the death cap: the working size is at most the cap, so that
+/// is at most twice it, the size that died.
 fn batch_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Option<u64> {
     let death = cal.and_then(|cal| {
         let cap = cal.death_cap_units?;
-        Some(match cal.probe {
-            Some(probe) if probe.lo <= cap => cap.max(probe.run),
-            _ => cap,
-        })
+        Some(cal.probe.map_or(cap, |probe| cap.max(probe.run)))
     });
     match (shape_ceiling_for(cal, entry), death) {
         (Some(shape), Some(death)) => Some(shape.min(death)),

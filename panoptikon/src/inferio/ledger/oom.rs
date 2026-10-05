@@ -251,8 +251,10 @@ impl VramLedger {
         if death_may_be_ram(state, &key.1, &charge) && !sized_by_queue {
             let cap = (charge.unit_budget / 2).max(1);
             let cal = state.calibration.entry(key.clone()).or_default();
+            let first = cal.death_cap_units.is_none();
             let cap = cal.death_cap_units.map_or(cap, |held| held.min(cap));
             cal.death_cap_units = Some(cap);
+            Self::note_death_cap(cal, cap, first);
             tracing::warn!(
                 model = %key.0,
                 gpu = %key.1,

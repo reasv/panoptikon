@@ -646,7 +646,9 @@ therefore differs from a GPU in six ways.
   re-tested like any other size: a death outside a probe starts the wait of
   a failed probe, and once the wait has run out a probe of the doubling from
   the cap runs the size that died, in full or not at all. Two clean windows
-  of it lift the cap; a death in it caps again and doubles the wait. It
+  of it lift the cap; a death in it caps again and doubles the wait. While
+  the cap stands, that re-test and a probe of the doubling below take
+  turns, the re-test first after the first death. It
   applies on every unified-memory device (the CPU device, MPS, an APU) and to
   a replica on a private-memory GPU whose window had host RAM booked. That
   GPU death is still no memory negative: its anchor and ramp are untouched.
