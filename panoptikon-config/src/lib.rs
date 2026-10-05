@@ -96,8 +96,6 @@ fn patch_table(concrete: &mut Table, before: &toml::Table, after: &toml::Table) 
     // blocks already there were above it.
     let mut first = String::new();
     for key in before.keys().filter(|key| !after.contains_key(*key)) {
-        // The lines above a removed key-value stay after the key-value rendered
-        // before it in this body.
         let Some(index) = concrete.iter().position(|(name, _)| name == key) else {
             continue;
         };
@@ -157,9 +155,6 @@ fn removed_lines(key: &Key, value: &Value) -> String {
 /// Appends `block` after the last key-value rendered before item `index`,
 /// descending into dotted-key tables; gives it back when there is none.
 fn append_to_previous_key(table: &mut Table, index: usize, mut block: String) -> Option<String> {
-    if block.is_empty() {
-        return None;
-    }
     let items: Vec<_> = table.iter_mut().take(index).collect();
     for (_, item) in items.into_iter().rev() {
         match item {
@@ -880,8 +875,8 @@ mod tests {
     /// above it stays where it was, before the comments of whatever follows.
     #[test]
     fn removing_a_key_keeps_the_comment_block_above_it() {
-        let dotted = "[vram]\n# a note\ngpu.CPU.a = 1\n# b note\ngpu.CPU.b = 2\n# k\n# k2\nkeep = 1\n# n\n[next]\n";
-        let cases: [(&str, &[&str]); 13] = [
+        let dotted = "[vram]\ntop = 1\n# a note\ngpu.CPU.a = 1\n# b note\ngpu.CPU.b = 2\n# k\n# k2\nkeep = 1\n# n\n[next]\n";
+        let cases: [(&str, &[&str]); 14] = [
             // Next key in the same table.
             (
                 "[vram]\n# margin note\nmargin = 0.10\n# cap note\ncap_fraction = 0.90\n",
@@ -890,7 +885,7 @@ mod tests {
             // Last key of its table, before the next table header (the
             // implicit `vram.gpu` renders nothing).
             (
-                "[vram]\nkeep = 1\n\n# margin note\nmargin = 0.10 # inline\n# cap_fraction = 0.90\n\n\
+                "[vram]\nkeep = 1\n\n# margin note\n\nmargin = 0.10 # inline\n# cap_fraction = 0.90\n\n\
                  # overrides\n[vram.gpu.CPU]\nmargin = 0.25\n",
                 &["margin = 0.10 # inline\n"],
             ),
@@ -906,8 +901,13 @@ mod tests {
             ),
             // Two adjacent keys, the second one last in its table; an indented key with no comment.
             (
-                "[vram]\n  # m\n  margin = 0.10\n  # c\n  cap_fraction = 0.90\n  # k\n[next]\n  n = 1\n  keep = 1\n[after]\n",
-                &["  margin = 0.10\n", "  cap_fraction = 0.90\n", "  n = 1\n"],
+                "[vram]\n  # m\n  margin = 0.10\n  # c\n  cap_fraction = 0.90\n  # k\n[next]\n  n = 1\n  # x\n  keep = 1\n[after]\n",
+                &[
+                    "  margin = 0.10\n",
+                    "  cap_fraction = 0.90\n",
+                    "  n = 1\n",
+                    "  keep = 1\n",
+                ],
             ),
             // Keys of a dotted-key table, which renders in its parent's body.
             (dotted, &["gpu.CPU.a = 1\n"]),
@@ -915,6 +915,11 @@ mod tests {
             (dotted, &["gpu.CPU.b = 2\n", "keep = 1\n"]),
             // The whole dotted-key table.
             (dotted, &["gpu.CPU.a = 1\n", "gpu.CPU.b = 2\n"]),
+            // A header table inside a dotted-key table.
+            (
+                "[f]\napple.color = 1\n# m\nm = 1\n[f.apple.texture]\ns = 1\n",
+                &["m = 1\n"],
+            ),
             // Last key of an array-of-tables element.
             ("[[p]]\nn = 1 # n\n# x\nx = 1\n[[p]]\nn = 2\n", &["x = 1\n"]),
             // Its first two keys.
