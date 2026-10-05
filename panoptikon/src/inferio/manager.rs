@@ -953,9 +953,25 @@ impl ModelManager {
                     inputs = request.inputs;
                     continue;
                 }
-                Err(_) => Err(Unattempted::error(format!(
-                    "model {inference_id} was unloaded before the request could be queued"
-                ))),
+                Err(_) => {
+                    // Still mapped to this channel: its dispatcher ended on its
+                    // own. Dropped here so the next predict reloads it.
+                    let mut state = self.state.lock().unwrap();
+                    let stale = state
+                        .models
+                        .get(inference_id)
+                        .is_some_and(|handle| handle.tx.same_channel(&tx));
+                    if stale {
+                        tracing::error!(
+                            model = %inference_id,
+                            "the model's dispatcher ended while it was loaded; dropping the model"
+                        );
+                        Self::forget_model(&mut state, inference_id);
+                    }
+                    Err(Unattempted::error(format!(
+                        "model {inference_id} was unloaded before the request could be queued"
+                    )))
+                }
             };
             drop(pin);
             self.deliver_pending_trims();
@@ -3584,7 +3600,8 @@ metadata.cost.seed_units = 1000000
     }
 
     /// A model whose dispatcher ended without removing it fails a predict as
-    /// never run instead of retrying on the same closed channel.
+    /// never run instead of retrying on the same closed channel, and the next
+    /// predict reloads it.
     #[tokio::test]
     async fn a_closed_channel_the_model_still_maps_to_fails_the_predict() {
         let setup = test_manager(Duration::from_secs(60), 32);
@@ -3605,6 +3622,10 @@ metadata.cost.seed_units = 1000000
             .expect("no retry loop")
             .expect_err("the channel is closed");
         assert!(err.downcast_ref::<Unattempted>().is_some(), "{err:#}");
+        let outputs = predict_one(&manager, "echo/test", "k", -1, None, json!(2))
+            .await
+            .expect("reloaded");
+        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": 2}))]);
         manager.shutdown().await;
     }
 
