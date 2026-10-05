@@ -640,9 +640,13 @@ therefore differs from a GPU in six ways.
   the batch that died; deflation is lost with the replica. So a worker that
   stops answering with a granted window in flight (killed by the kernel or
   by anyone but the gateway, or crashed) caps its (model, device) at half
-  that window's unit budget, at least one unit. The cap holds for the life
-  of the server process, halves again at each further death, and stops the
-  ramp like a shape ceiling; `/health` shows it as `death_cap_units`. It
+  that window's unit budget, at least one unit. The working size comes down
+  to the cap, which halves again at each further death and stops the ramp
+  like a shape ceiling; `/health` shows it as `death_cap_units`. The cap is
+  re-tested like any other size: a death outside a probe starts the wait of
+  a failed probe, and once the wait has run out a probe of the doubling from
+  the cap runs the size that died, in full or not at all. Two clean windows
+  of it lift the cap; a death in it caps again and doubles the wait. It
   applies on every unified-memory device (the CPU device, MPS, an APU) and to
   a replica on a private-memory GPU whose window had host RAM booked. That
   GPU death is still no memory negative: its anchor and ramp are untouched.

@@ -219,6 +219,7 @@ impl VramLedger {
             windows: 0,
             fresh: SizeEvidence::default(),
             largest: knee,
+            above_cap: 0,
             before: ramp::Verdict::Unsure,
         });
     }

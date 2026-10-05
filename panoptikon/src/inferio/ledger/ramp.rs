@@ -346,6 +346,18 @@ impl VramLedger {
         }
         if failed || charge.pressure != mps::MemoryPressure::Normal {
             let over = if failed { Over::Failed } else { Over::PutOff };
+            // A death's cap below the working size takes it there, and a
+            // death outside a probe waits as a failed probe does.
+            if let Some(cap) = cal
+                .death_cap_units
+                .filter(|cap| cal.knee_units > Some(*cap))
+            {
+                cal.knee_units = Some(cap);
+                cal.store_due = true;
+                if cal.probe.is_none() {
+                    cal.retest_after = Self::back_off(cal);
+                }
+            }
             if Self::end_probe(cal, &key, over, false) {
                 Self::flag_trial_trims_locked(state, &key);
             }
@@ -421,6 +433,13 @@ impl VramLedger {
                 probe.windows += 1;
                 probe.largest = probe.largest.max(charge.unit_budget);
                 let larger = probe.lo.saturating_mul(2);
+                // Two clean windows of a larger size above a death's cap lift it.
+                if ran == Some(larger) && cal.death_cap_units.is_some_and(|cap| larger > cap) {
+                    probe.above_cap += 1;
+                    if probe.above_cap >= 2 {
+                        cal.death_cap_units = None;
+                    }
+                }
                 if probe.run == larger && ran != Some(larger) {
                     // Memory could not grant the larger size in full.
                     if Self::end_probe(cal, &key, Over::Judged, false) {
@@ -519,6 +538,7 @@ impl VramLedger {
                     fresh: SizeEvidence::default(),
                     windows: 0,
                     largest: working,
+                    above_cap: 0,
                     before: Verdict::Unsure,
                 };
                 probe.before = Self::span_verdict(cal, &probe, &bar);
@@ -554,7 +574,12 @@ impl VramLedger {
             return false;
         };
         let mut working = from;
-        let fits = |units: u64| cal.memory_cap.is_none_or(|cap| units <= cap);
+        let fits = |units: u64| {
+            [cal.memory_cap, cal.death_cap_units]
+                .iter()
+                .flatten()
+                .all(|cap| units <= *cap)
+        };
         // Each step is a verdict the next cannot undo; the bound is a guard.
         for _ in 0..64 {
             let up = (cal.evidence_at(working), bar(working));
@@ -598,15 +623,20 @@ impl VramLedger {
     /// The undecided doubling the next probe measures, as its smaller size:
     /// the one above the working size, then the one below it (until the
     /// working size has earned its place), then in throughput mode the one
-    /// past a flat one.
+    /// past a flat one. None whose larger size is above a death's cap: that
+    /// one is measured again only in turn ([`Self::next_probe`]).
     fn undecided(
         cal: &ModelCalibration,
         mode: SizingMode,
         bar: &impl Fn(u64) -> f64,
     ) -> Option<u64> {
         let working = cal.knee_units?;
+        let under_cap = |lo: u64| {
+            cal.death_cap_units
+                .is_none_or(|cap| lo.saturating_mul(2) <= cap)
+        };
         let up = (cal.evidence_at(working), bar(working));
-        if verdict(&[up]) == Verdict::Unsure {
+        if under_cap(working) && verdict(&[up]) == Verdict::Unsure {
             return Some(working);
         }
         let down = working / 2;
@@ -615,14 +645,17 @@ impl VramLedger {
         }
         let twice = working.saturating_mul(2);
         let ahead = (cal.evidence_at(twice), bar(twice));
-        (mode == SizingMode::Throughput && verdict(&[up, ahead]) == Verdict::Unsure)
+        (mode == SizingMode::Throughput
+            && under_cap(twice)
+            && verdict(&[up, ahead]) == Verdict::Unsure)
             .then_some(twice)
     }
 
     /// The doubling the next probe measures: [`Self::undecided`], or once
     /// all are decided, the ones above and below the working size in turn, to
-    /// keep the evidence current.
-    fn next_probe(
+    /// keep the evidence current; only the one above while it runs past a
+    /// death's cap.
+    pub(super) fn next_probe(
         cal: &mut ModelCalibration,
         mode: SizingMode,
         bar: &impl Fn(u64) -> f64,
@@ -631,7 +664,10 @@ impl VramLedger {
         if let Some(lo) = Self::undecided(cal, mode, bar) {
             return Some(lo);
         }
-        cal.retest_below = !cal.retest_below && working > 1;
+        let capped = cal
+            .death_cap_units
+            .is_some_and(|cap| working.saturating_mul(2) > cap);
+        cal.retest_below = !cal.retest_below && working > 1 && !capped;
         Some(if cal.retest_below {
             working / 2
         } else {
@@ -663,6 +699,14 @@ impl VramLedger {
         true
     }
 
+    /// The wait after a probe that left the working size in place:
+    /// [`RETEST_WINDOWS`], doubled by each such probe before it in a row, up
+    /// to [`RETEST_MAX_DOUBLINGS`] times.
+    fn back_off(cal: &mut ModelCalibration) -> u32 {
+        cal.failed_trials = cal.failed_trials.saturating_add(1);
+        RETEST_WINDOWS << (cal.failed_trials - 1).min(RETEST_MAX_DOUBLINGS)
+    }
+
     /// End the probe, if one is on. One that moved the working size or
     /// decided its doubling lets the next start at once while a doubling is
     /// `pending` (still undecided); one that was put off, or left its
@@ -686,10 +730,7 @@ impl VramLedger {
         cal.retest_after = match over {
             Over::Moved | Over::Decided if pending => 0,
             Over::Moved | Over::PutOff | Over::Undecided => RETEST_WINDOWS,
-            Over::Decided | Over::Judged | Over::Failed => {
-                cal.failed_trials = cal.failed_trials.saturating_add(1);
-                RETEST_WINDOWS << (cal.failed_trials - 1).min(RETEST_MAX_DOUBLINGS)
-            }
+            Over::Decided | Over::Judged | Over::Failed => Self::back_off(cal),
         };
         cal.store_due = true;
         tracing::info!(

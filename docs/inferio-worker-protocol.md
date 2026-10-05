@@ -1488,7 +1488,8 @@ either way, so a trim never races a batch.
   it. If a batch outgrows RAM despite the ledger, the kernel kills the worker
   and not another program on the host; the death settles the window as
   `WorkerDied`, the job re-queues the items, and the model's batches on that
-  device are capped at half the batch that died until the server restarts
+  device are capped at half the batch that died until a batch size probe
+  runs that batch clean
   (design doc, "Host RAM on the CPU device"). The write is best effort.
 - **A request is not sent to a process that has already exited.** Before a
   frame is written the handle checks the child's exit status, and on Linux

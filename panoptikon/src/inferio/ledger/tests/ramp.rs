@@ -769,6 +769,23 @@ fn the_bar_follows_the_mode_the_device_and_the_memory_a_doubling_adds() {
     assert!((memory_doublings(Some(fit(640.0)), 64) - 1.5f64.log2()).abs() < 1e-12);
 }
 
+/// Below a death's cap no probe asks past it, the throughput look-ahead
+/// included: the doublings at and below the working size are measured in turn.
+#[test]
+fn no_probe_below_a_death_cap_asks_past_it() {
+    let bar = |_: u64| required_gain(SizingMode::Throughput, false);
+    let mut cal = ModelCalibration {
+        knee_units: Some(64),
+        death_cap_units: Some(128),
+        evidence: [(32, pairs(8.0, 0.2, 0.02)), (64, pairs(8.0, -0.1, 0.02))].into(),
+        ..ModelCalibration::default()
+    };
+    let probes: Vec<Option<u64>> = (0..4)
+        .map(|_| VramLedger::next_probe(&mut cal, SizingMode::Throughput, &bar))
+        .collect();
+    assert_eq!(probes, [Some(32), Some(64), Some(32), Some(64)]);
+}
+
 /// The budgets of `windows` windows of a replica seeded `seed` on a wide
 /// card in `mode`, at `rate`, and its working size after them.
 fn run_at(seed: u32, mode: SizingMode, windows: usize, rate: Rate) -> (Vec<u64>, Option<u64>) {

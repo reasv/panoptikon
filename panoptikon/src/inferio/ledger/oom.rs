@@ -228,8 +228,9 @@ impl VramLedger {
     /// A replica whose process died holding a granted window (`charge`).
     ///
     /// Where the death may be a host RAM kill ([`death_may_be_ram`]), the
-    /// (model, device) is capped at half that window's unit budget for the
-    /// life of this process, at least one unit. Without the cap the next
+    /// (model, device) is capped at half that window's unit budget, at least
+    /// one unit, until a probe re-runs the size that died clean
+    /// ([`ModelCalibration::death_cap_units`]). Without the cap the next
     /// replica is admitted for the batch that died, and dies again. A window
     /// the queue sized sets no cap: its size says nothing about the batch
     /// the model can run. An item-capped window does, since the cap sized it.
@@ -259,7 +260,7 @@ impl VramLedger {
                 batch_cap_units = cap,
                 "a worker died while running a granted window; this model's \
                  batches on this device are capped at half that batch until \
-                 the server restarts"
+                 a batch size probe runs that batch clean"
             );
         }
         let ram_mb = unified_ram_mb?;

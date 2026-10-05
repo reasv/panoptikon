@@ -197,12 +197,30 @@ fn ram_window_costing(
     fixed_mb: u64,
     per_unit_mb: u64,
 ) -> Grant {
+    let rising = |units| ladder_rate(&RISING, units);
+    let clean = WindowOutcome::Responded { oom: None };
+    let grant = ram_window_ending(handle, admission, (fixed_mb, per_unit_mb), rising, clean);
+    if !grant.squeezed {
+        admission.earn_next_size();
+    }
+    grant
+}
+
+/// One window of batches that peak `fixed_mb + per_unit_mb` per unit
+/// (`cost`) and run at `rate_at` units a second, ending in `outcome`.
+fn ram_window_ending(
+    handle: &TelemetryHandle,
+    admission: &Admission,
+    (fixed_mb, per_unit_mb): (u64, u64),
+    rate_at: impl Fn(u64) -> f64,
+    outcome: WindowOutcome,
+) -> Grant {
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
     let grant = *token.grant();
     let units = grant.unit_budget;
-    let rate = ladder_rate(&RISING, units);
+    let rate = rate_at(units);
     let host_ram = |batch: BatchMeasurement| BatchMeasurement {
         peak_rss_mb: Some(RSS_AT_LOAD_MB + fixed_mb + per_unit_mb * units),
         rss_after_mb: Some(RSS_AT_LOAD_MB),
@@ -214,10 +232,7 @@ fn ram_window_costing(
     })];
     batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| host_ram(warm_batch(units, rate))));
     handle.lock().unwrap().record_measurements(batches);
-    token.finish(WindowOutcome::Responded { oom: None });
-    if !grant.squeezed {
-        admission.earn_next_size();
-    }
+    token.finish(outcome);
     grant
 }
 
@@ -660,8 +675,9 @@ fn two_replicas_book_no_more_than_is_truly_free() {
 }
 
 /// A GPU replica that dies while its window holds a host RAM booking is
-/// capped at half that batch, since host RAM may be what killed it. Its
-/// anchor and ramp are left alone: on private memory a death is no negative.
+/// capped at half that batch, since host RAM may be what killed it, and its
+/// working size comes down to the cap. Its anchor and deflation are left
+/// alone: on private memory a death is no negative.
 #[test]
 fn a_gpu_replica_that_dies_with_host_ram_booked_is_capped() {
     let ledger = host(&[GPU], None);
@@ -683,7 +699,7 @@ fn a_gpu_replica_that_dies_with_host_ram_booked_is_capped() {
     assert_eq!(after.death_cap_units, Some(128));
     assert_eq!(after.unit_budget, 128);
     assert_eq!(after.max_units_measured, before.max_units_measured);
-    assert_eq!((after.deflation, after.knee_units), (0, before.knee_units));
+    assert_eq!((after.deflation, after.knee_units), (0, Some(128)));
     for _ in 0..4 {
         assert_eq!(ram_window(&handle, &admission).unit_budget, 128);
     }
@@ -713,6 +729,43 @@ fn a_death_in_a_booked_item_capped_window_caps() {
     assert!(row(&ledger, "g/capped").ram_booked_mb > 0);
     token.finish(WindowOutcome::WorkerDied);
     assert_eq!(row(&ledger, "g/capped").death_cap_units, Some(2));
+}
+
+/// The cap a death left is re-tested like any other size. The working size
+/// comes down to the cap and waits as after a failed probe; then a probe of
+/// the doubling from the cap runs the size that died. A death there caps
+/// again and doubles the wait; two clean windows there lift the cap.
+#[test]
+fn a_death_cap_is_re_tested_once_the_wait_of_a_failed_probe_has_run_out() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/died", GPU, 64);
+    cpu_free_to_book(&ledger, 45_000);
+    let window = |outcome| {
+        let rate = |units: u64| units.min(256) as f64;
+        ram_window_ending(&handle, &admission, (0, RAM_PER_UNIT_MB), rate, outcome).unit_budget
+    };
+    let clean = WindowOutcome::Responded { oom: None };
+    let died = WindowOutcome::WorkerDied;
+    let state = || {
+        let row = row(&ledger, "g/died");
+        (row.knee_units, row.death_cap_units)
+    };
+    let climb: Vec<u64> = (0..100)
+        .map(|_| window(clean))
+        .take_while(|_| state().0 != Some(256))
+        .collect();
+    assert_eq!(window(died), 256, "{climb:?}");
+    assert_eq!(state(), (Some(128), Some(128)));
+
+    for (wait, outcome) in [(RETEST_WINDOWS, died), (2 * RETEST_WINDOWS, clean)] {
+        // The wait, then the probe's lead-in and first window at the cap.
+        let held: Vec<u64> = (0..wait + 2).map(|_| window(clean)).collect();
+        assert!(held.iter().all(|units| *units == 128), "{held:?}");
+        assert_eq!(window(outcome), 256);
+        assert_eq!(state(), (Some(128), Some(128)));
+    }
+    assert_eq!(window(clean), 256);
+    assert_eq!(state(), (Some(256), None));
 }
 
 /// A probe stub answering `free_mb` for the CPU device.

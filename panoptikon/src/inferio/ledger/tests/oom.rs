@@ -257,8 +257,9 @@ fn a_death_in_a_window_the_queue_sized_sets_no_cap() {
         assert_eq!(token.grant().unit_budget, 50);
         token.finish(WindowOutcome::WorkerDied);
         assert_eq!(death_cap(&ledger), Some(25));
+        // As a lifted cap leaves it once the batch size has grown back.
         ledger.lock().calibration.values_mut().for_each(|cal| {
-            cal.death_cap_units = None;
+            (cal.death_cap_units, cal.knee_units) = (None, Some(full));
         });
         drop(admission);
 

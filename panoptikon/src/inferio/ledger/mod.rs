@@ -480,6 +480,8 @@ struct Probe {
     fresh: SizeEvidence,
     /// The largest size it was granted, for the trim that follows.
     largest: u64,
+    /// Clean windows it ran above a death's cap; the second lifts the cap.
+    above_cap: u32,
     /// The verdict on its doubling when it started: it ends when that moves.
     before: ramp::Verdict,
 }
@@ -1167,8 +1169,9 @@ struct ModelCalibration {
     /// See [`ShapeCeiling`]. Runtime-only.
     shape_ceiling: Option<ShapeCeiling>,
     /// Half the batch a replica was running when its process died
-    /// mid-window; no later batch of this (model, device) is larger. Kept
-    /// for the life of this process ([`VramLedger::note_death_locked`]).
+    /// mid-window ([`VramLedger::note_death_locked`]). No later batch of this
+    /// (model, device) is larger, but a probe's that re-runs the size that
+    /// died, and two clean windows of it lift the cap. Runtime-only.
     death_cap_units: Option<u64>,
     /// [`WorkerEntry::oom_at_floor`] of a replica that died at one unit; the
     /// next replica starts from it, a clean window clears it.
@@ -1242,9 +1245,16 @@ fn shape_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Opt
 
 /// The largest batch this replica may run whatever memory allows: the
 /// smaller of its shape ceiling ([`shape_ceiling_for`]) and the cap a death
-/// left ([`ModelCalibration::death_cap_units`]), if either stands.
+/// left ([`ModelCalibration::death_cap_units`]), if either stands. A probe of
+/// the doubling from the cap runs its larger size: at most the size that died.
 fn batch_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Option<u64> {
-    let death = cal.and_then(|cal| cal.death_cap_units);
+    let death = cal.and_then(|cal| {
+        let cap = cal.death_cap_units?;
+        Some(match cal.probe {
+            Some(probe) if probe.lo <= cap => cap.max(probe.run),
+            _ => cap,
+        })
+    });
     match (shape_ceiling_for(cal, entry), death) {
         (Some(shape), Some(death)) => Some(shape.min(death)),
         (shape, death) => shape.or(death),

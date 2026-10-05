@@ -244,7 +244,8 @@ pub struct LedgerWorkerHealth {
     /// Shape ceiling from `index_limit` clamps: caps `unit_budget`; runtime-only.
     pub shape_ceiling_units: Option<u64>,
     /// Half the batch a replica of this model was running here when its
-    /// process died mid-window: caps `unit_budget` until the server restarts.
+    /// process died mid-window: caps `unit_budget` until a probe runs the
+    /// size that died clean in two windows, or the server restarts.
     pub death_cap_units: Option<u64>,
     /// Windows counted in the evidence per batch size, over every run.
     pub throughput_samples: usize,
