@@ -848,7 +848,9 @@ def test_a_hog_event_the_hog_answered_with_under_a_chunk_is_void_and_warns(tmp_p
 def test_a_split_leg_is_judged_only_on_what_the_gateway_answers_for(tmp_path):
     (tmp_path / "legs.json").write_text(json.dumps(
         {"inference_url": "http://10.0.0.5:7777", "events": []}))
-    for checks, judged in (("all", list(analyze.SPLIT_LEG_CHECKS)),
+    for checks, judged in (("all", ["failures", "idle_liveness", "job_outcome",
+                                    "peak_fds", "ramp_progress",
+                                    "batch_coverage"]),
                            ("oracle_agreement,failures", ["failures"])):
         analyze.main(["--scenario", str(tmp_path), "--checks", checks,
                       "--json", str(tmp_path / "v.json"), "--quiet"])

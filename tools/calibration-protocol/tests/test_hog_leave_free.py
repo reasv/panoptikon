@@ -210,8 +210,8 @@ def test_free_ram_is_mem_available_less_s_reclaimable(monkeypatch):
 
 
 def test_a_pinned_leave_free_level_is_solved_once():
-    """`/set?leave_free=N&pin=1` keeps its first solve; without `pin` the
-    level is re-solved every `--reeval` (0 s here)."""
+    """`/set?leave_free=N&pin=1` keeps its first solve; without `pin`, also
+    after a pinned one, the level is re-solved every `--reeval` (0 s here)."""
 
     class _Backend(hog.Backend):
         name = "fake"
@@ -230,7 +230,8 @@ def test_a_pinned_leave_free_level_is_solved_once():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         for query, solves in (("leave_free=4096", [5904, 3904]),
-                              ("leave_free=4096&pin=1", [5904, 5904])):
+                              ("leave_free=4096&pin=1", [5904, 5904]),
+                              ("leave_free=4096", [5904, 3904])):
             backend.free = 10000
             urllib.request.urlopen(urllib.request.Request(
                 f"http://127.0.0.1:{server.server_port}/set?{query}",
