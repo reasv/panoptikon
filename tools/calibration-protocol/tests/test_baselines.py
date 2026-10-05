@@ -50,16 +50,19 @@ def _store(tmp_path: Path, *, schema: int = 3, extra: str = "",
            slope: float = 29.859099744349997, backend: str = "cuda",
            arch: str = "sm_120") -> Path:
     arch = f'arch = "{arch}"\n' if schema == 3 else ""
+    gpu, torch = (("AMD Radeon RX 6900 XT", "2.8.0+rocm6.4") if backend == "rocm"
+                  else ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                        "2.7.1+cu128"))
     path = tmp_path / "calibration.toml"
     path.write_text(f"""schema = {schema}
 
 [[profile]]
 inference_id = "{inference_id}"
 epoch = 1
-{arch}gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+{arch}gpu = "{gpu}"
 platform = "{platform}"
 backend = "{backend}"
-torch = "2.7.1+cu128"
+torch = "{torch}"
 dtype = "fp32"
 unit = "item"
 aggregation = "count"
@@ -133,9 +136,12 @@ def test_the_ratchet_anchor_travels_onto_every_shipped_row(tmp_path):
     assert [row["max_units_measured"] for row in doc["profile"]] == [768, 768]
 
 
-def test_a_row_measured_anywhere_but_linux_cuda_or_rocm_is_refused(tmp_path):
-    store = baselines.read_store(_store(tmp_path, platform="windows"), None)
-    with pytest.raises(baselines.BaselineError, match="linux/cuda or linux/rocm"):
+@pytest.mark.parametrize("platform,backend", [("windows", "cuda"), ("linux", "cpu")])
+def test_a_row_measured_anywhere_but_linux_cuda_or_rocm_is_refused(
+        tmp_path, platform, backend):
+    store = baselines.read_store(
+        _store(tmp_path, platform=platform, backend=backend), None)
+    with pytest.raises(baselines.BaselineError, match=f"{platform}/{backend}"):
         baselines.generate(store, baselines.read_allowlist(_registry(tmp_path)))
 
 
