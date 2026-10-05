@@ -90,14 +90,14 @@ impl VramLedger {
         let entry = state.workers.get(&worker)?;
         let one_unit = self.one_unit_appetite_mb_locked(state, entry);
         let key = (entry.inference_id.clone(), entry.gpu.clone());
-        let at_floor = charge
-            .filter(|charge| !charge.pressure.paging())
-            .is_some_and(|charge| {
-                charge.unit_budget <= 1
-                    && failed
-                    && ((charge.room as f64) < one_unit
-                        || (died && death_may_be_ram(state, &key.1, &charge)))
-            });
+        let at_floor = failed
+            && charge
+                .filter(|charge| !charge.pressure.paging())
+                .is_some_and(|charge| {
+                    charge.unit_budget <= 1
+                        && ((charge.room as f64) < one_unit
+                            || (died && death_may_be_ram(state, &key.1, &charge)))
+                });
         let entry = state.workers.get_mut(&worker)?;
         if clean {
             entry.oom_at_floor = 0;

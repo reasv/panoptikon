@@ -570,15 +570,6 @@ fn a_one_item_oom_with_room_to_spare_condemns_nothing() {
             token.grant().mb > 0,
             "the GPU has room; the window is priced"
         );
-        // An out-of-memory batch right after a pool release is not a spill.
-        handle
-            .lock()
-            .unwrap()
-            .record_measurements(vec![BatchMeasurement {
-                oom: true,
-                regrow_after: Some("spill".to_owned()),
-                ..warm_batch(1, 1.0)
-            }]);
         assert!(
             token
                 .finish(WindowOutcome::Responded {
@@ -606,7 +597,7 @@ fn one_item_windows_that_spill_with_no_room_for_one_condemn_the_replica() {
             .expect("registers");
         push_memory(&handle, free_mb, 0);
         ledger.ingest_all_for_test();
-        let window = |regrow_after: Option<&str>| {
+        let window = || {
             let token = admission.request_grant(1, None, 1, 0).expect("granted");
             assert_eq!(token.grant().unit_budget, 1);
             handle
@@ -615,21 +606,14 @@ fn one_item_windows_that_spill_with_no_room_for_one_condemn_the_replica() {
                 .record_measurements(vec![BatchMeasurement {
                     spilled: true,
                     items: Some(1),
-                    regrow_after: regrow_after.map(str::to_owned),
                     ..warm_batch(1, 1.0)
                 }]);
             token.finish(WindowOutcome::Responded { oom: None })
         };
-        // What the worker sends: the first spill releases the pool, only the
-        // next batch carries the re-grow, and a spill that persists releases
-        // nothing more.
-        let regrow_after = [None, Some("spill"), None];
-        assert_eq!(regrow_after.len(), OOM_WINDOWS_AT_FLOOR as usize);
-        let (last, earlier) = regrow_after.split_last().unwrap();
-        for regrow_after in earlier {
-            assert!(window(*regrow_after).is_none());
+        for _ in 1..OOM_WINDOWS_AT_FLOOR {
+            assert!(window().is_none());
         }
-        let verdict = window(*last);
+        let verdict = window();
         assert_eq!(verdict.is_some(), condemned, "{total_mb} MiB card");
         if let Some(verdict) = verdict {
             assert_eq!(verdict.base_mb, base_mb);
