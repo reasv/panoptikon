@@ -210,7 +210,8 @@ def test_in_a_container_kfd_is_found_by_the_fdinfo_pasid(tmp_path):
 def test_a_descriptor_inherited_across_fork_counts_once(tmp_path):
     """Parent and child both name the parent's PASID: its KFD entry is
     credited to the lower PID only. A child with a PASID of its own is
-    credited its own entry, whether or not its parent is read."""
+    credited its own entry, whether or not its parent is read, and when its
+    PID is lower than its parent's."""
     host = Host(tmp_path, host_pid_ns=False).gpu(1, 0x0300)
     host.kfd(4242, 1, 300 * MIB, pasid=32770)
     for pid in (700, 701):
@@ -219,11 +220,15 @@ def test_a_descriptor_inherited_across_fork_counts_once(tmp_path):
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu], [701, 700])[gpu.key] == (
         "kfd", {700: 300}, [])
     host.kfd(4243, 1, 500 * MIB, pasid=32771)
-    host.fdinfo(701, 4, _fd(BDF_03, 12, 200 * 1024, pasid=32771))
+    host.fdinfo(701, 12, _fd(BDF_03, 12, 200 * 1024, pasid=32771))
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu], [701, 700])[gpu.key] == (
         "kfd", {700: 300, 701: 500}, [])
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu], [701])[gpu.key] == (
         "kfd", {701: 500}, [])
+    host.fdinfo(650, 4, _fd(BDF_03, 12, 200 * 1024, pasid=32771))
+    host.fdinfo(650, 5, _fd(BDF_03, 11, 150 * 1024, pasid=32770))
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu], [650, 700])[gpu.key] == (
+        "kfd", {650: 500, 700: 300}, [])
 
 
 def test_one_pasid_on_two_gpus_counts_on_each(tmp_path):
@@ -798,9 +803,9 @@ def test_selftest_reads_free_until_it_settles():
     reads = iter([None] * 9)
     assert selftest.settled_free_mb(memory, lambda s: None, reads=9) == (
         None, None, 2.25, False)
-    reads = iter([1000] * 7 + [2000] * 9)
+    reads = iter([1000] * 8)
     assert selftest.settled_free_mb(memory, lambda s: None) == (
-        2000, "amdgpu-sysfs", 4.0, True)
+        1000, "amdgpu-sysfs", 2.0, True)
     for source, unified in (("nvml", False), ("amdgpu-sysfs", True)):
         reads = iter([1000, 2000])
         memory = types.SimpleNamespace(

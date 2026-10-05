@@ -10,6 +10,7 @@ or, where that cannot be used, from DRM fdinfo parsed as
 
 from __future__ import annotations
 
+from collections import Counter
 import os
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
@@ -292,10 +293,11 @@ def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = N
     KFD sets to its own PASID for that process. A unified GPU, or one without
     a KFD `gpu_id`, is read from fdinfo (KFD counts VRAM only, not GTT), as is,
     when PIDs are matched by PASID, a GPU where a PID holding memory has no KFD
-    entry. PIDs are taken in ascending order, and each takes the PASID of its
-    highest-numbered descriptor whose KFD entry no lower PID took. A descriptor
-    inherited across fork carries the parent's PASID and a lower number than
-    the child's own, so an entry two PIDs reach is credited once.
+    entry. PIDs are taken in ascending order, and each takes the first PASID
+    whose KFD entry no lower PID took: one no other read PID names before one
+    it shares (a descriptor inherited across fork), highest-numbered descriptor
+    first. An entry two PIDs reach is credited once, and a child keeps its own
+    entry whatever its PID.
     """
     kfd_root = os.path.join(roots.kfd, "proc")
     kfd_present = os.path.isdir(kfd_root)
@@ -315,9 +317,13 @@ def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = N
                    for pid in (pids if pids is not None else _numbered(kfd_root))}
     else:
         entries = {}
-        for pid in sorted(texts):
-            match = next((by_pasid[pasid] for pasid in map(_pasid, texts[pid] or [])
-                          if pasid and pasid in by_pasid
+        pasids = {pid: [p for p in map(_pasid, pid_texts or []) if p]
+                  for pid, pid_texts in texts.items()}
+        shared = Counter(p for found in pasids.values() for p in set(found))
+        for pid in sorted(pasids):
+            match = next((by_pasid[pasid] for pasid in
+                          sorted(pasids[pid], key=lambda p: shared[p] > 1)
+                          if pasid in by_pasid
                           and by_pasid[pasid] not in entries.values()), None)
             if match:
                 entries[pid] = match
