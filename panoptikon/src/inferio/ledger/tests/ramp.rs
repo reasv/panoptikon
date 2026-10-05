@@ -1218,16 +1218,13 @@ fn a_window_granted_before_the_trial_moved_on_is_not_a_cut_step() {
     assert_eq!(late.grant().unit_budget, 16);
     assert_eq!(window_leaving_warm(&handle, &admission, |_| 2, rising), 16);
     assert_eq!(ledger.trial_for_test("g/a", GPU).0, Some(32));
-    other_handle
-        .lock()
-        .unwrap()
-        .record_measurements(vec![
-            BatchMeasurement {
-                duration_ms: Some(16.0 * 1000.0 / rising(16)),
-                ..measurement(16, 260, 260)
-            };
-            2
-        ]);
+    other_handle.lock().unwrap().record_measurements(vec![
+        BatchMeasurement {
+            duration_ms: Some(16.0 * 1000.0 / rising(16)),
+            ..measurement(16, 260, 260)
+        };
+        2
+    ]);
     late.finish(WindowOutcome::Responded { oom: None });
     assert_eq!(ledger.trial_for_test("g/a", GPU).0, Some(32));
     assert_eq!(window_leaving_warm(&handle, &admission, |_| 2, rising), 32);
