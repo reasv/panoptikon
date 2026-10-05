@@ -1386,10 +1386,19 @@ def run_window(
     pending = list(range(len(inputs)))
     # The smallest priced units of a batch that failed on a shape ceiling.
     split_from: int | None = None
+    # The priced units of every batch in this window that ran whole.
+    ran_whole: list[int] = []
     # The one clamp this window reports for its splits: `to_units` is the
-    # largest batch that ran whole after a split, below the smallest batch that
+    # largest batch in this window that ran whole below the smallest batch that
     # failed; `from_units` is that smallest failed batch.
     split_clamp: dict[str, Any] | None = None
+
+    def bound_split(clamp: dict[str, Any]) -> None:
+        clamp["from_units"] = split_from
+        # 0: no batch has run whole below it (the ledger ignores 0).
+        clamp["to_units"] = max(
+            (whole for whole in ran_whole if whole < split_from), default=0
+        )
 
     def record(measurement: dict[str, Any]) -> dict[str, Any]:
         """Append a measurement; the first is stamped `trimmed` if the pool was
@@ -1504,12 +1513,8 @@ def run_window(
                 if split:
                     if split_from is None or priced < split_from:
                         split_from = priced
-                    # 0: no batch has yet run below it (the ledger ignores 0).
-                    if (
-                        split_clamp is not None
-                        and split_clamp["to_units"] >= split_from
-                    ):
-                        split_clamp["to_units"] = 0
+                    if split_clamp is not None:
+                        bound_split(split_clamp)
                     cap_items = len(batch) // 2
                     logger.warning(
                         "a batch of %d inputs exceeded a kernel's size limit "
@@ -1563,12 +1568,11 @@ def run_window(
                     executed,
                     len(batch),
                 )
+            whole = clamped is None and priceable and not absorbed_ooms
+            if whole:
+                ran_whole.append(priced)
             split_ran = (
-                split_from is not None
-                and clamped is None
-                and priced < split_from
-                and priceable
-                and not absorbed_ooms
+                split_from is not None and whole and priced < split_from
             )
             impl_cut = (
                 _utils_total("total_index_limit_events") > index_limits_before
@@ -1582,11 +1586,10 @@ def run_window(
                     live.free_mb,
                 )
                 if not impl_cut:
-                    clamped["from_units"] = split_from
                     split_clamp = clamped
+                    bound_split(split_clamp)
             elif split_ran:
-                split_clamp["to_units"] = max(split_clamp["to_units"], priced)
-                split_clamp["from_units"] = split_from
+                bound_split(split_clamp)
             measurement = memory.measure_batch(
                 state,
                 items=len(batch),

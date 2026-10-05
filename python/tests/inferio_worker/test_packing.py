@@ -2622,7 +2622,9 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
             for width in widths
         ]
         payload = packing.run_window(
-            impl, mixed, grant(unit_budget=budget, unit="pixel", aggregation="sum")
+            impl,
+            mixed,
+            grant(unit_budget=budget, unit="pixel", aggregation="sum"),
         )
         return impl.batches, clamps(payload["measurements"])
 
@@ -2646,6 +2648,24 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
     assert pixel_window([1, 1, 1, 120, 120, 120], padded, 24000) == (
         [4, 2, 2, 2],
         [(1, (12300, 12100))],
+    )
+    # A batch that ran whole before the first failure counts.
+    widths = [150, 150, 150, 100, 100, 50, 50]
+    assert pixel_window(widths, over(30000), 40000) == (
+        [2, 4, 2, 2, 1],
+        [(2, (40000, 30000))],
+    )
+
+    # A batch that ran whole below a later, smaller failure still counts.
+    def holds_150(inputs):
+        return len(inputs) > 4 or (
+            len(inputs) > 1 and any(item.data == 15000 for item in inputs)
+        )
+
+    widths = [100] * 3 + [300] * 3 + [150, 100, 100] + [100] * 3
+    assert pixel_window(widths, holds_150, 185000) == (
+        [12, 6, 3, 3, 3] + [1] * 6,
+        [(2, (35000, 30000))],
     )
 
     # A batch that ran at a size that later failed is not below it.
