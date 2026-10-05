@@ -1080,8 +1080,8 @@ def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
     assert numbers["items_per_s"] == pytest.approx(100 / 8.2)
     assert numbers["baseline_items_per_s"] == pytest.approx(5.0)
 
-    def record(start, end):
-        return {"total_segments": 100, "inference_time": 4.0,
+    def record(start, end, inference=4.0):
+        return {"total_segments": 100, "inference_time": inference,
                 "data_load_time": 0.5,
                 "start_time": f"2026-10-03 10:00:{start}",
                 "end_time": f"2026-10-03 10:00:{end}"}
@@ -1092,12 +1092,17 @@ def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
 
     # A backward step longer than the job: end before start, still the span.
     assert per_s([record(10, "05")], -10.0) == pytest.approx(20.0)
-    # A step larger than the span fell outside it: busy time, no step.
-    assert per_s([record(10, 20)], 30.0) == pytest.approx(100 / 4.5)
-    # A backward step the job's 12 s cannot hold fell outside the span; the
+    # A forward step that leaves less than the 4 s inference fell outside
+    # the span: no step. The whole-second times allow 1 s per record.
+    assert per_s([record(10, 20)], 30.0) == pytest.approx(10.0)
+    assert per_s([record(10, 20)], 7.5) == pytest.approx(10.0)
+    assert per_s([record(10, 20)], 7.0) == pytest.approx(100 / 3)
+    # A backward step the job's 13.5 s cannot hold fell outside the span; the
     # whole-second times allow 1 s per record over the job's time.
-    assert per_s([record(10, 20)], -5.0, 12.0) == pytest.approx(10.0)
+    assert per_s([record(10, 20)], -5.0, 13.5) == pytest.approx(10.0)
     assert per_s([record(10, 20)], -5.0, 14.5) == pytest.approx(100 / 15)
+    assert per_s([record(10, 20), record(30, 40)], -2.0, 20.5) == pytest.approx(
+        200 / 22)
     # A step under 1 s is not subtracted, one of 1 s is. A sub-second job's
     # start equals its end, and that span uses busy time.
     assert per_s([record(10, 20)], -0.9) == pytest.approx(10.0)
@@ -1105,8 +1110,8 @@ def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
     assert per_s([record(10, 10)], -0.002) == pytest.approx(100 / 4.5)
     # A step inside records shorter than a second each: busy time.
     assert per_s([record(10, "09")], -1.002) == pytest.approx(100 / 4.5)
-    assert per_s([record(10, "09"), record(20, 21)], -1.5) == pytest.approx(
-        200 / 9)
+    assert per_s([record(10, "09", 1.0), record(20, 21, 1.0)],
+                 -1.5) == pytest.approx(200 / 3)
     # Without a step, each record on its own: a span, or busy time.
     assert analyze._items_per_s([record(10, 20), {**record(21, 21),
                                  "end_time": None}]) == pytest.approx(200 / 14.5)

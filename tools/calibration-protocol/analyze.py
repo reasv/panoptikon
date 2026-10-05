@@ -2070,26 +2070,29 @@ def _items_per_s(records: List[Dict[str, Any]],
     standing in for a span that is missing or not positive. A clock step
     (`clock`: the step and the job's monotonic seconds) of 1 s or more comes
     off the summed spans instead (the times are whole seconds, so a smaller
-    step is noise), unless the corrected total exceeds the job's monotonic
-    seconds by over 1 s per record: the job ran inside them, so the step fell
-    outside the spans. Busy time stands in for all of them when a span is
-    missing or the corrected total is under 1 s per record."""
+    step is noise), unless the corrected total is over the job's monotonic
+    seconds or under the records' longer phase's busy seconds (also
+    monotonic) by over 1 s per record: the job holds the spans and the spans
+    hold that busy time, so the step fell outside them. Busy time stands in
+    for all of them when a span is missing or the corrected total is under
+    1 s per record."""
     items = sum(float(record.get("total_segments") or 0) for record in records)
+    phases = [(float(record.get("inference_time") or 0),
+               float(record.get("data_load_time") or 0)) for record in records]
     spans = [(_iso_epoch(str(record.get("start_time", "")).replace(" ", "T")),
               _iso_epoch(str(record.get("end_time", "")).replace(" ", "T")),
-              float(record.get("inference_time") or 0)
-              + float(record.get("data_load_time") or 0))
-             for record in records]
+              sum(phase)) for record, phase in zip(records, phases)]
     step, job_s = clock or (0.0, 0.0)
     seconds = None
     if abs(step) >= 1:
-        seconds = 0.0
+        seconds = sum(busy for _, _, busy in spans)
         if all(start is not None and end is not None for start, end, _ in spans):
-            seconds = sum(end - start for start, end, _ in spans) - step
-        if seconds > job_s + len(spans):
-            seconds = None
-        elif seconds < len(spans):
-            seconds = sum(busy for _, _, busy in spans)
+            corrected = sum(end - start for start, end, _ in spans) - step
+            least = sum(max(phase) for phase in phases) - len(spans)
+            if not least <= corrected <= job_s + len(spans):
+                seconds = None
+            elif corrected >= len(spans):
+                seconds = corrected
     if seconds is None:
         seconds = sum(end - start if start is not None and end is not None
                       and end > start else busy for start, end, busy in spans)
