@@ -20,10 +20,10 @@ pub(crate) fn check_databases(data_folder: &Path, index_db: &str) -> anyhow::Res
 }
 
 /// The first of `paths` with a `problem`, as a message. An index folder
-/// holding a database, or a user-data database file, can instead be moved out
-/// of the data folder: the folder only as root, unless it is a symlink in a
-/// writable `index/`; the file with its `-wal` and `-shm`, unless it is a
-/// symlink.
+/// holding a database, or one the current user cannot look into, or a
+/// user-data database file, can instead be moved out of the data folder: the
+/// folder only as root, unless it is a symlink in a writable `index/`; the
+/// file with its `-wal` and `-shm`, unless it is a symlink.
 fn refusal(
     data_folder: &Path,
     paths: &[PathBuf],
@@ -38,7 +38,7 @@ fn refusal(
     let what = if path.parent() == Some(index.as_path())
         && ["index.db", "storage.db"]
             .iter()
-            .any(|db| path.join(db).is_file())
+            .any(|db| path.join(db).try_exists().unwrap_or(true))
     {
         if link && problem(&index).is_none() {
             "move it"
@@ -407,7 +407,7 @@ pub(crate) mod tests {
             "index/default/storage.db",
             "index/default/config.toml",
             "index/default/index.db.bak",
-            "index/second/index.db",
+            "index/second/storage.db",
             "index/second/config.toml",
             "index/lost+found/file",
             "index/notes.txt",
@@ -504,8 +504,9 @@ pub(crate) mod tests {
 
     /// A user-data database can instead be moved out of the data folder with
     /// its `-wal` and `-shm`, and a real index database folder as root (it
-    /// cannot be moved without write access on it); a file inside it, a `-wal`
-    /// or `-shm`, and a folder the server creates databases in cannot.
+    /// cannot be moved without write access on it), also when its contents
+    /// cannot be seen; a file inside it, a `-wal` or `-shm`, and a folder the
+    /// server creates databases in cannot.
     #[test]
     fn a_database_its_wal_files_or_its_folder_owned_by_root_refuses() {
         let data = data_folder();
@@ -529,6 +530,36 @@ pub(crate) mod tests {
             let expected = refusal_text(plain, what, data.path());
             assert_eq!(refusal_for(data.path(), &[&owned]), Some(expected));
         }
+        use std::os::unix::fs::PermissionsExt as _;
+        let default = data.path().join("index/default");
+        std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = refusal_for(data.path(), &[&default]);
+        std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = owned_by(&default, 0, 1000, data.path());
+        assert_eq!(refused, Some(refusal_text(plain, as_root, data.path())));
+    }
+
+    /// The startup check offers moving out a user-data database linked to a
+    /// file another user owns.
+    #[test]
+    fn the_startup_check_offers_moving_out_a_linked_database() {
+        let Some((folder, owner)) = foreign_folder(false) else {
+            return;
+        };
+        let Ok(target) = folder.join("bin/env").canonicalize() else {
+            return;
+        };
+        if super::unix::access(&target) != (Access::Denied { owner }) {
+            return;
+        }
+        let data = data_folder();
+        assert!(check_databases(data.path(), "default").is_ok());
+        let link = data.path().join("user_data/linked.db");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error = check_databases(data.path(), "default").unwrap_err();
+        let plain = owned_by_another_user(&link, owner, &target);
+        let expected = refusal_text(plain, Some("move it"), data.path());
+        assert_eq!(error.to_string(), expected);
     }
 
     /// An empty data folder root owns (a bind mount Docker created), then
