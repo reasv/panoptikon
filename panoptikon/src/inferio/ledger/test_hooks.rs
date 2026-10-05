@@ -187,7 +187,7 @@ impl VramLedger {
 
     /// Install a working size as measured here.
     #[cfg(test)]
-    pub(super) fn set_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {
+    pub(in crate::inferio) fn set_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {
         let mut state = self.lock();
         let cal = state
             .calibration

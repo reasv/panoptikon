@@ -2196,6 +2196,26 @@ mod tests {
         );
     }
 
+    /// The figure is published at the grant, before the window's replies go
+    /// out: the first reply after the working size changed carries the new
+    /// size's figure, not the one before it.
+    #[tokio::test]
+    async fn the_first_reply_after_a_size_change_carries_its_in_flight_figure() {
+        let harness = one_replica(32_768, "batchsize_test", item_cost(8)).await;
+        let figure_after_one_window = async || {
+            harness
+                .predict(json_inputs(1), None)
+                .await
+                .expect("succeeded");
+            harness.stats.desired_in_flight_items.load(Relaxed)
+        };
+        let per_unit = WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK;
+        assert_eq!(figure_after_one_window().await, 8 * per_unit);
+        harness.ledger.set_knee_for_test("test/batch", TEST_GPU, 32);
+        assert_eq!(figure_after_one_window().await, 32 * per_unit);
+        harness.shutdown().await;
+    }
+
     /// Before each grant the ledger is told the largest count of items left
     /// that a request in the window or the queue carries, and `None` once no
     /// request carries one.

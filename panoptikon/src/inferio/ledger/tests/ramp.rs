@@ -866,6 +866,26 @@ fn a_job_too_short_to_repay_a_probe_runs_at_the_working_size() {
     assert!(probes(budgets(None, PROBE_PAYBACK_WINDOWS)));
 }
 
+/// From the settle that starts a probe, the caller is asked to keep the
+/// probe's larger size in flight, while the probe's lead-in window still
+/// runs the working size.
+#[test]
+fn the_settle_that_starts_a_probe_asks_the_caller_for_its_larger_size() {
+    let (ledger, handle, admission) = ramping_from_seed(64);
+    admission.note_remaining_items(Some(u64::MAX));
+    let probe_on = || ledger.trial_for_test("g/a", GPU).0.is_some();
+    for _ in 0..40 {
+        if probe_on() {
+            break;
+        }
+        assert_eq!(admission.in_flight_units(), 64 * WINDOW_DEPTH_MULTIPLIER);
+        window_at_the_rate(&handle, &admission, |_| 100.0);
+    }
+    assert!(probe_on());
+    assert_eq!(admission.in_flight_units(), 128 * WINDOW_DEPTH_MULTIPLIER);
+    assert_eq!(window_at_the_rate(&handle, &admission, |_| 100.0), 64);
+}
+
 /// A doubling whose probe cannot be granted in full is not run at all:
 /// on a card with room for 100 units the probe of 128 is granted the
 /// working size, ends, and nothing between 64 and 128 ever runs.
