@@ -476,6 +476,7 @@ impl VramLedger {
         });
         if let Some(charge) = charge {
             entry.pending_requests = entry.pending_requests.saturating_sub(charge.requests);
+            entry.items_since_dry = entry.items_since_dry.saturating_add(charge.requests as u64);
         }
         let granted_units = charge;
         // The trim path's idle clock starts at settle, on every outcome.

@@ -200,8 +200,9 @@ pub const MAX_PAIRS: f64 = 64.0;
 pub const PROBE_PAIRS: u32 = 4;
 pub const PROBE_WINDOWS: u32 = 16;
 
-/// Windows at the working size a job must have left for a probe to start,
-/// when the job says how much it has left.
+/// Windows at the working size a job must have left for a probe to start:
+/// the items it says it has left, or else the items since its queue last ran
+/// dry.
 pub const PROBE_PAYBACK_WINDOWS: u64 = 16;
 
 /// Windows at the working size after a probe that left it in place before
@@ -744,6 +745,9 @@ struct WorkerEntry {
     item_cap: Option<u32>,
     /// Items its job has left, when the caller says ([`Admission::note_remaining_items`]).
     remaining_items: Option<u64>,
+    /// Items settled since its queue last ran dry with no probe on: what its
+    /// job is taken to have left when the caller does not say.
+    items_since_dry: u64,
 }
 
 impl WorkerEntry {

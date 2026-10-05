@@ -334,7 +334,7 @@ impl VramLedger {
                 let room = i128::from(entry.reusable_pool_mb()) + overdraft;
                 price.units(room.max(0) as u64)
             });
-        let left = entry.remaining_items;
+        let left = entry.remaining_items.unwrap_or(entry.items_since_dry);
         let window_items = charge.requests as u64;
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let Some(cal) = state.calibration.get_mut(&key) else {
@@ -504,8 +504,7 @@ impl VramLedger {
                 cal.retest_after = cal.retest_after.saturating_sub(1);
                 // Only a job with work left to repay it is probed, and only
                 // from a window memory did not cut.
-                let pays =
-                    left.is_none_or(|left| left >= PROBE_PAYBACK_WINDOWS * window_items.max(1));
+                let pays = left >= PROBE_PAYBACK_WINDOWS * window_items.max(1);
                 if cal.retest_after > 0 || !pays || ran != Some(working) {
                     return;
                 }
@@ -642,23 +641,23 @@ impl VramLedger {
 
     /// The queue ran dry with `worker` free: its run ended, or its caller fell
     /// behind. A probe that is on goes on when work returns; the pool it grew
-    /// is released, [`TRIM_DEBOUNCE`] apart at most. Returns whether a probe
+    /// is released, [`TRIM_DEBOUNCE`] apart at most. With none on, the count
+    /// of items since the queue ran dry starts again. Returns whether a probe
     /// is on.
     pub(super) fn note_queue_dry_locked(state: &mut LedgerState, worker: WorkerId) -> bool {
-        let Some(entry) = state.workers.get(&worker) else {
+        let Some(entry) = state.workers.get_mut(&worker) else {
             return false;
         };
         let debounced = entry
             .last_trim_at
             .is_none_or(|at| at.elapsed() >= TRIM_DEBOUNCE);
         let key = (entry.inference_id.clone(), entry.gpu.clone());
-        let Some(cal) = state.calibration.get(&key) else {
+        let cal = state.calibration.get(&key);
+        let Some(probe) = cal.and_then(|cal| cal.probe) else {
+            entry.items_since_dry = 0;
             return false;
         };
-        let Some(probe) = cal.probe else {
-            return false;
-        };
-        if debounced && probe.largest > cal.knee_units.unwrap_or(0) {
+        if debounced && probe.largest > cal.and_then(|cal| cal.knee_units).unwrap_or(0) {
             Self::flag_trial_trim_locked(state, worker);
         }
         true

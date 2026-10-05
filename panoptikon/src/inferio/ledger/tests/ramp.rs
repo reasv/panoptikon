@@ -682,6 +682,8 @@ fn process_start(store: &Arc<CalibrationStore>, windows: usize, rate: Rate) -> V
         .register_worker("g/a", item_cost(64), &handle, None)
         .expect("registers");
     push_memory(&handle, 190_000, 1000);
+    // A job with no end in sight.
+    admission.note_remaining_items(Some(u64::MAX));
     let budgets = (0..windows)
         .map(|_| window_leaving_warm(&handle, &admission, |_| 2, rate))
         .collect();
@@ -775,6 +777,8 @@ fn run_at(seed: u32, mode: SizingMode, windows: usize, rate: Rate) -> (Vec<u64>,
         .register_worker("g/a", item_cost(seed), &handle, None)
         .expect("registers");
     push_memory(&handle, 390_000, 1000);
+    // A job with no end in sight.
+    admission.note_remaining_items(Some(u64::MAX));
     let budgets = (0..windows)
         .map(|_| window_at_the_rate(&handle, &admission, rate))
         .collect();
@@ -836,24 +840,30 @@ fn only_throughput_mode_looks_past_a_flat_doubling() {
 }
 
 /// A job that says it has too little left to repay a probe runs at the
-/// working size; one with no end in sight probes.
+/// working size; one with no end in sight probes. A job that does not say
+/// probes only once it has run as many items since its queue last ran dry.
 #[test]
 fn a_job_too_short_to_repay_a_probe_runs_at_the_working_size() {
-    let budgets = |left: Option<u64>| {
+    let budgets = |left: Option<u64>, dry_every: u64| {
         let (ledger, handle, admission) = ramping_from_seed(64);
         admission.note_remaining_items(left);
-        let budgets: Vec<u64> = (0..30)
-            .map(|_| window_at_the_rate(&handle, &admission, |_| 100.0))
+        let budgets: Vec<u64> = (1..=60)
+            .map(|window| {
+                if window % dry_every == 0 {
+                    admission.note_demand(0);
+                }
+                window_at_the_rate(&handle, &admission, |_| 100.0)
+            })
             .collect();
         drop(ledger);
         budgets
     };
-    assert!(
-        budgets(Some(PROBE_PAYBACK_WINDOWS - 1))
-            .iter()
-            .all(|units| *units == 64)
-    );
-    assert!(budgets(None).contains(&128));
+    let probes = |budgets: Vec<u64>| budgets.contains(&128);
+    assert!(!probes(budgets(Some(PROBE_PAYBACK_WINDOWS - 1), u64::MAX)));
+    assert!(probes(budgets(Some(u64::MAX), u64::MAX)));
+    // One item a window: the queue runs dry every `dry_every` windows.
+    assert!(!probes(budgets(None, PROBE_PAYBACK_WINDOWS - 1)));
+    assert!(probes(budgets(None, PROBE_PAYBACK_WINDOWS)));
 }
 
 /// A doubling whose probe cannot be granted in full is not run at all:

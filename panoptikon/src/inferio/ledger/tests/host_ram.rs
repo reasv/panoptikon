@@ -1603,6 +1603,8 @@ impl ColdRun {
             .register_worker("g/cold", item_cost(self.seed), &handle, Some(GPU))
             .expect("admitted on its card");
         cpu_free_to_book(&ledger, 45_000);
+        // A job with no end in sight.
+        admission.note_remaining_items(Some(u64::MAX));
         let mut pool = 0;
         let mut first_only = self.first_only_mb;
         let mut ran = Vec::new();

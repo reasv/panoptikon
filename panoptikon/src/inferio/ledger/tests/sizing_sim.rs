@@ -459,9 +459,10 @@ fn budget(mode: &str) -> VramBudget {
     }
 }
 
-/// Hand the ledger the items the job has left; `None`: no end in sight.
-fn remaining_work(admission: &Admission, items_left: Option<u64>) {
-    admission.note_remaining_items(items_left);
+/// Hand the ledger the items the job has not sent, as the dispatcher does,
+/// unless the scenario's job does not say.
+fn remaining_work(sc: &Scenario, admission: &Admission, unsent: u64) {
+    admission.note_remaining_items(sc.count.then_some(unsent));
 }
 
 /// `(window, value)` pairs from `w:v,w:v`.
@@ -486,7 +487,7 @@ fn pressure(level: &str) -> mps::MemoryPressure {
 const KEYS: &str = "name dev mode room total base seed pu ratio rsspu rsssd rssfirst rsshot win \
     rsslag items secs curve curve2 noise ndist levels nseed queue lag qmul qfloor cap fixed ovh trace \
     trace2 swstart tseed tmin tshared tref tnoise tlevel prof ship starts restart roomsched \
-    roomlate hostram hostfree hostsched pressure die cost upi v compact";
+    roomlate hostram hostfree hostsched pressure die cost upi v compact count";
 
 /// One scenario line. Every key is optional; defaults in [`Scenario::parse`].
 struct Scenario {
@@ -519,6 +520,8 @@ struct Scenario {
     windows: usize,
     items: u64,
     secs: f64,
+    /// The job says how many items it has left (`count=0`: it does not).
+    count: bool,
     /// The rate curve, and the one from start `switch_start` on.
     curve: Curve,
     curve2: Option<Curve>,
@@ -643,6 +646,7 @@ impl Scenario {
             windows: num("win", "400") as usize,
             items: num("items", "0") as u64,
             secs: num("secs", "0"),
+            count: get("count", "1") == "1",
             curve: Curve::parse(&get("curve", "flat:22")),
             curve2: Some(get("curve2", ""))
                 .filter(|c| !c.is_empty())
@@ -1135,7 +1139,9 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
             let token = match sc.fixed {
                 Some(_) => None,
                 None => {
-                    remaining_work(&admission, items_left);
+                    let sent = (window.len() + queued) as u64;
+                    let unsent = items_left.map_or(DEEP_QUEUE, |left| left.saturating_sub(sent));
+                    remaining_work(&sc, &admission, unsent);
                     let token = admission
                         .request_grant(window_units, sc.cap, window.len(), queued)
                         .expect("granted");

@@ -775,6 +775,7 @@ impl VramLedger {
                 ram_started: false,
                 item_cap: ram_at_load_mb.map(|_| 1),
                 remaining_items: None,
+                items_since_dry: 0,
             },
         );
         drop(state);
