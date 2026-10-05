@@ -993,8 +993,8 @@ booked centrally on the CPU device. It is never a throughput signal.
   already run, and never beyond one seed batch. A request
   of several items still runs whole in its window, at the cap per batch; for
   a count-priced model the cap is the unit budget too, for any other the
-  cap's share of the window's units (its units times the cap over its
-  items).
+  cap times the window's largest request, at most the window's units: no
+  batch within the cap holds more.
 - **What a capped window changes.** The grant reads `squeezed` for the
   dispatcher and `/health` reports `ram_ceiling_binding`. The window feeds
   no throughput sample, counts toward neither `max_units_measured_here` nor

@@ -1700,7 +1700,7 @@ fn the_largest_first_batch_of_two_cold_replicas_is_recorded() {
 
 /// A pixel-priced replica's single-item window holds one image per batch:
 /// its unit budget is the image's pixels, not one pixel. A window of more
-/// images than its item cap is priced at the cap's share of their pixels.
+/// images than its item cap is priced at the cap times its largest image.
 #[test]
 fn a_pixel_priced_single_item_window_is_one_image() {
     const IMAGE: u64 = 1_048_576;
@@ -1735,7 +1735,8 @@ fn a_pixel_priced_single_item_window_is_one_image() {
     assert_eq!(item_bound(&admission), usize::MAX);
 
     // Opened past two images by a stored size, the cap doubles to two: six
-    // images are priced at two.
+    // images are priced at two, and a 4-image item among five 1-image ones
+    // at eight.
     let profiles = Arc::new(FakeProfiles {
         seed: Some(ProfileSeed {
             slope_mb_per_unit: 0.001,
@@ -1759,6 +1760,11 @@ fn a_pixel_priced_single_item_window_is_one_image() {
         (grant.user_cap_items, grant.unit_budget),
         (Some(2), 2 * IMAGE)
     );
+    drop(token);
+    let token = admission
+        .request_grant_byte_bound(9 * IMAGE, 4 * IMAGE, None, 6, 0, false)
+        .expect("granted");
+    assert_eq!(token.grant().unit_budget, 8 * IMAGE);
 }
 
 /// A cold replica with a RAM side, alone on a card with `room_mb` for its

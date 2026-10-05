@@ -64,15 +64,15 @@ impl VramLedger {
     }
 
     /// Reserve headroom for one window and hand back the grant.
-    /// `window_units` is the dispatcher's estimate of its `window_items`
-    /// items; safety does not depend on it, since the worker packs within the
-    /// grant using exact counts.
+    /// `window_units` and `largest_request_units` (its largest request's)
+    /// are the dispatcher's estimates; safety does not depend on them, since
+    /// the worker packs within the grant using exact counts.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn request_grant(
         self: &Arc<Self>,
         worker: WorkerId,
         window_units: u64,
-        window_items: u64,
+        largest_request_units: u64,
         user_cap_items: Option<u32>,
         window_requests: usize,
         queued_behind: usize,
@@ -102,8 +102,9 @@ impl VramLedger {
         let headroom = signed_headroom.max(0) as u64;
         // The batch size, and what of it the window's content asks for. An
         // item cap (the user's included) limits the content like a short
-        // queue: for a count-priced model it is a unit count, else the cap's
-        // share of the window's units.
+        // queue: for a count-priced model it is a unit count, else the cap
+        // times the largest request's units, which no batch of at most `cap`
+        // items exceeds.
         let (size_asked, capped, wanted, item_cap) = {
             let entry = state.workers.get(&worker)?;
             let capped = Self::budget_locked(&state, entry);
@@ -111,9 +112,7 @@ impl VramLedger {
                 .map(|cap| user_cap_items.map_or(cap, |user| cap.min(user)));
             let content = match item_cap.map(u64::from) {
                 Some(cap) if entry.aggregation == CostAggregation::Count => window_units.min(cap),
-                Some(cap) if window_items > cap => (u128::from(window_units) * u128::from(cap))
-                    .div_ceil(u128::from(window_items))
-                    as u64,
+                Some(cap) => window_units.min(cap.saturating_mul(largest_request_units)),
                 _ => window_units,
             };
             (

@@ -567,8 +567,10 @@ pub(crate) async fn run_dispatcher(
             let take = window_take_count(&shapes, bounds);
             let window: Vec<Queued> = queue.drain(..take).collect();
             let (mut window_units, mut window_items, mut window_bytes) = (0u64, 0usize, 0usize);
+            let mut largest_request_units = 0u64;
             for queued in &window {
                 window_units = window_units.saturating_add(queued.shape.units);
+                largest_request_units = largest_request_units.max(queued.shape.units);
                 window_items = window_items.saturating_add(queued.shape.items);
                 window_bytes = window_bytes.saturating_add(queued.shape.bytes);
             }
@@ -586,7 +588,7 @@ pub(crate) async fn run_dispatcher(
                 Some(admission) => {
                     let grant = admission.request_grant_byte_bound(
                         window_units,
-                        shape.items,
+                        largest_request_units,
                         cap,
                         window.len(),
                         queue.len(),
@@ -2280,6 +2282,59 @@ mod tests {
             sizes.extend(batch_sizes(&outputs));
         }
         assert_eq!(sizes, [1, 2, 2]);
+        tx.send(DispatchMsg::Shutdown).expect("shutdown");
+        dispatcher.await.expect("dispatcher exits");
+    }
+
+    /// A capped window of a token-priced replica is priced at the cap times
+    /// its largest request: no batch of at most two items holds more.
+    #[tokio::test]
+    async fn a_capped_window_is_priced_at_the_cap_times_its_largest_request() {
+        let cost = CostDimension {
+            unit: CostUnit::Token,
+            aggregation: Some(CostAggregation::Sum),
+            seed_units: Some(4_096),
+            ..item_cost(0)
+        };
+        let ledger = VramLedger::for_test(
+            &[
+                (TEST_GPU, "TEST 9000", 32_768),
+                (super::super::cpu::DEVICE_KEY, "CPU", 65_536),
+            ],
+            VramBudget {
+                margin: Some(0.0),
+                cap_fraction: None,
+                knee_max_bucket_dispersion: None,
+            },
+        );
+        let replica = priced_replica(&ledger, TEST_GPU, "batchsize_test", cost, false).await;
+        let stats = Arc::new(ModelStats::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let dispatcher = tokio::spawn(run_dispatcher(
+            dispatcher_ctx(cost, Arc::clone(&stats)),
+            vec![replica],
+            rx,
+        ));
+        // A first window of one item doubles the cap to two; the next holds a
+        // 100-token request and five of 30 tokens.
+        let answers: Vec<_> = [40, 400, 120, 120, 120, 120, 120]
+            .into_iter()
+            .map(|bytes| {
+                let (reply, answer) = oneshot::channel();
+                tx.send(DispatchMsg::Predict(DispatchRequest {
+                    inputs: vec![json_input(json!("x".repeat(bytes)))],
+                    max_batch: None,
+                    reply,
+                }))
+                .expect("queued");
+                answer
+            })
+            .collect();
+        for answer in answers {
+            answer.await.expect("replied").expect("succeeded");
+        }
+        assert_eq!(stats.last_window_items.load(Relaxed), 6);
+        assert_eq!(stats.last_grant_units.load(Relaxed), 200);
         tx.send(DispatchMsg::Shutdown).expect("shutdown");
         dispatcher.await.expect("dispatcher exits");
     }
