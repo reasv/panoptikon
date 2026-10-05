@@ -1607,12 +1607,16 @@ def check_failures(ctx: Context) -> Verdict:
     unfired = ((priced and expected_ooms and not ooms)
                or (expected_deaths and not deaths))
     bad = ooms > expected_ooms or deaths > expected_deaths or unfired
+
+    def expected(count: int, floor: bool) -> str:
+        return f"expected {int(floor)}..{count}" if count else "expected 0"
+
     return Verdict(
         "failures", "FAIL" if bad else "PASS",
-        f"{ooms} OOM negatives (expected <= {expected_ooms}), "
+        f"{ooms} OOM negatives ({expected(expected_ooms, priced)}), "
         f"{collapses} throughput-collapse negatives, "
         f"{unified_deaths} unified-memory-device death negatives, "
-        f"{deaths} fatal worker deaths (expected <= {expected_deaths}), "
+        f"{deaths} fatal worker deaths ({expected(expected_deaths, True)}), "
         f"{len(fallbacks)} merged-window fallbacks ({oom_fallbacks} OOM)"
         f"{tier_clause}" + ("; declared, none seen" if unfired else ""),
         {"negative_reasons": reasons, "worker_deaths": deaths,

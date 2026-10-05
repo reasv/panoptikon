@@ -1294,6 +1294,18 @@ def test_deflation_still_listed_after_its_repay_time_fails():
     assert verdict.numbers["unrepaid_s"] == {}
 
 
+def test_failures_prints_the_range_each_count_is_held_to():
+    """A declared count is held to at least one, unless the model was never
+    granted memory."""
+    for log, ooms in (([_grant(100.0, 512, 1024)], "1..180"),
+                      ([_deflation(0)], "0..180")):
+        ctx = _utilization_context([], log=log)
+        ctx.args.expect_ooms, ctx.args.expect_deaths = 180, 0
+        detail = analyze.check_failures(ctx).detail
+        assert f"0 OOM negatives (expected {ooms})" in detail
+        assert "0 fatal worker deaths (expected 0)" in detail
+
+
 # --- job_outcome and legs.json -------------------------------------------------
 
 
