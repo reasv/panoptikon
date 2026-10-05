@@ -1010,6 +1010,8 @@ def test_batch_coverage_counts_every_batch_from_each_workers_seq_1():
     # A model missing from a sample was unloaded: the worker that loads it
     # again at the same key counts from its own seq 1.
     assert coverage(range(1, 4), [], range(4, 8)) == ("WARN", 7, 3, {MODEL: 3})
+    # So does an empty ring: a new worker seen idle before its first batch.
+    assert coverage(range(1, 5), (), range(1, 5)) == ("PASS", 8, 0, {})
     # A failed /health read ends no series.
     assert coverage(range(1, 5), None, range(3, 7)) == ("PASS", 6, 0, {})
     assert coverage((), (), check=analyze.CHECKS["batch_coverage"])[0] == "SKIP"
@@ -1057,6 +1059,11 @@ def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
     assert numbers["baseline_items_per_s"] == pytest.approx(5.0)
     assert (numbers["clock_step_s"], numbers["baseline_clock_step_s"]) == (
         None, None)
+    # A baseline under another name may be another job's: neither side.
+    other = stepped.with_name("other.json")
+    other.write_text(stepped.read_text())
+    assert throughput("--baseline-jobs", str(other))[
+        "baseline_items_per_s"] == pytest.approx(5.0)
     # An explicit --jobs may be another job's: no step is subtracted.
     assert throughput("--jobs", str(ours))["items_per_s"] == pytest.approx(
         100 / 8.2)
@@ -1075,14 +1082,15 @@ def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
         100 / 4.5)
     # A step under 1 s is not subtracted: a sub-second job's start equals its
     # end, and that span uses busy time.
+    assert analyze._items_per_s([record(10, 20)], -0.9) == pytest.approx(10.0)
     assert analyze._items_per_s([record(10, 10)], -0.002) == pytest.approx(
         100 / 4.5)
     # A step inside a record shorter than a second: busy time.
     assert analyze._items_per_s([record(10, "09")], -1.002) == pytest.approx(
         100 / 4.5)
     # Without a step, each record on its own: a span, or busy time.
-    assert analyze._items_per_s([record(10, 20), record(21, 21)]) == (
-        pytest.approx(200 / 14.5))
+    assert analyze._items_per_s([record(10, 20), {**record(21, 21),
+                                 "end_time": None}]) == pytest.approx(200 / 14.5)
     # With a step and a missing end: busy time for every record.
     assert analyze._items_per_s([record(10, 20), {**record(20, 20),
                                  "end_time": None}], -2.0) == pytest.approx(
