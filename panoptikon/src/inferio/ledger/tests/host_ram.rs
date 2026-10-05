@@ -1231,15 +1231,18 @@ fn the_costliest_batch_at_a_size_is_kept() {
     const SIZE: u64 = 1_000;
     let ledger = host(&[GPU], None);
     ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
-    let (a, a_admission) = cold_gpu_replica(&ledger, "g/ring", GPU, item_cost(64));
-    let (b, b_admission) = cold_gpu_replica(&ledger, "g/ring", GPU, item_cost(64));
+    let (handle, admission) = cold_gpu_replica(&ledger, "g/ring", GPU, item_cost(64));
     let newer = SIZE + 1..SIZE + FIT_RING as u64;
-    // Each replica's first batch is start-up.
-    growth_window(&a, &a_admission, &[(1, 0), (SIZE, 55 * SIZE)]);
-    let b_sizes: Vec<_> = newer.clone().map(|units| (units, 50 * units)).collect();
-    growth_window(&b, &b_admission, &[&[(1, 0)], &b_sizes[..]].concat());
-    growth_window(&a, &a_admission, &[(SIZE, 45 * SIZE)]);
-    growth_window(&b, &b_admission, &[(newer.end, 50 * newer.end); FIT_RING]);
+    // The first batch is start-up.
+    growth_window(&handle, &admission, &[(1, 0), (SIZE, 55 * SIZE)]);
+    let newer_sizes: Vec<_> = newer.clone().map(|units| (units, 50 * units)).collect();
+    growth_window(&handle, &admission, &newer_sizes);
+    growth_window(&handle, &admission, &[(SIZE, 45 * SIZE)]);
+    growth_window(
+        &handle,
+        &admission,
+        &[(newer.end, 50 * newer.end); FIT_RING],
+    );
     let state = ledger.lock();
     let ring = &state.calibration[&("g/ring".to_owned(), GPU.to_owned())].ram_samples;
     assert!(
