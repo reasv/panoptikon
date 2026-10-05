@@ -153,12 +153,20 @@ def test_a_test_call_that_raises_answers_false() -> None:
 
 
 def test_a_test_call_that_runs_answers_true(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        torch.nn.functional,
-        "scaled_dot_product_attention",
-        lambda *args, **kwargs: None,
-    )
+    """The call is made as language models make it: fp16, head_dim 128, fewer
+    KV heads than query heads, causal, no mask, `enable_gqa`."""
+    seen: dict = {}
+
+    def capture(query, key, value, **kwargs):
+        seen.update(query=query, key=key, value=value, kwargs=kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", capture)
     assert sdpa.fused_kernel_accepts_gqa(torch, torch.device("cpu")) is True
+    query, key, value = seen["query"], seen["key"], seen["value"]
+    assert query.dtype == key.dtype == value.dtype == torch.float16
+    assert query.shape[-1] == key.shape[-1] == value.shape[-1] == 128
+    assert query.shape[1] > key.shape[1] == value.shape[1]
+    assert seen["kwargs"] == {"is_causal": True, "enable_gqa": True}
 
 
 def test_transformers_still_decides_gqa_through_the_patched_name() -> None:
