@@ -135,7 +135,7 @@ def test_each_fixture_passes_at_its_thresholds_and_fails_one_past(tmp_path,
     at = _thresholds(expect)
     # One OOM negative per item: every image of the smoke tier.
     if name in ("oom", "oom_timed"):
-        assert at["--expect-ooms"] == legs.SMOKE_IMAGES
+        assert at["--expect-ooms"] == legs.SMOKE_IMAGES == 180
     # A failed-item threshold is the item count.
     assert at["--expect-failures"] in (0, legs.SMOKE_IMAGES)
     verdicts = _verdicts(tmp_path / "at", model, expect, at)
