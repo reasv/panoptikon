@@ -171,6 +171,20 @@ impl TranscodeCache {
     }
 
     pub(crate) async fn open(dir: PathBuf, budget_mb: u64, limit_mb: u64) -> Result<Self> {
+        Self::open_checked(dir, budget_mb, limit_mb, |dir| {
+            crate::ownership::database_problem(dir, DB_FILE_NAME)
+        })
+        .await
+    }
+
+    /// [`open`](Self::open), with the check for why the current user cannot
+    /// write the cache folder passed in.
+    async fn open_checked(
+        dir: PathBuf,
+        budget_mb: u64,
+        limit_mb: u64,
+        problem: impl Fn(&Path) -> Option<String>,
+    ) -> Result<Self> {
         // Absolutized ONCE, so every path this cache ever hands out inherits
         // it. A relative configured dir (the default `data/transcode-cache`
         // under a relative data folder) would otherwise leak into
@@ -185,14 +199,13 @@ impl TranscodeCache {
         // The cache is optional: a folder another user owns fails the open
         // when SQLite cannot open it at all, and is a warning when it opens
         // for reading only.
-        let problem = || crate::ownership::database_problem(&dir, DB_FILE_NAME);
         let cache = Self::open_absolute(dir.clone(), budget_mb, limit_mb)
             .await
-            .map_err(|err| match problem() {
+            .map_err(|err| match problem(&dir) {
                 Some(reason) => err.context(reason),
                 None => err,
             })?;
-        if let Some(reason) = problem() {
+        if let Some(reason) = problem(&dir) {
             tracing::warn!("new renditions cannot be stored in the transcode cache: {reason}");
         }
         Ok(cache)
@@ -1211,6 +1224,40 @@ mod tests {
             error.contains("failed to open the transcode cache db"),
             "{error}"
         );
+    }
+
+    /// A cache folder the current user cannot write opens with a warning and
+    /// still serves the artifacts it holds. Read-only modes stand in for a
+    /// folder another user owns, which a test cannot create.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cache_folder_it_cannot_write_still_serves_its_artifacts() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let set_mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let own = tempfile::tempdir().unwrap();
+        let dir = own.path().join("cache");
+        // Held open, so the -wal and -shm files a read-only open needs stay.
+        let writer = TranscodeCache::open(dir.clone(), 1, 1).await.unwrap();
+        let kept = commit(&writer, "kept", b"artifact").await;
+        let db = dir.join(DB_FILE_NAME);
+        let database = ["", "-wal", "-shm"].map(|suffix| format!("{}{suffix}", db.display()));
+        for file in &database {
+            set_mode(Path::new(file), 0o444);
+        }
+        set_mode(&dir, 0o555);
+
+        let reader =
+            TranscodeCache::open_checked(dir.clone(), 1, 1, |_| Some("not writable".to_string()))
+                .await
+                .expect("the cache opens");
+        let found = reader.lookup("kept").await;
+        set_mode(&dir, 0o755);
+        for file in &database {
+            set_mode(Path::new(file), 0o644);
+        }
+        assert_eq!(found.expect("the artifact is served").path, kept.path);
     }
 
     /// Writes `bytes` into `temp` and commits it under `key`, carrying the
