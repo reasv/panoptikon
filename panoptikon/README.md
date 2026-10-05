@@ -809,12 +809,13 @@ it can write every database in `data_folder` (with its `-wal`, `-shm` and
 folder) and the folders it still has to create databases in. After a run as
 another user (`sudo panoptikon`) that created a database, the next start stops
 with an error naming it and its owner. Change the owner of the folder the error
-names (a symlink's target, when there is one) with `sudo chown -R "$USER" <folder>`
-(Docker volumes: "Running as another user" in the [root README](../README.md#docker)).
-For an archive another user owns, the error offers moving it out: an index
-folder as root, or its link from a writable `index/`; a `user_data` database
-file with its `-wal` and `-shm`, or its link. The check lets a read-only
-filesystem through; it is named when a migration fails on it.
+names (a symlink's target, when there is one) with
+`sudo chown -R "$USER" <folder>` (Docker volumes: "Running as another user" in
+the [root README](../README.md#docker)). For an archive another user owns, the
+error offers moving it out: an index folder as root, or its link from a writable
+`index/`; a `user_data` database file with its `-wal` and `-shm`, or its link.
+The check lets a read-only filesystem through; it is named when a migration
+fails on it.
 
 ## Production UI
 

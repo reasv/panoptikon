@@ -1066,12 +1066,7 @@ mod route_tests {
             .await
             .unwrap_err();
         let error = format!("{error:#}");
-        assert!(error.starts_with(&expected), "{error}");
-        assert_ne!(error, expected);
-        assert!(
-            !error.contains("migrated"),
-            "refused before migrating: {error}"
-        );
+        assert_eq!(error, expected, "refused before migrating");
     }
 
     /// What `axum::serve` gave us for free, asserted rather than assumed now

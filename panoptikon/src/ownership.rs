@@ -19,10 +19,11 @@ pub(crate) fn check_databases(data_folder: &Path, index_db: &str) -> anyhow::Res
     }
 }
 
-/// The first of `paths` with a `problem`, as a message. An index database
-/// folder, or a user-data database file, can instead be moved out of the data
-/// folder: the folder only as root, unless it is a symlink in a writable
-/// `index/`; the file with its `-wal` and `-shm`, unless it is a symlink.
+/// The first of `paths` with a `problem`, as a message. An index folder
+/// holding a database, or a user-data database file, can instead be moved out
+/// of the data folder: the folder only as root, unless it is a symlink in a
+/// writable `index/`; the file with its `-wal` and `-shm`, unless it is a
+/// symlink.
 fn refusal(
     data_folder: &Path,
     paths: &[PathBuf],
@@ -34,7 +35,11 @@ fn refusal(
     let (index, user_data) = (data_folder.join("index"), data_folder.join("user_data"));
     let extension = path.extension().and_then(|extension| extension.to_str());
     let link = path.is_symlink();
-    let what = if path.parent() == Some(index.as_path()) {
+    let what = if path.parent() == Some(index.as_path())
+        && ["index.db", "storage.db"]
+            .iter()
+            .any(|db| path.join(db).is_file())
+    {
         if link && problem(&index).is_none() {
             "move it"
         } else {
@@ -63,8 +68,8 @@ pub(crate) fn explain_migration(err: anyhow::Error, data_folder: &Path) -> anyho
     explain(err, &absolute(data_folder), &paths)
 }
 
-/// The database a migration error names, with its `-wal` and `-shm` and the
-/// folder it is kept in; empty when the error names none.
+/// The database a migration error names, with what [`push_database`] lists
+/// and the folder it is kept in; empty when the error names none.
 fn migration_paths(err: &anyhow::Error) -> Vec<PathBuf> {
     let Some(FailedDatabase(db)) = err.downcast_ref() else {
         return Vec::new();
@@ -146,8 +151,9 @@ fn create_paths(tree: &Path, path: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
 }
 
 /// Why a database kept in a `folder` of its own cannot be written, if it
-/// cannot: what [`explain`] would add, over the folder, the database and its
-/// `-wal` and `-shm` (the folder's parent while the folder does not exist).
+/// cannot: what [`explain`] would add, over the folder, the database and what
+/// [`push_database`] lists (the folder's parent while the folder does not
+/// exist).
 pub(crate) fn database_problem(folder: &Path, file_name: &str) -> Option<String> {
     let mut paths = Vec::new();
     let tree = if folder.is_dir() {
@@ -161,10 +167,10 @@ pub(crate) fn database_problem(folder: &Path, file_name: &str) -> Option<String>
     reason(tree, &paths, true)
 }
 
-/// Everything under `data_folder` the server writes in place: each database
-/// with its `-wal` and `-shm`, and the folders it creates files in. Files it
-/// replaces by rename (`config.toml`) and anything else kept there are not
-/// listed. Reads two folder listings, never deeper.
+/// Everything the server writes in place for the databases in `data_folder`:
+/// each database with its `-wal` and `-shm`, and the folders it creates files
+/// in. Files it replaces by rename (`config.toml`) and anything else kept
+/// there are not listed. Reads two folder listings, never deeper.
 fn database_paths(data_folder: &Path, index_db: &str) -> Vec<PathBuf> {
     let index = data_folder.join("index");
     let user_data = data_folder.join("user_data");
@@ -526,7 +532,8 @@ pub(crate) mod tests {
     }
 
     /// An empty data folder root owns (a bind mount Docker created), then
-    /// `index/` without the default database's folder.
+    /// `index/` without the default database's folder, then an empty default
+    /// folder.
     #[test]
     fn a_folder_the_server_must_create_in_refuses() {
         let data = tempfile::tempdir().unwrap();
@@ -543,6 +550,10 @@ pub(crate) mod tests {
         assert_eq!(refusal_for(data, &[data]), None);
         let plain = owned_by(&index, 0, 1000, data);
         assert_eq!(refusal_for(data, &[&index]), Some(plain));
+        let default = index.join("default");
+        std::fs::create_dir(&default).unwrap();
+        let plain = owned_by(&default, 0, 1000, data);
+        assert_eq!(refusal_for(data, &[&default]), Some(plain));
     }
 
     /// A recursive change of owner of the data folder does not follow the
@@ -553,7 +564,7 @@ pub(crate) mod tests {
     #[test]
     fn a_symlinked_database_folder_is_listed_and_its_target_named() {
         // <root>/alias -> real; data/index -> x; x/linked -> y;
-        // data/user_data/user.db -> z/user.db.
+        // data/user_data/user.db -> ../../../z/user.db.
         let root = tempfile::tempdir().unwrap();
         let [real, x, y, z] = ["real", "x", "y", "z"].map(|name| root.path().join(name));
         std::fs::create_dir_all(real.join("data/user_data")).unwrap();
@@ -561,12 +572,13 @@ pub(crate) mod tests {
         std::fs::create_dir(&y).unwrap();
         std::fs::create_dir(&z).unwrap();
         std::fs::write(y.join("index.db"), b"").unwrap();
+        std::fs::write(x.join("default/index.db"), b"").unwrap();
         std::fs::write(z.join("user.db"), b"").unwrap();
         std::os::unix::fs::symlink(&real, root.path().join("alias")).unwrap();
         let data = root.path().join("alias/data");
         std::os::unix::fs::symlink(&x, data.join("index")).unwrap();
         std::os::unix::fs::symlink(&y, x.join("linked")).unwrap();
-        std::os::unix::fs::symlink(z.join("user.db"), data.join("user_data/user.db")).unwrap();
+        std::os::unix::fs::symlink("../../../z/user.db", data.join("user_data/user.db")).unwrap();
         let listed = database_paths(&data, "default");
         for path in ["index/linked", "index/linked/index.db"] {
             assert!(listed.contains(&data.join(path)), "{listed:?}");
