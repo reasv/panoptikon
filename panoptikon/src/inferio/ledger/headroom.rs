@@ -167,9 +167,9 @@ impl VramLedger {
     /// The largest batch, in units, a GPU replica's host RAM admits, and the
     /// MiB per unit it books at; `None` without a RAM side. The room is the
     /// CPU device's headroom (its cap, reserve and other processes' usage,
-    /// net of every booking) plus this replica's own resident growth no
-    /// booking claims. At least one unit; the seed until a batch measured the
-    /// cost, when nothing is booked.
+    /// net of every booking) plus this replica's own resident growth, which
+    /// it holds no booking against while it asks. At least one unit; the
+    /// seed until a batch measured the cost, when nothing is booked.
     pub(super) fn ram_ceiling_locked(
         &self,
         state: &LedgerState,
@@ -191,8 +191,7 @@ impl VramLedger {
         }
         let margin = self.budgets.for_gpu(cpu::DEVICE_KEY).margin_in_force();
         let headroom = self.overdraft_with_margin_locked(state, cpu::DEVICE_KEY, margin);
-        let credit = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
-        let room = (headroom + i128::from(credit)).max(0) as f64;
+        let room = (headroom + i128::from(entry.ram_growth_mb())).max(0) as f64;
         let mut units = cost.units_within(room);
         // A one-size cost prices no batch past twice the size it was
         // measured at.
@@ -601,23 +600,23 @@ impl VramLedger {
     }
 
     /// Whether another replica holds a reservation on `worker`'s device or
-    /// its RAM-domain peer.
+    /// its RAM-domain peer; `worker` itself holds none while it asks.
     pub(super) fn neighbour_reserved_locked(state: &LedgerState, worker: WorkerId) -> bool {
         let Some(requesting) = state.workers.get(&worker) else {
             return false;
         };
         let peer = Self::ram_domain_peer(state, &requesting.gpu);
-        state.workers.iter().any(|(id, entry)| {
-            *id != worker
-                && (entry.grants_on(&requesting.gpu) > 0
-                    || peer.is_some_and(|peer| entry.grants_on(peer) > 0))
+        state.workers.values().any(|entry| {
+            entry.grants_on(&requesting.gpu) > 0
+                || peer.is_some_and(|peer| entry.grants_on(peer) > 0)
         })
     }
 
     /// Contention split among hungry workers (pending requests, no grant
     /// held): appetite-weighted shares with a floor of one seed batch each,
     /// the floors shrunk pro-rata when they oversubscribe. The requester alone
-    /// is credited its own [`WorkerEntry::free_pool_mb`] on top.
+    /// is credited its own [`WorkerEntry::reusable_pool_mb`] on top: it holds
+    /// no grant while it asks.
     ///
     /// Pre-fit the share is the reservation. Beside other replicas
     /// ([`Self::replicas_locked`]) it is at most an equal part of the
@@ -640,7 +639,7 @@ impl VramLedger {
             };
         };
         let headroom = signed_headroom.max(0) as u64;
-        let credit = requesting.free_pool_mb();
+        let credit = requesting.reusable_pool_mb();
         let own_room = (signed_headroom + i128::from(credit)).clamp(0, i128::from(u64::MAX)) as u64;
         let hungry: Vec<&WorkerEntry> = state
             .workers

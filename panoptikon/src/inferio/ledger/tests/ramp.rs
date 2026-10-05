@@ -1182,11 +1182,11 @@ fn a_rising_rate_takes_a_window_per_doubling() {
 }
 
 /// A window is judged by the size it was asked to run: one granted 16
-/// units that settles after the trial has moved on to 32 is not 32 cut
-/// short by memory, and the trial goes on.
+/// units that settles after another replica of the model moved the trial on
+/// to 32 is not 32 cut short by memory, and the trial goes on.
 #[test]
 fn a_window_granted_before_the_trial_moved_on_is_not_a_cut_step() {
-    // A stored fit, so two windows can be out at once.
+    // A stored fit, so both replicas' windows are priced.
     let profiles = Arc::new(FakeProfiles {
         seed: Some(ProfileSeed {
             knee_units: None,
@@ -1199,18 +1199,26 @@ fn a_window_granted_before_the_trial_moved_on_is_not_a_cut_step() {
     let admission = ledger
         .register_worker("g/a", item_cost(8), &handle, None)
         .expect("registers");
+    let other_handle = loaded(Some(1_000), Some(0));
+    let other = ledger
+        .register_worker("g/a", item_cost(8), &other_handle, None)
+        .expect("registers");
+    // Another model's window stays open, so every window here runs beside
+    // one, as the late one does.
+    let neighbour = ledger
+        .register_worker("g/b", item_cost(8), &loaded(Some(1_000), Some(0)), None)
+        .expect("registers");
+    let _beside = neighbour.request_grant(1, None, 1, 0).expect("granted");
     push_memory(&handle, 190_000, 1_000);
     let rising = |units| (units as f64).sqrt();
     for _ in 0..2 {
         window_leaving_warm(&handle, &admission, |_| 2, rising);
     }
-    let late = admission
-        .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
+    let late = other.request_grant(u64::MAX, None, 1, 0).expect("granted");
     assert_eq!(late.grant().unit_budget, 16);
     assert_eq!(window_leaving_warm(&handle, &admission, |_| 2, rising), 16);
     assert_eq!(ledger.trial_for_test("g/a", GPU).0, Some(32));
-    handle
+    other_handle
         .lock()
         .unwrap()
         .record_measurements(vec![warm_batch(16, rising(16)); 2]);

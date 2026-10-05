@@ -86,7 +86,14 @@ impl VramLedger {
         let pressure = self.memory_pressure();
         let mut state = self.lock();
         Self::repay_deflation_locked(&mut state, worker);
-        let gpu = state.workers.get(&worker)?.gpu.clone();
+        let entry = state.workers.get(&worker)?;
+        // One window per replica at a time: the dispatcher hands a replica
+        // its next window only once the last one's grant has settled.
+        debug_assert!(
+            entry.grants.is_empty(),
+            "a replica asked for a second window"
+        );
+        let gpu = entry.gpu.clone();
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.pending_requests = window_requests.saturating_add(queued_behind);
         }
@@ -231,10 +238,10 @@ impl VramLedger {
                 .is_some_and(|price| unit_budget == price.units(share.mb).max(1));
         // What the booking may take out of free host RAM: the replica reuses
         // the growth it already holds.
-        let ram_new_mb = state.workers.get(&worker).map_or(0, |entry| {
-            let held = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
-            ram_mb.saturating_sub(held)
-        });
+        let ram_new_mb = state
+            .workers
+            .get(&worker)
+            .map_or(0, |entry| ram_mb.saturating_sub(entry.ram_growth_mb()));
         let grant_id = state.next_id();
         state
             .workers
