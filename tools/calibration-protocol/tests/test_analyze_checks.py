@@ -1217,6 +1217,26 @@ def test_deflation_that_never_recovers_passes_only_when_declared():
         assert _deflation_recovery(log, healthrec, True).verdict == "PASS"
 
 
+def test_deflation_still_listed_after_its_repay_time_fails():
+    """A negative left the worker at 2 at t=100: time alone repays both
+    levels by t=160, and a sample interval later it must be listed at 0."""
+    def judge(t_wall, interval=0.5, declared=False, log=None):
+        ctx = _utilization_context(
+            [{"kind": "header", "interval_s": interval},
+             {**_deflated_health(1), "t_wall": t_wall}],
+            log=[_deflation(2, "negative")] if log is None else log)
+        ctx.args.expect_deflated = declared
+        return analyze.check_deflation_recovery(ctx).verdict
+
+    assert judge(160.5) == "FAIL"
+    assert judge(160.4) == "WARN"
+    assert judge(160.5, interval=1.0) == "WARN"
+    assert judge(160.5, declared=True) == "PASS"
+    assert judge(160.5, log=[]) == "WARN"
+    later = {**_deflation(2, "negative"), "t_wall": 140.0}
+    assert judge(160.5, log=[_deflation(2, "negative"), later]) == "WARN"
+
+
 # --- job_outcome and legs.json -------------------------------------------------
 
 

@@ -1620,6 +1620,10 @@ def check_failures(ctx: Context) -> Verdict:
 #: `CLEAN_WINDOWS_TO_RESTORE`).
 CLEAN_WINDOWS_TO_RESTORE = 3
 
+#: Seconds since a worker's last negative that repay one level of deflation
+#: on a `/health` read (the ledger's `DEFLATION_REPAY_SECS`).
+DEFLATION_REPAY_S = 30
+
 
 def check_deflation_recovery(ctx: Context) -> Verdict:
     """Deflation must be repaid: one level per `CLEAN_WINDOWS_TO_RESTORE`
@@ -1631,10 +1635,12 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
     restarts at 0, as its replacement registers undeflated without a line.
     A worker that left keeps its last value.
 
-    FAIL: a level outlasted `CLEAN_WINDOWS_TO_RESTORE` clean windows. WARN:
-    still deflated when the recording ended. `--expect-deflated` declares a
-    model that OOMs on every batch: ending deflated is then its result, and
-    never deflating FAILs."""
+    FAIL: a level outlasted `CLEAN_WINDOWS_TO_RESTORE` clean windows, or the
+    last health sample lists a worker deflated at least `DEFLATION_REPAY_S`
+    per level its last negative left, plus one sample interval, after that
+    negative. WARN: still deflated when the recording ended.
+    `--expect-deflated` declares a model that OOMs on every batch: ending
+    deflated is then its result, and never deflating FAILs."""
     settle = "settled a granted window"
     from_log = any(event["level"] == "DEBUG"
                    and event["target"].startswith("panoptikon::inferio::ledger")
@@ -1684,7 +1690,30 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
     peak = max(row["peak"] for row in rows.values())
     held = {key: row["held"] for key, row in rows.items() if row["held"]}
     stuck = {key: row for key, row in rows.items() if row["final"] > 0}
-    if held or (declared and not peak):
+    # A negative starts the repay clock, and each /health read repays one
+    # level per whole DEFLATION_REPAY_S since it: by time alone, the levels a
+    # negative left are repaid that many DEFLATION_REPAY_S after it. One
+    # sample interval (healthrec's default without a header) covers the read.
+    negatives: Dict[str, Tuple[float, int]] = {}
+    for event in ctx.log_events(settle):
+        fields = event["fields"]
+        if (fields.get("outcome") == "negative" and "deflation" in fields
+                and event["t_wall"] is not None):
+            negatives[f"{fields.get('model')}@{fields.get('gpu')}"] = (
+                event["t_wall"], int(fields["deflation"]))
+    header = next((row for row in ctx.healthrec
+                   if row.get("kind") == "header"), {})
+    interval = float(header.get("interval_s") or 0.5)
+    last = ctx.health_samples[-1] if ctx.health_samples else {}
+    unrepaid: Dict[str, float] = {}
+    for worker in (last.get("health") or {}).get("workers") or []:
+        key = f"{worker['inference_id']}@{worker.get('gpu_uuid')}"
+        since, level = negatives.get(key, (last["t_wall"], 0))
+        if (not declared and int(worker.get("deflation") or 0)
+                and last["t_wall"] - since
+                >= level * DEFLATION_REPAY_S + interval):
+            unrepaid[key] = round(last["t_wall"] - since, 1)
+    if held or unrepaid or (declared and not peak):
         verdict = "FAIL"
     else:
         verdict = "WARN" if stuck and not declared else "PASS"
@@ -1693,6 +1722,9 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
         + ", ".join(f"{key}={row['peak']}" for key, row in rows.items()) + ")"
         + "".join(f"; {key} held {level} through {CLEAN_WINDOWS_TO_RESTORE} "
                   f"clean windows" for key, level in held.items())
+        + "".join(f"; {key} still deflated {age} s after its last negative, "
+                  f"past the time that repays it" for key, age in
+                  unrepaid.items())
         + f"; at the end {len(stuck)} worker(s) still deflated"
         + "".join(f"; {key} at {row['final']}"
                   + (f" after {row['clean']} clean window(s) at that level"
@@ -1706,6 +1738,7 @@ def check_deflation_recovery(ctx: Context) -> Verdict:
     return Verdict(
         "deflation_recovery", verdict, detail,
         {"source": source, "declared": declared, "held": held,
+         "unrepaid_s": unrepaid,
          "peak": {key: row["peak"] for key, row in rows.items()},
          "final": {key: row["final"] for key, row in rows.items()},
          "clean_windows_at_level": ({key: row["clean"]
