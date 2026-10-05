@@ -1107,6 +1107,8 @@ struct Ingested {
     /// The same whatever the memory pressure, unless host RAM set the
     /// budget: the [`PressureCap`] grows on these.
     filled: bool,
+    /// A batch grew the allocator pool; `None` without pool figures.
+    grew_pool: Option<bool>,
     /// Samples that entered the throughput ring.
     throughput_samples: usize,
     /// Which kind of negative, for the log; all fold into `negative`.
@@ -1130,12 +1132,14 @@ struct Ingested {
 /// windows during which macOS was swapping pages out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PressureCap {
-    /// Caps the unit budget: the size the last paging window ran at, at most
-    /// `regrow_to`, doubled by each clean full window since.
+    /// Caps the unit budget: the smallest size the paging windows ran at,
+    /// doubled by each clean full window since; at most `regrow_to` while
+    /// the level is above normal.
     units: u64,
-    /// How far `units` may grow back while the level is warning: the batch
-    /// size the grant asked when the first episode began, halved by each
-    /// paging window our batch began at it. Kept until the cap lifts.
+    /// How far `units` may grow back while the level is above normal: the
+    /// largest size a paging window's grant asked, at most half the unit
+    /// budget of each paging window our batch began. Kept until the cap
+    /// lifts.
     regrow_to: u64,
     /// When the window that last halved `regrow_to` settled.
     halved_at: Option<Instant>,

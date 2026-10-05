@@ -408,6 +408,8 @@ impl VramLedger {
         // the largest batch that ran uncut.
         let mut index_limit_to: Option<u64> = None;
         let mut ran_wider_uncut = 0u64;
+        // Whether a batch grew the pool; `None` while none had pool figures.
+        let mut window_grew_pool: Option<bool> = None;
         // Summed over the window, `None` while no batch reported the counter.
         let mut alloc_retries: Option<u64> = None;
         // `(MiB the pool grew back, that batch's wall time)` after a release
@@ -610,6 +612,7 @@ impl VramLedger {
                 _ => None,
             };
             let high_water = grew_pool == Some(true);
+            window_grew_pool = window_grew_pool.max(grew_pool);
             // Every batch that ran counts toward the warm-up, except negatives
             // and dropped collapses (skipped above).
             ran_batches = ran_batches.saturating_add(1);
@@ -897,6 +900,7 @@ impl VramLedger {
             fit_samples: fit_sample_count,
             at_budget: !queue_bound && !pressure && ran_full,
             filled: !queue_bound && !ram_bound && ran_full,
+            grew_pool: window_grew_pool,
             throughput_samples,
             oom: saw_oom,
             throughput_collapse: saw_collapse,

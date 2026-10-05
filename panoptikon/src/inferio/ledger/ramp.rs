@@ -313,26 +313,29 @@ impl VramLedger {
             Self::anchor_locked(state, entry),
             Self::batch_ceiling_locked(state, entry),
         );
-        cal_locked(state, entry)
-            .and_then(|cal| cal.pressure_cap)
-            .map_or(admitted, |cap| admitted.min(cap.units))
+        let cap = cal_locked(state, entry).and_then(|cal| cal.pressure_cap);
+        match cap {
+            None => admitted,
+            Some(cap) if pressure == mps::MemoryPressure::Normal => admitted.min(cap.units),
+            Some(cap) => admitted.min(cap.units).min(cap.regrow_to),
+        }
     }
 
     /// Maintain the [`PressureCap`] with one settled window.
     ///
-    /// A paging window that memory or the batch size set (not the queue) sets the
-    /// cap to its unit budget, at most the bound. The first one also sets the
-    /// bound, how far the cap may grow back at warning: the batch size its
-    /// grant asked. A window granted before the paging began, whose unit
-    /// budget is at least the smaller of the bound and the size its grant
-    /// asked and which ran a batch at that budget (`ran_full`), halves that
-    /// smaller size (at least 1); a window granted before an earlier window
-    /// halved the bound does not halve it again. So a batch size that made the
-    /// Mac page is not returned to while the level stays at warning, and
-    /// paging that began under a smaller batch, or before the grant, does not
-    /// lower the bound.
+    /// A paging window that memory or the batch size set (not the queue)
+    /// caps the batch at its unit budget, and sets the bound, how far the cap
+    /// may grow back above normal pressure: the largest size the paging
+    /// windows' grants asked. A window whose batch began the paging lowers
+    /// the bound to at most half its unit budget (at least 1); after that
+    /// only such a window moves it. A batch began the paging when its window
+    /// was granted before it, ran a batch at its budget (`ran_full`), and
+    /// grew our pool; without pool figures, when instead its unit budget was
+    /// at least the smaller of the bound and the size asked, and it was
+    /// granted after the last such window. So paging another program began
+    /// while our batches ran inside the pool they held leaves the bound.
     ///
-    /// Otherwise a clean window that ran full doubles the cap: at warning up
+    /// Otherwise a clean window that ran full doubles the cap: above normal up
     /// to that bound, at normal until it reaches the batch size admitted,
     /// where it lifts. The bound lasts as long as the cap, so a warning that
     /// returns first grows back to the same bound.
@@ -341,6 +344,7 @@ impl VramLedger {
         worker: WorkerId,
         charge: GrantCharge,
         ran_full: bool,
+        grew_pool: Option<bool>,
         negative: bool,
         paged_at_grant: bool,
     ) {
@@ -361,16 +365,27 @@ impl VramLedger {
             if charge.queue_bound && !charge.memory_cut {
                 return;
             }
-            let bound = cap.map_or(asked, |cap| cap.regrow_to);
-            let in_force = bound.min(asked);
             let halved_at = cap.and_then(|cap| cap.halved_at);
-            let halves = ran_full
-                && !paged_at_grant
-                && charge.unit_budget >= in_force
-                && halved_at.is_none_or(|at| charge.granted_at >= at);
-            let regrow_to = if halves { (in_force / 2).max(1) } else { bound };
+            let bound = match cap {
+                None => asked,
+                Some(cap) if halved_at.is_some() => cap.regrow_to,
+                Some(cap) => cap.regrow_to.max(asked),
+            };
+            let ours = grew_pool.unwrap_or_else(|| {
+                charge.unit_budget >= bound.min(asked)
+                    && halved_at.is_none_or(|at| charge.granted_at >= at)
+            });
+            let halves = ran_full && !paged_at_grant && ours;
+            let regrow_to = if halves {
+                bound.min(charge.unit_budget / 2).max(1)
+            } else {
+                bound
+            };
+            // A window granted before a later paging window cut the cap
+            // does not raise it.
+            let units = cap.map_or(charge.unit_budget, |cap| cap.units.min(charge.unit_budget));
             Some(PressureCap {
-                units: charge.unit_budget.min(regrow_to),
+                units: units.min(regrow_to),
                 regrow_to,
                 halved_at: halves.then(Instant::now).or(halved_at),
             })

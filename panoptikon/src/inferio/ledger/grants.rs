@@ -533,6 +533,7 @@ impl VramLedger {
                     worker,
                     charge,
                     ingested.filled,
+                    ingested.grew_pool,
                     negative,
                     paged_at_grant,
                 );

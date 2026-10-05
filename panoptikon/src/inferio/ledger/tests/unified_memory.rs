@@ -2103,11 +2103,24 @@ fn paging_windows(
 }
 
 /// A full window granted before macOS began paging and settled while it
-/// pages: one whose batch the paging began under. Its unit budget.
+/// pages: one whose batch the paging began under, growing the pool. Its unit
+/// budget.
 fn window_that_began_paging(
     ledger: &Arc<VramLedger>,
     handle: &TelemetryHandle,
     admission: &Admission,
+) -> u64 {
+    window_that_began_paging_ran(ledger, handle, admission, |units| {
+        measurement(units, 0, 10 * units + 100)
+    })
+}
+
+/// [`window_that_began_paging`] whose batch is `batch` of its unit budget.
+fn window_that_began_paging_ran(
+    ledger: &Arc<VramLedger>,
+    handle: &TelemetryHandle,
+    admission: &Admission,
+    batch: fn(u64) -> BatchMeasurement,
 ) -> u64 {
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
@@ -2117,9 +2130,14 @@ fn window_that_began_paging(
     handle
         .lock()
         .unwrap()
-        .record_measurements(vec![measurement(granted, 0, 10 * granted + 100)]);
+        .record_measurements(vec![batch(granted)]);
     token.finish(WindowOutcome::Responded { oom: None });
     granted
+}
+
+/// A batch that ran inside the pool it held.
+fn inside_its_pool(units: u64) -> BatchMeasurement {
+    measurement(units, 10 * units + 100, 10 * units + 100)
 }
 
 /// A window that runs out of memory while macOS pages was cut by the
@@ -2391,18 +2409,23 @@ fn at_warning_after_paging_the_batch_regrows_to_half_the_size_paging_began_at() 
     );
 
     ledger.set_memory_pressure_for_test(Normal);
+    assert_eq!(ramp_windows(&handle, &admission, 1), [16]);
+    ledger.set_memory_pressure_for_test(Warning);
+    assert_eq!(ramp_windows(&handle, &admission, 1), [16], "the bound");
+    ledger.set_memory_pressure_for_test(Normal);
     assert_eq!(ramp_windows(&handle, &admission, 2), [16, 32]);
     assert_eq!(pressure_cap(&ledger), None, "doubled to what is admitted");
     assert_eq!(ramp_windows(&handle, &admission, 2), [64, 64]);
     assert_eq!(shown(&ledger), (None, None));
 }
 
-/// Only an episode our batch began, granted before the paging and running
-/// at the bound, halves the bound: repeated episodes that began before the
-/// grant, or under a smaller batch, leave it, so they never walk the batch
-/// down. The bound lasts until the batch is back at what the ramp admits.
+/// Only an episode our batch began, granted before the paging and growing
+/// our pool, lowers the bound: repeated episodes that began before the
+/// grant, or while our batch ran inside the pool it held, leave it, so they
+/// never walk the batch down. The bound lasts until the batch is back at
+/// what the ramp admits.
 #[test]
-fn only_an_episode_our_batch_began_at_the_bound_halves_it() {
+fn only_an_episode_our_batch_began_lowers_the_bound() {
     use mps::MemoryPressure::{Normal, Paging, Warning};
     let (ledger, handle, admission) = ramped_mac_replica();
     for _ in 0..5 {
@@ -2420,13 +2443,16 @@ fn only_an_episode_our_batch_began_at_the_bound_halves_it() {
     paging_windows(&ledger, &handle, &admission, Paging, 1);
     ledger.set_memory_pressure_for_test(Warning);
     assert_eq!(ramp_windows(&handle, &admission, 1), [8]);
-    assert_eq!(window_that_began_paging(&ledger, &handle, &admission), 16);
+    assert_eq!(
+        window_that_began_paging_ran(&ledger, &handle, &admission, inside_its_pool),
+        16
+    );
     paging_windows(&ledger, &handle, &admission, Paging, 1);
     ledger.set_memory_pressure_for_test(Warning);
     assert_eq!(
         ramp_windows(&handle, &admission, 4),
         [8, 16, 32, 64],
-        "began under 16, below the bound"
+        "began while our batch ran inside its pool"
     );
 
     assert_eq!(window_that_began_paging(&ledger, &handle, &admission), 64);
@@ -2438,19 +2464,19 @@ fn only_an_episode_our_batch_began_at_the_bound_halves_it() {
     assert_eq!(pressure_cap(&ledger), None, "back at what the ramp admits");
 }
 
-/// A window granted before the paging began that ran a batch at what its
-/// grant asked halves the smaller of the bound and that size, whatever its
-/// settle changed and whichever window settles first; a window granted before
-/// that halving does not halve it again, one granted after it does. Rows: at
-/// warning, a replica that normal pressure would let double its working size,
-/// memory having granted nothing above it; a deflation the window's settle
-/// repaid; an out-of-memory failure; a second replica granted after the
-/// paging began, beside a window granted before the halving that settles
-/// after it; a window right after a halving, which runs the halved size; a
-/// window whose batches ran below its budget; a deflation that puts the size
-/// asked below the bound.
+/// A window granted before the paging began that ran a batch at its budget
+/// and grew our pool lowers the bound to at most half that budget, whatever
+/// its settle changed; until then the bound is the largest size a paging
+/// window asked, whichever settles first. Without pool figures the window
+/// must have run at the bound. Rows: at warning, a replica that normal pressure would
+/// let double its working size, memory having granted nothing above it; a
+/// deflation the window's settle repaid; an out-of-memory failure; a second
+/// replica asking less, granted after the paging began and settled first,
+/// beside two windows granted before it; a window right after a halving that
+/// ran inside its pool; a window whose batches ran below its budget; memory
+/// that cut the batch below the bound; a batch without pool figures.
 #[test]
-fn paging_our_batch_began_at_what_its_grant_asked_halves_the_bound() {
+fn paging_our_batch_began_lowers_the_bound_to_half_its_budget() {
     use mps::MemoryPressure::{Paging, Warning};
     type Setup = fn(&Arc<VramLedger>, &TelemetryHandle, &Admission);
     let room_cut: Setup = |ledger, handle, admission| {
@@ -2505,13 +2531,22 @@ fn paging_our_batch_began_at_what_its_grant_asked_halves_the_bound() {
         assert_eq!(early.grant().unit_budget, 64);
         assert_eq!(before_halving.grant().unit_budget, 64);
         ledger.set_memory_pressure_for_test(Paging);
-        push_ram(&late, MAC_TOTAL_MB, 0, 180, 0);
+        // Asks 16.
+        ledger
+            .lock()
+            .workers
+            .get_mut(&late_admission.worker_id())
+            .expect("the late replica")
+            .deflation = 2;
+        // A pool for 16 units beside the two windows' 1 480 MiB.
+        push_ram(&late, MAC_TOTAL_MB, 0, 1_740, 0);
         let token = late_admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
+        assert_eq!(token.grant().unit_budget, 16);
         late.lock()
             .unwrap()
-            .record_measurements(vec![measurement(8, 0, 180)]);
+            .record_measurements(vec![measurement(16, 0, 260)]);
         token.finish(WindowOutcome::Responded { oom: None });
         for token in [early, before_halving] {
             handle
@@ -2520,11 +2555,13 @@ fn paging_our_batch_began_at_what_its_grant_asked_halves_the_bound() {
                 .record_measurements(vec![measurement(64, 0, 740)]);
             token.finish(WindowOutcome::Responded { oom: None });
         }
+        assert_eq!(pressure_cap(ledger).map(|cap| cap.units), Some(16));
     };
-    let halved_again: Setup = |ledger, handle, admission| {
+    let ran_inside_its_pool: Setup = |ledger, handle, admission| {
         ledger.set_memory_pressure_for_test(Warning);
         assert_eq!(window_that_began_paging(ledger, handle, admission), 64);
-        assert_eq!(window_that_began_paging(ledger, handle, admission), 32);
+        let ran = window_that_began_paging_ran(ledger, handle, admission, inside_its_pool);
+        assert_eq!(ran, 32);
     };
     let below_budget: Setup = |ledger, handle, admission| {
         let token = admission
@@ -2538,22 +2575,29 @@ fn paging_our_batch_began_at_what_its_grant_asked_halves_the_bound() {
             .record_measurements(vec![measurement(64, 0, 740)]);
         token.finish(WindowOutcome::Responded { oom: None });
     };
-    let smaller_asked: Setup = |ledger, handle, admission| {
-        assert_eq!(window_that_began_paging(ledger, handle, admission), 128);
-        for entry in ledger.lock().workers.values_mut() {
-            entry.deflation = 1;
-            entry.clean_windows = 0;
-        }
+    let below_the_bound: Setup = |ledger, handle, admission| {
+        // Free memory for 32 units.
+        push_ram(handle, MAC_TOTAL_MB, 420, 0, 0);
         assert_eq!(window_that_began_paging(ledger, handle, admission), 32);
+    };
+    let without_pool_figures: Setup = |ledger, handle, admission| {
+        ledger.set_memory_pressure_for_test(Warning);
+        let ran =
+            window_that_began_paging_ran(ledger, handle, admission, |units| BatchMeasurement {
+                reserved_before_mb: None,
+                ..measurement(units, 0, 10 * units + 100)
+            });
+        assert_eq!(ran, 64);
     };
     for (setup, regrow_to, regrowth) in [
         (room_cut, 32, [8, 16, 32, 32, 32]),
         (deflated, 32, [8, 16, 32, 32, 32]),
         (out_of_memory, 64, [8, 16, 32, 64, 64]),
         (two_replicas, 32, [8, 16, 32, 32, 32]),
-        (halved_again, 16, [8, 16, 16, 16, 16]),
+        (ran_inside_its_pool, 32, [8, 16, 32, 32, 32]),
         (below_budget, 128, [8, 16, 32, 64, 64]),
-        (smaller_asked, 16, [8, 16, 16, 16, 16]),
+        (below_the_bound, 16, [8, 16, 16, 16, 16]),
+        (without_pool_figures, 32, [8, 16, 32, 32, 32]),
     ] {
         let (ledger, handle, admission) = ramped_mac_replica();
         setup(&ledger, &handle, &admission);

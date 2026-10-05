@@ -313,27 +313,34 @@ Single synthetic device:
     knee, does not count as the size the ramp reached or toward a knee's
     expiry, and its throughput-collapse flags are ignored. A grant above
     normal asks for at most the working size: no trial size and no doubling.
-    So at warning a replica asks for no larger size than it had; its grant
-    can still be smaller while free memory is short. A squeeze there (a
-    neighbour, a dip in the reading) lasts only as long as its cause.
+    So at warning no batch runs above the working size; its grant can still
+    be smaller while free memory is short. Below the working size a
+    deflation is still repaid and the cap below still grows back. A squeeze
+    there (a neighbour, a dip in the reading) lasts only as long as its
+    cause.
   - **A paging episode leaves a cap** (`PressureCap`, per model and device, so
     a replica loaded afterwards runs what one that lived through it runs).
-    Each paging window that memory or the ramp sized sets the cap to its unit
-    budget, at most the bound; one the queue sized sets it only when memory
-    cut the batch below the queue. The first one also sets the bound, how far
-    the cap may grow back while the level stays at warning: the batch size
-    its grant asked. **A window granted before the paging began that ran a
-    batch at its budget, that budget at least the smaller of the bound and
-    the size its grant asked, halves that smaller size (at least 1); a window
-    granted before an earlier window halved the bound does not halve it
-    again.** The size asked is read at the grant, so a deflation the settle
-    repays or adds does not change it. A batch size that tipped the machine
-    into paging is therefore not returned to at warning, and paging that
-    began before the grant or under a smaller batch leaves the bound alone.
+    Each paging window that memory or the ramp sized caps the batch at its
+    unit budget, at most the bound; one the queue sized does so only when
+    memory cut the batch below the queue. A window granted before a later
+    paging window cut the cap does not raise it. The bound is how far the cap
+    may grow back while the level is above normal: the largest size the
+    paging windows' grants asked. **A window whose batch began the paging
+    lowers the bound to at most half its unit budget (at least 1): it was
+    granted before the paging began, ran a batch at its budget, and grew our
+    pool.** Without pool figures (a CPU replica) its unit budget must
+    instead be at least the smaller of the bound and the size its grant
+    asked, and it must have been granted after the last window that lowered
+    the bound. After the first lowering only such a window moves the bound. The size asked is
+    read at the grant, so a deflation the settle repays or adds does not
+    change it. So a batch size whose memory growth began the paging is not
+    returned to above normal, and paging that began before the grant, or
+    while our batches ran inside the pool they held, leaves the bound alone.
   - **Growing back.** Each clean window that filled its budget doubles the
-    cap: at warning up to that bound, at normal until it reaches what the
-    ramp admits, where the cap lifts and the bound is forgotten. A warning
-    that returns before then grows back to the same bound.
+    cap: above normal up to that bound, at normal until it reaches what the
+    ramp admits, where the cap lifts and the bound is forgotten. Above normal
+    the bound also caps the batch when the cap has grown past it, so a
+    warning that returns before the cap lifts runs at most the bound.
   - **Out-of-memory failures in a paging window** still deflate, but do not
     count toward `OOM_WINDOWS_AT_FLOOR` and do not clear it: while paging
     every window is one unit with no room, and three failures there would
