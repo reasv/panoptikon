@@ -411,7 +411,7 @@ def test_the_denominator_is_bounded_by_the_room_a_hog_leaves():
 
     def utilization(target="gpu", held=3800, gpus=(GPU, GPU), unified=False,
                     hog_gpu=GPU, fit=None, states=None, logged=True,
-                    extra_gpus=()):
+                    extra_gpus=(), trial=False):
         states = states or [(10.0, 0), (50.0, held + 400), (110.0, held),
                             (150.0, 0)]
         hog = [{"kind": "header", "target": target, "gpu_uuid": hog_gpu,
@@ -421,6 +421,7 @@ def test_the_denominator_is_bounded_by_the_room_a_hog_leaves():
         log = [{**_budget_grant(100), "t_wall": t_wall,
                 "fields": {**_budget_grant(100)["fields"], "gpu": gpu}}
                for t_wall, gpu in zip((100.0, 120.0), gpus)]
+        log += [_trial_over(3)] if trial else []
         healthrec = [_worker_health(100)]
         if not logged:
             log, healthrec = [], [{**_worker_health(100), "t_wall": t_wall}
@@ -437,6 +438,7 @@ def test_the_denominator_is_bounded_by_the_room_a_hog_leaves():
 
     mps = analyze.MPS_DEVICE_KEY
     assert utilization() == ("PASS", 312)
+    assert utilization(trial=True) == ("PASS", 64)
     assert utilization(gpus=(GPU, "GPU-1111")) == ("FAIL", 512)
     assert utilization(hog_gpu="GPU-1111") == ("FAIL", 512)
     assert utilization(target="ram") == ("FAIL", 512)

@@ -1929,9 +1929,7 @@ def check_utilization(ctx: Context) -> Verdict:
             rows.append({**row, "boundary_units": None})
             continue
         knee = knees.get(model)
-        # The knee can only lower the bar: a cap above the OOM boundary would
-        # be scoring the leg against memory the probe says is not there.
-        allowed = min(boundary, knee["rung"] or knee["knee"]) if knee else 0
+        allowed = (knee["rung"] or knee["knee"]) if knee else 0
         held = _hog_least_held_mb(
             ctx, issued_at.get(model) or published_at.get(model, []))
         room = (int(boundary - held / slopes[model])
@@ -1940,7 +1938,9 @@ def check_utilization(ctx: Context) -> Verdict:
             rows.append({**row, "boundary_units": boundary,
                          "room_units": room, "denominator_units": None})
             continue
-        denominator = min(allowed or boundary, room or boundary)
+        # The knee can only lower the bar: a cap above the OOM boundary would
+        # be scoring the leg against memory the probe says is not there.
+        denominator = min(boundary, allowed or boundary, room or boundary)
         ratio = admitted / denominator
         ok = ratio >= threshold
         rows.append({**row, "boundary_units": boundary,
