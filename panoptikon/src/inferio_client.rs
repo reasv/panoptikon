@@ -3047,9 +3047,11 @@ pub(crate) mod tests {
                 .build()
                 .unwrap()
         };
+        // Never accepts: its connections wait in the backlog, so checks miss.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", silent.local_addr().unwrap());
         let first = runtime();
         let client = first.block_on(async {
-            let url = format!("http://{}", closed_port().await);
             let client = health_checked_client(&url, Transport::Http11).await;
             assert!(client.start_health_checks());
             // The task is between two checks.
