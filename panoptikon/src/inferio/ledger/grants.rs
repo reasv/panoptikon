@@ -100,11 +100,11 @@ impl VramLedger {
         };
         let signed_headroom = self.overdraft_with_margin_locked(&state, &gpu, margin);
         let headroom = signed_headroom.max(0) as u64;
-        // The batch size, and what of it the window's content asks for. An
-        // item cap (the user's included) limits the content like a short
-        // queue: for a count-priced model it is a unit count, else the cap
-        // times the largest input's units, which no batch of at most `cap`
-        // items exceeds.
+        // The batch size, and what of it the window's content asks for. The
+        // ledger's item cap, lowered to the user's if smaller, limits the
+        // content like a short queue: for a count-priced model it is a unit
+        // count, else the cap times the largest input's units, which no batch
+        // of at most `cap` items exceeds.
         let (size_asked, capped, wanted, item_cap) = {
             let entry = state.workers.get(&worker)?;
             let capped = Self::budget_locked(&state, entry);
