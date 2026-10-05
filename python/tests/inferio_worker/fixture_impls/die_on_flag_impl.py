@@ -9,8 +9,9 @@ requests to be queued/dispatched on the other replica) and the normal
 predict is slow enough (1s) to still be in flight when the death is
 detected.
 
-`{"die_alone": true}` does the same when it is the only input; in a batch of
-several it sleeps ~1s and raises ValueError, and the worker lives.
+`{"die_alone": true}` does the same, with exit status 8, when it is the only
+input; in a batch of several it sleeps ~1s and raises ValueError, and the
+worker lives.
 """
 
 import os
@@ -38,7 +39,7 @@ class DieOnFlagModel:
         )
         if die_alone and len(inputs) == 1:
             time.sleep(0.2)
-            os._exit(7)
+            os._exit(8)
         time.sleep(1.0)
         if die_alone:
             raise ValueError("die_alone in a batch of several inputs")

@@ -1186,26 +1186,25 @@ impl ModelManager {
     /// After a fatal worker death: drop the model from all bookkeeping so the
     /// next predict reloads it. The generation guards against a respawn race.
     ///
-    /// A replica the ledger condemned on one of `gpus` (it did not fit the
-    /// card) arms the load-failure cooldown, so the reload waits instead of
+    /// `deaths` holds each death's GPU and message. The first death on a GPU
+    /// the ledger condemned the model on (it did not fit the card) arms the
+    /// load-failure cooldown with its message, so the reload waits instead of
     /// respawning on the next item; also when the model was unloaded meanwhile.
     pub(crate) fn handle_worker_death(
         &self,
         inference_id: &str,
         generation: u64,
-        reason: &str,
-        gpus: &[&str],
+        deaths: &[(&str, &str)],
     ) {
         let mut state = self.state.lock().unwrap();
-        let window = gpus
+        let window = deaths
             .iter()
-            .any(|gpu| self.ledger.was_condemned(inference_id, gpu))
-            .then(|| {
+            .find(|(gpu, _)| self.ledger.was_condemned(inference_id, gpu))
+            .and_then(|(_, message)| {
                 state
                     .cooldowns
-                    .note_failure(inference_id, reason, &self.cfg.loads, Instant::now())
-            })
-            .flatten();
+                    .note_failure(inference_id, message, &self.cfg.loads, Instant::now())
+            });
         let matches = state
             .models
             .get(inference_id)
@@ -3631,10 +3630,11 @@ metadata.cost.seed_units = 1000000
 
     /// A death the *ledger* called is a costed load failure: the cooldown
     /// arms with the verdict's sentence, so the reload waits rather than
-    /// being respawned by the next item; also when the model was unloaded
-    /// before the death handler ran, and when the condemned replica dies
-    /// while the dispatcher drains after a death on the other card. Every
-    /// other fatal death still respawns at once
+    /// being respawned by the next item. Also when the condemned replica dies
+    /// while an unload drains it, and when it dies while the dispatcher
+    /// drains after a death on the other card: the cooldown then names its
+    /// death, and a request its window left unsent goes to the cooldown.
+    /// Every other fatal death still respawns at once
     /// (`worker_death_cleans_up_and_next_predict_respawns`).
     #[tokio::test]
     async fn a_condemned_models_death_arms_the_cooldown() {
@@ -3663,20 +3663,36 @@ metadata.cost.seed_units = 1000000
                         .expect_err("the poison request fails with the fatal death")
                 }
             };
+            let mut condemned_death = None;
             if unloaded_first {
+                let dying = tokio::spawn(die());
+                wait_for_stats(&manager, id, generation, |stats| {
+                    stats.in_flight_windows.load(Relaxed) == 1
+                })
+                .await;
                 manager.unload_model("k", id).await.expect("unloaded");
-                manager.handle_worker_death(
-                    id,
-                    generation,
-                    "the worker failed fatally",
-                    &["GPU-0000"],
-                );
+                dying.await.unwrap();
             } else if id == "dieledgerpair/test" {
-                // The first death is on GPU-3333; GPU-0000's comes during the drain.
+                // The first death is on GPU-3333; GPU-0000's comes during the
+                // drain, in the retry of a merged window that leaves `5` unsent.
                 let first = tokio::spawn(die());
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                die().await;
+                let spawn_predict = |value| {
+                    let manager = manager.clone();
+                    tokio::spawn(
+                        async move { predict_one(&manager, id, "k", -1, None, value).await },
+                    )
+                };
+                let alone = spawn_predict(json!({"die_alone": true}));
+                let kept = spawn_predict(json!(5));
+                let err = alone.await.unwrap().expect_err("dies alone");
+                condemned_death = Some(format!("{err:#}"));
                 first.await.unwrap();
+                let err = kept
+                    .await
+                    .unwrap()
+                    .expect_err("handed back into the cooldown");
+                assert!(format!("{err:#}").contains("cooldown"), "{err:#}");
             } else {
                 die().await;
             }
@@ -3700,6 +3716,13 @@ metadata.cost.seed_units = 1000000
                 "the sentence that killed it is what /health says: {}",
                 cooldown.last_error
             );
+            if let Some(death) = condemned_death {
+                assert_eq!(
+                    cooldown.last_error,
+                    truncate_error(&death),
+                    "the condemned replica's death, not the first one"
+                );
+            }
             let err = predict_one(&manager, id, "k", -1, Some(1), json!("ok"))
                 .await
                 .expect_err("the reload waits for the cooldown");

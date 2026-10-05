@@ -804,23 +804,7 @@ pub(crate) async fn run_dispatcher(
                 );
             }
             let deaths = drain_in_flight(&ctx, &mut in_flight, &mut free).await;
-            // The handle is gone: this only arms a condemned card's cooldown.
-            let gpus: Vec<&str> = deaths
-                .iter()
-                .filter_map(|death| death.gpu.as_deref())
-                .collect();
-            if let (false, Some(manager)) = (gpus.is_empty(), ctx.manager.upgrade()) {
-                manager.handle_worker_death(
-                    &ctx.inference_id,
-                    ctx.generation,
-                    &deaths[0].message,
-                    &gpus,
-                );
-            }
-            deaths
-                .into_iter()
-                .flat_map(|death| death.unsent)
-                .for_each(hand_back);
+            let unsent = settle_deaths(&ctx, deaths);
             // Then the unload ladder on every replica concurrently.
             let results = join_all(free.into_iter().map(|replica| replica.worker.shutdown())).await;
             for result in results {
@@ -831,6 +815,8 @@ pub(crate) async fn run_dispatcher(
                     );
                 }
             }
+            // After the ladder, so their callers reload with these replicas freed.
+            unsent.into_iter().for_each(hand_back);
         }
         End::Fatal(death) => {
             // Any replica fatal -> the whole model dies. Stats first, for /health.
@@ -840,27 +826,29 @@ pub(crate) async fn run_dispatcher(
             // The other replicas' windows finish and keep their outputs.
             let drained = drain_in_flight(&ctx, &mut in_flight, &mut free).await;
             join_all(free.into_iter().map(|replica| replica.worker.kill())).await;
-            let deaths: Vec<Death> = std::iter::once(death).chain(drained).collect();
-            // Before the requests go back, so their callers load a new set.
-            if let Some(manager) = ctx.manager.upgrade() {
-                let gpus: Vec<&str> = deaths
-                    .iter()
-                    .filter_map(|death| death.gpu.as_deref())
-                    .collect();
-                manager.handle_worker_death(
-                    &ctx.inference_id,
-                    ctx.generation,
-                    &deaths[0].message,
-                    &gpus,
-                );
-            }
-            deaths
+            // Settled before the requests go back, so their callers load a new set.
+            settle_deaths(&ctx, std::iter::once(death).chain(drained).collect())
                 .into_iter()
-                .flat_map(|death| death.unsent)
                 .chain(take_queued(&mut queue, &mut rx))
                 .for_each(hand_back);
         }
     }
+}
+
+/// Report `deaths` to the manager and return the requests they left unsent,
+/// in order. No death, no report: a dispatcher whose channel closed while its
+/// model still maps to it also ends without one.
+fn settle_deaths(ctx: &DispatcherContext, deaths: Vec<Death>) -> Vec<DispatchRequest> {
+    if !deaths.is_empty()
+        && let Some(manager) = ctx.manager.upgrade()
+    {
+        let gpus_and_messages: Vec<(&str, &str)> = deaths
+            .iter()
+            .filter_map(|death| Some((death.gpu.as_deref()?, death.message.as_str())))
+            .collect();
+        manager.handle_worker_death(&ctx.inference_id, ctx.generation, &gpus_and_messages);
+    }
+    deaths.into_iter().flat_map(|death| death.unsent).collect()
 }
 
 /// Close the channel and take every request still queued or in it.
