@@ -2056,20 +2056,27 @@ def _clock_step(legs: Optional[Dict[str, Any]]) -> Optional[float]:
 
 def _items_per_s(records: List[Dict[str, Any]],
                  clock_step: Optional[float] = None) -> float:
-    """Items over the server's start-to-end spans less the clock step; over
-    busy time when a span is missing or the corrected total is not positive."""
+    """Items over the server's start-to-end spans, a record's busy time
+    standing in for a span that is missing or not positive. A clock step of
+    1 s or more comes off the summed spans instead (the times are whole
+    seconds, so a smaller step is noise); busy time then stands in for all of
+    them when a span is missing or the corrected total is not positive."""
     items = sum(float(record.get("total_segments") or 0) for record in records)
     spans = [(_iso_epoch(str(record.get("start_time", "")).replace(" ", "T")),
-              _iso_epoch(str(record.get("end_time", "")).replace(" ", "T")))
+              _iso_epoch(str(record.get("end_time", "")).replace(" ", "T")),
+              float(record.get("inference_time") or 0)
+              + float(record.get("data_load_time") or 0))
              for record in records]
-    seconds = 0.0
-    if all(start is not None and end is not None for start, end in spans):
-        seconds = (sum(end - start for start, end in spans)
-                   - (clock_step or 0.0))
-    if seconds <= 0:
-        seconds = sum(float(record.get("inference_time") or 0)
-                      + float(record.get("data_load_time") or 0)
-                      for record in records)
+    step = clock_step or 0.0
+    if abs(step) < 1:
+        seconds = sum(end - start if start is not None and end is not None
+                      and end > start else busy for start, end, busy in spans)
+    else:
+        seconds = 0.0
+        if all(start is not None and end is not None for start, end, _ in spans):
+            seconds = sum(end - start for start, end, _ in spans) - step
+        if seconds <= 0:
+            seconds = sum(busy for _, _, busy in spans)
     return items / seconds if seconds > 0 else 0.0
 
 

@@ -1066,6 +1066,17 @@ def test_throughput_corrects_both_sides_for_the_clock_step_or_neither(tmp_path):
     # A step larger than the span fell outside it: busy time, no step.
     assert analyze._items_per_s([record(10, 20)], 30.0) == pytest.approx(
         100 / 4.5)
+    # A step under 1 s is not subtracted: a sub-second job's start equals its
+    # end, and that span uses busy time.
+    assert analyze._items_per_s([record(10, 10)], -0.002) == pytest.approx(
+        100 / 4.5)
+    # Without a step, each record on its own: a span, or busy time.
+    assert analyze._items_per_s([record(10, 20), record(21, 21)]) == (
+        pytest.approx(200 / 14.5))
+    # With a step and a missing end: busy time for every record.
+    assert analyze._items_per_s([record(10, 20), {**record(20, 20),
+                                 "end_time": None}], -2.0) == pytest.approx(
+        200 / 9)
 
 
 # --- deflation_recovery ------------------------------------------------------
