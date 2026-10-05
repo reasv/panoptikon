@@ -2271,7 +2271,8 @@ mod tests {
 
     /// A ROCm host whose GPU this process cannot open (no render node, as
     /// without the render group) has no visible GPU: models are placed on the
-    /// CPU device and no pin is written, as under a blank visibility variable.
+    /// CPU device and no pin is written, as under a blank visibility variable,
+    /// whatever a visibility variable names.
     #[test]
     fn a_rocm_gpu_this_process_cannot_open_puts_models_on_the_cpu_device() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2298,6 +2299,7 @@ mod tests {
         for ambient in [
             [None; rocm::VISIBILITY_VARS.len()],
             [Some(""), None, None, None],
+            [Some("0"), None, None, None],
         ] {
             let host = probe_rocm_at(&roots, ambient, false).inventory;
             assert!(host.no_visible_gpu, "{ambient:?}");

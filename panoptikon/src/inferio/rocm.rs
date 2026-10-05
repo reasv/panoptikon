@@ -132,31 +132,15 @@ impl ProbeFailure {
 }
 
 /// Build the GPU inventory, or a [`ProbeFailure`] for an unknown host.
-/// `ambient` holds each [`VISIBILITY_VARS`] value, by position. Any ambient
-/// restriction leaves the inventory unknown, since HIP indices count the
-/// filtered set and cannot be mapped to KFD nodes. Empty when this process
-/// can use no GPU, so ROCr enumerates none and workers run on the CPU.
+/// `ambient` holds each [`VISIBILITY_VARS`] value, by position. Empty when
+/// this process can use no GPU, so ROCr enumerates none whatever the filter
+/// says and workers run on the CPU. Otherwise any ambient restriction leaves
+/// the inventory unknown, since HIP indices count the filtered set and cannot
+/// be mapped to KFD nodes.
 pub(super) fn build(
     roots: &SysfsRoots,
     ambient: [Option<&str>; VISIBILITY_VARS.len()],
 ) -> Result<Vec<GpuInfo>, ProbeFailure> {
-    if let Some(var) = ambient_restriction(ambient) {
-        tracing::info!(
-            variable = var,
-            hip_layer = ambient_hip_restriction(ambient),
-            "an ambient GPU visibility restriction is set; leaving the ROCm \
-             GPU inventory unknown (HIP device indices count the filtered \
-             set, so our pins cannot compose with it) — workers inherit the \
-             restriction as-is: a HIP-layer restriction suppresses our \
-             pinning entirely, and under a ROCR-only one a registry index \
-             pin from the registry is still written and selects *within* the \
-             operator's filtered set, not the host's own GPU order. That \
-             last point is the diagnostic for \"the model ran on a different \
-             card than devices = [N] names\": with a ROCR filter in force, \
-             index N counts the GPUs the operator left visible"
-        );
-        return Err(ProbeFailure::logged("ambient visibility restriction", 0, 0));
-    }
     let openable = openable_gpu_nodes(roots)?;
     let gpu_nodes = openable.gpu_nodes;
     let count = openable.nodes.len();
@@ -164,7 +148,8 @@ pub(super) fn build(
         if gpu_nodes + openable.hidden == 0 {
             tracing::warn!(
                 "this host is configured for ROCm but its KFD topology lists no \
-                 GPU; models run on the CPU device, priced against RAM"
+                 GPU; models run on the CPU device, priced against RAM, until \
+                 panoptikon restarts after the GPU appears"
             );
         } else {
             tracing::warn!(
@@ -180,6 +165,27 @@ pub(super) fn build(
             );
         }
         return Ok(Vec::new());
+    }
+    if let Some(var) = ambient_restriction(ambient) {
+        tracing::info!(
+            variable = var,
+            hip_layer = ambient_hip_restriction(ambient),
+            "an ambient GPU visibility restriction is set; leaving the ROCm \
+             GPU inventory unknown (HIP device indices count the filtered \
+             set, so our pins cannot compose with it) — workers inherit the \
+             restriction as-is: a HIP-layer restriction suppresses our \
+             pinning entirely, and under a ROCR-only one a registry index \
+             pin from the registry is still written and selects *within* the \
+             operator's filtered set, not the host's own GPU order. That \
+             last point is the diagnostic for \"the model ran on a different \
+             card than devices = [N] names\": with a ROCR filter in force, \
+             index N counts the GPUs the operator left visible"
+        );
+        return Err(ProbeFailure::logged(
+            "ambient visibility restriction",
+            gpu_nodes,
+            count,
+        ));
     }
     let mut rows = Vec::with_capacity(count);
     for (index, (node, props, fusion)) in openable.nodes.iter().enumerate() {
@@ -321,7 +327,8 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
     let mut nodes = node_dirs(&roots.kfd_nodes);
     // Numeric order: a string sort would put node 10 before node 2.
     nodes.sort_by_key(|(node, _)| *node);
-    let kfd_openable = opens_read_write(&roots.kfd);
+    let kfd = opens_read_write(&roots.kfd);
+    let kfd_openable = kfd.is_ok();
     let mut gpu_nodes = 0usize;
     let mut hidden = 0usize;
     let mut out = Vec::new();
@@ -402,6 +409,27 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
         let fusion = (roots.fusion)(&render);
         out.push((node, props, fusion));
     }
+    if let Err(err) = kfd
+        && gpu_nodes > 0
+    {
+        // A missing device or group lasts until a restart or a new login;
+        // any other error may pass while the GPU exists.
+        if !matches!(
+            err.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        ) {
+            tracing::warn!(
+                error = %err,
+                "/dev/kfd cannot be opened read-write; leaving the ROCm GPU \
+                 inventory unknown"
+            );
+            return Err(ProbeFailure::logged("/dev/kfd open failed", gpu_nodes, 0));
+        }
+        tracing::info!(
+            error = %err,
+            "/dev/kfd cannot be opened read-write; no GPU node is usable"
+        );
+    }
     Ok(OpenableNodes {
         gpu_nodes,
         hidden,
@@ -417,9 +445,10 @@ fn open_render_node(dev_dri: &Path, minor: u64) -> io::Result<fs::File> {
     OpenOptions::new().read(true).write(true).open(render)
 }
 
-/// Whether `path` opens read-write, as ROCr opens `/dev/kfd`.
-fn opens_read_write(path: &Path) -> bool {
-    OpenOptions::new().read(true).write(true).open(path).is_ok()
+/// Open `path` read-write, as ROCr opens `/dev/kfd`.
+fn opens_read_write(path: &Path) -> io::Result<()> {
+    OpenOptions::new().read(true).write(true).open(path)?;
+    Ok(())
 }
 
 /// Whether amdgpu flags this GPU as an APU: `AMDGPU_IDS_FLAGS_FUSION` in the
@@ -498,7 +527,7 @@ fn node_dirs(root: &Path) -> Vec<(u32, PathBuf)> {
 pub(super) fn topology_gpus(roots: &SysfsRoots, check_access: bool) -> Vec<(String, bool)> {
     let mut nodes = node_dirs(&roots.kfd_nodes);
     nodes.sort_by_key(|(node, _)| *node);
-    let kfd_openable = check_access && opens_read_write(&roots.kfd);
+    let kfd_openable = check_access && opens_read_write(&roots.kfd).is_ok();
     nodes
         .into_iter()
         .filter_map(|(_, dir)| {
@@ -1418,6 +1447,20 @@ mod tests {
                 assert_eq!(hidden.build(), Some(Vec::new()));
             }
         }
+    }
+
+    /// A `/dev/kfd` that fails to open for a reason other than a missing
+    /// device or group (here EISDIR) leaves the inventory unknown while the
+    /// topology lists a GPU.
+    #[cfg(unix)]
+    #[test]
+    fn other_kfd_open_errors_leave_the_inventory_unknown() {
+        let fixture = Fixture::new();
+        fs::remove_file(&fixture.roots.kfd).unwrap();
+        fs::create_dir(&fixture.roots.kfd).unwrap();
+        assert_eq!(fixture.build(), Some(Vec::new()), "no GPU node");
+        fixture.dgpu(1, LOC_03_00, 128, GB24);
+        assert_eq!(fixture.bucket(), Some("/dev/kfd open failed"));
     }
 
     /// Any of the four visibility vars blanks the inventory; empty and
