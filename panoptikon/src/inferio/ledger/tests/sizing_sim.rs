@@ -446,16 +446,23 @@ impl Device {
     }
 }
 
-/// The memory budget every device is configured with: the shipped default.
-/// A sizing mode (`balanced`, `throughput`) is applied here once the ledger
-/// has one.
-fn budget(_mode: &str) -> VramBudget {
-    VramBudget::default()
+/// The memory budget every device is configured with: the shipped default,
+/// in sizing mode `mode` (`balanced`, `throughput`).
+fn budget(mode: &str) -> VramBudget {
+    let sizing = match mode {
+        "throughput" => SizingMode::Throughput,
+        _ => SizingMode::Balanced,
+    };
+    VramBudget {
+        sizing: Some(sizing),
+        ..VramBudget::default()
+    }
 }
 
-/// Where a design hands the ledger the items its job has left; the ledger
-/// takes none today. `None`: the job has no end in sight.
-fn remaining_work(_admission: &Admission, _items_left: Option<u64>) {}
+/// Hand the ledger the items the job has left; `None`: no end in sight.
+fn remaining_work(admission: &Admission, items_left: Option<u64>) {
+    admission.note_remaining_items(items_left);
+}
 
 /// `(window, value)` pairs from `w:v,w:v`.
 fn schedule<T>(spec: &str, value: impl Fn(&str) -> T) -> Vec<(usize, T)> {
@@ -731,7 +738,8 @@ impl Scenario {
         }
     }
 
-    /// Items the queue holds for the next window.
+    /// Items the queue holds for the next window, from the batch size the
+    /// caller was told to keep in flight for, `lag` windows back (`fed`).
     fn queue_hold(&self, window: usize, ran: &[u64], items_left: Option<u64>) -> u64 {
         let mut items = match self.queue.as_str() {
             "full" => DEEP_QUEUE,
@@ -775,7 +783,10 @@ fn stored_row(sc: &Scenario, anchor: u64, working: Option<u64>) -> ProfileUpdate
         samples: 20,
         knee_units: working,
         knee_trials: Default::default(),
-        knee_rates: Vec::new(),
+        sizes: Vec::new(),
+        ram_ring: Vec::new(),
+        ram_startup_mb: 0,
+        ram_first_units: 0,
         max_units_measured: anchor,
         local_samples: 20,
         ring: [anchor / 4, anchor / 2, anchor]
@@ -920,6 +931,9 @@ struct Start {
     over_room: u32,
     first_at_stored: i64,
     ran: Vec<u64>,
+    /// The batch size the caller was told to keep in flight for, per window:
+    /// the size run, or a probe's larger size.
+    fed: Vec<u64>,
     working: Vec<u64>,
     window_ms: Vec<u64>,
     window_items: Vec<u64>,
@@ -1086,7 +1100,14 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
             }
             ledger.record_free_for_test(sc.device.key(), free_now(room, pool));
             let items_left = (sc.items > 0).then(|| sc.items - done);
-            let hold = sc.queue_hold(w, &st.ran, items_left);
+            let hold = sc.queue_hold(w, &st.fed, items_left);
+            // While a probe is on, the batch size the dispatcher tells the
+            // caller to keep in flight for: its larger size.
+            let probing = sc.fixed.is_none() && ledger_row(&ledger).trial_units.is_some();
+            let fed = probing.then(|| {
+                in_flight_target_units(admission.in_flight_units(), last_grant.as_ref())
+                    / WINDOW_DEPTH_MULTIPLIER
+            });
             // The dispatcher's window: within the ledger's window target.
             let (target, mut item_bound) = match sc.fixed {
                 Some(units) => (units.saturating_mul(WINDOW_DEPTH_MULTIPLIER), usize::MAX),
@@ -1400,6 +1421,7 @@ fn run_scenario(line: &str, traces: &Path, out: &mut impl std::io::Write) {
                 st.first_at_stored = w as i64;
             }
             st.ran.push(budget);
+            st.fed.push(fed.map_or(budget, |fed| fed.max(budget)));
             st.window_ms.push(out_ms.round() as u64);
             st.window_items.push(st.items - items_before);
             st.pools.push(window_pool);
@@ -1545,7 +1567,7 @@ fn every_device_simulates_one_line_per_start() {
     spec += "name=fixed dev=gpu fixed=48 win=20 lag=2 v=1\n";
     spec += "name=cpu-pool dev=cpu room=40000 total=48000 pu=46 curve=geo:1.2:20 win=300 v=1\n";
     spec += "name=pool pu=30 ratio=16:1.6,256:1.8 rsssd=0.2 rssfirst=500 rsslag=50 \
-             curve=knee:1.3:256:8 noise=0.05 win=300 lag=2 v=1\n";
+             curve=knee:1.3:128:8 noise=0.05 win=300 lag=2 v=1\n";
     let mut out = Vec::new();
     run_spec(&spec, Path::new(""), &mut out);
     let out = String::from_utf8(out).unwrap();
