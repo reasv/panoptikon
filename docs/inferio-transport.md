@@ -464,9 +464,10 @@ health check when the connection cannot see it.
   only a request to a server declared frozen starts one (see "Health"). A
   check misses on its deadline or on a 502, 503 or 504, a proxy saying the
   server behind it did not answer. Any other outcome, a refused connection or
-  a failed TLS handshake included, is no evidence of a freeze. `/health`
-  reads in-memory state and touches no model, so a busy server answers it and
-  a long batch is never cut off.
+  a failed TLS handshake included, is no evidence of a freeze, and neither is
+  a missed check when a response other than those came from the base URL
+  since the previous check. `/health` reads in-memory state and touches no
+  model, so a busy server answers it and a long batch is never cut off.
 - `HEALTH_CHECK_MISSES` (2) checks in a row without an answer declare the
   server frozen, about 50 s into the stall, and log one WARN. Every request
   waiting on it fails as a keep-alive timeout fails it (phase `Headers`, class
@@ -479,8 +480,9 @@ health check when the connection cannot see it.
   checks in a row`.
 - A check must reach the server on a new connection. A proxy that caps its
   connections to the server (HAProxy `maxconn`, nginx `max_conns`) can queue
-  the check behind predicts until it times out, so a busy server can be
-  declared frozen; the README says how to avoid it.
+  the check behind predicts until it times out. A response arriving meanwhile
+  answers the check, so a busy server is declared frozen only when no request
+  is answered during two checks in a row; the README says how to avoid it.
 - A predict with no response head also logs a WARN after `STALL_WARN_AFTER`
   (120 s) and again each time the wait doubles (240 s, 480 s, …).
 

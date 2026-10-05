@@ -348,8 +348,9 @@ either way its items are owed, and the next run retries them.
 The check goes through the proxy on a connection of its own, over HTTP/2 or
 HTTP/1.1 as the requests are. A proxy that caps its connections to the
 server (HAProxy `maxconn`, nginx `max_conns`) can queue the check behind
-predictions until it times out, and then a busy server is taken for frozen.
-Raise the cap well above the requests the gateway keeps in flight, or exempt
+predictions until it times out. A busy server is then taken for frozen when
+no prediction completes during two checks in a row (about 20 s). Raise the
+cap well above the requests the gateway keeps in flight, or exempt
 `/api/inference/health`.
 
 See the configuration reference in
