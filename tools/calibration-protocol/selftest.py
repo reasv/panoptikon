@@ -235,23 +235,26 @@ def probe_free_tiers(memory: Any) -> List[Dict[str, Any]]:
 
 
 def settled_free_mb(memory: Any, sleep: Callable[[float], None] = time.sleep,
-                    interval_s: float = 0.25, reads: int = 40
+                    interval_s: float = 0.25, reads: int = 40,
+                    hold_s: float = 2.0
                     ) -> Tuple[Optional[int], Optional[str], Optional[float],
                                Optional[bool]]:
     """Device free after teardown, as `(free_mb, source, seconds, settled)`.
     amdgpu lowers a discrete GPU's VRAM used counter some time after a
-    release, so there free is read until two reads `interval_s` apart agree,
-    at most `reads` more reads. Any other source is read once, and `seconds`
-    and `settled` are None."""
+    release, so there sysfs free is reread every `interval_s` until it holds
+    for `hold_s`, at most `reads` more reads; a failed read restarts the hold.
+    Any other source is read once, and `seconds` and `settled` are None."""
     free_mb, _, source = memory.free_total_mb()
     if source != "amdgpu-sysfs" or _safe(memory._unified_gpu):
         return free_mb, source, None, None
+    held_since = 0
     for taken in range(1, reads + 1):
         sleep(interval_s)
-        again, _, source = memory.free_total_mb()
-        if again == free_mb:
+        again, source = memory._free_mb("amdgpu-sysfs")
+        if again is None or again != free_mb:
+            free_mb, held_since = again, taken
+        elif (taken - held_since) * interval_s >= hold_s:
             return free_mb, source, taken * interval_s, True
-        free_mb = again
     return free_mb, source, reads * interval_s, False
 
 
@@ -289,6 +292,8 @@ def _free_tier_reason(memory: Any, tier: str) -> str:
             return ("NVML unavailable" if memory._nvml() is None
                     else "NVML gave no memory info for this process's device")
         if tier == "amdgpu-sysfs":
+            if not memory._is_hip(memory._torch()):
+                return "the worker's torch is not a ROCm build"
             if memory.device_bdf() is not None:
                 return "amdgpu sysfs present but mem_info_vram_* unreadable"
             return "no amdgpu sysfs: " + rocm_reason(

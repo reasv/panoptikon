@@ -208,15 +208,20 @@ def test_in_a_container_kfd_is_found_by_the_fdinfo_pasid(tmp_path):
 
 
 def test_a_descriptor_inherited_across_fork_counts_once(tmp_path):
-    """Parent and child both name the parent's PASID: KFD's figure would be
-    credited to each, so the GPU is read from fdinfo, the client once."""
+    """Parent and child both name the parent's PASID: its KFD entry is
+    credited to the lower PID only. A child with a PASID of its own after the
+    inherited one is credited its own entry."""
     host = Host(tmp_path, host_pid_ns=False).gpu(1, 0x0300)
     host.kfd(4242, 1, 300 * MIB, pasid=32770)
     for pid in (700, 701):
         host.fdinfo(pid, 3, _fd(BDF_03, 11, 150 * 1024, pasid=32770))
     (gpu,) = rocm_sysfs.inventory(host.roots)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
-        "fdinfo", {700: 150}, [])
+        "kfd", {700: 300}, [])
+    host.kfd(4243, 1, 500 * MIB, pasid=32771)
+    host.fdinfo(701, 4, _fd(BDF_03, 12, 200 * 1024, pasid=32771))
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
+        "kfd", {700: 300, 701: 500}, [])
 
 
 def test_one_pasid_on_two_gpus_counts_on_each(tmp_path):
@@ -733,12 +738,12 @@ def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(
 
 
 def test_selftest_reasons_name_what_is_missing(tmp_path, monkeypatch):
-    def fdinfo(own_mb, hip=True):
+    def fdinfo(own_mb, hip=True, bdf=None):
         return types.SimpleNamespace(fdinfo_own_vram_mb=lambda: own_mb,
                                      _torch=lambda: None,
-                                     _is_hip=lambda torch: hip)
+                                     _is_hip=lambda torch: hip,
+                                     device_bdf=lambda: bdf)
 
-    sysfs = types.SimpleNamespace(device_bdf=lambda: None)
     host = Host(tmp_path)
     gpu_nodes = selftest.rocm_sysfs.gpu_nodes
     monkeypatch.setattr(selftest.rocm_sysfs, "gpu_nodes",
@@ -746,7 +751,7 @@ def test_selftest_reasons_name_what_is_missing(tmp_path, monkeypatch):
     assert selftest.rocm_reason("tier") == "not a ROCm host"
     assert selftest._fdinfo_reason(fdinfo(None)) == (
         "no DRM fdinfo VRAM figure for this process: not a ROCm host")
-    assert selftest._free_tier_reason(sysfs, "amdgpu-sysfs") == (
+    assert selftest._free_tier_reason(fdinfo(None), "amdgpu-sysfs") == (
         "no amdgpu sysfs: not a ROCm host")
     host.gpu(1, 0x0300, openable=False)
     assert selftest.rocm_reason("tier") == (
@@ -755,30 +760,38 @@ def test_selftest_reasons_name_what_is_missing(tmp_path, monkeypatch):
     assert selftest.rocm_reason("tier") == "tier"
     assert selftest._fdinfo_reason(fdinfo(None, hip=False)) == (
         "the worker's torch is not a ROCm build")
+    assert selftest._free_tier_reason(
+        fdinfo(None, hip=False, bdf="0000:01:00.0"), "amdgpu-sysfs") == (
+        "the worker's torch is not a ROCm build")
     assert selftest._fdinfo_reason(fdinfo(None)) == (
         "no DRM fdinfo VRAM figure for this process: "
         "no amdgpu fdinfo record of this device parsed")
     assert selftest._fdinfo_reason(fdinfo(900)) == (
         "fdinfo read 900 MiB; the worker rejected it as implausible")
-    assert selftest._free_tier_reason(sysfs, "amdgpu-sysfs") == (
+    assert selftest._free_tier_reason(fdinfo(None), "amdgpu-sysfs") == (
         "no amdgpu sysfs: no GPU resolved for this device")
 
 
 def test_selftest_reads_free_until_it_settles():
-    """On a discrete amdgpu GPU free rises over three reads after teardown,
-    then holds; a figure that never holds stops at the read bound. A unified
-    GPU or any other source is read once."""
-    reads = iter([1000, 1500, 2000, 2000])
+    """On a discrete amdgpu GPU free is reread from sysfs until it holds for
+    2 s; a change or a failed read restarts the hold, and a figure that never
+    holds stops at the read bound. A unified GPU or any other source is read
+    once."""
+    reads = iter([1500, None, None] + [2000] * 9)
     memory = types.SimpleNamespace(
-        free_total_mb=lambda: (next(reads), 24576, "amdgpu-sysfs"),
+        free_total_mb=lambda: (1000, 24576, "amdgpu-sysfs"),
+        _free_mb=lambda source: (next(reads), source),
         _unified_gpu=lambda: False)
     sleeps = []
     assert selftest.settled_free_mb(memory, sleeps.append) == (
-        2000, "amdgpu-sysfs", 0.75, True)
-    assert sleeps == [0.25] * 3
-    reads = iter(range(1000, 2000))
+        2000, "amdgpu-sysfs", 3.0, True)
+    assert sleeps == [0.25] * 12
+    reads = iter(range(1001, 2000))
     assert selftest.settled_free_mb(memory, lambda s: None, reads=5) == (
         1005, "amdgpu-sysfs", 1.25, False)
+    reads = iter([None] * 9)
+    assert selftest.settled_free_mb(memory, lambda s: None, reads=9) == (
+        None, "amdgpu-sysfs", 2.25, False)
     for source, unified in (("nvml", False), ("amdgpu-sysfs", True)):
         reads = iter([1000, 2000])
         memory = types.SimpleNamespace(
