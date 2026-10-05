@@ -428,6 +428,18 @@ fn probe_rocm_at(
             "detected GPU"
         );
     }
+    if let Some(gpu) = default_gpu(&gpus)
+        && lacks_wheel_kernels(gpu, gfx_override())
+    {
+        tracing::warn!(
+            gfx = gpu.arch().as_deref().unwrap_or("unknown"),
+            index = gpu.index,
+            "the default GPU has no kernels in the ROCm build of torch: models \
+             placed on it fail unless {GFX_OVERRIDE_ENV_VAR} names a supported \
+             target of the same generation (in Docker: \
+             deploy/docker-compose.rocm.yml) or they are pinned to another device"
+        );
+    }
     rocm_host(roots, Some(gpus.into()), ambient_hip_restriction, false)
 }
 
@@ -841,18 +853,23 @@ fn default_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
     default_gpu_with(gpus, gfx_override())
 }
 
+/// A ROCm GPU whose gfx target is outside [`ROCM_WHEEL_GFX`], unless
+/// `gfx_override` is set.
+fn lacks_wheel_kernels(gpu: &GpuInfo, gfx_override: bool) -> bool {
+    !gfx_override
+        && gpu.gfx_target_version.is_some()
+        && !gpu
+            .arch()
+            .is_some_and(|arch| ROCM_WHEEL_GFX.contains(&arch.as_str()))
+}
+
 /// A ROCm GPU outside [`ROCM_WHEEL_GFX`] last (unless `gfx_override`), then
 /// the highest compute capability, ties broken by
 /// [`GpuInfo::placement_total_mb`] and then the lowest index.
 fn default_gpu_with(gpus: &[GpuInfo], gfx_override: bool) -> Option<&GpuInfo> {
     gpus.iter().min_by_key(|gpu| {
-        let no_kernels = !gfx_override
-            && gpu.gfx_target_version.is_some()
-            && !gpu
-                .arch()
-                .is_some_and(|arch| ROCM_WHEEL_GFX.contains(&arch.as_str()));
         (
-            no_kernels,
+            lacks_wheel_kernels(gpu, gfx_override),
             std::cmp::Reverse(gpu.cap_tenths()),
             std::cmp::Reverse(gpu.placement_total_mb()),
             gpu.index,
