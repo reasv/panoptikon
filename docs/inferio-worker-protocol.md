@@ -476,7 +476,7 @@ reading by construction excludes. Memory the worker has kept allocated since
 its load counts the same way, up to `grant.fixed_mb`: the grant prices the
 fixed part of a batch over the level at load, and a batch does not allocate
 again what an earlier one left in place. It is not the ledger's own credit
-(`reserved_now − reserved_at_load − grants`, `share_locked`), but it is why a
+(`reserved_now − reserved_at_load`, `share_locked`), but it is why a
 grant can sit above the free reading at all — a pre-fit grant is `headroom +
 the requester's free pool`, or a part of the headroom plus that pool when
 other replicas share the device — so both ends cut the batch from the same
