@@ -41,27 +41,28 @@ HEADER = json.dumps({"kind": "header"}) + "\n"
 SAMPLE = json.dumps({"kind": "sample", "seq": 0, "t_wall": 100.0}) + "\n"
 
 
-def test_the_leg_waits_for_every_recorder_and_marks_a_silent_one(tmp_path):
+def test_the_leg_waits_for_every_recorder_and_marks_a_silent_one(
+        monkeypatch, tmp_path):
     sampled, late = tmp_path / "vramrec.jsonl", tmp_path / "healthrec.jsonl"
     sampled.write_text(HEADER + SAMPLE)
     late.write_text(HEADER)
     writer = threading.Timer(0.3, lambda: late.write_text(HEADER + SAMPLE))
     writer.start()
-    assert legs.unsampled([sampled, late], 5.0) == []
-    writer.join()
-
-    # A partly written sample line is not a sample.
-    late.write_text(HEADER + SAMPLE[:20])
-    sampled.write_text(HEADER)
     leg = types.SimpleNamespace(path=lambda name: tmp_path / name, events=[])
     leg.mark = lambda name, **detail: legs.Leg.mark(leg, name, **detail)
-    legs.Leg.wait_for_recorders(leg, ["healthrec", "healthrec-remote"],
-                                timeout=0.3)
+    legs.Leg.wait_for_recorders(leg, ["healthrec"], timeout=5.0)
+    writer.join()
+    assert leg.events == []
+
+    # A missing file, and a partly written sample line, hold no sample.
+    sampled.unlink()
+    late.write_text(HEADER + SAMPLE[:20])
+    monkeypatch.setattr(legs.time, "monotonic", lambda: 1234.56789)
+    legs.Leg.wait_for_recorders(leg, ["healthrec"], timeout=0)
     (event,) = leg.events
     assert (event["event"], event["files"], event["waited_s"]) == (
-        "recorder_sample_timeout",
-        ["vramrec.jsonl", "healthrec.jsonl", "healthrec-remote.jsonl"], 0.3)
-    assert isinstance(event["t_mono"], float)
+        "recorder_sample_timeout", ["vramrec.jsonl", "healthrec.jsonl"], 0)
+    assert event["t_mono"] == 1234.568
 
 
 def test_a_hog_event_that_asks_for_nothing_is_marked_and_skips_hog_tracking(
@@ -200,7 +201,7 @@ def mark_then_sigint(self, name, **detail):
     if name == "interrupted":
         signal.raise_signal(signal.SIGINT)
 legs.Leg.mark = mark_then_sigint
-legs.unsampled = lambda paths, timeout: []
+legs.Leg.wait_for_recorders = lambda self, health: None
 legs.nvml_total_mb = lambda device: None
 legs.rocm_sysfs.inventory = lambda *roots: []
 directory = tmp / "run" / "S14"

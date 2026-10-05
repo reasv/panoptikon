@@ -754,26 +754,6 @@ def wait_for(predicate: Callable[[], bool], timeout: float,
 RECORDER_START_S = 30.0
 
 
-def unsampled(paths: Sequence[Path], timeout: float) -> List[str]:
-    """Waits up to `timeout` for every JSONL file to hold a sample record;
-    returns the names of those that still hold none."""
-    def sampled(path: Path) -> bool:
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return False
-        for line in lines:
-            try:
-                if json.loads(line).get("kind") == "sample":
-                    return True
-            except ValueError:  # a partly written last line
-                pass
-        return False
-
-    wait_for(lambda: all(map(sampled, paths)), timeout, interval=0.1)
-    return [path.name for path in paths if not sampled(path)]
-
-
 def port_is_open(host: str, port: int, timeout: float = 1.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -1002,8 +982,23 @@ class Leg:
         """Waits up to `timeout` for vramrec's and each `health` recorder's
         recording to hold a sample; marks `recorder_sample_timeout` with those
         that still hold none."""
-        missing = unsampled([self.path(f"{name}.jsonl")
-                             for name in ("vramrec", *health)], timeout)
+        paths = [self.path(f"{name}.jsonl") for name in ("vramrec", *health)]
+
+        def sampled(path: Path) -> bool:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                return False
+            for line in lines:
+                try:
+                    if json.loads(line).get("kind") == "sample":
+                        return True
+                except ValueError:  # a partly written last line
+                    pass
+            return False
+
+        wait_for(lambda: all(map(sampled, paths)), timeout, interval=0.1)
+        missing = [path.name for path in paths if not sampled(path)]
         if missing:
             self.mark("recorder_sample_timeout", files=missing,
                       waited_s=timeout)
