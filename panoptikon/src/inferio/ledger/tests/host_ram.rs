@@ -1560,8 +1560,8 @@ fn a_short_window_does_not_double_the_item_cap() {
 /// size, run up to [`WINDOW_DEPTH_MULTIPLIER`] batches deep, and each falls
 /// short of its peak by at most one capped batch at the costliest page,
 /// whether the pages come in random order or cheap ones come first. A second
-/// size gives the slope: once the pages cost what was measured, no window
-/// falls short, and the ramp goes on.
+/// size gives the slope, and the ramp goes on; when cheap pages come first,
+/// no window falls short once the pages cost what was measured.
 #[test]
 fn a_costly_first_input_under_retention_costs_at_most_a_capped_batch() {
     use rand::{Rng, SeedableRng, rngs::StdRng};
