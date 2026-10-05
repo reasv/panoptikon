@@ -343,10 +343,10 @@ async fn build_read_pool(paths: &DbPaths, attach_user_data: bool) -> Result<Sqli
     };
     if let Err(err) = opened.await {
         tracing::error!(error = %err, "failed to open read connection");
-        log_open_problem(paths, attach_user_data, false);
+        log_open_problem(paths, attach_user_data, false, false);
         return Err(ApiError::internal("Failed to open database"));
     }
-    log_open_success(paths, attach_user_data, false);
+    log_open_success(paths, attach_user_data, false, false);
     let pool = SqlitePoolOptions::new()
         .max_connections(READ_POOL_MAX_CONNECTIONS)
         .min_connections(0)
@@ -652,26 +652,33 @@ async fn connect_db(
     user_data_wl: bool,
     attach_user_data: bool,
 ) -> Result<SqliteConnection, ApiError> {
+    let readonly_mode = readonly_mode();
+    let write_lock = write_lock && !readonly_mode;
+    let user_data_wl = user_data_wl && attach_user_data && !readonly_mode;
     let conn = open_db(paths, write_lock, user_data_wl, attach_user_data).await;
-    let write = write_lock || user_data_wl;
     match conn {
-        Ok(_) => log_open_success(paths, attach_user_data, write),
-        Err(_) => log_open_problem(paths, attach_user_data, write),
+        Ok(_) => log_open_success(paths, attach_user_data, write_lock, user_data_wl),
+        Err(_) => log_open_problem(paths, attach_user_data, write_lock, user_data_wl),
     }
     conn
 }
 
-/// The database files, each with whether the open asked for a write lock,
-/// whose open problem was logged and that have not been opened the same way
-/// since.
+/// The database files whose open problem was logged, each with whether it
+/// was opened for writing, that have not been opened the same way since.
 static OPEN_PROBLEMS: Mutex<BTreeSet<(PathBuf, bool)>> = Mutex::new(BTreeSet::new());
 
-/// The files an open of `paths` opens: the user-data file only when attached.
-fn opened_files(paths: &DbPaths, attach_user_data: bool) -> impl Iterator<Item = &PathBuf> {
-    let user_db_file = attach_user_data.then_some(&paths.user_db_file);
+/// The files an open of `paths` opens, each with whether it is opened for
+/// writing: the user-data file only when attached.
+fn opened_files(
+    paths: &DbPaths,
+    attach_user_data: bool,
+    write_index: bool,
+    write_user_data: bool,
+) -> impl Iterator<Item = (&PathBuf, bool)> {
+    let user_db_file = attach_user_data.then_some((&paths.user_db_file, write_user_data));
     let files = [
-        Some(&paths.index_db_file),
-        Some(&paths.storage_db_file),
+        Some((&paths.index_db_file, write_index)),
+        Some((&paths.storage_db_file, write_index)),
         user_db_file,
     ];
     files.into_iter().flatten()
@@ -679,28 +686,37 @@ fn opened_files(paths: &DbPaths, attach_user_data: bool) -> impl Iterator<Item =
 
 /// Logs why a database in `paths` cannot be written: another user owns it or
 /// its filesystem is read-only. Logged once per database file and kind of
-/// open (read or write) until an open of the same kind succeeds.
-fn log_open_problem(paths: &DbPaths, attach_user_data: bool, write: bool) {
-    let Some((file, reason)) = opened_files(paths, attach_user_data).find_map(|file| {
+/// open (read or write) of that file until an open of the same kind succeeds.
+fn log_open_problem(
+    paths: &DbPaths,
+    attach_user_data: bool,
+    write_index: bool,
+    write_user_data: bool,
+) {
+    let mut files = opened_files(paths, attach_user_data, write_index, write_user_data);
+    let Some((key, reason)) = files.find_map(|(file, write)| {
         let name = file.file_name()?.to_str()?;
-        Some((
-            file,
-            crate::ownership::database_problem(file.parent()?, name)?,
-        ))
+        let reason = crate::ownership::database_problem(file.parent()?, name)?;
+        Some(((file.clone(), write), reason))
     }) else {
         return;
     };
     let mut logged = OPEN_PROBLEMS.lock().unwrap_or_else(|err| err.into_inner());
-    if logged.insert((file.clone(), write)) {
+    if logged.insert(key) {
         tracing::warn!(reason, "cannot open a database");
     }
 }
 
-/// After an open of `paths` succeeds, a problem with its files in an open of
-/// the same kind is logged again.
-fn log_open_success(paths: &DbPaths, attach_user_data: bool, write: bool) {
+/// After an open of `paths` succeeds, a problem with each of its files in an
+/// open of the same kind is logged again.
+fn log_open_success(
+    paths: &DbPaths,
+    attach_user_data: bool,
+    write_index: bool,
+    write_user_data: bool,
+) {
     let mut logged = OPEN_PROBLEMS.lock().unwrap_or_else(|err| err.into_inner());
-    for file in opened_files(paths, attach_user_data) {
+    for (file, write) in opened_files(paths, attach_user_data, write_index, write_user_data) {
         logged.remove(&(file.clone(), write));
     }
 }
@@ -712,9 +728,6 @@ async fn open_db(
     attach_user_data: bool,
 ) -> Result<SqliteConnection, ApiError> {
     ensure_sqlite_extensions()?;
-    let readonly_mode = readonly_mode();
-    let write_lock = write_lock && !readonly_mode;
-    let user_data_wl = user_data_wl && attach_user_data && !readonly_mode;
     let open_readonly = !write_lock && !user_data_wl;
 
     let mut conn = if open_readonly {
@@ -855,6 +868,28 @@ async fn open_db(
         }
     }
 
+    // SQLite opens a file it cannot write read-only, without an error.
+    {
+        let mut handle = conn.lock_handle().await.map_err(|err| {
+            tracing::error!(error = %err, "failed to lock the connection");
+            ApiError::internal("Failed to open database")
+        })?;
+        let db = handle.as_raw_handle().as_ptr();
+        let schemas = [
+            (c"main", write_lock),
+            (c"storage", write_lock),
+            (c"user_data", user_data_wl),
+        ];
+        for (schema, written) in schemas {
+            // SAFETY: `db` is the open connection, locked by `handle`, and
+            // `schema` is NUL-terminated.
+            if written && unsafe { libsqlite3_sys::sqlite3_db_readonly(db, schema.as_ptr()) } == 1 {
+                tracing::error!(?schema, "database opened read-only");
+                return Err(ApiError::internal("Failed to open database"));
+            }
+        }
+    }
+
     sqlx::query("PRAGMA foreign_keys = ON")
         .execute(&mut conn)
         .await
@@ -947,9 +982,9 @@ mod tests {
     }
 
     /// A database that cannot be opened fails a request at once, and each
-    /// folder another user owns is logged once until an open of the same kind
-    /// succeeds, naming the folder and its owner. A cached read pool for it is
-    /// dropped.
+    /// file another user owns is logged once per kind of open of that file
+    /// until an open of the same kind succeeds, naming the folder and its
+    /// owner. A cached read pool for it is dropped.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_database_that_cannot_be_opened_fails_at_once_and_names_the_owner() {
@@ -1010,12 +1045,43 @@ mod tests {
         make_openable(&link, true);
         let pooled = acquire_read_conn(&no_names, &names("foreign_owned"), false).await;
         drop(pooled.unwrap());
+        assert!(
+            open_index_db_read_no_user_data("foreign_owned")
+                .await
+                .is_ok()
+        );
         make_openable(&link, false);
         failed.push(open().await.is_err());
+        assert_eq!(reasons.lock().unwrap().len(), 2);
         make_openable(&link, true);
         assert!(open().await.is_ok());
         make_openable(&link, false);
         failed.push(open().await.is_err());
+        let user_db = env.path().join("user_data/foreign_user.db");
+        make_openable(&link, true);
+        fs::write(&user_db, "").unwrap();
+        let user_write = || open_user_data_write("foreign_owned", "foreign_user");
+        assert!(user_write().await.is_ok());
+        make_openable(&link, false);
+        failed.push(open().await.is_err());
+        make_openable(&link, true);
+        fs::remove_file(&user_db).unwrap();
+        symlink(foreign, &user_db).unwrap();
+        let user_read = || open_index_db_read("foreign_owned", "foreign_user");
+        failed.extend([user_read().await.is_err(), user_write().await.is_err()]);
+        let owned_key = ("foreign_owned".to_owned(), String::new(), false);
+        read_pools().lock().unwrap().remove(&owned_key);
+        let user_names = DbNames {
+            index_db: "foreign_owned".to_owned(),
+            user_data_db: "foreign_user".to_owned(),
+        };
+        assert!(
+            acquire_read_conn(&no_names, &user_names, false)
+                .await
+                .is_ok()
+        );
+        failed.extend([user_read().await.is_err(), user_write().await.is_err()]);
+        make_openable(&link, false);
         failed.push(read().await.is_err());
         make_openable(&read_link, true);
         drop(read().await.unwrap());
@@ -1034,18 +1100,48 @@ mod tests {
         let pooled = acquire_read_conn(&no_names, &names("foreign_pool"), false).await;
         failed.push(pooled.is_err());
         let dropped = !read_pools().lock().unwrap().contains_key(&key);
-        read_pools()
-            .lock()
-            .unwrap()
-            .remove(&("foreign_owned".to_owned(), String::new(), false));
-        for link in [&link, &read_link, &pool_link] {
+        read_pools().lock().unwrap().remove(&owned_key);
+        for link in [&link, &read_link, &pool_link, &user_db] {
             fs::remove_file(link).unwrap();
         }
         assert!(failed.iter().all(|failed| *failed) && dropped, "{failed:?}");
-        let [read, write, pool] = [&read_link, &link, &pool_link]
+        let [read, write, user, pool] = [&read_link, &link, &user_db, &pool_link]
             .map(|link| Some(owned_by_another_user(link, owner, foreign)));
-        let expected = [read.clone(), write.clone(), write, read, pool];
+        let expected = [&read, &write, &write, &user, &user, &read, &pool].map(Clone::clone);
         assert_eq!(*reasons.lock().unwrap(), expected);
+    }
+
+    /// A write open fails when SQLite can open a file it writes only read-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_open_of_a_read_only_file_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _env = crate::test_utils::test_data_dir();
+        let name = "read_only_files";
+        let paths = db_paths(name, name).unwrap();
+        let index = open_index_db_write_no_user_data(name).await.unwrap();
+        index.close().await.unwrap();
+        fs::write(&paths.user_db_file, "").unwrap();
+        let user_data = open_user_data_write(name, name).await.unwrap();
+        user_data.close().await.unwrap();
+        let files = [
+            (&paths.index_db_file, false),
+            (&paths.storage_db_file, false),
+            (&paths.user_db_file, true),
+        ];
+        for (file, user_data) in files {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o444)).unwrap();
+            if fs::OpenOptions::new().write(true).open(file).is_ok() {
+                return;
+            }
+            let opened = if user_data {
+                open_user_data_write(name, name).await
+            } else {
+                open_index_db_write_no_user_data(name).await
+            };
+            fs::set_permissions(file, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(opened.is_err(), "{}", file.display());
+        }
     }
 
     /// A read pool whose connections are all busy times out and is kept.
