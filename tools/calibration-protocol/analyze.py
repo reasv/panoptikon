@@ -805,8 +805,10 @@ def _source_counts(sources: Dict[str, int]) -> str:
 def check_oracle_agreement(ctx: Context) -> Verdict:
     """`external_mb` vs (GPU used - our workers' NVML usage): +/-1 GiB or 2%.
 
-    Skipped while no job ran, or while a release or hog move larger than the
-    allowance lies between the ledger's free reading and the oracle sample."""
+    Skipped while no job ran, where GPU used moved past the allowance, or by
+    an unknown amount, during the per-process scan, or while a release or hog
+    move larger than the allowance lies between the ledger's free reading and
+    the oracle sample."""
     if not ctx.health_samples or not ctx.vram_samples:
         return Verdict("oracle_agreement", "SKIP",
                        "needs both healthrec.jsonl and vramrec.jsonl")
@@ -899,7 +901,8 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                 breaches += 1
     skipped = "".join(
         f"; {count} GPU-samples {why} were skipped" for count, why in (
-            (skewed, "read while GPU used moved past the allowance"),
+            (skewed, "read while GPU used moved past the allowance, "
+                     "or by an unknown amount"),
             (releasing, "read while a release was still leaving GPU used"),
             (hog_moving, "read while the hog moved")) if count) + (
         f" ({read_age} of them only because the ledger read free before both "
