@@ -106,7 +106,9 @@ change:   a probe's own pairs more than 3.5 standard errors from the doubling's
   (`Admission::note_remaining_items`); a probe starts only with
   `PROBE_PAYBACK_WINDOWS` windows of work left. The count arrives as
   predict's `remaining_items`, and a caller that does not say is taken to
-  have the items run since its queue last ran dry.
+  have the items run since its queue last ran dry. Without a count, a probe
+  can start too near a job's end to finish; it goes on in the next job, but a
+  restart loses it.
 - **Bounded weight.** A doubling's pairs weigh at most 64: past that, older
   pairs count for less. A rate that changes (new inputs, a rate that rises
   late in a job) is caught by the change test at the next re-test, at most
