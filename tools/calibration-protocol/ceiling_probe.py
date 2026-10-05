@@ -118,7 +118,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import corpus as corpus_files  # noqa: E402
@@ -418,7 +418,7 @@ class Rocm:
                  roots: rocm_sysfs.Roots = rocm_sysfs.Roots()) -> None:
         self.gpu = gpu
         self.roots = roots
-        self.own_source: Optional[str] = None  # "kfd" or "fdinfo"
+        self.own_sources: Set[str] = set()  # "kfd" and/or "fdinfo"
 
     @classmethod
     def pinned(cls, device: int, environ: Dict[str, str],
@@ -446,8 +446,33 @@ class Rocm:
         pid = os.getpid()
         reading = rocm_sysfs.process_vram_mb(
             self.roots, [self.gpu], [pid])[self.gpu.key]
-        self.own_source = reading.source
+        self.own_sources.add(reading.source)
         return reading.held.get(pid)
+
+    def _pin_text(self) -> str:
+        return f"pinned HIP device {self.gpu.index} ({self.gpu.bdf})"
+
+    def check_torch(self, torch: Any) -> None:
+        """Exits unless torch is a ROCm build that sees one device, the pinned
+        one."""
+        hip = getattr(torch.version, "hip", None)
+        if not hip:
+            raise SystemExit(
+                f"ceiling_probe: {self._pin_text()}, but torch "
+                f"{torch.__version__} is not a ROCm build (no torch.version.hip)")
+        count = torch.cuda.device_count()
+        if count != 1:
+            raise SystemExit(
+                f"ceiling_probe: {self._pin_text()}, but torch {torch.__version__} "
+                f"sees {count} devices")
+
+    def check_bdf(self, bdf: Optional[str]) -> None:
+        """Exits unless the loaded model is on the pinned GPU; `bdf` is
+        `memory.device_bdf()`, None when the worker cannot name a GPU."""
+        if bdf != self.gpu.bdf:
+            raise SystemExit(
+                f"ceiling_probe: {self._pin_text()}, but the model loaded on "
+                f"{bdf or 'no GPU the worker can name'}")
 
 
 # --- MPS: no NVML, no peak API, so the peak has to be sampled -------------
@@ -771,10 +796,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--data", default="{}",
                         help="JSON merged into every input's data dict")
     parser.add_argument("--device", default="0",
-                        help="NVML GPU index; without NVML, the HIP device "
-                             "index (KFD order, a single-index "
-                             "HIP_VISIBLE_DEVICES wins); or `mps` for the "
-                             "unified device on Apple Silicon")
+                        help='NVML index; else the HIP index (README "ROCm"); '
+                             'or `mps`')
     parser.add_argument("--sample-ms", type=float, default=20.0,
                         help="MPS only: interval of the in-batch peak sampler. "
                              "torch.mps has no peak API, so the post-batch "
@@ -885,15 +908,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if gpu is None:
+        nvml_error = None if nvml is None else nvml.error
+        if os.path.isdir(rocm_sysfs.Roots().kfd):
+            raise SystemExit(
+                f"ceiling_probe: neither NVML nor KFD has a GPU with index "
+                f"{device_index} (nvml error: {nvml_error}; on ROCm, a "
+                f"visibility variable other than a single-index "
+                f"HIP_VISIBLE_DEVICES leaves nothing to pin)")
         hint = ("  On Apple Silicon there is no NVML: use `--device mps`."
                 if sys.platform == "darwin" else "")
         raise SystemExit(
-            f"ceiling_probe: neither NVML nor KFD has a GPU with index "
-            f"{device_index} (nvml error: "
-            f"{None if nvml is None else nvml.error}; on ROCm, a visibility "
-            f"variable other than a single-index HIP_VISIBLE_DEVICES leaves "
-            f"nothing to pin)" + hint
-        )
+            f"ceiling_probe: NVML has no GPU with index {device_index} "
+            f"(nvml error: {nvml_error})" + hint)
     if not items:
         raise SystemExit("ceiling_probe: --corpus is required for a real run")
 
@@ -987,6 +1013,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not mps:
         import torch
 
+        if rocm is not None:
+            rocm.check_torch(torch)
+        elif getattr(torch.version, "hip", None):
+            raise SystemExit(
+                f"ceiling_probe: pinned NVML GPU {gpu['uuid']}, but torch "
+                f"{torch.__version__} is a ROCm build")
+
     free_before = device_free_mb()
 
     def load_readings() -> Dict[str, Any]:
@@ -1005,6 +1038,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     instance, load, load_facts = load_instance(
         impl_cls, resolved["config"], synchronize, load_readings)
+    if rocm is not None:
+        rocm.check_bdf(worker_memory.device_bdf())
     reserved_at_load = load["reserved_at_load_mb"]
     base_nvml = load["base_nvml_mb"]
 
@@ -1261,7 +1296,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif rocm is not None:
         device = {**gpu, "name": torch.cuda.get_device_name(0),
                   "hip_visible_devices": os.environ["HIP_VISIBLE_DEVICES"],
-                  "own_source": rocm.own_source}
+                  "own_source": sorted(rocm.own_sources)}
     else:
         device = {**gpu,
                   "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]}

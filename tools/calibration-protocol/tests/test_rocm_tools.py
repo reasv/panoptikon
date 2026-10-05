@@ -16,9 +16,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import types
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -602,32 +604,111 @@ def test_the_tools_pin_like_the_spawner(tmp_path, monkeypatch, capsys):
                "PANOPTIKON_UNIFIED_GPU": BDF_0C}
     assert pin(1) == unified
     assert pin(0, {"HIP_VISIBLE_DEVICES": "1"}) == unified
+    assert pin(0, {"HIP_VISIBLE_DEVICES": "0,1"}) is None
     assert pin(0, {"ROCR_VISIBLE_DEVICES": "1"}) is None
+    assert pin(0, {"GPU_DEVICE_ORDINAL": "0"}) is None
     assert pin(5) is None
 
     host.kfd(os.getpid(), 1, 300 * MIB)
+    host.kfd(os.getpid() + 1, 1, 700 * MIB)
     rocm = probe.Rocm.pinned(0, {}, host.roots)
     assert rocm.env() == pin(0)
     assert rocm.row() == {
         "index": 0, "uuid": f"GPU-BDF-{BDF_03}", "name": None,
         "total_mb": 24576, "free_mb": 22528, "bdf": BDF_03, "unified": False,
         "backend": "rocm"}
-    assert (rocm.free_mb(), rocm.own_mb(), rocm.own_source) == (22528, 300, "kfd")
+    assert (rocm.free_mb(), rocm.own_mb(), rocm.own_sources) == (
+        22528, 300, {"kfd"})
+    # Without KFD's per-process directory the next reading is fdinfo's.
+    shutil.rmtree(tmp_path / "kfd/proc")
+    rocm.own_mb()
+    assert rocm.own_sources == {"fdinfo", "kfd"}
     apu = probe.Rocm.pinned(1, {}, host.roots)
     assert apu.env() == unified
+    assert (apu.row()["unified"], apu.row()["bdf"]) == (True, BDF_0C)
     assert (apu.row()["total_mb"], apu.free_mb()) == (512 + 1024, 384 + 1024)
     assert probe.Rocm.pinned(0, {"CUDA_VISIBLE_DEVICES": "0"}, host.roots) is None
 
+    # NVML first: a ROCm GPU is taken only where NVML has no GPU N.
     pinned = probe.Rocm.pinned
-    monkeypatch.setattr(probe, "Nvml", lambda: types.SimpleNamespace(
-        gpus=lambda: [], error="NVMLError_LibraryNotFound"))
+    _clear_visibility(monkeypatch)
     monkeypatch.setattr(probe.Rocm, "pinned", lambda device, environ: pinned(
         device, environ, host.roots))
-    assert probe.main(["--model", "tags/wd-vit-tagger-v3", "--device", "1",
-                       "--dry-run"]) == 0
-    plan = json.loads(capsys.readouterr().out)
-    assert plan["backend"] == "rocm"
-    assert plan["device"] == apu.row()
+    nvml_gpu = {"index": 1, "uuid": "GPU-1"}
+    for gpus, backend, device in (([], "rocm", apu.row()),
+                                  ([nvml_gpu], "cuda", nvml_gpu)):
+        monkeypatch.setattr(probe, "Nvml", lambda: types.SimpleNamespace(
+            gpus=lambda: gpus, error=None))
+        assert probe.main(["--model", "tags/wd-vit-tagger-v3", "--device", "1",
+                           "--dry-run"]) == 0
+        plan = json.loads(capsys.readouterr().out)
+        assert (plan["backend"], plan["device"]) == (backend, device)
+
+
+@pytest.mark.parametrize("hip,bdf,nvml_gpus", [
+    ("6.4.43482", BDF_03, []), (None, BDF_03, []), ("6.4.43482", None, []),
+    ("6.4.43482", BDF_03, [{"index": 0, "uuid": "GPU-1"}])],
+    ids=["ok", "hip None", "BDF mismatch", "hip on NVML"])
+def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(tmp_path, monkeypatch,
+                                                         hip, bdf, nvml_gpus):
+    """A run to the JSON on a fixture ROCm host, with a stand-in torch and an
+    impl that allocates nothing. The probe exits unless torch is a ROCm build
+    and the model loaded on the pinned GPU (`memory.device_bdf()`), and exits
+    on a ROCm torch pinned to an NVML GPU."""
+    host = Host(tmp_path / "host").gpu(1, 0x0300)
+    host.kfd(os.getpid(), 1, 300 * MIB)
+    pinned = probe.Rocm.pinned
+    monkeypatch.setattr(probe.Rocm, "pinned", lambda device, environ: pinned(
+        device, environ, host.roots))
+    monkeypatch.setattr(probe, "Nvml", lambda: types.SimpleNamespace(
+        gpus=lambda: nvml_gpus, error=None, handle_for_uuid=lambda uuid: None))
+    _clear_visibility(monkeypatch)
+    monkeypatch.setattr(sys, "path", [str(HERE.parents[1] / "python"), *sys.path])
+    (tmp_path / "item.txt").write_text("a caption")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"items": [{"path": "item.txt", "kind": "text"}]}))
+    (tmp_path / "registry.toml").write_text(
+        '[group.probe.inference_ids.echo]\nconfig.impl_class = "echo_test"\n')
+    zero = lambda *args: 0  # noqa: E731
+    cuda = types.SimpleNamespace(
+        device_count=lambda: 1, get_device_name=lambda index: "AMD Radeon",
+        is_available=lambda: True, is_initialized=lambda: False,
+        synchronize=lambda: None, empty_cache=lambda: None,
+        reset_peak_memory_stats=lambda: None, memory_reserved=zero,
+        memory_allocated=zero, max_memory_reserved=zero,
+        max_memory_allocated=zero)
+    torch = types.SimpleNamespace(
+        __version__="2.8.0+rocm6.4", cuda=cuda,
+        version=types.SimpleNamespace(hip=hip, cuda=None))
+    out = tmp_path / "probe.json"
+    argv = ["--model", "probe/echo", "--device", "0", "--repo", str(tmp_path),
+            "--registry", str(tmp_path / "registry.toml"),
+            "--impl-dir", str(HERE.parents[1] / "python/tests/inferio_worker"
+                              "/fixture_impls"),
+            "--corpus", str(tmp_path / "manifest.json"), "--max-batch", "1",
+            "--out", str(out)]
+    with mock.patch.dict(os.environ), mock.patch.dict(sys.modules,
+                                                      {"torch": torch}):
+        from inferio_worker import memory
+
+        monkeypatch.setattr(memory, "device_bdf", lambda: bdf)
+        if hip is None or bdf is None or nvml_gpus:
+            with pytest.raises(SystemExit):
+                probe.main(argv)
+            return
+        assert probe.main(argv) == 0
+        assert (os.environ["HIP_VISIBLE_DEVICES"],
+                os.environ["PANOPTIKON_DEVICE_PIN"]) == ("0", "0")
+    result = json.loads(out.read_text())
+    assert result["backend"] == "rocm"
+    device = result["device"]
+    assert (device["bdf"], device["hip_visible_devices"],
+            device["own_source"]) == (BDF_03, "0", ["kfd"])
+    assert None not in (result["load"]["free_before_mb"],
+                        result["load"]["base_nvml_mb"],
+                        result["batches"][0]["gpu_free_mb"],
+                        result["batches"][0]["nvml_own_mb"])
+    assert {"dtype", "dtype_method", "gqa_check", "transformers"} <= set(result)
 
 
 def test_selftest_reasons_name_what_is_missing(tmp_path, monkeypatch):
