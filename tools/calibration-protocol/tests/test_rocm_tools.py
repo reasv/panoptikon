@@ -324,6 +324,11 @@ def test_used_that_moves_during_the_process_scan_is_flagged_and_not_judged(
 
     monkeypatch.setattr(vramrec.rocm_sysfs, "process_vram_mb", moving)
     assert sample() == [(6144, 5120), (512, 1536)]
+    # A failed read before the scan leaves the skew unknown.
+    failing, memory = iter([None]), vramrec.rocm_sysfs.memory_mb
+    monkeypatch.setattr(vramrec.rocm_sysfs, "memory_mb",
+                        lambda *args: next(failing, memory(*args)))
+    assert sample() == [(6144, None), (512, 0)]
 
     # The allowance on this 24 GiB GPU is 1 GiB, on a 96 GiB one 1966 MiB; the
     # measured difference is 3800 MiB with `external_mb` 0, 1800 MiB with 2000

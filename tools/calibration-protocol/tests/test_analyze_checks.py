@@ -648,6 +648,7 @@ def test_grant_safety_never_passes_a_grant_a_release_may_have_covered():
     assert skewed(100, 200)["covered_by_release"][0]["released_mb"] == 5200
     assert skewed(300, 300)["over_free"][0]["released_mb"] == 4900
     assert skewed(None, 0)["over_free"][0]["released_mb"] == 0
+    assert skewed(0, None)["over_free"][0]["released_mb"] == 0
 
 
 def test_a_sample_older_than_twice_the_recorder_interval_is_not_joined():
@@ -981,20 +982,23 @@ def test_calibration_learned_cannot_judge_a_seed_no_window_reached():
 
 
 def test_batch_coverage_counts_every_batch_from_each_workers_seq_1():
-    def coverage(*samples, check=analyze.check_batch_coverage):
+    def coverage(*samples, check=analyze.check_batch_coverage,
+                 generations=None):
         """Each sample is one replica's ring or a list of rings, one per
         replica; an empty list is a sample without the model, None a failed
-        /health read."""
+        /health read. The model's generation is 1 unless `generations` gives
+        one per sample."""
         recording = []
-        for rings in samples:
+        for rings, generation in zip(samples,
+                                     generations or [1] * len(samples)):
             if rings is None:
                 recording.append({"kind": "sample", "t_wall": 100.0,
                                   "health": {"ok": False}})
                 continue
             rings = rings if isinstance(rings, list) else [rings]
-            models = [{"inference_id": MODEL, "generation": 1, "replicas": [
-                {"recent_batches": [{"seq": seq} for seq in ring]}
-                for ring in rings]}] if rings else []
+            models = [{"inference_id": MODEL, "generation": generation,
+                       "replicas": [{"recent_batches": [{"seq": seq} for seq in ring]}
+                                    for ring in rings]}] if rings else []
             recording.append({"kind": "sample", "t_wall": 100.0,
                               "health": {"ok": True, "models": models}})
         verdict = check(_context(healthrec=recording))
@@ -1008,6 +1012,9 @@ def test_batch_coverage_counts_every_batch_from_each_workers_seq_1():
     assert coverage(range(1, 5), range(3, 7)) == ("PASS", 6, 0, {})
     # A seq that goes back is a new worker, counted from its seq 1.
     assert coverage(range(1, 5), (2, 3)) == ("WARN", 6, 1, {MODEL: 1})
+    # A respawned worker, a new generation, counts from its own seq 1.
+    assert coverage(range(1, 5), range(5, 9), generations=(1, 2)) == (
+        "WARN", 8, 4, {MODEL: 4})
     # Each replica is its own series.
     assert coverage([range(1, 5), range(5, 9)],
                     [range(5, 9), range(9, 13)]) == ("WARN", 16, 4, {MODEL: 4})
