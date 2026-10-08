@@ -3068,6 +3068,48 @@ fn while_the_mac_pages_a_pre_fit_batch_fits_the_pool_held() {
     assert_eq!(grant.unit_budget, 16, "at warning the batch size is held");
 }
 
+/// While macOS pages, a pre-fit batch fits the pool held less the deficit
+/// against the reserve, once: 140 MiB above the reserve is 7 units at 20 MiB
+/// a unit. A window still out holds 100 MiB of that pool, so the share is
+/// only 40 MiB, 2 units; the pool held, not the share, sizes the batch.
+#[test]
+fn while_the_mac_pages_the_deficit_comes_off_the_pool_held_once() {
+    let ledger = mps_ledger();
+    let handle = loaded_mps(Some(MAC_TOTAL_MB));
+    let admission = ledger
+        .register_worker("g/a", item_cost(8), &handle, None)
+        .expect("registers");
+    push_ram(&handle, MAC_TOTAL_MB, 90_000, 0, 0);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![measurement(8, 0, 160); 5]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    admission.earn_next_size();
+    // 100 MiB above the reserve before macOS pages: the window takes it.
+    push_ram(&handle, MAC_TOTAL_MB, mac_reserve() + 100, 0, 0);
+    ledger.health();
+    let out = admission.request_grant(2, None, 1, 0).expect("granted");
+    assert_eq!(out.grant().mb, 100);
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
+    ledger.install_probe_stub(Some(vec![GpuMemory {
+        uuid: MPS_GPU.to_owned(),
+        total_mb: MAC_RAM_MB,
+        free_mb: 0,
+        gtt: None,
+    }]));
+    push_ram(&handle, MAC_TOTAL_MB, 90_000, mac_reserve() + 140, 0);
+    ledger.health();
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let grant = token.grant();
+    assert_eq!((grant.mb, grant.unit_budget), (40, 7));
+}
+
 /// At warning with free RAM below the reserve the grant keeps the pool the
 /// replica holds and says macOS is not paging, so the worker's clamp keeps
 /// it too (`test_packing.py`, the same figures); while paging it says so.
