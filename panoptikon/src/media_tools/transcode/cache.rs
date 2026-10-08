@@ -1205,7 +1205,7 @@ mod tests {
         std::os::unix::fs::symlink(folder, &dir).unwrap();
         let error = TranscodeCache::open(dir.clone(), 1, 1).await.err().unwrap();
         let error = format!("{error:#}");
-        let expected = owned_by_another_user(&dir, owner, &dir);
+        let expected = owned_by_another_user(&dir, owner, folder);
         assert!(error.starts_with(&expected), "{error}");
         assert!(
             error.contains("failed to open the transcode cache db"),

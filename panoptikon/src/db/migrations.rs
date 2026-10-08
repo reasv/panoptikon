@@ -225,7 +225,29 @@ fn db_paths(index_db: &str, user_data_db: &str) -> Result<DbPaths> {
     })
 }
 
+/// The database a migration failed on: the outermost context of every
+/// [`migrate_path`] error.
+#[derive(Debug)]
+pub(crate) struct FailedDatabase(pub(crate) PathBuf);
+
+impl std::fmt::Display for FailedDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to migrate database {}", self.0.display())
+    }
+}
+
 async fn migrate_path(
+    path: &Path,
+    migrator: &Migrator,
+    expected_alembic_head: &str,
+    kind: DbKind,
+) -> Result<()> {
+    migrate_file(path, migrator, expected_alembic_head, kind)
+        .await
+        .map_err(|err| err.context(FailedDatabase(path.to_path_buf())))
+}
+
+async fn migrate_file(
     path: &Path,
     migrator: &Migrator,
     expected_alembic_head: &str,
@@ -236,23 +258,23 @@ async fn migrate_path(
         .create_if_missing(true);
     let mut conn = SqliteConnection::connect_with(&options)
         .await
-        .with_context(|| format!("failed to open database {}", path.display()))?;
+        .context("failed to open")?;
     let fresh = !has_user_tables(&mut conn).await?;
     ensure_baseline_if_needed(&mut conn, migrator, expected_alembic_head)
         .await
-        .with_context(|| format!("refusing to migrate database {}", path.display()))?;
+        .context("refusing to migrate")?;
     reconcile_recorded_checksums(&mut conn, migrator)
         .await
-        .with_context(|| format!("failed to reconcile checksums in {}", path.display()))?;
+        .context("failed to reconcile checksums")?;
     let applied_before = applied_migration_count(&mut conn).await?;
     migrator
         .run(&mut conn)
         .await
-        .with_context(|| format!("failed to migrate database {}", path.display()))?;
+        .context("failed to run migrations")?;
     if fresh {
         stamp_alembic_head(&mut conn, expected_alembic_head)
             .await
-            .with_context(|| format!("failed to stamp database {}", path.display()))?;
+            .context("failed to stamp the alembic head")?;
     } else if applied_migration_count(&mut conn).await? > applied_before {
         // A migration ran against existing data. If it created an index,
         // sqlite_stat1 now describes every index EXCEPT the new one, and a
@@ -273,7 +295,7 @@ async fn migrate_path(
         sqlx::query("ANALYZE")
             .execute(&mut conn)
             .await
-            .with_context(|| format!("failed to ANALYZE {} after migration", path.display()))?;
+            .context("failed to ANALYZE after migration")?;
         tracing::info!(
             db = %path.display(),
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -294,7 +316,7 @@ async fn migrate_path(
     sqlx::query("PRAGMA journal_mode=WAL")
         .execute(&mut conn)
         .await
-        .with_context(|| format!("failed to enable WAL on {}", path.display()))?;
+        .context("failed to enable WAL")?;
     Ok(())
 }
 
@@ -828,7 +850,8 @@ mod tests {
     }
 
     // A Python DB behind head must not be baselined — the init snapshot
-    // assumes columns an older schema doesn't have.
+    // assumes columns an older schema doesn't have. The error names the
+    // database it failed on.
     #[tokio::test]
     async fn baseline_refuses_outdated_alembic_revision() {
         let dir = tempfile::tempdir().unwrap();
@@ -844,6 +867,8 @@ mod tests {
         .await
         .expect_err("outdated revision must be refused");
         assert!(format!("{err:#}").contains("alembic revision"), "{err:#}");
+        let failed = err.downcast_ref::<FailedDatabase>();
+        assert_eq!(failed.map(|failed| &failed.0), Some(&path));
     }
 
     // A non-empty DB without alembic_version is of unknown provenance and

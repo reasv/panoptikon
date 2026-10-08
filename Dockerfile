@@ -92,18 +92,20 @@ COPY --from=rust-build /src/target/release/panoptikon /usr/local/bin/panoptikon
 WORKDIR /app
 COPY config/server/docker.toml config/server/docker.toml
 COPY config/inference/example.toml config/inference/example.toml
-# /app/data must exist owned by the runtime user (ubuntu:24.04's built-in
-# uid-1000 `ubuntu` user): a named volume mounted there inherits this
-# ownership (Docker creates missing mountpoints as root).
-RUN mkdir -p data && chown -R ubuntu:ubuntu /app
 # The root of every relative path (runtime/, data/, config/) and the config in
 # it, so a process started in another working directory still finds the
 # environment set up below. Login sessions (SSH on a rented GPU host) do not
 # inherit ENV; they read /etc/environment.
 ENV PANOPTIKON_ROOT=/app
 ENV PANOPTIKON_CONFIG_PATH=/app/config/server/docker.toml
-RUN env | grep '^PANOPTIKON_' >> /etc/environment
-USER ubuntu
+# uv hardlinks from its cache by default, which fails on some storage drivers
+# (overlay2 on ZFS); copying always works. Set so a `panoptikon setup` re-run
+# inside the container, login sessions included, inherits it.
+ENV UV_LINK_MODE=copy
+RUN env | grep -E '^(PANOPTIKON_|UV_LINK_MODE=)' >> /etc/environment
+# HOME is the same for every process the container starts, root included, so
+# models download to the cache volume (/home/ubuntu/.cache).
+ENV HOME=/home/ubuntu
 # The NVIDIA container runtime injects driver libraries per this list; its
 # default when unset is compute,utility, which OMITS libnvidia-encode — video
 # transcoding's nvenc would silently fall back to software. Inert without the
@@ -120,17 +122,22 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 # ffmpeg/ffprobe binaries setup's static-ffmpeg prefetch downloads — the
 # image wires the apt ffmpeg via [jobs] in docker.toml instead.
 #
-# uv hardlinks from its cache by default, which fails on some storage drivers
-# (overlay2 on ZFS); copying always works. An ENV so a `panoptikon setup`
-# re-run inside the container inherits it.
-ENV UV_LINK_MODE=copy
+# /app and /home/ubuntu belong to the runtime user (ubuntu:24.04's built-in
+# uid-1000 `ubuntu` user) and to group 0 with the owner's permissions, so the
+# image also runs under any other uid in group 0 (Docker's group for a uid the
+# image has no entry for). A named volume mounted there takes this ownership on
+# first use (Docker creates missing mountpoints as root). Done in the layer that
+# creates the venv so it is not copied into a second layer.
 ARG ACCELERATOR=cpu
 RUN panoptikon setup --accelerator ${ACCELERATOR} \
     && cp /app/runtime/venv/lib/python*/site-packages/pypdfium2_raw/libpdfium.so \
           /app/libpdfium.so \
-    && rm -rf /home/ubuntu/.cache/uv \
+    && uv cache clean \
     && rm -rf /app/runtime/venv/lib/python*/site-packages/static_ffmpeg/bin \
-    && mkdir -p /home/ubuntu/.cache
+    && mkdir -p /app/data /home/ubuntu/.cache \
+    && chown -R ubuntu:0 /app /home/ubuntu \
+    && chmod -R g=u /app /home/ubuntu
+USER ubuntu
 
 # 6342 private admin, 6339 public restricted (see config/server/docker.toml).
 EXPOSE 6342 6339

@@ -414,6 +414,9 @@ struct StoreState {
     pending: bool,
     last_write: Option<Instant>,
     flush_scheduled: bool,
+    /// The cause of the last warning that the local half failed to read or
+    /// write, so a failure that repeats is logged once; cleared on success.
+    warned: Option<String>,
 }
 
 /// One entry that matches a query, with everything the ranking needs.
@@ -489,10 +492,24 @@ impl CalibrationStore {
         if state.local_loaded && local_mtime == state.local_mtime {
             return;
         }
-        let Some(disk) = read_file(&self.paths.local_path) else {
-            state.local_mtime = None;
-            return;
+        let disk = match read_file(&self.paths.local_path) {
+            Ok(disk) => disk,
+            Err(err) => {
+                if let Some(reason) = self.new_failure_locked(state, err.to_string(), false) {
+                    tracing::warn!(
+                        error = %err,
+                        path = %self.paths.local_path.display(),
+                        reason,
+                        "failed to read the local calibration store; the next \
+                         lookup tries again, and writes wait for it"
+                    );
+                }
+                state.local_loaded = false;
+                state.local_mtime = None;
+                return;
+            }
         };
+        state.warned = None;
         if state.pending {
             // Held entries are newer than disk; take only the keys not held.
             for profile in disk {
@@ -513,13 +530,50 @@ impl CalibrationStore {
         let mut profiles = Vec::new();
         for dir in &self.paths.shipped_dirs {
             for file in toml_files(dir) {
-                for mut profile in read_file(&file).unwrap_or_default() {
+                let file_profiles = read_file(&file).unwrap_or_else(|err| {
+                    tracing::warn!(
+                        error = %err,
+                        path = %file.display(),
+                        "failed to read a calibration file; it contributes \
+                         nothing until it is edited or the server restarts"
+                    );
+                    Vec::new()
+                });
+                for mut profile in file_profiles {
                     profile.strip_local_authority();
                     profiles.push(profile);
                 }
             }
         }
         profiles
+    }
+
+    /// The cause of a failed read or write of the local half, or `None` when
+    /// it was the last one logged: another user owning the store (on a read;
+    /// a write replaces it by rename) or its folder, a read-only filesystem,
+    /// or else `error`.
+    fn new_failure_locked(
+        &self,
+        state: &mut StoreState,
+        error: String,
+        write: bool,
+    ) -> Option<String> {
+        let path = &self.paths.local_path;
+        let folder = path.parent().unwrap_or(Path::new("."));
+        // The folder to hand over is the data folder.
+        let data_folder = folder.parent().unwrap_or(folder);
+        // A name not in the folder checks the folder alone.
+        let checked = if write {
+            path.with_extension("new")
+        } else {
+            path.clone()
+        };
+        let cause = crate::ownership::create_problem(data_folder, &checked).unwrap_or(error);
+        if state.warned.as_ref() == Some(&cause) {
+            return None;
+        }
+        state.warned = Some(cause.clone());
+        Some(cause)
     }
 
     /// Every entry matching the model half of the key, best first: exact torch
@@ -757,11 +811,7 @@ impl CalibrationStore {
             if !state.local_loaded {
                 self.load_local_locked(&mut state, false);
                 if !state.local_loaded {
-                    tracing::warn!(
-                        path = %self.paths.local_path.display(),
-                        "the local calibration store cannot be read; deferring \
-                         the write rather than overwriting entries we never saw"
-                    );
+                    // Never overwrite entries we could not read.
                     return;
                 }
             }
@@ -798,6 +848,7 @@ impl CalibrationStore {
                 let mut state = self.lock();
                 state.local_mtime = file_mtime(&path);
                 state.local_loaded = true;
+                state.warned = None;
                 drop(state);
                 tracing::info!(
                     path = %path.display(),
@@ -806,13 +857,19 @@ impl CalibrationStore {
                 );
             }
             Err(err) => {
-                tracing::warn!(
-                    error = %format!("{err:#}"),
-                    path = %path.display(),
-                    "failed to write the local calibration store"
-                );
+                let mut state = self.lock();
                 // Keep the change in memory so the next trigger retries.
-                self.lock().pending = true;
+                state.pending = true;
+                let reason =
+                    self.new_failure_locked(&mut state, err.root_cause().to_string(), true);
+                if let Some(reason) = reason {
+                    tracing::warn!(
+                        error = %format!("{err:#}"),
+                        path = %path.display(),
+                        reason,
+                        "failed to write the local calibration store"
+                    );
+                }
             }
         }
     }
@@ -1002,23 +1059,15 @@ fn torch_major_minor(version: &str) -> String {
 }
 
 /// Parse one store file. An invalid or other-schema file reads as empty, and
-/// a malformed entry is skipped. `None` only when the file could not be read
-/// (not cached; retried); a missing file is `Some(vec![])`.
-fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
-    let source = match fs::read_to_string(path) {
-        Ok(source) => source,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                path = %path.display(),
-                "failed to read a calibration file; leaving it unread so the \
-                 next lookup tries again"
-            );
-            return None;
-        }
+/// a malformed entry is skipped. `Err` only when the file could not be read;
+/// a missing file is empty, and a file that is not UTF-8 is invalid.
+fn read_file(path: &Path) -> std::io::Result<Vec<CalibrationProfile>> {
+    let parsed = match fs::read_to_string(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => Err(err.to_string()),
+        source => toml::from_str::<toml::Value>(&source?).map_err(|err| err.to_string()),
     };
-    let raw: toml::Value = match toml::from_str(&source) {
+    let raw = match parsed {
         Ok(raw) => raw,
         Err(err) => {
             tracing::warn!(
@@ -1027,7 +1076,7 @@ fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
                 "calibration file is not valid TOML; ignoring it (models it \
                  describes will recalibrate from scratch)"
             );
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
     };
     let Some(table) = raw.as_table() else {
@@ -1035,7 +1084,7 @@ fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
             path = %path.display(),
             "calibration file is not a TOML table; ignoring it"
         );
-        return Some(Vec::new());
+        return Ok(Vec::new());
     };
     let schema = table
         .get("schema")
@@ -1048,18 +1097,18 @@ fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
             supported = SCHEMA,
             "calibration file does not declare the supported schema; ignoring it"
         );
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
     let entries = match table.get("profile") {
         Some(toml::Value::Array(entries)) => entries.clone(),
-        None => return Some(Vec::new()),
+        None => return Ok(Vec::new()),
         Some(_) => {
             tracing::warn!(
                 path = %path.display(),
                 "calibration file's `profile` is not an array of tables; \
                  ignoring it"
             );
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
     };
     let total = entries.len();
@@ -1102,7 +1151,7 @@ fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
             }
         }
     }
-    Some(profiles)
+    Ok(profiles)
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
@@ -1855,15 +1904,17 @@ sample_delta_mb = [80, 160]
             assert!(lookup(&store, id).is_none(), "{id} is not loadable");
         }
 
-        // A corrupt *local* store is equally non-fatal, and writing over it
-        // works.
+        // A corrupt *local* store, not TOML or not UTF-8, is equally
+        // non-fatal, and writing over it works.
         let local = root.path().join("data/inferio/calibration.toml");
         fs::create_dir_all(local.parent().unwrap()).unwrap();
-        fs::write(&local, "[[profile]\nbroken").unwrap();
-        let store = self::store(root.path());
-        assert!(store.local_entries().is_empty());
-        store.record(update("clip/vit", "fp16", 0.79));
-        assert_eq!(self::store(root.path()).local_entries().len(), 1);
+        for corrupt in [b"[[profile]\nbroken".as_slice(), &[0xff]] {
+            fs::write(&local, corrupt).unwrap();
+            let store = self::store(root.path());
+            assert!(store.local_entries().is_empty());
+            store.record(update("clip/vit", "fp16", 0.79));
+            assert_eq!(self::store(root.path()).local_entries().len(), 1);
+        }
     }
 
     /// The pre-load tiers: no torch and no dtype still answer a base, and it
@@ -2366,6 +2417,7 @@ sample_delta_mb = [80, 160]
         // reachable without a test-only hook.
         fs::create_dir_all(&path).unwrap();
         let store = store(root.path());
+        let (_guard, reasons) = crate::test_utils::warned_reasons();
         assert!(store.local_entries().is_empty());
         assert!(
             !store.local_is_loaded(),
@@ -2380,6 +2432,10 @@ sample_delta_mb = [80, 160]
             "nothing was written over the unread store"
         );
         assert!(!store.local_is_loaded(), "and the failure was not cached");
+        assert!(
+            matches!(reasons.lock().unwrap()[..], [Some(_)]),
+            "one cause, one WARN"
+        );
 
         // The file becomes readable again, carrying another model this
         // process never saw. The retry merges rather than truncating.
@@ -2400,6 +2456,103 @@ sample_delta_mb = [80, 160]
         let stored = |id: &str| by_key[&(id.into(), ARCH.into(), "fp16".into())].slope_mb_per_unit;
         approx(stored("clip/vit"), 0.79); // the pending update was never dropped
         approx(stored("clip/other"), 0.5); // and the unseen entry was not truncated
+
+        // After a write or a read succeeds, a failure is warned about again,
+        // and a write after a failed read waits for a read. The directory's
+        // mtime is stamped past the write's, which can share its timestamp tick.
+        #[cfg(unix)]
+        {
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            let later = SystemTime::now() + Duration::from_secs(5);
+            fs::File::open(&path).unwrap().set_modified(later).unwrap();
+            let _ = lookup(&store, "clip/vit");
+            assert_eq!(reasons.lock().unwrap().len(), 2);
+            fs::remove_dir(&path).unwrap();
+            fs::write(&path, "schema = 3\n").unwrap();
+            let _ = lookup(&store, "clip/vit");
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(root.path(), &path).unwrap();
+            let later = SystemTime::now() + Duration::from_secs(10);
+            fs::File::open(&path).unwrap().set_modified(later).unwrap();
+            let _ = lookup(&store, "clip/vit");
+            assert_eq!(reasons.lock().unwrap().len(), 3);
+            store.record(update("clip/vit", "fp16", 0.8));
+            assert!(
+                path.is_symlink(),
+                "nothing was written over the unread store"
+            );
+        }
+    }
+
+    /// A store folder another user owns is warned about once, naming it and
+    /// its owner, however many writes fail, again after a write succeeds, and
+    /// once for a new cause; the update stays in memory. A store file another
+    /// user owns is no cause of a failed write, which replaces it, but is
+    /// named on a failed read.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_folder_another_user_owns_is_warned_about_once() {
+        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let Some((folder, owner)) = foreign_folder(false) else {
+            return;
+        };
+        if !folder.join("share").is_dir() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        symlink(folder, &data).unwrap();
+        let store = CalibrationStore::with_debounce(
+            StorePaths {
+                shipped_dirs: vec![root.path().join("shipped")],
+                local_path: data.join("share/inferio/calibration.toml"),
+            },
+            env(),
+            Duration::ZERO,
+        );
+        let (_guard, reasons) = crate::test_utils::warned_reasons();
+        for slope in [0.5, 0.6, 0.7] {
+            store.record(update("clip/vit", "fp16", slope));
+        }
+        approx(lookup(&store, "clip/vit").unwrap().slope_mb_per_unit, 0.7);
+        let relink = |target: &Path| {
+            fs::remove_file(&data).unwrap();
+            symlink(target, &data).unwrap();
+        };
+        let writable = tempfile::tempdir().unwrap();
+        relink(writable.path());
+        CalibrationProfiles::flush(store.as_ref());
+        relink(folder);
+        store.record(update("clip/vit", "fp16", 0.9));
+        let own = tempfile::tempdir().unwrap();
+        fs::create_dir_all(own.path().join("share/inferio")).unwrap();
+        symlink(folder, own.path().join("share/inferio/calibration.toml")).unwrap();
+        let read_only = fs::Permissions::from_mode(0o555);
+        fs::set_permissions(own.path().join("share/inferio"), read_only).unwrap();
+        relink(own.path());
+        store.record(update("clip/vit", "fp16", 1.0));
+        store.record(update("clip/vit", "fp16", 1.1));
+        let own_mode = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(own.path().join("share/inferio"), own_mode).unwrap();
+        let link = own.path().join("share/inferio/calibration.toml");
+        let reader = CalibrationStore::with_debounce(
+            StorePaths {
+                shipped_dirs: vec![root.path().join("shipped")],
+                local_path: link.clone(),
+            },
+            env(),
+            Duration::ZERO,
+        );
+        let _ = lookup(&reader, "clip/vit");
+        let reasons = reasons.lock().unwrap();
+        let share = data.join("share");
+        let expected = Some(owned_by_another_user(&share, owner, &share));
+        assert_eq!(reasons[..2], [expected.clone(), expected]);
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
+        let read = owned_by_another_user(&link, owner, folder);
+        assert_eq!(reasons[2..], [Some(denied), Some(read)]);
     }
 
     /// A local entry with no fit of its own — what the ledger writes while it

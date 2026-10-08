@@ -95,7 +95,7 @@ mod tests {
         let runtime = temp.path().join("runtime");
         std::os::unix::fs::symlink(folder, &runtime).unwrap();
         let error = RootLock::acquire(temp.path().to_path_buf()).err().unwrap();
-        let expected = owned_by_another_user(&runtime, owner, &runtime);
+        let expected = owned_by_another_user(&runtime, owner, folder);
         assert!(format!("{error:#}").starts_with(&expected), "{error:#}");
         assert!(
             format!("{error:#}").contains("failed to open root lock"),

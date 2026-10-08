@@ -434,21 +434,23 @@ container, pair it with [Panoptikon Relay](https://github.com/reasv/panoptikon-r
 on your client (see above).
 
 **Running as another user.** The container runs as the image's `ubuntu` user
-(uid 1000), which owns `/app` and everything on the three volumes.
+(uid 1000). `/app` and `/home/ubuntu` belong to that user and to group 0 with
+the same permissions, and `HOME` is `/home/ubuntu` in every process the
+container starts, so root (`--user 0`, `user: "0"`, or a host that only runs
+containers as root) and any other uid in group 0 (`--user 1234`, or
+`--user <uid>:0` when you give a group or the uid exists in the image) work
+too, with models on the cache volume.
 
-- **root** (`--user 0`, `user: "0"`, or a host that only runs containers as
-  root) works, with two differences. Models are downloaded to `/root/.cache`,
-  so mount the cache volume there instead of `/home/ubuntu/.cache`. And what
-  root writes to the volumes belongs to root: once that includes a database,
-  a later start as the default user stops with an error naming it. Hand the
-  volumes back first (with the cache volume at its default mount point):
+What one user writes to the volumes belongs to that user, and no other user
+but root can write to it: a start on another user's database stops with an error
+naming the owner, and model downloads into another user's cache fail. Hand the
+volumes to the user that will run the container first (here the default user;
+`1234:0` for `--user 1234`):
 
-  ```bash
-  docker compose run --rm --user 0 --entrypoint chown panoptikon \
-    -R ubuntu:ubuntu /app/data /app/config /home/ubuntu/.cache
-  ```
-- **Any other uid** (`--user 1234`) is not supported: the server has to write
-  to `/app/runtime` inside the image, and stops at startup saying so.
+```bash
+docker compose run --rm --user 0 --entrypoint chown panoptikon \
+  -R ubuntu:0 /app/data /app/config /home/ubuntu/.cache
+```
 
 The server uses `/app` whatever the working directory, through
 `PANOPTIKON_ROOT` and `PANOPTIKON_CONFIG_PATH`: the image sets both in its
@@ -456,6 +458,8 @@ environment, and in `/etc/environment` for login sessions (SSH on a rented GPU
 host). A shell with neither starts an empty root in its own directory and
 reports no Python environment; pass both there:
 `panoptikon --root /app --config /app/config/server/docker.toml accelerator`.
+`PANOPTIKON_*` values you override with `-e` reach `docker exec` but not always
+SSH sessions, which read `/etc/environment`: pass `--root`/`--config` there too.
 
 **File descriptors.** Local inference is served over loopback HTTP by the same
 process that calls it, so each batch item in flight costs about two sockets;
