@@ -1945,13 +1945,10 @@ impl TxFailure {
 }
 
 async fn begin_tx(conn: &mut SqliteConnection) -> ApiResult<()> {
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = ?err, "failed to begin transaction");
-            ApiError::internal("Failed to begin transaction")
-        })?;
+    crate::db::begin_immediate(conn).await.map_err(|err| {
+        tracing::error!(error = ?err, "failed to begin transaction");
+        ApiError::internal("Failed to begin transaction")
+    })?;
     Ok(())
 }
 
@@ -2474,6 +2471,47 @@ mod tests {
             state.tag_ids.is_empty(),
             "a rolled back group must hand back no cached tag ids"
         );
+    }
+
+    // A transaction refused by a `-shm` another user left beside the index
+    // names that file and its owner.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_transaction_refused_by_another_users_shm_names_the_owner() {
+        use crate::ownership::tests::{DENIED_OWNER, owned_by_another_user};
+        use std::os::unix::fs::PermissionsExt as _;
+        let _test_env = test_data_dir();
+        let index_db = "writer_foreign_shm";
+        let paths = crate::db::migrations::migrate_databases_on_disk(Some(index_db), None)
+            .await
+            .unwrap();
+        let mut shm = paths.index_db_file.clone().into_os_string();
+        shm.push("-shm");
+        let shm = std::path::PathBuf::from(shm);
+        // Not empty: SQLite changes an empty `-shm` to the database's mode,
+        // which it cannot do to another user's file.
+        std::fs::write(&shm, [0; 32768]).unwrap();
+        std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&shm).is_ok() {
+            return;
+        }
+        let mut state = IndexDbWriterState {
+            index_db: index_db.to_owned(),
+            idle_timeout: Duration::from_secs(300),
+            last_used: None,
+            conn: None,
+            tags_dirty_marked: false,
+            tag_ids: TagIdCache::default(),
+        };
+        let (_guard, reasons) = crate::test_utils::warned_reasons();
+        DENIED_OWNER.set(Some(0));
+        let result = state.with_transaction(|_| Box::pin(async { Ok(()) })).await;
+        DENIED_OWNER.set(None);
+        std::fs::remove_file(&shm).unwrap();
+        assert!(result.is_err());
+        let folder = paths.index_db_file.parent().unwrap();
+        let expected = owned_by_another_user(&shm, 0, folder);
+        assert_eq!(*reasons.lock().unwrap(), [Some(expected)]);
     }
 
     // The continuous scan is not a queue job and has no boundary, so its item

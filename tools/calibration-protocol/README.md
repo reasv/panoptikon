@@ -540,7 +540,12 @@ from KFD's per-process counter or DRM fdinfo, as `rocm_sysfs.py` reads them for
 `vramrec.py`; `device.own_source` lists which were read. The torch figures
 are HIP's. The probe exits unless torch is a ROCm build that sees one device
 and the model loads on the pinned GPU (`memory.device_bdf()`), and exits on a
-ROCm torch pinned to an NVML GPU.
+ROCm torch pinned to an NVML GPU. On an APU no batch starts (warmup, sweep,
+each repeat, bisect) while free memory is below the RAM the CPU device keeps
+free (a tenth of RAM, 2 to 16 GiB, or a quarter under 8 GiB; RAM is capped by
+the cgroup limit), since past host RAM the kernel kills a process. A bisect
+stopped this way has `stopped_early: true` and `high_items` the largest size
+it ran.
 
 `--mode audio-npy` is required for the `whisper` and `clap` groups: those
 impls read their input with `deserialize_array`
@@ -585,6 +590,7 @@ the worker's post-load attention check, run at the same point: per dtype
 | `fit_reserved` | the same fields with `basis` `delta_mb` — or `null` |
 | `fit_sampled` | MPS only: the same fields with `basis` `sampled_peak_mb`, i.e. the fit over the true in-batch peak rather than the post-batch read — or `null` |
 | `bisect` | `free_mb_at_start`, `reserved_at_bisect_start_mb`, `largest_ok_units`, `largest_ok_items`, `first_oom_items`, `first_index_limit_items`, `low_items`, `high_items`, `stopped_early`, `trace[]` — or `null` |
+| `ram_floor` | APU only: `floor_mb`, and `stopped_before[]` (`items`, `free_mb`), each batch not started because free memory was below `floor_mb` |
 
 `fit` is Theil-Sen over (`units`, `peak_allocated_mb`) across every row with
 `ran_whole_batch: true` — the currency the ledger fits (it regresses

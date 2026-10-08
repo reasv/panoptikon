@@ -243,6 +243,15 @@ fn reason(tree: &Path, paths: &[PathBuf], read_only_too: bool) -> Option<String>
         if tests::READ_ONLY.get() {
             return unix::reason(tree, paths, read_only_too, uid, |_| unix::Access::ReadOnly);
         }
+        #[cfg(test)]
+        if let Some(owner) = tests::DENIED_OWNER.get() {
+            return unix::reason(tree, paths, read_only_too, uid, |path| {
+                match unix::access(path) {
+                    unix::Access::Denied { .. } => unix::Access::Denied { owner },
+                    access => access,
+                }
+            });
+        }
         unix::reason(tree, paths, read_only_too, uid, unix::access)
     }
     #[cfg(not(unix))]
@@ -359,6 +368,10 @@ pub(crate) mod tests {
 
     thread_local! {
         pub(super) static READ_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// When set, every path the current user cannot write is reported as
+        /// owned by this uid, as a file another user left behind would be.
+        pub(crate) static DENIED_OWNER: std::cell::Cell<Option<u32>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// A folder another user owns, with its owner, where creating a file

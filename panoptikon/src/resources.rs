@@ -686,9 +686,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_folder_another_user_owns_is_named() {
-        use crate::ownership::tests::{
-            foreign_folder, not_writable_by_current_user, owned_by_another_user,
-        };
+        use crate::ownership::tests::{foreign_folder, not_writable_by_current_user};
         let Some((folder, owner)) = foreign_folder(false) else {
             return;
         };
@@ -706,6 +704,7 @@ mod tests {
         assert!(error.starts_with(&format!("{expected}: ")), "{error}");
         #[cfg(feature = "bundled")]
         {
+            use crate::ownership::tests::owned_by_another_user;
             let expected = owned_by_another_user(&share, owner, &share);
             let error = format!("{:#}", write_default_configs_in(&share).unwrap_err());
             assert!(error.starts_with(&expected), "{error}");
