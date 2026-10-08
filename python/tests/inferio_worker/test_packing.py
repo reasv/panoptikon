@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -1066,6 +1067,27 @@ def test_at_warning_an_mps_clamp_keeps_the_pool_the_grant_kept():
             model = Recorder()
             packing.run_window(model, items(64), wire)
         assert len(model.batches[0]) == first, paging
+
+
+def test_the_mps_clamp_log_says_how_far_ram_is_below_the_reserve(caplog):
+    """While paging with RAM 1 000 MiB below a 2 000 MiB reserve and 200 MiB
+    of pool, nothing is left to spend: the log states the shortfall and a
+    remainder of 0, never a negative figure."""
+    with mps_host(available_mb=1_000) as mps:
+        mps.allocate(1_000, driver_mb=1_200)
+        with caplog.at_level(logging.INFO, logger="inferio_worker.packing"):
+            live = packing.clamp_to_live_memory(
+                8, 8_000, ram_reserve_mb=2_000, paging=True
+            )
+    assert live.units == 1
+    (message,) = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "inferio_worker.packing"
+    ]
+    # (shortfall, reserve, pool, left, grant, from, to)
+    figures = [int(figure) for figure in re.findall(r"-?\d+", message)]
+    assert figures == [1_000, 2_000, 200, 0, 8_000, 8, 1], message
 
 
 def test_paging_during_a_long_batch_cuts_the_next_one():
