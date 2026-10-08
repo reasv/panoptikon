@@ -1667,7 +1667,7 @@ fn pressure_cap(ledger: &Arc<VramLedger>) -> Option<PressureCap> {
 }
 
 /// `windows` windows while macOS pages: the worker reads nothing available
-/// above the RAM reserve and holds 180 MiB of pool, which is 8 units.
+/// and holds 180 MiB of pool above the RAM reserve, which is 8 units.
 fn paging_windows(
     ledger: &Arc<VramLedger>,
     handle: &TelemetryHandle,
@@ -1678,8 +1678,8 @@ fn paging_windows(
     push_ram(
         handle,
         MAC_TOTAL_MB,
-        cpu::ram_reserve_mb(MAC_RAM_MB),
-        180,
+        0,
+        cpu::ram_reserve_mb(MAC_RAM_MB) + 180,
         0,
     );
     for window in 0..windows {
@@ -1718,8 +1718,8 @@ fn an_out_of_memory_window_while_the_mac_pages_leaves_the_pool_margin() {
         push_ram(
             &handle,
             MAC_TOTAL_MB,
-            cpu::ram_reserve_mb(MAC_RAM_MB),
-            180,
+            0,
+            cpu::ram_reserve_mb(MAC_RAM_MB) + 180,
             0,
         );
         let token = admission
@@ -1914,8 +1914,8 @@ fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
     push_ram(
         &handle,
         MAC_TOTAL_MB,
-        cpu::ram_reserve_mb(MAC_RAM_MB),
-        180,
+        0,
+        cpu::ram_reserve_mb(MAC_RAM_MB) + 180,
         0,
     );
     let granted = queued_window_at_the_rate(&handle, &admission, 20, |_| 100.0);
@@ -1959,8 +1959,8 @@ fn at_warning_without_paging_the_batch_size_is_held() {
     push_ram(
         &handle,
         MAC_TOTAL_MB,
-        cpu::ram_reserve_mb(MAC_RAM_MB),
-        180,
+        0,
+        cpu::ram_reserve_mb(MAC_RAM_MB) + 180,
         0,
     );
     assert_eq!(ramp_window(&handle, &admission, &MINILM_M3_MAX), 8);
