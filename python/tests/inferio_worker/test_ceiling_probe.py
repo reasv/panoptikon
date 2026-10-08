@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from inferio_worker import packing
+from inferio_worker import memory, packing, sdpa
 from inferio_worker.inputs import PredictionInput
 
 PROBE = (
@@ -187,3 +187,54 @@ def test_a_non_pixel_model_is_priced_by_its_own_aggregation(probe):
     )
     assert canvas is None, "an area prices nothing outside pixel pricing"
     assert price([PredictionInput(file=png_bytes(8000, 6000))] * 4) == 4
+
+
+# ---------------------------------------------------------------------------
+# The load: the worker's order and the worker's facts
+# ---------------------------------------------------------------------------
+
+
+def test_the_probe_records_the_workers_dtype_and_the_transformers_version(
+    probe, monkeypatch
+):
+    """The probe loads in the worker's order (load, pin check, priced load,
+    GQA check). The dtype is the worker's own, here from a module two levels
+    inside the impl; the GQA check's decision and the imported transformers
+    module's version are recorded beside it."""
+    torch = pytest.importorskip("torch")
+    events: list[str] = []
+
+    class Impl:
+        def __init__(self):
+            self.pipeline = SimpleNamespace(model=torch.nn.Linear(2, 2).half())
+
+        def load(self):
+            events.append("load")
+
+    def readings():
+        events.append("readings")
+        return {"base_nvml_mb": 512}
+
+    monkeypatch.setattr(
+        memory, "pinned_device_missing", lambda: events.append("pin")
+    )
+    monkeypatch.setattr(
+        sdpa,
+        "expand_kv_heads_without_fused_gqa",
+        lambda: events.append("gqa") or sdpa.PATCHED,
+    )
+    monkeypatch.setitem(
+        sys.modules, "transformers", SimpleNamespace(__version__="4.99.0")
+    )
+    monkeypatch.delitem(sys.modules, "inferio.impl.utils", raising=False)
+    _, load, facts = probe.load_instance(
+        Impl, {}, lambda: events.append("synchronize"), readings
+    )
+    assert events == ["load", "pin", "synchronize", "readings", "gqa"]
+    assert load["base_nvml_mb"] == 512
+    assert facts == {
+        "dtype": "fp16",
+        "dtype_method": "inferred",
+        "gqa_check": "patched",
+        "transformers": "4.99.0",
+    }

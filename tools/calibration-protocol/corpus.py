@@ -33,7 +33,8 @@ Output -- `<out>/manifest.json`:
      checks), "tier", "seed", "scale", "generated_at",
      "root" (abs out dir), "counts" (per kind), "total_bytes", "elapsed_s",
      "items": [
-       {"id", "path" (relative to root), "abspath", "mime", "bytes",
+       {"id", "path" (relative to root; `read_manifest` resolves it where
+        the corpus is now), "abspath", "mime", "bytes",
         "kind": "image"|"text"|"audio"|"pdf"|"junk", "group" (tier label),
         "format": "JPEG"|"PNG"|"WEBP"|"WAV"|"MP3"|"PDF"|"TXT"|null,
         "width", "height", "pixels", "seconds", "pages", "text_bytes",
@@ -625,6 +626,24 @@ def estimate_bytes(specs: List[Dict[str, Any]]) -> int:
         else:
             total += 4096
     return total
+
+
+def read_manifest(path: Path) -> Dict[str, Any]:
+    """A manifest with every item's `abspath` set to where the file is now.
+
+    `path` is relative to the corpus root: the manifest's own directory, or,
+    when the files are not there (`--manifest` wrote it elsewhere), the
+    recorded `root`. A copied corpus reads its own files, not the original's.
+    """
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    items = manifest.get("items") or []
+    root = path.parent
+    if items and not (root / items[0]["path"]).exists():
+        root = Path(manifest.get("root") or root)
+    for item in items:
+        item["abspath"] = str(root / item["path"])
+    manifest["root"] = str(root)
+    return manifest
 
 
 def human(size: int) -> str:

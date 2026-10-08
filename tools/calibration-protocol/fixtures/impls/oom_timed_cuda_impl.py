@@ -1,21 +1,20 @@
-"""Fixture impl that OOMs for the first N seconds after load, then recovers.
+"""Fixture impl that OOMs on its first N predicts, then recovers.
 
-Every predict raises the classified batch-1 OOM error until `oom_secs` have
-elapsed since `load()`, and succeeds after that. The worker is never killed
-and the profile is never reloaded, so the deflation counter that climbed
-during the OOM phase is the one whose recovery is timed afterwards -- which
-is what `oom_cuda_impl.py` (OOMs forever) cannot measure.
+The first `oom_predicts` predicts raise the classified batch-1 OOM error, and
+every later one succeeds. The worker is never killed and the profile is never
+reloaded, so the deflation counter that climbed during the OOM phase is the
+one whose recovery is timed afterwards -- which is what `oom_cuda_impl.py`
+(OOMs forever) cannot measure. A count, not a time, so every job longer than
+the OOM phase records the recovery, however fast the host runs it.
 
 Config keys (registry TOML, passed as **kwargs):
-  oom_secs: seconds after load during which every predict OOMs (default 120).
-  load_mb:  MiB held for the model's lifetime (default 64).
-  device:   torch device string (default "cuda").
+  oom_predicts: how many predicts OOM, from the first (default 20).
+  load_mb:      MiB held for the model's lifetime (default 64).
+  device:       torch device string (default "cuda").
 
 See tools/calibration-protocol/fixtures/README.md "Why a CUDA-touching
 variant exists".
 """
-
-import time
 
 import torch
 
@@ -25,15 +24,15 @@ class OomTimedCudaModel:
         self.config = config
         self.load_mb = int(config.get("load_mb", 64))
         self.device = str(config.get("device", "cuda"))
-        self.oom_secs = float(config.get("oom_secs", 120.0))
-        self._loaded_at = None
+        self.oom_predicts = int(config.get("oom_predicts", 20))
+        self.predicts = 0
         self._ballast = None
 
     def predict(self, inputs):
-        started = self._loaded_at if self._loaded_at is not None else time.monotonic()
-        if time.monotonic() - started < self.oom_secs:
+        self.predicts += 1
+        if self.predicts <= self.oom_predicts:
             raise RuntimeError(
-                "INFERENCE_OOM_BATCH_SIZE_1: fixture single-item OOM (timed)"
+                "INFERENCE_OOM_BATCH_SIZE_1: fixture single-item OOM (first predicts)"
             )
         return [{"batch": len(inputs)} for _ in inputs]
 
@@ -50,11 +49,9 @@ class OomTimedCudaModel:
         self._ballast = torch.empty(elems, dtype=torch.float32, device=self.device)
         self._ballast.fill_(1.0)
         torch.cuda.synchronize()
-        self._loaded_at = time.monotonic()
 
     def unload(self) -> None:
         self._ballast = None
-        self._loaded_at = None
         try:
             torch.cuda.empty_cache()
         except Exception:

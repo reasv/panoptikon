@@ -78,8 +78,8 @@ real batch and compares its units/sec against the clean batch from section 5:
 below `COLLAPSE_RATIO` the verdict is a **spill**, reported as
 `oom.kind = "throughput_collapse"` with both rates, and no `oom_class`.
 
-The ladder stops 4 096 MiB past the board's own total, and the flag is refused
-outright (exit 2) when no board total resolved: on WDDM nothing raises, so an
+The ladder stops 4 096 MiB past the GPU's own total, and the flag is refused
+outright (exit 2) when no GPU total resolved: on WDDM nothing raises, so an
 unbounded ladder would spill host RAM rather than exhaust a device.
 
 **On MPS the device total *is* host RAM**, so the overshoot is dropped and the
@@ -127,13 +127,13 @@ DEFAULT_BATCH = 8
 DEFAULT_MODEL = "tags/wd-vit-tagger-v3"
 
 # Filler ladder for `--induce-oom`. The chunk is large enough that a 100 GB
-# board is filled in a few dozen allocations and small enough that the last
+# GPU is filled in a few dozen allocations and small enough that the last
 # successful one leaves little unusable slack.
 FILLER_CHUNK_MB = 1024
-# Stop the ladder this far past the board's own total: a device that has taken
+# Stop the ladder this far past the GPU's own total: a device that has taken
 # its whole total and this much again is not going to raise (WDDM's sysmem
 # fallback, or a unified-memory host), so the throughput check takes over. An
-# absolute figure rather than a multiple, so an over-subscribed board spills a
+# absolute figure rather than a multiple, so an over-subscribed GPU spills a
 # bounded amount into host RAM instead of 1.25x its own VRAM.
 FILLER_OVERSHOOT_MB = 4096
 
@@ -144,7 +144,7 @@ MPS_WATERMARK_ENV = ("PYTORCH_MPS_HIGH_WATERMARK_RATIO",
 
 # `--induce-oom` on a unified device: RAM the ladder will not take. The device
 # total *is* host memory here, so a filler that runs past it does not exhaust
-# a board -- it pushes the machine into the compressor and then into jetsam,
+# a GPU -- it pushes the machine into the compressor and then into jetsam,
 # which kills processes that have nothing to do with this test.
 UNIFIED_RAM_FLOOR_MB = 16384
 
@@ -176,28 +176,6 @@ def load_probe(here: Path) -> Any:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
-
-
-def rocm_pin(device: int, environ: Dict[str, str],
-             roots: rocm_sysfs.Roots = rocm_sysfs.Roots()) -> Dict[str, str]:
-    """The variables the spawner would give a worker on HIP device `device`:
-    `HIP_VISIBLE_DEVICES` and, on a unified GPU, `PANOPTIKON_UNIFIED_GPU`.
-    A single index already in `HIP_VISIBLE_DEVICES` is kept and names the
-    device; any other visibility variable leaves the process unpinned."""
-    hip = (environ.get("HIP_VISIBLE_DEVICES") or "").strip()
-    others = ("ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL")
-    if any((environ.get(name) or "").strip() for name in others) or (
-            hip and not hip.isdigit()):
-        return {}
-    gpu = next((gpu for gpu in rocm_sysfs.inventory(roots)
-                if gpu.index == (int(hip) if hip else device)), None)
-    if gpu is None:
-        return {}
-    out = {"HIP_VISIBLE_DEVICES": str(gpu.index),
-           "PANOPTIKON_DEVICE_PIN": str(gpu.index)}
-    if gpu.unified:
-        out["PANOPTIKON_UNIFIED_GPU"] = gpu.bdf
-    return out
 
 
 def synth_items(count: int, pixels: int, out_dir: Path) -> List[Dict[str, Any]]:
@@ -256,6 +234,52 @@ def probe_free_tiers(memory: Any) -> List[Dict[str, Any]]:
     return rows
 
 
+def settled_free_mb(memory: Any, sleep: Callable[[float], None] = time.sleep,
+                    interval_s: float = 0.25, reads: int = 40,
+                    hold_s: float = 2.0
+                    ) -> Tuple[Optional[int], Optional[str], Optional[float],
+                               Optional[bool]]:
+    """Device free after teardown, as `(free_mb, source, seconds, settled)`.
+    amdgpu lowers a discrete GPU's VRAM used counter some time after a
+    release, so there sysfs free is reread every `interval_s` until it holds
+    for `hold_s`, at most `reads` more reads; a failed read restarts the hold.
+    Any other source is read once, and `seconds` and `settled` are None."""
+    free_mb, _, source = memory.free_total_mb()
+    if source != "amdgpu-sysfs" or _safe(memory._unified_gpu):
+        return free_mb, source, None, None
+    held_since = 0
+    for taken in range(1, reads + 1):
+        sleep(interval_s)
+        again, source = memory._free_mb("amdgpu-sysfs")
+        if again is None or again != free_mb:
+            free_mb, held_since = again, taken
+        elif (taken - held_since) * interval_s >= hold_s:
+            return free_mb, source, taken * interval_s, True
+    return free_mb, source, reads * interval_s, False
+
+
+def rocm_reason(on_rocm: str) -> str:
+    """`on_rocm` where this process can open a GPU KFD lists; otherwise
+    "not a ROCm host" when KFD lists no GPU, or that none can be opened."""
+    nodes = rocm_sysfs.gpu_nodes()
+    if not nodes:
+        return "not a ROCm host"
+    if not any(node["openable"] for node in nodes):
+        return "KFD lists a GPU but this process cannot open its render node"
+    return on_rocm
+
+
+def _fdinfo_reason(memory: Any) -> str:
+    """Why the fdinfo base tier returned nothing."""
+    if not _safe(lambda: memory._is_hip(memory._torch())):
+        return "the worker's torch is not a ROCm build"
+    own_mb = memory.fdinfo_own_vram_mb()
+    if own_mb is not None:
+        return f"fdinfo read {own_mb} MiB; the worker rejected it as implausible"
+    return "no DRM fdinfo VRAM figure for this process: " + rocm_reason(
+        "no amdgpu fdinfo record of this device parsed")
+
+
 def _free_tier_reason(memory: Any, tier: str) -> str:
     """Why one free tier returned nothing, in the tier's own terms."""
     try:
@@ -268,9 +292,12 @@ def _free_tier_reason(memory: Any, tier: str) -> str:
             return ("NVML unavailable" if memory._nvml() is None
                     else "NVML gave no memory info for this process's device")
         if tier == "amdgpu-sysfs":
-            return ("no amdgpu sysfs (not a ROCm host, or no device resolved)"
-                    if memory.device_bdf() is None
-                    else "amdgpu sysfs present but mem_info_vram_* unreadable")
+            if not memory._is_hip(memory._torch()):
+                return "the worker's torch is not a ROCm build"
+            if memory.device_bdf() is not None:
+                return "amdgpu sysfs present but mem_info_vram_* unreadable"
+            return "no amdgpu sysfs: " + rocm_reason(
+                "no GPU resolved for this device")
         if tier == "mps":
             return ("torch.backends.mps unavailable"
                     if memory._torch_mps() is None
@@ -321,8 +348,9 @@ def probe_base_tiers(
     except Exception as exc:  # pragma: no cover - defensive
         row("nvml", None, f"raised {type(exc).__name__}: {exc}"[:200])
     try:
-        row("fdinfo", memory._fdinfo_base_mb(reserved_mb, reserved_delta),
-            "no DRM fdinfo VRAM figure for this process (not a ROCm host)")
+        value = memory._fdinfo_base_mb(reserved_mb, reserved_delta)
+        row("fdinfo", value, _fdinfo_reason(memory)
+            if value is None or value <= 0 else "")
     except Exception as exc:  # pragma: no cover - defensive
         row("fdinfo", None, f"raised {type(exc).__name__}: {exc}"[:200])
     try:
@@ -523,7 +551,7 @@ def induce_oom(
     `packing._note_throughput` does inside a real window.
 
     **On MPS the ladder is bounded differently.** The device total is host
-    memory, so `FILLER_OVERSHOOT_MB` past it is not slack on a board but
+    memory, so `FILLER_OVERSHOOT_MB` past it is not slack on a GPU but
     swap on the machine: the overshoot is dropped, and the ladder also stops
     while `UNIFIED_RAM_FLOOR_MB` of RAM is still available (`kind:
     "ram_floor"`), because past that macOS starts killing processes that have
@@ -557,7 +585,7 @@ def induce_oom(
 
     # The currency, not `torch.cuda.is_available()`: with a GPU visible and
     # `INFERIO_DEVICE=cpu`, every other section prices RAM and filling the
-    # board would answer a question about a device under test by nobody.
+    # GPU would answer a question about a device under test by nobody.
     if _safe(memory._ram_currency):
         result["kind"] = "unavailable"
         result["message_head"] = ("RAM is the currency on this host: there is "
@@ -572,7 +600,7 @@ def induce_oom(
         return result
 
     # A unified device's "total" is host RAM: overshooting it swaps the
-    # machine instead of exhausting a board.
+    # machine instead of exhausting a GPU.
     unified = device == "mps" or bool(_safe(memory._unified_gpu))
     cap_mb = total_mb if unified else total_mb + FILLER_OVERSHOOT_MB
     if cap_mb_override:
@@ -637,7 +665,7 @@ def induce_oom(
                 print(f"  {result['message_head']}", file=sys.stderr)
             return result
 
-        # Nothing raised with the board over-subscribed: the WDDM shape. Run
+        # Nothing raised with the GPU over-subscribed: the WDDM shape. Run
         # one real batch against it and let the throughput comparator decide.
         if not quiet:
             print(f"  filler held {held_mb} MiB without an exception; "
@@ -897,7 +925,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         os.environ["CUDA_VISIBLE_DEVICES"] = pin
         os.environ.setdefault("PANOPTIKON_DEVICE_PIN", pin)
     else:
-        hip_env = rocm_pin(args.device, dict(os.environ))
+        hip_gpu = rocm_sysfs.pinned_gpu(args.device, dict(os.environ))
+        hip_env = rocm_sysfs.pin_env(hip_gpu) if hip_gpu else {}
         pin = hip_env.get("HIP_VISIBLE_DEVICES")
         for name, value in hip_env.items():
             os.environ.setdefault(name, value)
@@ -1060,17 +1089,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.induce_oom:
             # A unified ROCm GPU's total is carve-out plus GTT, which HIP's
             # `total_memory` may not report; `free_total_mb` does.
-            board_total = ((total_mb if _safe(memory._unified_gpu) else None)
-                           or document["device"].get("gpu_total_mb") or total_mb)
-            if board_total is None:
-                print("VERDICT: --induce-oom refused: no board total resolved, "
+            gpu_total = ((total_mb if _safe(memory._unified_gpu) else None)
+                         or document["device"].get("gpu_total_mb") or total_mb)
+            if gpu_total is None:
+                print("VERDICT: --induce-oom refused: no GPU total resolved, "
                       "so the filler ladder has no bound")
                 return 2
             if not args.quiet:
                 print("selftest: inducing a failure", file=sys.stderr)
             document["oom"] = induce_oom(
                 memory, packing, run_batch, args.batch,
-                document["batch"].get("units_per_s"), board_total, args.quiet,
+                document["batch"].get("units_per_s"), gpu_total, args.quiet,
                 args.oom_cap_mb,
             )
         else:
@@ -1089,16 +1118,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             pass
 
-    free_after_mb, _, free_after_source = memory.free_total_mb()
+    free_after_mb, free_after_source, settle_s, settled = settled_free_mb(memory)
     document["released"] = {"free_mb": free_after_mb,
-                            "free_source": free_after_source}
+                            "free_source": free_after_source,
+                            "settle_s": settle_s, "settled": settled}
     line, degraded = verdict_line(document)
     document["degraded"] = degraded
     document["verdict"] = line
 
     print_document(document, sys.stdout)
+    settle = "" if settled is None else (
+        f", {'settled' if settled else 'not settled'} after {settle_s} s")
     print(f"device free after teardown: {free_after_mb} MiB "
-          f"({free_after_source})")
+          f"({free_after_source}){settle}")
     if args.json_path:
         path = Path(args.json_path)
         path.parent.mkdir(parents=True, exist_ok=True)

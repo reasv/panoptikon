@@ -29,7 +29,8 @@ Usage
     hog.py idle                             # allocate nothing; drive it over HTTP
 
 Common options are in `--help`; `--port N` adds an HTTP control endpoint on
-127.0.0.1 (`GET /state`, `POST /set?mb=N|leave_free=N`, `/resume`, `/stop`).
+127.0.0.1 (`GET /state`, `POST /set?mb=N|leave_free=N[&pin=1]`, `/resume`,
+`/stop`; `pin=1` solves a leave-free level once, then holds).
 
 Output schema (JSONL)
 ---------------------
@@ -42,7 +43,8 @@ Samples: {"schema": "hog/1", "kind": "state", "seq", "t_mono", "t_wall",
           "iso", "pid", "chunks", "total_mb", "last_error", "phase",
           "override": "mb"|"leave_free"|null,
           "target_mb" (asked for), "held_mb" (allocated and touched),
-          "free_mb" (GPU, or MemAvailable), "own_mb" (NVML own-PID, or RSS),
+          "free_mb" (GPU, or MemAvailable less SReclaimable),
+          "own_mb" (NVML own-PID, or RSS),
           on ROCm free from amdgpu sysfs and own from KFD or DRM fdinfo,
           "oom" (cumulative failed allocation attempts),
           and with `--touch-period` set: "touched_mb_total", "touch_sweeps"}
@@ -469,8 +471,12 @@ class RamBackend(Backend):
         return int(touched // MIB)
 
     def free_total_mb(self) -> Tuple[Optional[int], Optional[int]]:
+        # MemAvailable less SReclaimable: the free RAM the product reads.
         info = _meminfo()
-        return info.get("MemAvailable"), info.get("MemTotal")
+        available = info.get("MemAvailable")
+        return (None if available is None
+                else max(0, available - info.get("SReclaimable", 0)),
+                info.get("MemTotal"))
 
     def own_mb(self) -> Optional[int]:
         try:
@@ -729,6 +735,10 @@ class Hog:
         self.target_mb = 0
         self._last_free_eval = -1e9
         self._leave_free_target: Optional[int] = None
+        #: the free level a leave-free target was solved for, else None
+        self.leave_mb: Optional[int] = None
+        #: a `/set` with `pin=1`: its leave-free target is solved once
+        self.pinned = False
         # Re-touch bookkeeping (see `touch`).
         self.touch_period = float(getattr(args, "touch_period", 0.0) or 0.0)
         self._touch_cursor = 0
@@ -785,9 +795,27 @@ class Hog:
                 del self.chunks[want_chunks:]
                 self.backend.reclaim()
                 return
+            # Where allocating past physical memory succeeds (WSL, WDDM's
+            # system-memory fallback) no failure ends the fill; free reaching
+            # the level does, and what is held then is the target. The level
+            # is the leave-free level or `--min-free-mb`, whichever is higher.
+            # Free is re-read once `read_every` MiB has been taken since the
+            # last read, so after a reading above the level the hog takes
+            # less than `read_every` plus one chunk; what others allocate
+            # meanwhile adds to that.
+            level = max(self.leave_mb or 0, self.args.min_free_mb)
+            read_every = min(1024, max(chunk_mb, level // 4))
+            unread_mb = read_every  # the first chunk reads free
             while len(self.chunks) < want_chunks:
                 if _stop.is_set():
                     return
+                if ((self.leave_mb is not None or level)
+                        and unread_mb >= read_every):
+                    unread_mb = 0
+                    free_mb, _ = self.backend.free_total_mb()
+                    if free_mb is not None and free_mb <= level:
+                        self._leave_free_target = self.target_mb = self.held_mb
+                        return
                 try:
                     self.chunks.append(self.backend.alloc())
                 except Exception as exc:  # OOM or any allocator failure
@@ -796,6 +824,7 @@ class Hog:
                     # Back off: hold what we got and stop trying this tick.
                     self.backend.reclaim()
                     return
+                unread_mb += chunk_mb
                 if emit is not None and (
                     time.monotonic() - last_emit >= self.args.progress_every
                 ):
@@ -849,23 +878,25 @@ class Hog:
 
     # -- schedule ---------------------------------------------------------
     def resolve_target(self, elapsed: float) -> int:
+        self.leave_mb = None
         if self.override == "mb":
             self.phase = "override:mb"
             return self.override_mb
         if self.override == "leave_free":
             self.phase = "override:leave-free"
+            self.leave_mb = self.override_mb
             return self._leave_free(self.override_mb)
         absolute, leave_free, phase = self.schedule.target(elapsed)
         self.phase = phase
         if leave_free is not None:
+            self.leave_mb = leave_free
             return self._leave_free(leave_free)
         return int(absolute or 0)
 
     def _leave_free(self, leave_mb: int) -> int:
         now = time.monotonic()
-        if (
-            self._leave_free_target is not None
-            and now - self._last_free_eval < self.args.reeval
+        if self._leave_free_target is not None and (
+            self.pinned or now - self._last_free_eval < self.args.reeval
         ):
             return self._leave_free_target
         free_mb, _ = self.backend.free_total_mb()
@@ -914,16 +945,16 @@ def make_handler(hog: Hog):  # noqa: ANN201
                     hog._leave_free_target = None
                     hog._last_free_eval = -1e9
                 elif "leave_free" in query:
-                    hog.override = "leave_free"
-                    hog.override_mb = int(float(query["leave_free"][0]))
+                    hog.override, hog.override_mb = "leave_free", int(float(query["leave_free"][0]))
                     hog._leave_free_target = None
                     hog._last_free_eval = -1e9
                 else:
                     self._reply(400, {"error": "need ?mb= or ?leave_free="})
                     return
+                hog.pinned = "pin" in query
                 self._reply(200, hog.state())
             elif path == "/resume":
-                hog.override = None
+                hog.override, hog.pinned = None, False
                 hog._leave_free_target = None
                 hog._last_free_eval = -1e9
                 self._reply(200, hog.state())
@@ -975,6 +1006,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "worse on --target mps -- see default_touch_period")
     parser.add_argument("--reeval", type=float, default=2.0,
                         help="seconds between leave-free re-evaluations")
+    parser.add_argument("--min-free-mb", type=int, default=0,
+                        help="take no more once free is at or below this, "
+                             "whatever the schedule asks")
     parser.add_argument("--progress-every", type=float, default=2.0,
                         help="seconds between `progress` records while a large "
                              "allocation is still in flight")

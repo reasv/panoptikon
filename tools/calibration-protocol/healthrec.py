@@ -36,6 +36,9 @@ Sample:
                             + "cost_" prefixed cost fields
                             + "replicas": [REPLICA_KEYS]],
                 "raw": {...}}            # only with --full
+               (a failed poll whose body is JSON keeps "detail" and
+                "inference_clients": the gateway's 504 for an inference
+                server that did not answer)
      "queue": {"ok", "status_code", "latency_ms", "error",
                "running": [JobModel], "queued": [JobModel],
                "outcomes": [{"queue_id","status","error"}]}}
@@ -80,12 +83,16 @@ def fetch(url: str, timeout: float) -> Dict[str, Any]:
                 "payload": payload,
             }
     except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            payload = None
         return {
             "ok": False,
             "status_code": exc.code,
             "latency_ms": round((time.monotonic() - started) * 1000.0, 3),
             "error": f"HTTP {exc.code}: {exc.reason}",
-            "payload": None,
+            "payload": payload,
         }
     except Exception as exc:
         return {
@@ -143,7 +150,7 @@ MODEL_KEYS = (
     "last_grant_units", "last_window_items", "total_predict_requests",
     "total_batches",
     # What the server publishes to callers, and how often a window was formed
-    # short of the budget the ledger allowed.
+    # short of the ledger's window target (three batches at the budget).
     "desired_in_flight_items", "queue_bound_windows",
 )
 
@@ -157,6 +164,14 @@ def flatten_health(result: Dict[str, Any], full: bool) -> Dict[str, Any]:
     }
     payload = result.get("payload")
     if not isinstance(payload, dict):
+        return out
+    if full:
+        out["raw"] = payload
+    if not result["ok"]:
+        # A gateway whose inference server did not answer still reports its
+        # own clients, and whether it declared that server frozen.
+        out["detail"] = payload.get("detail")
+        out["inference_clients"] = payload.get("inference_clients")
         return out
     out["status"] = payload.get("status")
     out["shutting_down"] = payload.get("shutting_down")
@@ -209,8 +224,6 @@ def flatten_health(result: Dict[str, Any], full: bool) -> Dict[str, Any]:
         ]
         models.append(row)
     out["models"] = models
-    if full:
-        out["raw"] = payload
     return out
 
 
@@ -222,7 +235,7 @@ def flatten_queue(result: Dict[str, Any]) -> Dict[str, Any]:
         "error": result["error"],
     }
     payload = result.get("payload")
-    if not isinstance(payload, dict):
+    if not result["ok"] or not isinstance(payload, dict):
         return out
     queue = payload.get("queue") or []
     out["running"] = [job for job in queue if job.get("running")]

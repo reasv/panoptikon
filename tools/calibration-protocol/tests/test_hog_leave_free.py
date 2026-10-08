@@ -8,6 +8,9 @@ one captured set of counters, and they differ by 9 109 MiB -- so a
 `leave-free 20480` leg held 9 109 MiB too little and left ~11 371 MiB free
 under the reading everything else now uses.
 
+The fill itself stops on the free reading, not on an allocation failure:
+where allocating past physical memory succeeds there is no failure to stop it.
+
 Run with the managed interpreter:
 
     python/.venv/bin/python -m pytest tools/calibration-protocol/tests -q
@@ -18,6 +21,9 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import sys
+import threading
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 HOG = Path(__file__).resolve().parents[1] / "hog.py"
@@ -113,3 +119,125 @@ def _target(free_mb: int, held_mb: int, leave: int) -> int:
     made.chunks = [None] * (held_mb * MIB // backend.chunk_bytes())
     assert made.held_mb == held_mb
     return made._leave_free(leave)
+
+
+def test_the_fill_stops_once_free_reaches_the_level():
+    """Where allocation past physical memory succeeds, no failure stops the
+    fill. Here every chunk the hog takes, the job's pool takes another, so
+    the one solve at the start (10 240 - 6 000 = 4 240 MiB) would overshoot
+    the level. Free is re-read once per GiB taken (at 0, 1 024, 2 048 and
+    3 072 MiB held), so the fill stops at 3 072 MiB held with 4 096 free,
+    from the schedule's level as from a `/set?leave_free=`."""
+
+    class _Backend(hog.Backend):
+        name = "overcommits"
+        free = 10240
+
+        def chunk_bytes(self) -> int:
+            return 128 * MIB
+
+        def alloc(self):
+            self.free -= 2 * 128
+            return object()
+
+        def free_total_mb(self):
+            return self.free, 24576
+
+    args = argparse.Namespace(touch_period=0.0, progress_every=2.0,
+                              reeval=999999.0, min_free_mb=0)
+    for override in (None, "leave_free"):
+        backend = _Backend()
+        made = hog.Hog(backend, hog.LeaveFree(6000), args)
+        made.override, made.override_mb = override, 6000
+        made.target_mb = made.resolve_target(0.0)
+        assert made.target_mb == 4240
+        made.apply(made.target_mb)
+        assert (made.held_mb, made.target_mb, backend.free) == (
+            3072, 3072, 4096)
+        # The next tick holds there, pinned, though the job gave memory back.
+        backend.free = 8192
+        made.target_mb = made.resolve_target(0.5)
+        made.apply(made.target_mb)
+        assert (made.held_mb, made.target_mb) == (3072, 3072)
+        backend.free = 6000
+        made.apply(4096)
+        assert made.held_mb == 3072
+
+    # A hold is not stopped by the last leave-free level.
+    backend.free = 6000
+    made.override, made.override_mb = "mb", 6144
+    made.apply(made.resolve_target(1.0))
+    assert made.held_mb == 6144
+
+
+def test_free_is_read_per_quarter_of_the_level_and_the_floor_stops_a_hold():
+    """A leave-free 1 024 MiB re-reads free every 256 MiB taken: with the job
+    taking as much as the hog, the fill stops 84 MiB below the level, not
+    1 620. `--min-free-mb` stops a hold the same way, at its own level."""
+
+    class _Backend(hog.Backend):
+        name = "overcommits"
+
+        def __init__(self, free, job_share):
+            self.free, self.job_share = free, job_share
+
+        def chunk_bytes(self) -> int:
+            return 128 * MIB
+
+        def alloc(self):
+            self.free -= 128 * (1 + self.job_share)
+            return object()
+
+        def free_total_mb(self):
+            return self.free, 24576
+
+    for schedule, floor, free, job_share, held, left in (
+            (hog.LeaveFree(1024), 0, 3500, 1, 1280, 940),
+            (hog.Hold(8192), 2048, 4096, 0, 2048, 2048),
+            (hog.Hold(8192), 0, 4096, 0, 8192, -4096)):
+        backend = _Backend(free, job_share)
+        made = hog.Hog(backend, schedule, argparse.Namespace(
+            touch_period=0.0, progress_every=2.0, reeval=999999.0,
+            min_free_mb=floor))
+        made.apply(made.resolve_target(0.0))
+        assert (made.held_mb, backend.free) == (held, left)
+
+
+def test_free_ram_is_mem_available_less_s_reclaimable(monkeypatch):
+    monkeypatch.setattr(hog, "_meminfo", lambda: {
+        "MemAvailable": 10000, "SReclaimable": 3000, "MemTotal": 32000})
+    assert hog.RamBackend.free_total_mb(None) == (7000, 32000)
+
+
+def test_a_pinned_leave_free_level_is_solved_once():
+    """`/set?leave_free=N&pin=1` keeps its first solve; without `pin`, also
+    after a pinned one, the level is re-solved every `--reeval` (0 s here)."""
+
+    class _Backend(hog.Backend):
+        name = "fake"
+        free = 10000
+
+        def chunk_bytes(self) -> int:
+            return 128 * MIB
+
+        def free_total_mb(self):
+            return self.free, 24576
+
+    backend = _Backend()
+    args = argparse.Namespace(touch_period=0.0, progress_every=2.0, reeval=0.0)
+    made = hog.Hog(backend, hog.Idle(), args)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), hog.make_handler(made))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        for query, solves in (("leave_free=4096", [5904, 3904]),
+                              ("leave_free=4096&pin=1", [5904, 5904]),
+                              ("leave_free=4096", [5904, 3904])):
+            backend.free = 10000
+            urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/set?{query}",
+                method="POST")).close()
+            first = made.resolve_target(0.0)
+            backend.free = 8000
+            assert [first, made.resolve_target(1.0)] == solves
+    finally:
+        server.shutdown()

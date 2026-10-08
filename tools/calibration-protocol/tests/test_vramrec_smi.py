@@ -40,7 +40,7 @@ def _load():
 vramrec = _load()
 
 # Captured on `gcs` (driver 590.48.01, two RTX PRO 6000 Blackwell) while
-# SGLang held both boards, with the exact command the platform notes name.
+# SGLang held both GPUs, with the exact command the platform notes name.
 CAPTURED_CSV = """pid, used_gpu_memory [MiB]
 80613, 92908 MiB
 80614, 92908 MiB
@@ -160,6 +160,15 @@ def test_a_healthy_nvml_gpu_never_calls_nvidia_smi():
     assert row["procs"][0]["used_mb"] == 512
 
 
+def test_a_process_row_records_its_pid_in_its_own_namespace(monkeypatch):
+    """`NSpid` lists the PID in each namespace, innermost last."""
+    monkeypatch.setattr(vramrec, "_read_text", lambda path: (
+        "NSpid:\t48211\t17\nVmHWM:\t2048 kB\nVmRSS:\t1024 kB\n"
+        if path.endswith("/status") else None))
+    row, _ = _sample([_gpu([{"pid": 48211, "used_mb": 512, "type": "compute"}])], {})
+    assert (row["procs"][0]["ns_pid"], row["procs"][0]["rss_mb"]) == (17, 1)
+
+
 def test_a_blind_gpu_is_priced_from_nvidia_smi_and_says_so():
     row, smi = _sample([_gpu([{"pid": 9, "used_mb": None, "type": "compute"}])],
                        {9: 4096})
@@ -171,7 +180,7 @@ def test_a_blind_gpu_is_priced_from_nvidia_smi_and_says_so():
 
 def test_an_empty_nvml_list_on_a_posix_host_never_calls_nvidia_smi():
     """The idle-GPU state of S2 and S3 before the model loads: NVML lists
-    nothing, and on POSIX that is an idle board rather than a hidden answer."""
+    nothing, and on POSIX that is an idle GPU rather than a hidden answer."""
     if vramrec.IS_WINDOWS:  # pragma: no cover - the rule inverts there
         pytest.skip("on Windows an empty list is a hidden answer")
     row, smi = _sample([_gpu([])], {77: 2048})

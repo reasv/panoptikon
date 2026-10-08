@@ -15,9 +15,10 @@ Usage
     legs.py --scenario S2 --bin PATH --config C1 --results DIR \\
             [--run-id ID] [--gpu-total-mb 24564] [--python PATH] \\
             [--model ID] [--models a,b,c] [--scan-audio] [--corpus DIR] \\
-            [--note "..."] [--port N] \\
+            [--note "..."] [--port N] [--inference-url URL] \\
             [--seed-calibration FILE] [--job-cap S] [--settle S] \\
             [--hog-device N] [--hog-target gpu|mps|ram] [--min-free-mb 1024] \\
+            [--hog-event at=S,leave_free=MIB|hold=MIB|release ...] \\
             [--list] [--dry-run]
 
 `--list` prints the scenario table and exits; `--dry-run` resolves everything
@@ -54,28 +55,31 @@ in `legs.json` under `analyze_command`.
 `--gpu-total-mb`, and the scaling rule
 --------------------------------------
 Every hog figure in the scenario table is a **fraction of the GPU's total**,
-not a number of MiB, because a schedule written for a 97 887 MiB board says
+not a number of MiB, because a schedule written for a 97 887 MiB GPU says
 nothing on a 24 564 MiB one: `leave-free 12288` is comfortable on the first
 and more than the whole model plus corpus on the second. The rule is:
 
     mib = round(fraction x gpu_total_mb)
 
-with `--gpu-total-mb` defaulting to the board `vramrec.py` reports for
+with `--gpu-total-mb` defaulting to the GPU total `vramrec.py` reports for
 `--hog-device`. A `leave-free` figure is then floored at `--min-free-mb`
 (default 1 024) so the model under test still fits on a small card, and a
 `hold` figure is capped at `gpu_total_mb - --min-free-mb` for the same reason.
-Whenever the floor or the cap actually binds, the leg writes a `floor_bound`
-event into `legs.json` and prints a `PRECONDITION:` line: the leg is then
-applying the floor's pressure, not the fraction's, and two legs written to
-different fractions can land on the same level.
+The hog itself takes no more once free is at the floor, which also bounds a
+hold on host RAM. Whenever the floor or the cap actually binds, the leg writes
+a `floor_bound` event into `legs.json` and prints a `PRECONDITION:` line: the
+leg is then applying the floor's pressure, not the fraction's, and two legs
+written to different fractions can land on the same level.
 
-S4c's spike is not a fraction. Its "~2 GB free" is the defensive clamp's own
-threshold, so it is 2 048 MiB on every board, neither scaled nor floored.
+S4c's spike is not a fraction: it squeezes the GPU to about 2 GB free, so it
+is 2 048 MiB on every GPU, not scaled, and raised only by a `--min-free-mb`
+above it. A `--hog-event` figure is in MiB too: not scaled,
+but bounded like every figure.
 Both the fraction and the resolved MiB are recorded in `legs.json`, and the
 reference column in `--list` is the figure this host's runs used, so a
 cross-platform comparison can state what changed.
 
-**On a unified-memory device there is no board for NVML to report**, so a leg
+**On a unified-memory device there is no GPU total for NVML to report**, so a leg
 with a hog refuses to start until `--gpu-total-mb` is given rather than
 scaling against this host's 97 887 MiB reference. The figure to give is the
 total the *worker adopts* -- `recommended_max_memory()`, which `selftest.py`
@@ -106,12 +110,16 @@ The recorders handle `SIGBREAK` for exactly this reason, so a Windows
 teardown flushes its last samples instead of losing them. `hog.py` is asked to
 release over its own HTTP endpoint first, on every platform, because that is
 the only stop that is observably complete before the process exits.
+SIGTERM, SIGHUP (an ssh drop; not under nohup) or SIGBREAK sent to `legs.py`
+itself ends the leg as Ctrl-C does: the same teardown, and `legs.json` with
+the outcome `interrupted`.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import re
@@ -126,7 +134,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -135,9 +143,10 @@ HERE = Path(__file__).resolve().parent
 IS_WINDOWS = os.name == "nt"
 
 sys.path.insert(0, str(HERE))
+import corpus as corpus_tiers  # noqa: E402
 import rocm_sysfs  # noqa: E402
 
-# The board every figure in SCENARIOS was measured against, so `--list` can
+# The GPU total every figure in SCENARIOS was measured against, so `--list` can
 # print what this host actually ran beside the fraction.
 REFERENCE_TOTAL_MB = 97887
 
@@ -165,11 +174,41 @@ class HogEvent:
     #: exactly one of these
     hold_fraction: Optional[float] = None
     leave_free_fraction: Optional[float] = None
-    #: an absolute level, for a figure the protocol states in MiB rather than
-    #: as a share of the board: S4c's 2 GB is the defensive clamp's own
-    #: threshold, the same number on a 24 GB card as on a 96 GB one.
+    #: absolute levels, for a figure stated in MiB rather than as a share of
+    #: the GPU's total: S4c squeezes to about 2 GB free, the same number on a
+    #: 24 GB card as on a 96 GB one, and `--hog-event` is in MiB.
     leave_free_mb: Optional[int] = None
+    hold_mb: Optional[int] = None
     label: str = ""
+    #: a `--hog-event`: a leave-free level is solved once, at the event, and
+    #: then held, on any scenario
+    pinned: bool = False
+
+
+def parse_hog_event(text: str) -> HogEvent:
+    """`at=S,leave_free=MIB`, `at=S,hold=MIB` or `at=S,release`: a hog change
+    S seconds after the job is posted, in MiB, not scaled. S and MIB are
+    finite and not negative."""
+    pairs = [part.partition("=")[::2] for part in text.split(",")]
+    fields = dict(pairs)
+    try:
+        if len(fields) != len(pairs):
+            raise ValueError("a key is repeated")
+        at_s = float(fields.pop("at"))
+        if fields == {"release": ""}:
+            fields = {"hold": "0"}
+        ((key, value),) = fields.items()
+        mib = int(value)
+        if math.isfinite(at_s) and at_s >= 0 and mib >= 0:
+            if key == "leave_free":
+                return HogEvent(at_s, leave_free_mb=mib, label=text,
+                                pinned=True)
+            if key == "hold":
+                return HogEvent(at_s, hold_mb=mib, label=text, pinned=True)
+    except (KeyError, ValueError):
+        pass
+    raise argparse.ArgumentTypeError(
+        f"{text!r}: want at=S,leave_free=MIB, at=S,hold=MIB or at=S,release")
 
 
 @dataclass(frozen=True)
@@ -179,7 +218,7 @@ class Scenario:
     #: `count`, `ramp`, `ramp8`, `smoke` ... resolved under `results/corpus/`
     corpus: str
     model: str = DEFAULT_MODEL
-    #: the hog's opening schedule, as a fraction of the board
+    #: the hog's opening schedule, as a fraction of the GPU's total
     hog_hold_fraction: Optional[float] = None
     hog_leave_free_fraction: Optional[float] = None
     #: `--reeval` for the hog: 999999 pins it, so a shrinking `free` reading
@@ -199,6 +238,8 @@ class Scenario:
     expect: Tuple[str, ...] = ()
     #: what the scenario needs of the host before it starts
     preconditions: Tuple[str, ...] = ()
+    #: healthrec's polling interval, unless `--health-interval` sets one
+    health_interval: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -212,20 +253,30 @@ class Fixture:
     no_items: bool = False
 
 
+#: The smoke tier's images, the only items the fixtures' handler accepts.
+SMOKE_IMAGES = sum(group.count for group in corpus_tiers.tier_groups("smoke")
+                   if group.kind == "image")
+
 #: Keyed by the inference id with its `_cuda`/`_cpu` suffix stripped: the two
 #: variants differ in whether the ledger prices them, not in what they
-#: inject. The thresholds are per fixture, against the 180-item smoke tier; a
-#: leg on a bigger corpus raises them by hand. One flat `--expect-ooms 1` for
-#: the whole table would FAIL every fixture but one for working as designed.
+#: inject. The thresholds are per fixture, against the smoke tier; a leg on a
+#: bigger corpus raises them by hand. A fixture that OOMs on every batch logs
+#: at most one OOM negative per item, and `oom` runs no clean window, so its
+#: deflation does not return to 0 within the leg's settle, and the model is
+#: unloaded when its job ends. An OOM negative holds at least one predict that
+#: OOMed, so `oom_timed` logs at most its registry `oom_predicts` (20).
 S5_FIXTURES: Dict[str, Fixture] = {
     "oom_second_batch": Fixture(("--expect-ooms", "1")),
-    "oom": Fixture(("--expect-ooms", "60", "--expect-failures", "180",
-                    "--expect-failed-jobs", "1")),
-    "oom_timed": Fixture(("--expect-ooms", "60", "--expect-failures", "180",
+    "oom": Fixture(("--expect-ooms", str(SMOKE_IMAGES),
+                    "--expect-failures", str(SMOKE_IMAGES),
+                    "--expect-failed-jobs", "1", "--expect-deflated")),
+    "oom_timed": Fixture(("--expect-ooms", "20",
+                          "--expect-failures", str(SMOKE_IMAGES),
                           "--expect-failed-jobs", "1")),
     "failbatch": Fixture(),
     "failbatch_oomtext": Fixture(),
-    "dying": Fixture(("--expect-deaths", "200", "--expect-failures", "200",
+    "dying": Fixture(("--expect-deaths", "200",
+                      "--expect-failures", str(SMOKE_IMAGES),
                       "--expect-failed-jobs", "1")),
     "dies_on_load": Fixture(("--expect-failed-jobs", "1",
                              "--expect-empty-setters"), no_items=True),
@@ -251,7 +302,7 @@ SCENARIOS: Dict[str, Scenario] = {
                "grant_safety,failures,job_outcome,ledger_invariant,peak_fds",
         preconditions=(
             "the GPU's other tenant is STILL RUNNING - this is the only leg "
-            "that wants a full board",
+            "that wants a full GPU",
         ),
     ),
     "S2": Scenario(
@@ -282,7 +333,7 @@ SCENARIOS: Dict[str, Scenario] = {
     ),
     "S4a": Scenario(
         key="S4a",
-        note="constant external pressure: the hog holds the board down to a "
+        note="constant external pressure: the hog holds the GPU down to a "
              "fixed free level for the whole job",
         corpus="ramp",
         hog_leave_free_fraction=12288 / REFERENCE_TOTAL_MB,
@@ -290,13 +341,13 @@ SCENARIOS: Dict[str, Scenario] = {
         checks="all",
         preconditions=(
             "the GPU is idle apart from the hog",
-            "judge `utilization` against the probe's boundary AT THE HOG'S "
-            "FREE LEVEL, never the full-GPU boundary",
+            "judge `utilization` against the idle-GPU probe: the check "
+            "subtracts what the hog held",
         ),
     ),
     "S4b": Scenario(
         key="S4b",
-        note="step up: the hog takes another ~31% of the board 60 s into the "
+        note="step up: the hog takes another ~31% of the GPU 60 s into the "
              "job, between windows",
         corpus="ramp8",
         hog_hold_fraction=0.0,
@@ -312,7 +363,7 @@ SCENARIOS: Dict[str, Scenario] = {
     ),
     "S4c": Scenario(
         key="S4c",
-        note="spike: the hog squeezes the board to ~2 GB free for 10 s at "
+        note="spike: the hog squeezes the GPU to ~2 GB free for 10 s at "
              "t = 90 s, then releases",
         corpus="ramp8",
         hog_hold_fraction=0.0,
@@ -330,7 +381,7 @@ SCENARIOS: Dict[str, Scenario] = {
     ),
     "S4d": Scenario(
         key="S4d",
-        note="step down: the hog starts holding the board and releases "
+        note="step down: the hog starts holding the GPU and releases "
              "everything at t = 120 s; the budget must grow back",
         corpus="ramp8",
         hog_leave_free_fraction=8192 / REFERENCE_TOTAL_MB,
@@ -346,7 +397,8 @@ SCENARIOS: Dict[str, Scenario] = {
         corpus="smoke",
         model="calibfixture/oom_second_batch_cuda",
         checks="all",
-        expect=("--expect-ooms", "1"),
+        # A fixture's job can last 0.3 s.
+        health_interval=0.1,
         preconditions=(
             "run fixtures/install-fixtures.sh first, or point the gateway's "
             "config_dirs/impl_dirs at fixtures/registry and fixtures/impls",
@@ -465,18 +517,30 @@ class Supervisor:
         creationflags = 0
         if IS_WINDOWS:
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-        popen = subprocess.Popen(
-            [str(part) for part in argv],
-            stdout=handle if handle is not None else subprocess.DEVNULL,
-            stderr=subprocess.STDOUT if handle is not None
-            else subprocess.DEVNULL,
-            cwd=str(cwd) if cwd else None,
-            env=env,
-            creationflags=creationflags,
-            start_new_session=not IS_WINDOWS,
-        )
-        child = Child(name, popen, handle)
-        self.children.append(child)
+        # A stop signal waits until the child is registered, so the teardown
+        # stops it, and is then raised again.
+        held: List[int] = []
+        saved = {sig: signal.signal(sig, lambda signum, _: held.append(signum))
+                 for sig in (signal.SIGINT, *STOP_SIGNALS)
+                 if signal.getsignal(sig) is not signal.SIG_IGN}
+        try:
+            popen = subprocess.Popen(
+                [str(part) for part in argv],
+                stdout=handle if handle is not None else subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if handle is not None
+                else subprocess.DEVNULL,
+                cwd=str(cwd) if cwd else None,
+                env=env,
+                creationflags=creationflags,
+                start_new_session=not IS_WINDOWS,
+            )
+            child = Child(name, popen, handle)
+            self.children.append(child)
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+            for signum in held[:1]:
+                signal.raise_signal(signum)
         return child
 
     def stop(self, child: Child, grace: Optional[float] = None) -> str:
@@ -650,15 +714,42 @@ class FdRecorder(threading.Thread):
     def stop(self) -> None:
         self._stopped.set()
         # Joined, so no sample lands in the file after the gateway is gone.
-        self.join(timeout=2)
+        try:
+            self.join(timeout=2)
+        except RuntimeError:
+            pass  # never started: nothing to join
 
 
 # --- small helpers ---------------------------------------------------------
 
 
 def iso_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
-        f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+#: The signals that end a leg as Ctrl-C does, where the OS has them.
+STOP_SIGNALS = [getattr(signal, name) for name in
+                ("SIGTERM", "SIGHUP", "SIGBREAK") if hasattr(signal, name)]
+
+
+def ignore_stop_signals() -> None:
+    for sig in (signal.SIGINT, *STOP_SIGNALS):
+        signal.signal(sig, signal.SIG_IGN)
+
+
+def stop_on_signals() -> None:
+    """SIGTERM, SIGHUP and SIGBREAK end the leg as Ctrl-C does, through its
+    teardown: the children run in their own sessions, so a driver killed
+    outright leaves them running. A signal already ignored (nohup) stays
+    ignored. Once the teardown starts, stop signals are ignored."""
+    def interrupt(signum: int, _frame: Any) -> None:
+        ignore_stop_signals()
+        raise KeyboardInterrupt(signal.Signals(signum).name)
+
+    for sig in STOP_SIGNALS:
+        if signal.getsignal(sig) is not signal.SIG_IGN:
+            signal.signal(sig, interrupt)
 
 
 def wait_for(predicate: Callable[[], bool], timeout: float,
@@ -672,6 +763,10 @@ def wait_for(predicate: Callable[[], bool], timeout: float,
             pass
         time.sleep(interval)
     return False
+
+
+#: How long the gateway's start waits for the recorders' first samples.
+RECORDER_START_S = 30.0
 
 
 def port_is_open(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -740,6 +835,14 @@ def corpus_tier_scale(name: str) -> Tuple[str, float]:
     if head and head != name:
         return head, float(name[len(head):])
     return name, 1.0
+
+
+def corpus_dir(args: argparse.Namespace, scenario: Scenario) -> Path:
+    # Absolute, always: the gateway chdirs into `--root`, so a relative
+    # `included_folders` entry resolves against a different directory there and
+    # the rescan quietly indexes nothing.
+    return (Path(args.corpus) if args.corpus
+            else Path(args.results) / "corpus" / scenario.corpus).resolve()
 
 
 def corpus_command(corpus: Path, tier: str, scale: float) -> str:
@@ -822,8 +925,8 @@ def derived_text_complaint(models: List[str], corpus: Path) -> Optional[str]:
             f"/text` and run this leg on it")
 
 
-def board_total_mb(device: int) -> Optional[int]:
-    """The board's total, from NVML, for the hog scaling rule.
+def nvml_total_mb(device: int) -> Optional[int]:
+    """The GPU's total, from NVML, for the hog scaling rule.
 
     None on a host with no NVML, which includes every Mac: the unified
     device's total is the worker's adopted recommended-max and only
@@ -880,17 +983,52 @@ class Leg:
     endpoints: List[Dict[str, Any]] = field(default_factory=list)
     #: the extraction chain this leg runs, after `--model` / `--models`
     models: Tuple[str, ...] = ()
+    #: set once the jobs have ended; a hog event not yet fired is then void
+    job_done: threading.Event = field(default_factory=threading.Event)
 
     # -- recording ----------------------------------------------------------
 
     def mark(self, name: str, **detail: Any) -> None:
-        record = {"iso": iso_now(), "event": name, **detail}
+        # `t_mono` measures how far the wall clock steps (WSL2 steps it).
+        record = {"iso": iso_now(), "t_mono": round(time.monotonic(), 3),
+                  "event": name, **detail}
         self.events.append(record)
-        print(f"[{record['iso']}] {name}"
-              + (f" {json.dumps(detail)}" if detail else ""), flush=True)
+        try:
+            print(f"[{record['iso']}] {name}"
+                  + (f" {json.dumps(detail)}" if detail else ""), flush=True)
+        except OSError:
+            # a hung-up terminal or a closed pipe: the rest of the console
+            # output is dropped, so the exit status stays the leg's
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
     def path(self, name: str) -> Path:
         return self.directory / name
+
+    def wait_for_recorders(self, health: Sequence[str],
+                           timeout: float = RECORDER_START_S) -> None:
+        """Waits up to `timeout` for vramrec's and each `health` recorder's
+        recording to hold a sample; marks `recorder_sample_timeout` with those
+        that still hold none."""
+        paths = [self.path(f"{name}.jsonl") for name in ("vramrec", *health)]
+
+        def sampled(path: Path) -> bool:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                return False
+            for line in lines:
+                try:
+                    if json.loads(line).get("kind") == "sample":
+                        return True
+                except ValueError:  # a partly written last line
+                    pass
+            return False
+
+        wait_for(lambda: all(map(sampled, paths)), timeout, interval=0.1)
+        missing = [path.name for path in paths if not sampled(path)]
+        if missing:
+            self.mark("recorder_sample_timeout", files=missing,
+                      waited_s=timeout)
 
     # -- the job API --------------------------------------------------------
 
@@ -1021,11 +1159,21 @@ class Leg:
 
     def expectations(self) -> Tuple[str, ...]:
         """`analyze.py --expect-*` for this leg: the fixture's own, where it
-        runs one, and the scenario's otherwise."""
+        runs one, a failed-item ceiling on a `poison` corpus, and the
+        scenario's otherwise."""
         for model in self.models:
             fixture = fixture_for(model)
             if fixture is not None:
                 return fixture.expect
+        try:
+            manifest = corpus_dir(self.args, self.scenario) / "manifest.json"
+            tier = json.loads(manifest.read_text(encoding="utf-8")).get("tier")
+        except Exception:  # no corpus, or no readable manifest
+            tier = None
+        if tier == "poison":
+            # poison's items are built to fail as input.
+            return ("--expect-failures", str(sum(
+                group.count for group in corpus_tiers.tier_groups("poison"))))
         return self.scenario.expect
 
     def job_items(self, model: str, tag: str) -> Optional[int]:
@@ -1046,6 +1194,19 @@ class Leg:
 
     def hog_url(self, path: str) -> str:
         return f"http://127.0.0.1:{self.args.hog_port}{path}"
+
+    def hog_command(self, schedule: List[str]) -> List[str]:
+        args = self.args
+        argv = [self.python, str(HERE / "hog.py"), "--target",
+                args.hog_target, "--port", str(args.hog_port),
+                "--out", str(self.path("hog.jsonl")),
+                "--min-free-mb", str(args.min_free_mb),
+                "--hold-at-end", "--quiet"]
+        if args.hog_target == "gpu":
+            argv += ["--device", str(args.hog_device)]
+        if self.scenario.hog_reeval is not None:
+            argv += ["--reeval", str(self.scenario.hog_reeval)]
+        return argv + schedule
 
     def hog_schedule(self) -> Tuple[List[str], Dict[str, Any]]:
         """The opening schedule in MiB, plus what it was derived from."""
@@ -1080,9 +1241,9 @@ class Leg:
             return ["hold", str(mib)], detail
         return [], {}
 
-    def note_floor(self, kind: str, at: str, fraction: float, scaled_mb: int,
-                   resolved_mb: int) -> None:
-        """Record a figure `--min-free-mb` moved off its own fraction.
+    def note_floor(self, kind: str, at: str, fraction: Optional[float],
+                   scaled_mb: int, resolved_mb: int) -> None:
+        """Record a figure `--min-free-mb` moved off its stated value.
 
         A bound floor makes two legs written to different fractions apply the
         same pressure, so the leg says so instead of letting a reader compare
@@ -1099,24 +1260,27 @@ class Leg:
     def resolved_events(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for event in self.scenario.events:
-            row: Dict[str, Any] = {"at_s": event.at_s, "label": event.label}
-            if event.leave_free_mb is not None:
-                row["leave_free_mb"] = event.leave_free_mb
-                row["fraction"] = None
-            elif event.leave_free_fraction is not None:
-                scaled = scale_mb(event.leave_free_fraction, self.total_mb)
-                row["leave_free_mb"] = max(self.args.min_free_mb, scaled)
-                row["fraction"] = event.leave_free_fraction
-                self.note_floor("leave-free", event.label or f"t+{event.at_s:g}s",
-                                event.leave_free_fraction, scaled,
+            at = event.label or f"t+{event.at_s:g}s"
+            row: Dict[str, Any] = {"at_s": event.at_s, "label": event.label,
+                                   "pinned": event.pinned}
+            if (event.leave_free_mb is not None
+                    or event.leave_free_fraction is not None):
+                fraction = event.leave_free_fraction
+                figure = (event.leave_free_mb if fraction is None
+                          else scale_mb(fraction, self.total_mb))
+                row["leave_free_mb"] = max(self.args.min_free_mb, figure)
+                row["fraction"] = fraction
+                self.note_floor("leave-free", at, fraction, figure,
                                 row["leave_free_mb"])
             else:
-                scaled = scale_mb(event.hold_fraction or 0.0, self.total_mb)
-                row["mb"] = min(scaled,
+                fraction = (None if event.hold_mb is not None
+                            else event.hold_fraction or 0.0)
+                figure = (event.hold_mb if fraction is None
+                          else scale_mb(fraction, self.total_mb))
+                row["mb"] = min(figure,
                                 max(0, self.total_mb - self.args.min_free_mb))
-                row["fraction"] = event.hold_fraction
-                self.note_floor("hold", event.label or f"t+{event.at_s:g}s",
-                                event.hold_fraction or 0.0, scaled, row["mb"])
+                row["fraction"] = fraction
+                self.note_floor("hold", at, fraction, figure, row["mb"])
             out.append(row)
         return out
 
@@ -1126,27 +1290,36 @@ class Leg:
         Timed from the job's POST rather than from the leg's start, because
         what the scenario is describing is a change *during* the job: the S4b
         step lands 60.0 s after the submit, not 60 s after the recorders came
-        up.
+        up. An event the jobs ended before is marked void and not fired.
         """
-        for event in events:
-            delay = posted_at + event["at_s"] - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
+        for index, event in enumerate(events):
+            due = posted_at + event["at_s"]
+            if self.job_done.wait(max(0.0, due - time.monotonic())):
+                for skipped in events[index:]:
+                    self.mark("hog_event_void", label=skipped["label"],
+                              at_s=skipped["at_s"], reason="after the job")
+                return
             query = ("leave_free=%d" % event["leave_free_mb"]
                      if "leave_free_mb" in event else "mb=%d" % event["mb"])
             self.mark("hog_event_request", label=event["label"], query=query,
-                      at_s=event["at_s"])
+                      at_s=event["at_s"], pinned=event["pinned"],
+                      late_s=round(max(0.0, time.monotonic() - due), 3))
             try:
-                request(self.hog_url(f"/set?{query}"), method="POST",
-                        timeout=10)
+                request(self.hog_url(f"/set?{query}"
+                                     + ("&pin=1" if event["pinned"] else "")),
+                        method="POST", timeout=10)
             except HttpError as exc:
                 self.mark("hog_event_failed", label=event["label"],
                           error=str(exc))
                 continue
             self.mark("hog_event_ack", label=event["label"])
-            # Record the fill, so `legs.json` states how long the board took
-            # to change and `analyze.py`'s hog_tracking has a wall clock.
+            # Record the fill, so `legs.json` states how long the GPU took
+            # to change, until the next event is due.
+            next_due = (posted_at + events[index + 1]["at_s"]
+                        if index + 1 < len(events) else math.inf)
             for _ in range(40):
+                if time.monotonic() >= next_due:
+                    break
                 try:
                     state = get_json(self.hog_url("/state"), timeout=5)
                 except HttpError:
@@ -1372,6 +1545,21 @@ def config_tree(name: str, repo: Path) -> Path:
     return (repo / CONFIGS[name].get("tree", ".")).resolve()
 
 
+def venv_python(venv: Path) -> Path:
+    """The interpreter of virtualenv `venv` on this OS."""
+    if IS_WINDOWS:
+        return venv / "Scripts" / "python.exe"
+    return venv / "bin" / "python"
+
+
+def cudnn_library_dir(python: Path) -> Optional[Path]:
+    """The `nvidia/cudnn/lib` directory in the venv of interpreter `python`,
+    or None when that venv has none."""
+    found = sorted(python.parent.parent.glob(
+        "lib/python3*/site-packages/nvidia/cudnn/lib"))
+    return found[-1] if found else None
+
+
 _TOML_BASE_URL = re.compile(r'^(\s*base_url\s*=\s*"[^"]*:)(\d+)(.*)$')
 
 
@@ -1419,8 +1607,7 @@ def render_config(name: str, repo: Path) -> str:
         config_dirs.append(tree / "tools" / "calibration-protocol" / "config"
                            / spec["registry"])
     for key, value in (
-            ("python", json.dumps(str(tree / "python" / ".venv" / "bin"
-                                      / "python"))),
+            ("python", json.dumps(str(venv_python(tree / "python" / ".venv")))),
             ("impl_dirs", paths(tree / "python" / "inferio" / "impl",
                                 tree / "inferio_custom")),
             ("config_dirs", paths(*config_dirs)),
@@ -1432,15 +1619,20 @@ def render_config(name: str, repo: Path) -> str:
     return text
 
 
-def config_env(name: str, repo: Path, base: Dict[str, str]) -> Dict[str, str]:
+def config_env(name: str, repo: Path, base: Dict[str, str],
+               python: Optional[str] = None) -> Dict[str, str]:
     """The gateway's environment for configuration `name`, over `base`.
 
     The trace directive carries the ledger's grant/settle/refit lines, and the
-    worker's DEBUG level its batch plans. `LD_LIBRARY_PATH` names the venv's
-    cuDNN because CTranslate2 (faster-whisper) dlopens `libcudnn_ops.so.9` and
-    that directory is not on the loader path; torch finds its own copy.
+    worker's DEBUG level its batch plans. `LD_LIBRARY_PATH` names the cuDNN
+    in the worker's venv (`python`, else the tree's) because CTranslate2
+    (faster-whisper) dlopens `libcudnn_ops.so.9` and that directory is not on
+    the loader path; torch finds its own copy. It is left out when that venv
+    has no cuDNN.
     """
     tree = config_tree(name, repo)
+    cudnn = cudnn_library_dir(Path(shutil.which(python) or python) if python
+                              else venv_python(tree / "python" / ".venv"))
     # A configuration that names its own tree (C0, the master baseline) runs
     # that tree's binary whatever the caller exported; the others share the
     # checkout, so a caller's PANOPTIKON_BIN only picks which build of it.
@@ -1451,24 +1643,24 @@ def config_env(name: str, repo: Path, base: Dict[str, str]) -> Dict[str, str]:
                            or str(tree / "target" / "release" / "panoptikon")),
         "RUST_LOG": "info,panoptikon::inferio=trace",
         "INFERIO_WORKER_LOG_LEVEL": "DEBUG",
-        "LD_LIBRARY_PATH": str(tree / "python" / ".venv" / "lib" / "python3.12"
-                               / "site-packages" / "nvidia" / "cudnn" / "lib"),
     }
     if CONFIGS[name].get("accelerator") == "rocm":
-        del env["LD_LIBRARY_PATH"]
         env["RUST_LOG"] += ",panoptikon::db::batch_auto=debug"
+    elif cudnn is not None:
+        env["LD_LIBRARY_PATH"] = str(cudnn)
     return {**env, **CONFIGS[name].get("env", {})}
 
 
 def resolve_config(args: argparse.Namespace, base: Dict[str, str],
-                   python_given: bool = False
+                   python: Optional[str] = None
                    ) -> Tuple[str, str, Dict[str, str], str]:
     """`--config` as a configuration id or a path to a TOML.
 
     Returns (config text, file name, environment, where the environment came
     from). A path's environment is the `env.<id>` file beside it, if any. An
     id's paths follow `--repo`, so its venv must exist there unless
-    `--python` replaces it or nothing is started.
+    `--python` (`python`) replaces it or no worker is started (`--dry-run`,
+    `--inference-url`).
     """
     given = str(args.config)
     candidate = Path(given)
@@ -1478,20 +1670,26 @@ def resolve_config(args: argparse.Namespace, base: Dict[str, str],
         candidate = candidate.resolve()
         env_file = (candidate.parent
                     / f"env.{candidate.stem.replace('server-', '')}")
-        return (candidate.read_text(encoding="utf-8"), str(candidate),
-                read_env_file(env_file, base),
+        env = read_env_file(env_file, base)
+        if python:
+            env.pop("LD_LIBRARY_PATH", None)
+            cudnn = cudnn_library_dir(Path(shutil.which(python) or python))
+            if cudnn is not None:
+                env["LD_LIBRARY_PATH"] = str(cudnn)
+        return (candidate.read_text(encoding="utf-8"), str(candidate), env,
                 str(env_file) if env_file.is_file() else "")
     if given not in CONFIGS:
         raise SystemExit(f"legs.py: no config {given!r} - pass a path, or one "
                          f"of {', '.join(CONFIGS)}")
     repo = Path(args.repo).resolve()
     text = render_config(given, repo)
-    venv = config_tree(given, repo) / "python" / ".venv" / "bin" / "python"
-    if not venv.exists() and not python_given and not args.dry_run:
+    venv = venv_python(config_tree(given, repo) / "python" / ".venv")
+    if (not venv.exists() and not python and not args.dry_run
+            and not args.inference_url):
         raise SystemExit(f"legs.py: {given} runs the worker on {venv}, which "
                          f"does not exist - pass --repo <checkout with a "
                          f"synced venv> or --python")
-    return (text, f"server-{given}.toml", config_env(given, repo, base),
+    return (text, f"server-{given}.toml", config_env(given, repo, base, python),
             f"CONFIGS[{given!r}]")
 
 
@@ -1584,6 +1782,37 @@ def repin_ports(text: str, offset: int) -> str:
     return "\n".join(out) + "\n"
 
 
+def remote_inference(text: str, url: str) -> str:
+    """`url` as the config's one `[[upstreams.inference]]` server, with
+    `[inference_local]` off: the gateway forwards every inference request
+    there."""
+    out: List[str] = []
+    section = ""
+    for line in text.splitlines():
+        header = _TOML_SECTION.match(line)
+        if header:
+            section = header.group(1).strip().strip("[]")
+        if section != "upstreams.inference":
+            out.append(line)
+    text = set_toml_key("\n".join(out) + "\n", "inference_local", "enabled",
+                        "false")
+    return text + f"\n[[upstreams.inference]]\nbase_url = {json.dumps(url)}\n"
+
+
+def leg_config(text: str, python: Optional[str], port: Optional[int],
+               inference_url: Optional[str]) -> str:
+    """The config the gateway runs: `python` as the worker's interpreter,
+    every listener moved so the gateway binds `port`, and `inference_url` as
+    its inference server. `--write-config` writes the same text."""
+    if python:
+        text = repin_inference_python(text, python)
+    if port:
+        text = repin_ports(text, port - (config_port(text) or 6342))
+    if inference_url:
+        text = remote_inference(text, inference_url)
+    return text
+
+
 def config_inference_python(text: str) -> Optional[str]:
     """`[inference_local] python`, or None when the config leaves it to the
     gateway's own managed venv."""
@@ -1665,7 +1894,7 @@ def print_table() -> None:
         for line in scenario.preconditions:
             print(f"        ! {line}")
     print(f"\nThe hog fractions are of the GPU's total; the MiB column is "
-          f"this host's reference board ({REFERENCE_TOTAL_MB} MiB). "
+          f"this host's reference GPU ({REFERENCE_TOTAL_MB} MiB). "
           f"--gpu-total-mb re-resolves them.")
 
 
@@ -1709,16 +1938,23 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="gateway port: every listener the config "
                              "declares moves with it, in the per-leg copy "
                              "(default: read from the config)")
+    parser.add_argument("--inference-url", default=None,
+                        help="an inference server on another host: the "
+                             "gateway forwards inference to it instead of "
+                             "running its own, and a second healthrec polls "
+                             "its /health into healthrec-remote.jsonl")
     parser.add_argument("--legacy-port", type=int, default=None,
                         help="an extra listener to probe on top of the ones "
                              "the config declares (S14 probes every "
                              "[[server.endpoints]] port and expects 200)")
     parser.add_argument("--gpu-total-mb", type=int, default=None,
-                        help="board total the hog figures scale against "
+                        help="GPU total the hog figures scale against "
                              "(default: NVML's, or amdgpu sysfs', for "
                              "--hog-device)")
     parser.add_argument("--min-free-mb", type=int, default=1024,
-                        help="floor under a scaled leave-free figure")
+                        help="floor under a leave-free figure, and what "
+                             "a hold leaves free; the hog takes no more once "
+                             "free is at it")
     parser.add_argument("--hog-device", type=int, default=0)
     parser.add_argument("--hog-target", choices=("gpu", "mps", "ram"),
                         default="gpu",
@@ -1728,6 +1964,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "device `ram` is pressure on the same budget "
                              "by the other route, so a macOS pass runs "
                              "both")
+    parser.add_argument("--hog-event", action="append", default=[],
+                        type=parse_hog_event,
+                        metavar="at=S,leave_free=MIB|hold=MIB|release",
+                        help="a hog change S seconds after the job is posted, "
+                             "beside the scenario's own (repeatable); a "
+                             "leave-free level is solved once, at the event, "
+                             "and then held; on a scenario without a hog, one "
+                             "starts holding 0")
     parser.add_argument("--hog-port", type=int, default=6401)
     parser.add_argument("--seed-calibration",
                         help="calibration.toml copied into the fresh root "
@@ -1739,7 +1983,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="seconds between the job and the final snapshots")
     parser.add_argument("--stop-grace", type=float, default=60.0)
     parser.add_argument("--vram-interval", type=float, default=0.25)
-    parser.add_argument("--health-interval", type=float, default=0.5)
+    parser.add_argument("--health-interval", type=float, default=None,
+                        help="seconds; default: the scenario's")
     parser.add_argument("--health-full", action="store_true",
                         help="healthrec.py --full (keeps the raw payload; "
                              "~2x the file, needed for inference_clients and "
@@ -1755,8 +2000,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     # Only an explicit `--python` repins the worker; the default is this
-    # interpreter, which is the right recorder but not the right worker.
-    explicit_python = args.python
+    # interpreter, which is the right recorder but not the right worker. A
+    # path is made absolute, since the gateway runs in `--root`; never
+    # resolved, since a venv's interpreter is a symlink out of the venv.
+    explicit_python = (os.path.abspath(args.python)
+                       if args.python and os.path.dirname(args.python)
+                       else args.python)
     args.python = args.python or sys.executable
 
     if args.list:
@@ -1774,10 +2023,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.write_config:
         # What `config/run-gateway.sh` starts a gateway with.
         text, name, variables, _ = resolve_config(args, dict(os.environ),
-                                                  explicit_python is not None)
+                                                  explicit_python)
         refuse_inherited_visibility(text, variables, env)
-        if explicit_python:
-            text = repin_inference_python(text, explicit_python)
+        text = leg_config(text, explicit_python, args.port, args.inference_url)
         out = Path(args.write_config)
         out.mkdir(parents=True, exist_ok=True)
         stem = Path(name).stem.replace("server-", "")
@@ -1801,16 +2049,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                      f"starts the recorders and the hog before it is noticed")
 
     original, config_name, config_vars, env_source = resolve_config(
-        args, env, explicit_python is not None)
+        args, env, explicit_python)
     refuse_inherited_visibility(original, config_vars, env)
     env.update(config_vars)
     env.setdefault("RUST_LOG", "info,panoptikon::inferio=trace")
     env.setdefault("INFERIO_WORKER_LOG_LEVEL", "DEBUG")
-    declared_port = config_port(original) or 6342
-    port = args.port or declared_port
-    # `--port` has to reach the gateway's own listeners, not only the probe.
-    port_offset = port - declared_port
+    port = args.port or config_port(original) or 6342
     base = f"http://127.0.0.1:{port}"
+    health_urls = {"healthrec": base}
+    if args.inference_url:
+        # The server's own report: the gateway answers 504 for a server it
+        # declared frozen. healthrec adds `/api/inference/health`, and the
+        # gateway accepts the URL with or without `/api/inference`.
+        health_urls["healthrec-remote"] = (
+            args.inference_url.rstrip("/").removesuffix("/api/inference"))
     # `--models` beats the scenario's own chain, which beats a single model.
     models = ([m.strip() for m in args.models.split(",") if m.strip()]
               if args.models else
@@ -1826,12 +2078,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"rejects a bare id (`tags/wd-vit-tagger-v3`, "
             f"`textembed/all-MiniLM-L6-v2`). `--list` prints each scenario's "
             f"own id")
-    # Absolute, always: the gateway chdirs into `--root`, so a relative
-    # `included_folders` entry resolves against a different directory there and
-    # the rescan quietly indexes nothing.
-    corpus = (Path(args.corpus) if args.corpus
-              else Path(args.results) / "corpus" / scenario.corpus).resolve()
-    measured_total_mb = board_total_mb(args.hog_device)
+    corpus = corpus_dir(args, scenario)
+    measured_total_mb = nvml_total_mb(args.hog_device)
     measured_source = "nvml"
     rocm_host = measured_total_mb is None and bool(rocm_sysfs.inventory())
     if rocm_host:
@@ -1840,15 +2088,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     total_mb = args.gpu_total_mb or measured_total_mb or REFERENCE_TOTAL_MB
     wants_hog = (scenario.hog_hold_fraction is not None
                  or scenario.hog_leave_free_fraction is not None)
-    if wants_hog and not args.gpu_total_mb and measured_total_mb is None:
-        # Scaling a fraction against another machine's board is not a
-        # degraded measurement, it is a different experiment.
+    if args.inference_url and (wants_hog or args.hog_event or scenario.restart
+                               or scenario.learning):
+        raise SystemExit(
+            "legs.py: --inference-url with a hog, a restart or learning: each "
+            "acts on this host, not on the inference server's")
+    if ((wants_hog or args.hog_event) and not args.gpu_total_mb
+            and measured_total_mb is None):
+        # Scaling or bounding a figure by another machine's total is a
+        # different experiment, not a degraded measurement.
         raise SystemExit(
             "legs.py: this leg drives a hog and no device total could be "
             "read (no NVML or amdgpu sysfs here). Pass --gpu-total-mb with "
             "the total the "
             "worker adopts -- on macOS that is the recommended-max "
             "`selftest.py` prints as device.gpu_total_mb, not hw.memsize")
+    if args.hog_event:
+        timed = tuple(sorted(scenario.events + tuple(args.hog_event),
+                             key=lambda event: event.at_s))
+        if wants_hog:
+            scenario = replace(scenario, events=timed)
+        else:
+            scenario = replace(scenario, events=timed, hog_hold_fraction=0.0)
+            if scenario.checks != "all":
+                scenario = replace(scenario, checks=scenario.checks
+                                   + ",hog_tracking,deflation_recovery")
 
     if args.dry_run:
         directory = Path(args.results) / (args.run_id or "<run-id>") / scenario.key
@@ -1866,14 +2130,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # config's own `[inference_local] python`.
     inference_python = config_inference_python(original)
     python_source = "config" if inference_python else "the gateway's managed venv"
-    text = original
     if explicit_python:
         inference_python, python_source = explicit_python, "--python"
-        text = repin_inference_python(text, explicit_python)
-    if port_offset:
-        text = repin_ports(text, port_offset)
+    text = leg_config(original, explicit_python, args.port, args.inference_url)
     # A generated config is always written; a config given by path is used in
-    # place unless `--python` or `--port` changed it.
+    # place unless `--python`, `--port` or `--inference-url` changed it.
     gateway_config = Path(config_name)
     if text != original or not gateway_config.is_absolute():
         gateway_config = directory / gateway_config.name
@@ -1905,6 +2166,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "dotenv": (None if args.no_dotenv
                    else str(dotenv) if dotenv.is_file() else None),
         "base_url": base,
+        "inference_url": args.inference_url,
+        "health_urls": health_urls,
         "bound_ports": {"gateway": port,
                         **{row["name"]: row["port"] for row in leg.endpoints}},
         "legacy_port": args.legacy_port,
@@ -1918,6 +2181,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 else measured_source if measured_total_mb
                                 else "reference default"),
         "hog": ({"target": args.hog_target, "schedule": schedule,
+                 "reeval": scenario.hog_reeval,
                  **schedule_detail} if schedule else None),
         "hog_events": events,
         "floor_bound": leg.floor_notes,
@@ -1936,10 +2200,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"PRECONDITION: {line}", flush=True)
     for note in leg.floor_notes:
         print(f"PRECONDITION: the --min-free-mb {note['min_free_mb']} floor "
-              f"binds on this {note['gpu_total_mb']} MiB board - {note['at']} "
+              f"binds on this {note['gpu_total_mb']} MiB GPU - {note['at']} "
               f"{note['kind']} {note['scaled_mb']} -> {note['resolved_mb']} "
-              f"MiB, so this leg applies the floor's pressure, not the "
-              f"fraction's", flush=True)
+              f"MiB, so this leg applies the floor's pressure"
+              + ("" if note["fraction"] is None else ", not the fraction's"),
+              flush=True)
         leg.mark("floor_bound", **note)
     leg.mark("inference_python", python=inference_python,
              source=python_source, config=str(gateway_config))
@@ -1981,6 +2246,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     fds: Optional[FdRecorder] = None
     outcome = "incomplete"
+    stop_on_signals()
     try:
         # 1. the oracle, before anything of ours is on the GPU
         vram_argv = [
@@ -1999,18 +2265,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         leg.supervisor.start("vramrec", vram_argv)
         leg.mark("vramrec_started")
 
-        # 2. the hog, filled before the gateway sees the board
+        # 2. the hog, filled before the gateway sees the GPU
         if schedule:
-            hog_argv = [args.python, str(HERE / "hog.py"), "--target",
-                        args.hog_target, "--port", str(args.hog_port),
-                        "--out", str(leg.path("hog.jsonl")),
-                        "--hold-at-end", "--quiet"]
-            if args.hog_target == "gpu":
-                hog_argv += ["--device", str(args.hog_device)]
-            if scenario.hog_reeval is not None:
-                hog_argv += ["--reeval", str(scenario.hog_reeval)]
-            hog_argv += schedule
-            leg.supervisor.start("hog", hog_argv)
+            leg.supervisor.start("hog", leg.hog_command(schedule))
             leg.mark("hog_started", schedule=schedule, detail=schedule_detail)
             if not wait_for(lambda: port_is_open("127.0.0.1", args.hog_port),
                             60.0):
@@ -2033,13 +2290,23 @@ def main(argv: Optional[List[str]] = None) -> int:
                 leg.mark("hog_state_unreadable", error=str(exc))
 
         # 3. the gateway's own view, then the gateway
-        health_argv = [args.python, str(HERE / "healthrec.py"), "--base", base,
-                       "--out", str(leg.path("healthrec.jsonl")), "--interval",
-                       str(args.health_interval), "--quiet"]
-        if args.health_full:
-            health_argv.append("--full")
-        leg.supervisor.start("healthrec", health_argv)
-        leg.mark("healthrec_started")
+        for name, url in health_urls.items():
+            health_argv = [
+                args.python, str(HERE / "healthrec.py"), "--base", url,
+                "--out", str(leg.path(f"{name}.jsonl")), "--interval",
+                str(leg.scenario.health_interval if args.health_interval is None
+                    else args.health_interval), "--quiet"]
+            if url != base:
+                health_argv.append("--no-queue")
+            elif args.inference_url:
+                # The gateway answers for a server that does not answer only
+                # after its 10 s health deadline.
+                health_argv += ["--timeout", "15"]
+            if args.health_full:
+                health_argv.append("--full")
+            leg.supervisor.start(name, health_argv)
+            leg.mark(f"{name}_started")
+        leg.wait_for_recorders(list(health_urls))
 
         gateway = leg.start_gateway()
         fds = FdRecorder(gateway.pid, leg.path("fds.jsonl"))
@@ -2068,6 +2335,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             step = leg.run_job(chained, "" if index == 1 else f"-{index}")
             if step != "drained":
                 outcome = step
+        leg.job_done.set()
         if driver is not None:
             driver.join(timeout=max(60.0, max(e["at_s"] for e in events) + 60))
 
@@ -2117,9 +2385,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         time.sleep(args.settle)
         save(f"{base}/api/inference/health", leg.path("health-end.json"))
         leg.snapshot_calibration("calibration.after.toml")
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         outcome = "interrupted"
-        leg.mark("interrupted")
+        leg.mark("interrupted", signal=str(exc) or "SIGINT")
     except SystemExit as exc:
         outcome = f"aborted: {exc}"
         leg.mark("aborted", error=str(exc))
@@ -2127,6 +2395,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         outcome = f"error: {type(exc).__name__}: {exc}"
         leg.mark("error", error=str(exc))
     finally:
+        ignore_stop_signals()
+        leg.mark("stopping", stop_grace_s=args.stop_grace)
         if fds is not None:
             fds.stop()
         # The hog is asked to release over HTTP first: that is the only stop
@@ -2136,19 +2406,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                 request(leg.hog_url("/stop"), method="POST", timeout=5)
                 leg.mark("hog_stop_requested")
                 time.sleep(3.0)
-            except HttpError:
+            except (HttpError, OSError):
                 pass
         stopped = leg.supervisor.stop_all()
         leg.mark("processes_stopped", **stopped)
         leg.copy_log()
-
-    plan["outcome"] = outcome
-    plan["events"] = leg.events
-    plan["processes"] = {child.name: {"pid": child.pid,
-                                      "returncode": child.popen.returncode}
-                         for child in leg.supervisor.children}
-    leg.path("legs.json").write_text(json.dumps(plan, indent=1),
-                                     encoding="utf-8")
+        plan["outcome"] = outcome
+        plan["events"] = leg.events
+        plan["processes"] = {child.name: {"pid": child.pid,
+                                          "returncode": child.popen.returncode}
+                             for child in leg.supervisor.children}
+        leg.path("legs.json").write_text(json.dumps(plan, indent=1),
+                                         encoding="utf-8")
     print(f"\nDONE {directory}  outcome={outcome}")
     print("analyze with:\n  " + " ".join(leg.analyze_command()))
     return 0 if outcome == "drained" else 1

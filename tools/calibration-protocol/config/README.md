@@ -12,7 +12,8 @@ the binary, `python/.venv`, the inference sources and `.env` all come from
 it, and C0's tree is `panoptikon-master` beside it. From a worktree with no
 venv of its own, pass `--repo /path/to/main/checkout` (or `--python`);
 `run-gateway.sh` takes the same as `CALIB_REPO=<checkout>` (or
-`CALIB_WORKER_PYTHON=<python>`). A missing
+`CALIB_WORKER_PYTHON=<python>`), and `CALIB_PORT` / `CALIB_INFERENCE_URL` as
+`--port` / `--inference-url`. A missing
 `config/server/default.toml` or venv stops the leg with a message naming it.
 A caller's `PANOPTIKON_BIN` picks the binary for every id except C0, which
 always runs its own tree's build.

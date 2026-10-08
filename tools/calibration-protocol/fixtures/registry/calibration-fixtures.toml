@@ -91,15 +91,16 @@ config.load_mb    = 64
 config.message    = "refusing merged batch of {n}: the caption cache is out of memory slots"
 metadata.description = "Non-OOM merged-batch failure whose text contains 'out of memory'"
 
-# Batch-1 OOM for the first `oom_secs` after load, healthy afterwards. The only
-# fixture that can show `deflation` climbing AND recovering on one resident
-# worker (how long recovery takes once a healthy model runs on the same
-# replica).
+# Batch-1 OOM on the first `oom_predicts` predicts, healthy afterwards. The
+# only fixture that can show `deflation` climbing AND recovering on one
+# resident worker (how long recovery takes once a healthy model runs on the
+# same replica). 20 predicts deflate the worker and leave most of the smoke
+# tier's 180 images for the recovery.
 [group.calibfixture.inference_ids.oom_timed_cuda]
-config.impl_class = "oom_timed_cuda_test"
-config.load_mb    = 64
-config.oom_secs   = 120
-metadata.description = "Batch-1 OOM for 120 s after load, then healthy (CUDA-touching, priced)"
+config.impl_class   = "oom_timed_cuda_test"
+config.load_mb      = 64
+config.oom_predicts = 20
+metadata.description = "Batch-1 OOM on its first 20 predicts, then healthy (CUDA-touching, priced)"
 
 # Raises inside load(): the model never becomes resident. Measures the respawn
 # cadence and the time a request stream takes to fail.

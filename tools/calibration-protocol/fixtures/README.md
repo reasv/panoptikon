@@ -116,8 +116,8 @@ the declared `output_type = "tags"`. Measured: a 180-item job over
 `calib_hostless` workaround is gone.
 
 Inference ids: `calibfixture/{oom_second_batch,oom,failbatch,dying}_{cuda,cpu}`,
-plus `calibfixture/oom_timed_cuda` (batch-1 OOM for
-`oom_secs` after load, healthy afterwards — the only way to time deflation's
+plus `calibfixture/oom_timed_cuda` (batch-1 OOM on its first
+`oom_predicts` predicts, healthy afterwards — the only way to time deflation's
 *recovery* on one resident worker) and `calibfixture/dies_on_load_cuda`
 (raises inside `load()`, for the respawn-cadence measurement).
 Use the `_cuda` ids whenever the ledger is under test (priced, GPU-resolved);

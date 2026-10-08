@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import importlib.util
+import itertools
 import json
 import math
 import re
@@ -227,8 +228,17 @@ class Context:
     jobs: Optional[Any]
     probes: List[Dict[str, Any]]
     fds: List[Dict[str, Any]] = field(default_factory=list)
-    # When `legs.py` asked the hog to stop: the gateway is idle from then on.
-    teardown_t: Optional[float] = None
+    # From `legs.json`: each drained `job_end`, or the hog stop, to the next
+    # `job_start`, or to the end of the recording.
+    idle_spans: List[Tuple[float, float]] = field(default_factory=list)
+    # Labels of the hog events that applied no pressure (`_void_hog_events`).
+    void_hog_events: List[str] = field(default_factory=list)
+    # How far the wall clock stepped during the first job, the one jobs.json
+    # records, and that job's monotonic seconds, from `legs.json`.
+    clock_step: Optional[Tuple[float, float]] = None
+    # `legs.json`'s jobs that did not drain: each `job_end` outcome other
+    # than `drained`, and "no job_end" for a job the leg never saw end.
+    unfinished_jobs: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.vram_samples = [row for row in self.vramrec if row.get("kind") == "sample"]
@@ -238,26 +248,146 @@ class Context:
         self._hog_times = [row["t_wall"] for row in self.hog_samples]
         self.worker_re = re.compile(self.args.worker_pattern)
         self.worker_spawns = _worker_spawns(self.log)
-        self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
+        # A worker in a container logs its PID there, which vramrec records as
+        # `ns_pid` beside the host PID. A spawn takes the first such process
+        # to appear on a GPU after it.
         self._pid_first_seen: Optional[Dict[int, float]] = None
+        last: Dict[int, float] = {}
+        starts: Dict[int, List[Tuple[float, int]]] = {}
+        for sample in self.vram_samples:
+            for gpu in sample.get("gpus", []):
+                for proc in gpu.get("procs", []):
+                    pid, t_wall = proc["pid"], sample["t_wall"]
+                    if (proc.get("ns_pid") not in (None, pid)
+                            and t_wall - last.get(pid, -math.inf) > PID_REUSE_GAP_S):
+                        starts.setdefault(proc["ns_pid"], []).append((t_wall, pid))
+                    last[pid] = t_wall
+        for spawn in self.worker_spawns:
+            floor = spawn["t_wall"] - SPAWN_CLOCK_SLACK_S
+            spawn["pid"] = next((pid for t_wall, pid in starts.get(spawn["pid"], [])
+                                 if t_wall >= floor), spawn["pid"])
+        self.spawned_pids = {spawn["pid"] for spawn in self.worker_spawns}
+        self._release_windows: Dict[str, Tuple[List[Tuple[float, float, int, int]],
+                                               List[float], List[float]]] = {}
+        # Each worker PID spawned before a death line for its model, to the
+        # times of those lines.
+        self.death_t: Dict[int, List[float]] = {}
+        for event in self.log_matching("worker died fatally"):
+            for spawn in self.worker_spawns:
+                if (event["t_wall"] is not None and spawn["t_wall"] <= event["t_wall"]
+                        and spawn["model"] == str(event["fields"].get("model"))):
+                    self.death_t.setdefault(spawn["pid"], []).append(event["t_wall"])
+        self.vram_tolerance = self._join_tolerance(self._vram_times, self.vramrec)
+        self.hog_tolerance = self._join_tolerance(self._hog_times, self.hog)
+
+    def _join_tolerance(self, times: List[float],
+                        rows: List[Dict[str, Any]]) -> float:
+        """`--join-tolerance`, else twice the median gap between the
+        recorder's samples, else twice its header's `interval_s`, else 1.5 s."""
+        if getattr(self.args, "join_tolerance", None) is not None:
+            return self.args.join_tolerance
+        gaps = sorted(later - earlier for earlier, later in zip(times, times[1:]))
+        if gaps:
+            return 2.0 * gaps[len(gaps) // 2]
+        header = next((row for row in rows if row.get("kind") == "header"), {})
+        interval = header.get("interval_s")
+        if isinstance(interval, (int, float)) and interval > 0:
+            return 2.0 * interval
+        return 1.5
 
     def vram_at(self, t_wall: float) -> Optional[Dict[str, Any]]:
         return _nearest(self.vram_samples, self._vram_times, t_wall,
-                        self.args.join_tolerance)
+                        self.vram_tolerance)
 
     def vram_before(self, t_wall: float) -> Tuple[Optional[Dict[str, Any]],
                                                   Optional[Dict[str, Any]]]:
         """The latest oracle sample at or before `t_wall`, if it is at most
-        `--join-tolerance` old, and the sample after it."""
+        the join tolerance old, and the sample after it."""
         index = bisect.bisect_right(self._vram_times, t_wall)
-        if index == 0 or t_wall - self._vram_times[index - 1] > self.args.join_tolerance:
+        if index == 0 or t_wall - self._vram_times[index - 1] > self.vram_tolerance:
             return None, None
         after = self.vram_samples[index] if index < len(self.vram_samples) else None
         return self.vram_samples[index - 1], after
 
     def hog_at(self, t_wall: float) -> Optional[Dict[str, Any]]:
         return _nearest(self.hog_samples, self._hog_times, t_wall,
-                        self.args.join_tolerance)
+                        self.hog_tolerance)
+
+    def released_mb(self, uuid: str, start: float, end: float,
+                    readings: Tuple[float, ...]) -> int:
+        """MiB freed on this GPU that `used` may not have shown yet: another
+        process's release window meeting `[start, end]`, or one of our workers'
+        holding one of `readings`. The README's oracle_agreement row says how
+        long a window lasts."""
+        if uuid not in self._release_windows:
+            rows = [(sample["t_wall"], gpu) for sample in self.vram_samples
+                    for gpu in [self.oracle_gpu(sample, uuid)]
+                    if gpu is not None and gpu.get("used_mb") is not None
+                    and not gpu.get("error")]
+            unattributed = [_unattributed_mb(gpu) for _, gpu in rows]
+            windows = []
+            for index in range(1, len(rows)):
+                (t_before, before), (t_shown, shown) = rows[index - 1], rows[index]
+                now = {proc["pid"]: proc.get("used_mb")
+                       for proc in shown.get("procs") or []}
+                ours = others = 0
+                opened = t_before
+                unreadable = shown.get("unreadable_pids") or []
+                for proc in before.get("procs") or []:
+                    held, later = proc.get("used_mb"), now.get(proc["pid"], 0)
+                    # An unreadable PID's figure is unknown, not fallen.
+                    if (held is None or later is None or later >= held
+                            or proc["pid"] in unreadable):
+                        continue
+                    if self.is_ours(proc):
+                        ours += int(held) - int(later)
+                        if proc["pid"] not in now:
+                            opened = min([opened] + [
+                                died for died in self.death_t.get(proc["pid"], [])
+                                if died >= t_shown - WORKER_TEARDOWN_MAX_S])
+                    else:
+                        others += int(held) - int(later)
+                if ours + others <= 0:
+                    continue
+                end_t = t_shown + (ours + others) / 1024 * RELEASE_LAG_S_PER_GIB
+                level = unattributed[index - 1] + allowance_mb(shown.get("total_mb"))
+                cap = end_t + RELEASE_DRAIN_MAX_S
+                drained = cap
+                for later in range(index, len(rows)):
+                    if rows[later][0] >= cap:
+                        break
+                    if unattributed[later] <= level:
+                        drained = rows[later][0]
+                        break
+                windows.append((opened, max(end_t, drained), ours, others))
+            # Sorted by opening, with the latest close up to each window.
+            windows.sort()
+            self._release_windows[uuid] = (
+                windows, [window[0] for window in windows],
+                list(itertools.accumulate((window[1] for window in windows), max)))
+        windows, opens, reach = self._release_windows[uuid]
+        windows = windows[bisect.bisect_left(reach, min(start, *readings)):
+                          bisect.bisect_left(opens, max(end, *readings))]
+        return sum(others for opened, closed, _, others in windows
+                   if opened < end and closed >= start) + sum(
+            ours for opened, closed, ours, _ in windows
+            if any(opened < t <= closed for t in readings))
+
+    def hog_moved_mb(self, uuid: str, readings: Tuple[float, float]) -> int:
+        """How far what hog.py held on this GPU may have changed between the
+        two reading times, each bounded by the hog rows either side of it."""
+        header = next((row for row in self.hog if row.get("kind") == "header"), {})
+        if header.get("target", "gpu") != "gpu" or header.get("gpu_uuid") != uuid:
+            return 0
+
+        def held_near(t: float) -> List[int]:
+            """`held_mb` from the last hog row before `t` to the first after it."""
+            rows = self.hog_samples[max(0, bisect.bisect_left(self._hog_times, t) - 1):
+                                    bisect.bisect_right(self._hog_times, t) + 1]
+            return [row.get("held_mb") or 0 for row in rows]
+
+        first, second = held_near(readings[0]), held_near(readings[1])
+        return max((abs(a - b) for a in first for b in second), default=0)
 
     def oracle_gpu(self, sample: Dict[str, Any], uuid: str) -> Optional[Dict[str, Any]]:
         for gpu in sample.get("gpus", []):
@@ -420,6 +550,8 @@ DEPARTED_REPLICA = "credited a departed replica's footprint"
 # One INFO per window settled as an OOM negative, carrying `source`, `trust`,
 # `exception`, `free_mb_at_failure`, `grant_mb`, `oom_samples`; prefix match.
 OOM_TIER_LINE = "classified this window as an out-of-memory negative"
+# DEBUG, carrying `deflation` after a repayment for elapsed time; prefix match.
+DEFLATION_REPAID_LINE = "repaid deflation by elapsed time"
 
 # A pid absent this long and then back is read as a different process.
 PID_REUSE_GAP_S = 60.0
@@ -529,6 +661,28 @@ def _pid_mb(gpu: Dict[str, Any], pid: int) -> Optional[int]:
     return None
 
 
+def _unattributed_mb(gpu: Dict[str, Any]) -> int:
+    """`used` less every process the oracle lists on this GPU."""
+    return int(gpu["used_mb"]) - sum(int(proc.get("used_mb") or 0)
+                                     for proc in gpu.get("procs") or [])
+
+
+def allowance_mb(total_mb: Any) -> float:
+    """How far `external_mb` and the oracle may disagree: 1 GiB or 2 %."""
+    return max(1024.0, 0.02 * int(total_mb or 0))
+
+
+#: How late amdgpu's `used` shows a free, per GiB freed: about 12 ms on
+#: gfx1030 and 40 ms on an MI100. The per-process figure falls at once, so in
+#: between `used` less our workers counts freed memory as another process's.
+RELEASE_LAG_S_PER_GIB = 0.040
+#: How long past that bound `used` may still be draining.
+RELEASE_DRAIN_MAX_S = 2.0
+#: How long a dead worker's PID may stay listed after its death line.
+WORKER_TEARDOWN_MAX_S = 10.0
+#: The ledger's EXTERNAL_SAMPLE_MAX_AGE: an older reading is due a refresh.
+LEDGER_READ_MAX_AGE_S = 10.0
+
 # How long a hog must hold, and how much, before `external_mb` not moving at
 # all is a fault rather than staleness. See the README's "Checks, one by one".
 HOG_STALL_SECONDS = 60.0
@@ -562,21 +716,25 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
     working batch size beside it: one source for `ramp_progress` and
     `calibration_learned`, so they agree.
 
-    The working size is read here because a budget can be *deliberately* low:
-    it is the smallest size whose rate is within 5 % of the best a trial
-    measured, and a worker at it tries the sizes next to it every so often.
-    Without it those samples look exactly like a batch size that never left
-    the seed.
-
     Only a working size `/health` marks `knee_is_local` counts: a trial on
     this machine measured the sizes next to it and moved to it or left it in
-    place. The size
-    a replica merely opened at, or one seeded from a shipped profile, is "not
-    measured yet", which is a leg that learned nothing.
+    place. The size a replica merely opened at, or one seeded from a shipped
+    profile, is "not measured yet". A worker is a model on one GPU, and a
+    model's size is `measured` when one of its workers has a local size that
+    moved, turned local after the worker's first sample (a local size the
+    first sample already carried was resumed from this machine's store), or
+    has an `a batch size trial is over` line for its model and GPU. That
+    line alone is not enough: a failed or put-off trial logs it too and
+    places no size.
     """
     series: Dict[str, List[int]] = {}
     fits: Dict[str, int] = {}
     knees: Dict[str, Dict[str, int]] = {}
+    trials = {(str(event["fields"].get("model")), event["fields"].get("gpu"))
+              for event in ctx.log_events("a batch size trial is over")}
+    # Per worker: whether its first sample carried a local size, its last
+    # local size, and whether this leg measured it.
+    workers: Dict[Tuple[str, Any], Dict[str, int]] = {}
     for sample in ctx.health_samples:
         for worker in (sample.get("health") or {}).get("workers") or []:
             key = worker["inference_id"]
@@ -584,31 +742,36 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
             series.setdefault(key, []).append(budget)
             if worker.get("fit_samples"):
                 fits[key] = max(fits.get(key, 0), int(worker["fit_samples"]))
-            row = knees.setdefault(key, {"knee": 0, "knee_first": 0,
-                                         "knee_moves": 0, "_last": 0})
             knee = (int(worker.get("knee_units") or 0)
                     if worker.get("knee_is_local") else 0)
+            row = knees.setdefault(key, {"knee": 0, "knee_first": 0,
+                                         "knee_moves": 0, "measured": 0})
+            gpu = worker.get("gpu_uuid")
+            seen = workers.setdefault(
+                (key, gpu), {"from_start": int(knee > 0), "last": 0,
+                             "measured": int((key, gpu) in trials)})
             if knee:
                 if not row["knee_first"]:
                     row["knee_first"] = knee
                 # A later trial moved it, up or down.
-                if knee != row["_last"] and row["_last"]:
+                if knee != seen["last"] and seen["last"]:
                     row["knee_moves"] += 1
+                    seen["measured"] = 1
+                if not seen["from_start"]:
+                    seen["measured"] = 1
                 row["knee"] = max(row["knee"], knee)
-                row["_last"] = knee
-    for row in knees.values():
-        row.pop("_last", None)
+                seen["last"] = knee
+                row["measured"] |= seen["measured"]
     return series, fits, knees
 
 
 def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
+    """`_budget_series` per model."""
     series, fits, knees = _budget_series(ctx)
     return {
         model: {"first": values[0], "peak": max(values), "last": values[-1],
                 "low": min(values), "fit_samples": fits.get(model, 0),
-                "knee": knees.get(model, {}).get("knee", 0),
-                "knee_first": knees.get(model, {}).get("knee_first", 0),
-                "knee_moves": knees.get(model, {}).get("knee_moves", 0)}
+                **knees[model]}
         for model, values in series.items()
     }
 
@@ -617,7 +780,7 @@ def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
 
 
 #: Oracle sources that price no process **by construction**, as opposed to a
-#: board that happens to be idle. `"mps-ram"` is macOS: there is no
+#: GPU that happens to be idle. `"mps-ram"` is macOS: there is no
 #: per-process GPU counter on Apple Silicon at all, so every figure in the row
 #: is host RAM and the only GPU-side self-report is the worker's own
 #: `driver_allocated` in `/health` (`vramrec.py`, "The macOS oracle").
@@ -637,11 +800,11 @@ def oracle_prices_pids(gpu: Dict[str, Any],
     process -- every `used_mb` is null, `oracle_source` is "none" (or
     "nvidia-smi" in a recording predating the rule that a null fill is not a
     fill) with nothing behind it, and a check that subtracts "ours" from the
-    GPU total would report our own workers' VRAM as the disagreement. A board
+    GPU total would report our own workers' VRAM as the disagreement. A GPU
     holding nothing counts as priced: there is no attribution to miss.
 
     A source that prices nothing by construction is judged before that
-    idle-board shortcut: on MPS an idle device is not an absence of
+    idle-GPU shortcut: on MPS an idle device is not an absence of
     attribution to miss, it is a platform with none to have.
 
     On ROCm the row is priced unless a PID whose descriptors could not be read
@@ -663,7 +826,13 @@ def _source_counts(sources: Dict[str, int]) -> str:
 
 
 def check_oracle_agreement(ctx: Context) -> Verdict:
-    """`external_mb` vs (GPU used - our workers' NVML usage): +/-1 GiB or 2%."""
+    """`external_mb` vs (GPU used - our workers' NVML usage): +/-1 GiB or 2%.
+
+    Skipped from a drained `job_end` (or the hog stop) to the next
+    `job_start`; where GPU used moved past the allowance, or by
+    an unknown amount, during the per-process scan, where the ledger's free
+    reading is over 10 s old, or while a release or hog move larger than the
+    allowance lies between that reading and the oracle sample."""
     if not ctx.health_samples or not ctx.vram_samples:
         return Verdict("oracle_agreement", "SKIP",
                        "needs both healthrec.jsonl and vramrec.jsonl")
@@ -674,15 +843,20 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     unpriced = 0
     unpriced_sources: Dict[str, int] = {}
     per_gpu: Dict[str, float] = {}
-    teardown = 0
+    idle = 0
+    skewed = 0
+    stale = 0
+    releasing = 0
+    hog_moving = 0
+    # Of those two, skipped only because the ledger read before both samples.
+    read_age = 0
+    read_age_worst = 0
     for sample in ctx.health_samples:
         health = sample.get("health") or {}
         if not health.get("ok"):
             continue
-        # Once the hog is stopped the idle gateway keeps its last external
-        # figure until something asks it to refresh: not a disagreement.
-        if ctx.teardown_t is not None and sample["t_wall"] >= ctx.teardown_t:
-            teardown += 1
+        if any(start <= sample["t_wall"] < end for start, end in ctx.idle_spans):
+            idle += 1
             continue
         vram = ctx.vram_at(sample["t_wall"])
         if vram is None:
@@ -704,11 +878,42 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                 source = str(oracle.get("oracle_source"))
                 unpriced_sources[source] = unpriced_sources.get(source, 0) + 1
                 continue
+            allowance = allowance_mb(gpu.get("total_mb") or oracle.get("total_mb"))
+            # `used` moved by up to `skew_mb` while the processes were read:
+            # past the allowance, or unknown, the sample is skipped; below it
+            # the true difference is at least the measured one less the skew.
+            skew = oracle.get("skew_mb", 0)
+            if skew is None or skew > allowance:
+                skewed += 1
+                continue
             ours, _ = ctx.our_pids_mb(oracle)
             oracle_external = max(0, int(oracle["used_mb"]) - ours)
-            delta = abs(int(gpu.get("external_mb") or 0) - oracle_external)
-            total = int(gpu.get("total_mb") or oracle.get("total_mb") or 0)
-            allowance = max(1024.0, 0.02 * total)
+            raw = abs(int(gpu.get("external_mb") or 0) - oracle_external)
+            # A reading this old is due a refresh; grant_safety judges any grant
+            # priced from it.
+            age = (gpu.get("external_sample_age_ms") or 0) / 1000.0
+            if age > LEDGER_READ_MAX_AGE_S:
+                stale += 1
+                continue
+            # From the ledger's free reading, or the earlier sample, to the later one.
+            read_t = sample["t_wall"] - age
+            first = min(sample["t_wall"], vram["t_wall"])
+            last = max(sample["t_wall"], vram["t_wall"])
+            released = ctx.released_mb(uuid, min(read_t, first), last,
+                                       (vram["t_wall"], read_t))
+            moved = ctx.hog_moved_mb(uuid, (read_t, vram["t_wall"]))
+            if max(released, moved) > allowance:
+                if released > allowance:
+                    releasing += 1
+                else:
+                    hog_moving += 1
+                if read_t < first and max(
+                        ctx.released_mb(uuid, first, last, (vram["t_wall"], first)),
+                        ctx.hog_moved_mb(uuid, (first, last))) <= allowance:
+                    read_age += 1
+                    read_age_worst = max(read_age_worst, raw)
+                continue
+            delta = max(0, raw - max(skew, released, moved))
             joined += 1
             per_gpu[uuid] = max(per_gpu.get(uuid, 0.0), float(delta))
             if delta > worst:
@@ -719,10 +924,25 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                     "oracle_external_mb": oracle_external,
                     "gpu_used_mb": oracle.get("used_mb"),
                     "our_pids_mb": ours,
+                    "skew_mb": skew, "released_mb": released,
+                    "hog_moved_mb": moved,
                     "allowance_mb": round(allowance),
                 }
             if delta > allowance:
                 breaches += 1
+    skipped = "".join(
+        f"; {count} GPU-samples {why} were skipped" for count, why in (
+            (skewed, "read while GPU used moved past the allowance, "
+                     "or by an unknown amount"),
+            (stale, f"whose ledger free reading was over "
+                    f"{LEDGER_READ_MAX_AGE_S:.0f} s old"),
+            (releasing, "read while a release was still leaving GPU used"),
+            (hog_moving, "read while the hog moved")) if count) + (
+        f" ({read_age} of them only because the ledger read free before both "
+        f"samples; worst difference {read_age_worst} MiB)" if read_age else "")
+    excluded = {"idle_samples": idle, "skewed_samples": skewed, "stale_samples": stale,
+                "releasing_samples": releasing, "hog_moving_samples": hog_moving,
+                "read_age_samples": read_age, "read_age_worst_mb": read_age_worst}
     if joined == 0 and unpriced:
         return Verdict(
             "oracle_agreement", "SKIP",
@@ -731,13 +951,16 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             "no per-process attribution to check `external_mb` against -- "
             "the WDDM signature (or MPS, which has no per-process GPU "
             "counter at all, or ROCm with a worker whose descriptors the "
-            "oracle could not read), not a disagreement",
+            "oracle could not read), not a disagreement" + skipped,
             {"joined": 0, "unpriced_samples": unpriced,
-             "oracle_sources": unpriced_sources})
+             "oracle_sources": unpriced_sources, **excluded})
     if joined == 0:
         return Verdict("oracle_agreement", "SKIP",
-                       "no health sample could be joined to a vramrec sample "
-                       f"within {ctx.args.join_tolerance}s")
+                       ("every joined GPU-sample was skipped"
+                        if idle + skewed + stale + releasing + hog_moving else
+                        "no health sample could be joined to a vramrec sample "
+                        f"within {ctx.vram_tolerance:.2f}s") + skipped,
+                       {"joined": 0, **excluded})
     verdict = "PASS" if breaches == 0 else "FAIL"
     return Verdict(
         "oracle_agreement", verdict,
@@ -745,10 +968,11 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
         f"GPU-samples; {breaches} outside the allowance"
         + (f"; {unpriced} further samples priced no PID and were skipped"
            if unpriced else "")
-        + (f"; {teardown} health samples after the hog stop were not joined"
-           if teardown else ""),
+        + (f"; {idle} health samples from a drained job_end (or the hog stop)"
+           " to the next job_start were not joined" if idle else "")
+        + skipped,
         {"joined": joined, "breaches": breaches, "worst_mb": worst,
-         "unpriced_samples": unpriced, "teardown_samples": teardown,
+         "unpriced_samples": unpriced, **excluded,
          "per_gpu_worst_mb": per_gpu, "worst_sample": worst_row},
     )
 
@@ -1213,29 +1437,39 @@ def _released_mb(before: Dict[str, Any], after: Dict[str, Any],
                  requester: Set[int]) -> int:
     """Memory freed on a GPU between two oracle rows by processes that are
     neither the requester nor gone by the later row: the fall in `used`, less
-    what vanished processes held, plus the requester's own change. A worker
-    the grant killed, or the requester emptying its cache after an
-    out-of-memory error, is a consequence of the grant, never a release."""
+    what vanished processes held and both rows' `skew_mb` (how far `used`
+    moved while the processes were read), plus the requester's own change.
+    A row whose `skew_mb` is unknown proves no release. A worker the grant
+    killed, or the requester emptying its cache after an out-of-memory error,
+    is a consequence of the grant, never a release."""
+    if None in (before.get("skew_mb", 0), after.get("skew_mb", 0)):
+        return 0
     held = {proc["pid"]: int(proc.get("used_mb") or 0)
             for proc in before.get("procs") or []}
     now = {proc["pid"]: int(proc.get("used_mb") or 0)
            for proc in after.get("procs") or []}
     released = int(before["used_mb"]) - int(after["used_mb"])
     released -= sum(mb for pid, mb in held.items() if pid not in now)
+    released -= int(before.get("skew_mb", 0)) + int(after.get("skew_mb", 0))
     released += sum(now[pid] - held.get(pid, 0)
                     for pid in requester if pid in now)
     return released
 
 
-def _requester_pids(ctx: Context, model: Any,
-                    rows: List[Dict[str, Any]]) -> Set[int]:
-    """Our worker PIDs in `rows` that may have asked for this grant: those
-    spawned as `model`, else every one of ours when the log ties none to it."""
+def _requesters(ctx: Context, model: Any,
+                rows: List[Dict[str, Any]]) -> List[Set[int]]:
+    """The PIDs in `rows` that may have asked for this grant: ours spawned as
+    `model` when one is on the GPU; else, one choice each, none of them or
+    any one of ours that no spawn line ties to another model."""
     ours = {proc["pid"] for row in rows for proc in row.get("procs") or []
             if ctx.is_ours(proc)}
     named = {spawn["pid"] for spawn in ctx.worker_spawns
              if spawn["model"] == str(model)}
-    return (named & ours) or ours
+    if named & ours:
+        return [named & ours]
+    other = {spawn["pid"] for spawn in ctx.worker_spawns
+             if spawn["model"] and spawn["model"] != str(model)}
+    return [set()] + [{pid} for pid in sorted(ours - other)]
 
 
 def check_grant_safety(ctx: Context) -> Verdict:
@@ -1245,7 +1479,9 @@ def check_grant_safety(ctx: Context) -> Verdict:
     latest `vramrec.jsonl` sample at or before it and asks whether it exceeded
     the GPU's *live* free memory. Over it is a FAIL, or a WARN when the next
     sample shows a release by other processes that covers the shortfall: the
-    release may have come first, and the recording cannot say.
+    release may have come first, and the recording cannot say. Without the
+    model's spawned PID on the GPU the release is computed for each possible
+    requester, and covered under some but not all is a WARN too.
     Without that file the check reports WARN, never PASS -- the priced-headroom
     clause alone only re-checks the ledger's arithmetic against itself.
     """
@@ -1257,6 +1493,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
     over_headroom = []
     over_free = []
     covered = []
+    without_spawn_line = []
     joined = 0
     undecided = 0
     on_cpu = 0
@@ -1293,28 +1530,34 @@ def check_grant_safety(ctx: Context) -> Verdict:
                "model": fields.get("model")}
         nxt = (ctx.oracle_gpu(after, fields.get("gpu"))
                if after and after["t_wall"] - event["t_wall"]
-               <= ctx.args.join_tolerance else None)
+               <= ctx.vram_tolerance else None)
         if (nxt and nxt.get("used_mb") is not None
                 and oracle.get("used_mb") is not None):
-            released = _released_mb(oracle, nxt, _requester_pids(
-                ctx, fields.get("model"), [oracle, nxt]))
-            if released >= shortfall:
-                covered.append({**row, "released_mb": released})
+            released = [_released_mb(oracle, nxt, pids) for pids in _requesters(
+                ctx, fields.get("model"), [oracle, nxt])]
+            if min(released) >= shortfall:
+                covered.append({**row, "released_mb": min(released)})
                 continue
+            if max(released) >= shortfall:
+                without_spawn_line.append({**row, "released_mb": max(released)})
+                continue
+            row["released_mb"] = max(released)
         over_free.append(row)
     zero_mb = sum(1 for event in grants if event["fields"].get("mb") == 0)
+    no_next = sum(1 for row in over_free if "released_mb" not in row)
     if over_headroom or over_free:
         verdict = "FAIL"
-    elif joined == 0 or covered or undecided:
+    elif joined == 0 or covered or without_spawn_line or undecided:
         # A grant the oracle could not clear keeps the leg from PASS.
         verdict = "WARN"
     else:
         verdict = "PASS"
     detail = (f"{len(grants)} grants; {len(over_headroom)} exceeded the headroom "
               f"they were priced against; {len(over_free)} exceeded the oracle's "
-              f"live free memory plus their own pool ({joined} judged, "
-              f"{undecided} not decidable: no oracle sample shortly before; "
-              f"{on_cpu} on the CPU device, which the oracle does not record); "
+              f"live free memory plus their own pool ({no_next} with no usable "
+              f"next sample within {ctx.vram_tolerance:.2f}s to show a release; "
+              f"{joined} judged, {undecided} not decidable: no oracle sample "
+              f"shortly before; {on_cpu} on the CPU device, which the oracle does not record); "
               f"{zero_mb} were memory-blind (mb=0)")
     if covered:
         detail += (f"  -- {len(covered)} exceeded the free memory seen before "
@@ -1325,6 +1568,13 @@ def check_grant_safety(ctx: Context) -> Verdict:
                                f"{row['own_pool_mb']:.0f} pool, "
                                f"{row['released_mb']} released"
                                for row in covered[:10]))
+    if without_spawn_line:
+        models = sorted({str(row["model"]) for row in without_spawn_line})
+        detail += (f"  -- {len(without_spawn_line)} are covered by the release "
+                   "for some of the workers that may have asked for them and "
+                   "not for others: no `spawned an inferio worker` line names "
+                   f"{', '.join(models)} (RUST_LOG=info,panoptikon::inferio=trace), "
+                   "or the PID it names is not among the GPU's processes")
     if joined == 0:
         detail += ("  -- ORACLE CLAUSE NOT RUN: "
                    + ("no vramrec.jsonl in the scenario (record it with "
@@ -1332,13 +1582,15 @@ def check_grant_safety(ctx: Context) -> Verdict:
                       "safety)"
                       if not ctx.vram_samples else
                       f"no grant was decidable against a vramrec sample at "
-                      f"or before it, within {ctx.args.join_tolerance}s")
+                      f"or before it, within {ctx.vram_tolerance:.2f}s")
                    + ". Only the ledger's own arithmetic was verified")
     return Verdict(
         "grant_safety", verdict, detail,
         {"grants": len(grants), "over_headroom": over_headroom[:10],
          "over_free": over_free[:10], "covered_by_release": covered[:10],
+         "covered_without_spawn_line": without_spawn_line[:10],
          "zero_mb_grants": zero_mb, "joined": joined, "undecided": undecided,
+         "no_next_sample": no_next,
          "cpu_grants": on_cpu, "vramrec_samples": len(ctx.vram_samples),
          "oracle_clause_ran": joined > 0},
     )
@@ -1347,8 +1599,12 @@ def check_grant_safety(ctx: Context) -> Verdict:
 def check_failures(ctx: Context) -> Verdict:
     """OOM negatives, worker deaths and merged-window fallbacks in the log.
 
-    Where the log names the tier that classified each negative, it is tallied
-    as `source/trust`; a recording predating that line carries none, and the
+    Counts within `--expect-ooms` / `--expect-deaths` PASS; a declared
+    count with none seen FAILs, as the fault never fired. A model the ledger
+    never granted memory settles no window, so a log at DEBUG with no grant
+    line holds it to no OOM floor (a `_cpu` fixture on a GPU host). Where the
+    log names the tier that classified each negative, it is tallied as
+    `source/trust`; a recording predating that line carries none, and the
     clause is then omitted rather than reported empty."""
     if not ctx.log:
         return Verdict("failures", "SKIP", "no panoptikon.log")
@@ -1383,16 +1639,25 @@ def check_failures(ctx: Context) -> Verdict:
             tier_clause += f", {unnamed} unnamed"
     expected_ooms = ctx.args.expect_ooms
     expected_deaths = ctx.args.expect_deaths
-    bad = ooms > expected_ooms or deaths > expected_deaths
-    verdict = "FAIL" if bad else ("WARN" if (ooms or deaths) else "PASS")
+    debug = any(event["level"] in ("DEBUG", "TRACE")
+                and event["target"].startswith("panoptikon::inferio")
+                for event in ctx.log)
+    priced = bool(ctx.log_events("issued a memory grant")) or not debug
+    unfired = ((priced and expected_ooms and not ooms)
+               or (expected_deaths and not deaths))
+    bad = ooms > expected_ooms or deaths > expected_deaths or unfired
+
+    def expected(count: int, floor: bool) -> str:
+        return f"expected {int(floor)}..{count}" if count else "expected 0"
+
     return Verdict(
-        "failures", verdict,
-        f"{ooms} OOM negatives (expected <= {expected_ooms}), "
+        "failures", "FAIL" if bad else "PASS",
+        f"{ooms} OOM negatives ({expected(expected_ooms, priced)}), "
         f"{collapses} throughput-collapse negatives, "
         f"{unified_deaths} unified-memory-device death negatives, "
-        f"{deaths} fatal worker deaths (expected <= {expected_deaths}), "
+        f"{deaths} fatal worker deaths ({expected(expected_deaths, True)}), "
         f"{len(fallbacks)} merged-window fallbacks ({oom_fallbacks} OOM)"
-        f"{tier_clause}",
+        f"{tier_clause}" + ("; declared, none seen" if unfired else ""),
         {"negative_reasons": reasons, "worker_deaths": deaths,
          "fallbacks": len(fallbacks), "oom_fallbacks": oom_fallbacks,
          **({"oom_tiers": tiers} if tiers else {}),
@@ -1400,36 +1665,155 @@ def check_failures(ctx: Context) -> Verdict:
     )
 
 
+#: Consecutive clean windows that repay one level of deflation (the ledger's
+#: `CLEAN_WINDOWS_TO_RESTORE`).
+CLEAN_WINDOWS_TO_RESTORE = 3
+
+#: Seconds since a worker's last negative that repay one level of deflation
+#: on a `/health` read (the ledger's `DEFLATION_REPAY_SECS`).
+DEFLATION_REPAY_S = 30
+
+#: A settle line is logged after the ledger lock drops, so it can be stamped
+#: after a health read that already saw its level.
+SETTLE_LOG_SLACK_S = 2.0
+
+
 def check_deflation_recovery(ctx: Context) -> Verdict:
-    """Deflation must return to 0 within 3 clean windows per level."""
-    if not ctx.health_samples:
-        return Verdict("deflation_recovery", "SKIP", "no healthrec.jsonl")
-    peak: Dict[str, int] = {}
-    last: Dict[str, int] = {}
-    series: Dict[str, List[Tuple[float, int]]] = {}
-    for sample in ctx.health_samples:
+    """Deflation must be repaid: one level per `CLEAN_WINDOWS_TO_RESTORE`
+    consecutive clean windows, or one by elapsed time on a `/health` read.
+
+    Read from the log when it holds any DEBUG ledger line: the settle and
+    time-repay lines carry the worker's `deflation`. Otherwise `/health`
+    samples stand in, and only the end state is judged. A worker that died
+    restarts at 0, as its replacement registers undeflated without a line.
+    A worker that left keeps its last value.
+
+    FAIL: a level outlasted `CLEAN_WINDOWS_TO_RESTORE` clean windows, or a
+    worker is still deflated in a health sample read `DEFLATION_REPAY_S` per
+    level after the negative that set it (the latest due time on the model
+    and GPU): time alone repays it by then. WARN: still deflated when the
+    recording ended. `--expect-deflated` declares a model that OOMs on every
+    batch: ending deflated is then its result, and never deflating FAILs."""
+    settle = "settled a granted window"
+    from_log = any(event["level"] == "DEBUG"
+                   and event["target"].startswith("panoptikon::inferio::ledger")
+                   for event in ctx.log)
+    # Per worker: peak and final deflation, consecutive clean windows at the
+    # final level, and the highest level that outlasted
+    # CLEAN_WINDOWS_TO_RESTORE. The window that repays a level is logged at
+    # the new level and does not count toward it. A time repay restarts the
+    # count, because its line is logged inside the ledger lock and can print
+    # ahead of the settle line of a window that settled first. Any change of
+    # level restarts it too: two replicas of a model on one GPU share a key.
+    rows: Dict[str, Dict[str, int]] = {}
+    for event in ctx.log if from_log else []:
+        fields = event["fields"]
+        if "deflation" not in fields or not (
+                event["message"] == settle
+                or event["message"].startswith(DEFLATION_REPAID_LINE)):
+            continue
+        row = rows.setdefault(f"{fields.get('model')}@{fields.get('gpu')}",
+                              {"peak": 0, "final": 0, "clean": 0, "held": 0})
+        value, outcome = int(fields["deflation"]), fields.get("outcome")
+        row["peak"] = max(row["peak"], value)
+        if outcome == "aborted":
+            continue  # it leaves the clean count as it was
+        if outcome == "worker_died":
+            value = 0
+        if outcome == "clean":
+            row["clean"] = 0 if value != row["final"] else row["clean"] + 1
+        else:
+            row["clean"] = 0
+        row["final"] = value
+        if value and row["clean"] >= CLEAN_WINDOWS_TO_RESTORE:
+            row["held"] = max(row["held"], value)
+    source = "log" if rows else "healthrec"
+    for sample in ctx.health_samples if not rows else []:
+        for worker in (sample.get("health") or {}).get("workers") or []:
+            row = rows.setdefault(
+                f"{worker['inference_id']}@{worker.get('gpu_uuid')}",
+                {"peak": 0, "final": 0, "clean": 0, "held": 0})
+            row["final"] = int(worker.get("deflation") or 0)
+            row["peak"] = max(row["peak"], row["final"])
+    if not rows:
+        return Verdict("deflation_recovery", "SKIP",
+                       "no ledger DEBUG line and no worker in any health "
+                       "sample")
+    declared = bool(getattr(ctx.args, "expect_deflated", False))
+    peak = max(row["peak"] for row in rows.values())
+    held = {key: row["held"] for key, row in rows.items() if row["held"]}
+    stuck = {key: row for key, row in rows.items() if row["final"] > 0}
+    # A settle line with a `reason` (a negative, or a death on a unified-
+    # memory device) restarts the repay clock, and each /health read repays
+    # one level per whole DEFLATION_REPAY_S since it: by time alone, the
+    # levels it left are repaid by `t + level * DEFLATION_REPAY_S`. Replicas
+    # share a key, so a key is due at the latest of those due times.
+    # healthrec reads one sample at a time and stamps it after the read, so
+    # the read behind a sample came after the previous sample's stamp.
+    restarts: Dict[str, List[Tuple[float, float]]] = {}
+    for event in ctx.log_events(settle):
+        fields = event["fields"]
+        if ("reason" in fields and "deflation" in fields
+                and event["t_wall"] is not None):
+            restarts.setdefault(f"{fields.get('model')}@{fields.get('gpu')}",
+                                []).append((event["t_wall"], event["t_wall"]
+                                            + int(fields["deflation"])
+                                            * DEFLATION_REPAY_S))
+
+    def listed(sample: Dict[str, Any]) -> Dict[str, int]:
+        """Each key's highest level in this sample."""
+        levels: Dict[str, int] = {}
         for worker in (sample.get("health") or {}).get("workers") or []:
             key = f"{worker['inference_id']}@{worker.get('gpu_uuid')}"
-            value = int(worker.get("deflation") or 0)
-            peak[key] = max(peak.get(key, 0), value)
-            last[key] = value
-            series.setdefault(key, []).append((sample["t_wall"], value))
-    if not peak:
-        return Verdict("deflation_recovery", "SKIP", "no workers in any health sample")
-    cutoff = ctx.idle_cutoff()
-    stuck = {key: value for key, value in last.items() if value > 0}
-    max_peak = max(peak.values())
-    if max_peak == 0:
-        return Verdict("deflation_recovery", "PASS",
-                       "deflation never left 0 on any worker",
-                       {"peak": peak})
-    verdict = "PASS" if not stuck else "FAIL"
+            levels[key] = max(levels.get(key, 0),
+                              int(worker.get("deflation") or 0))
+        return levels
+
+    unrepaid: Dict[str, float] = {}
+    for previous, sample in zip(ctx.health_samples, ctx.health_samples[1:]):
+        before = listed(previous)
+        for key, level in listed(sample).items():
+            # The read behind a sample that lists a higher level saw it, so
+            # the negative that set it was noted before the sample's stamp.
+            if key in restarts and level > before.get(key, level):
+                restarts[key].append((sample["t_wall"], sample["t_wall"]
+                                      + level * DEFLATION_REPAY_S))
+            due = max((repaid for logged, repaid in restarts.get(key, [])
+                       if logged <= sample["t_wall"] + SETTLE_LOG_SLACK_S),
+                      default=math.inf)
+            if not declared and level and previous["t_wall"] >= due:
+                unrepaid[key] = max(unrepaid.get(key, 0.0),
+                                    round(previous["t_wall"] - due, 1))
+    if held or unrepaid or (declared and not peak):
+        verdict = "FAIL"
+    else:
+        verdict = "WARN" if stuck and not declared else "PASS"
+    detail = (
+        f"from the {source}: peak deflation {peak} ("
+        + ", ".join(f"{key}={row['peak']}" for key, row in rows.items()) + ")"
+        + "".join(f"; {key} held {level} through {CLEAN_WINDOWS_TO_RESTORE} "
+                  f"clean windows" for key, level in held.items())
+        + "".join(f"; {key} still deflated {late} s after time alone "
+                  f"repays it" for key, late in unrepaid.items())
+        + f"; at the end {len(stuck)} worker(s) still deflated"
+        + "".join(f"; {key} at {row['final']}"
+                  + (f" after {row['clean']} clean window(s) at that level"
+                     if source == "log" else "")
+                  for key, row in stuck.items()))
+    if declared:
+        detail += (" (declared: --expect-deflated)" if peak else
+                   "; declared --expect-deflated, but it never deflated")
+    elif verdict == "WARN":
+        detail += ": the recording ended before recovery"
     return Verdict(
-        "deflation_recovery", verdict,
-        f"peak deflation {max_peak} ({', '.join(f'{k}={v}' for k, v in peak.items())}); "
-        f"at the end of the recording {len(stuck)} worker(s) were still deflated"
-        + (f" ({stuck})" if stuck else ""),
-        {"peak": peak, "final": last, "idle_cutoff": cutoff},
+        "deflation_recovery", verdict, detail,
+        {"source": source, "declared": declared, "held": held,
+         "unrepaid_s": unrepaid,
+         "peak": {key: row["peak"] for key, row in rows.items()},
+         "final": {key: row["final"] for key, row in rows.items()},
+         "clean_windows_at_level": ({key: row["clean"]
+                                     for key, row in rows.items()}
+                                    if source == "log" else None)},
     )
 
 
@@ -1476,18 +1860,24 @@ def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
     size trial is over` lines with `moved=false`, the `knee_units` of every
     `/health` sample marked `knee_is_local` (the only one a leg that *resumed*
     a stored size has), and the local store's own `knee_units`, which is
-    written only for a size a trial placed. The rung is the settle lines'
-    `max_units_measured` -- the largest batch that ran -- with the store's
-    copy of that field as the fallback.
+    written only for a size a trial placed. The largest trial size is the
+    largest size this leg's trials ran (`largest_units`); the settle lines'
+    `max_units_measured` is the anchor, which a seeded or stored profile
+    raises, so it is not read.
     """
     rows: Dict[str, Dict[str, int]] = {}
 
     def row(model: str) -> Dict[str, int]:
-        return rows.setdefault(model, {"knee": 0, "knee_named": 0, "rung": 0})
+        return rows.setdefault(model, {"knee": 0, "knee_named": 0,
+                                       "largest_trial": 0})
 
+    ran: Dict[str, int] = {}
     for event in ctx.log_matching("a batch size trial is over"):
         fields = event["fields"]
         model, knee = fields.get("model"), fields.get("units")
+        largest = fields.get("largest_units")
+        if model is not None and isinstance(largest, (int, float)):
+            ran[str(model)] = max(ran.get(str(model), 0), int(largest))
         if (model is None or not isinstance(knee, (int, float))
                 or fields.get("moved") not in (False, "false")):
             continue
@@ -1500,23 +1890,50 @@ def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
             row(model)["knee"] = max(row(model)["knee"], knee_row["knee"])
     for profile in (ctx.after or {}).get("profile") or []:
         model = str(profile.get("inference_id"))
-        knee, rung = profile.get("knee_units"), profile.get("max_units_measured")
+        knee = profile.get("knee_units")
         if isinstance(knee, (int, float)) and knee:
             entry = row(model)
             entry["knee"] = max(entry["knee"], int(knee))
             # The store's figure is the size the leg ended on, so it is the
             # one the detail names when the trial lines disagree.
             entry["knee_named"] = int(knee)
-        if isinstance(rung, (int, float)) and model in rows:
-            rows[model]["rung"] = int(rung)
-    for event in ctx.log_events("settled a granted window"):
-        fields = event["fields"]
-        model, rung = fields.get("model"), fields.get("max_units_measured")
-        if model is None or not isinstance(rung, (int, float)):
-            continue
-        if str(model) in rows:
-            rows[str(model)]["rung"] = max(rows[str(model)]["rung"], int(rung))
+    for model, entry in rows.items():
+        entry["largest_trial"] = ran.get(model, 0)
     return {model: entry for model, entry in rows.items() if entry["knee"]}
+
+
+#: The orchestrator's device key for the single unified device (`mps.rs`).
+MPS_DEVICE_KEY = "GPU-MPS"
+
+
+def _hog_least_held_mb(ctx: Context,
+                       grants: List[Tuple[float, Any]]) -> int:
+    """The least MiB hog.py held on the GPU of `grants` (`(t_wall, gpu)`)
+    from the first to the last of them, with its GPU context; 0 when they ran
+    on more than one GPU or on one the hog did not fill. A host-RAM hog fills
+    a unified device (vramrec's `unified`, or the Mac's) and no other."""
+    header = next((row for row in ctx.hog if row.get("kind") == "header"), {})
+    gpus = {gpu for _, gpu in grants}
+    if len(gpus) != 1:
+        return 0
+    gpu = gpus.pop()
+    context = int(header.get("context_mb") or 0)
+    if header.get("target") == "ram":
+        meta = next((row for row in ctx.vramrec
+                     if row.get("kind") == "header"), {})
+        context = 0
+        if gpu != MPS_DEVICE_KEY and not any(
+                row.get("uuid") == gpu and row.get("unified")
+                for row in meta.get("gpus") or []):
+            return 0
+    elif gpu != header.get("gpu_uuid"):
+        return 0
+    times = sorted(t_wall for t_wall, _ in grants)
+    first = max(0, bisect.bisect_right(ctx._hog_times, times[0]) - 1)
+    last = bisect.bisect_right(ctx._hog_times, times[-1])
+    held = min((int(row.get("held_mb") or 0)
+                for row in ctx.hog_samples[first:last]), default=0)
+    return held + context if held else 0
 
 
 def check_utilization(ctx: Context) -> Verdict:
@@ -1537,10 +1954,18 @@ def check_utilization(ctx: Context) -> Verdict:
     0.06-0.12 against it -- a FAIL for obeying the design. Where a trial
     measured the sizes next to the working size and left it in place
     (`_knee_holds`), the denominator is what the ledger actually tried: the
-    largest batch the settle lines measured, or the working size itself when
-    none was recorded, and never above the probe boundary. A leg whose batch
+    largest size this leg's trials ran, or the working size itself when no
+    trial line names one, and never above the probe boundary. A leg whose batch
     size no trial has left in place -- one stuck at the size it opened at
     included -- is scored against the probe boundary.
+
+    **A hog leaves less room than the probe had.** The probe boundary is
+    measured on a GPU with nothing else on it; the denominator is never above
+    that boundary less the least the hog held while the model ran and the
+    least reserve the model's grants carried, divided by the probe's reserved
+    slope (all physical memory). A room under one
+    unit, or a hog with no reserved slope to price it, is not decidable, and
+    the row says so.
 
     Same split as `slope_accuracy`: "no worker was ever admitted" is a result,
     "no probe boundary was passed" a harness omission."""
@@ -1549,18 +1974,30 @@ def check_utilization(ctx: Context) -> Verdict:
                        "no healthrec.jsonl in the scenario -- record the "
                        "gateway's own view with healthrec.py")
     published: Dict[str, int] = {}
+    # Per model, when and on which GPU it held a budget.
+    published_at: Dict[str, List[Tuple[float, Any]]] = {}
     for sample in ctx.health_samples:
         for worker in (sample.get("health") or {}).get("workers") or []:
             key = worker["inference_id"]
             published[key] = max(published.get(key, 0),
                                  int(worker.get("unit_budget") or 0))
+            published_at.setdefault(key, []).append(
+                (sample["t_wall"], worker.get("gpu_uuid")))
     issued: Dict[str, int] = {}
+    issued_at: Dict[str, List[Tuple[float, Any]]] = {}
+    reserves: Dict[str, int] = {}
     for event in ctx.log_events("issued a memory grant"):
         fields = event["fields"]
         model, budget = fields.get("model"), fields.get("unit_budget")
         if model is None or not isinstance(budget, (int, float)):
             continue
         issued[str(model)] = max(issued.get(str(model), 0), int(budget))
+        reserve = fields.get("reserve_mb")
+        if isinstance(reserve, (int, float)):
+            reserves[str(model)] = int(min(reserves.get(str(model), reserve),
+                                           reserve))
+        issued_at.setdefault(str(model), []).append(
+            (event["t_wall"], fields.get("gpu")))
     peak = {model: issued.get(model, value)
             for model, value in published.items()}
     if not peak:
@@ -1572,7 +2009,16 @@ def check_utilization(ctx: Context) -> Verdict:
                        {"health_samples": len(ctx.health_samples),
                         "learning": _declared_learning(ctx)})
     boundaries: Dict[str, Optional[int]] = {}
+    slopes: Dict[str, float] = {}
     for probe in ctx.probes:
+        # Physical MiB per unit: `fit_reserved`, or a headline fit not on the
+        # allocated basis (an older file, or MPS's peak_reserved).
+        fit = probe.get("fit_reserved") or probe.get("fit") or {}
+        if (not probe.get("fit_reserved") and
+                str(fit.get("basis") or "").startswith("peak_allocated")):
+            fit = {}
+        if fit.get("slope_mb_per_unit"):
+            slopes.setdefault(probe.get("model"), fit["slope_mb_per_unit"])
         bisect_info = probe.get("bisect") or {}
         # The superseded `mpsprobe/1` writes `batches` as bare ints, so the
         # last entry is only a boundary when it is a `ceiling_probe/1` row.
@@ -1594,29 +2040,49 @@ def check_utilization(ctx: Context) -> Verdict:
             rows.append({**row, "boundary_units": None})
             continue
         knee = knees.get(model)
+        allowed = (knee["largest_trial"] or knee["knee"]) if knee else 0
+        held = _hog_least_held_mb(
+            ctx, issued_at.get(model) or published_at.get(model, []))
+        # The ledger also withholds its reserve: the least on the model's
+        # grant lines.
+        room = (int(boundary - (held + reserves.get(model, 0)) / slopes[model])
+                if held and model in slopes else None)
+        if held and (room is None or room < 1):
+            rows.append({**row, "boundary_units": boundary,
+                         "room_units": room, "denominator_units": None})
+            continue
         # The knee can only lower the bar: a cap above the OOM boundary would
         # be scoring the leg against memory the probe says is not there.
-        allowed = min(boundary, knee["rung"] or knee["knee"]) if knee else 0
-        denominator = allowed or boundary
+        denominator = min(boundary, allowed or boundary, room or boundary)
         ratio = admitted / denominator
         ok = ratio >= threshold
         rows.append({**row, "boundary_units": boundary,
                      "knee_units": ((knee["knee_named"] or knee["knee"])
                                     if knee else None),
-                     "held_rung_units": (knee["rung"] or None) if knee else None,
-                     "denominator_units": denominator,
+                     "largest_trial_units": ((knee["largest_trial"] or None)
+                                             if knee else None),
+                     "room_units": room, "denominator_units": denominator,
                      "ratio": round(ratio, 4), "ok": ok})
         verdict = "PASS" if (verdict in ("INFO", "PASS") and ok) else "FAIL"
 
     def against(row: Dict[str, Any]) -> str:
         if not row.get("boundary_units"):
             return " (no probe boundary)"
+        if row["denominator_units"] is None:
+            return ((" / the probe has no reserved slope to price the hog's "
+                     "memory" if row["room_units"] is None else
+                     " / the hog left no room for one unit")
+                    + f" (probe boundary {row['boundary_units']}): not "
+                    f"decidable")
+        if row["room_units"] == row["denominator_units"]:
+            return (f" / room under the hog {row['room_units']} (probe "
+                    f"boundary {row['boundary_units']}) = {row['ratio']:.2f}")
         if not row.get("knee_units"):
             return (f" / probe boundary {row['boundary_units']} = "
                     f"{row['ratio']:.2f}")
-        held = (f", rung {row['held_rung_units']}"
-                if row.get("held_rung_units") else "")
-        if row["denominator_units"] != (row.get("held_rung_units")
+        held = (f", largest trial size {row['largest_trial_units']}"
+                if row.get("largest_trial_units") else "")
+        if row["denominator_units"] != (row.get("largest_trial_units")
                                         or row["knee_units"]):
             return (f" / held at knee_units={row['knee_units']}{held}, capped "
                     f"at the probe boundary {row['boundary_units']} = "
@@ -1651,23 +2117,35 @@ def check_throughput(ctx: Context) -> Verdict:
     if not records:
         return Verdict("throughput", "SKIP",
                        "jobs.json has no LogRecord history entries")
-    ours = _items_per_s(records)
+    clock = ctx.clock_step
     baseline = ctx.args.baseline_items_per_s
+    baseline_clock = None
     if baseline is None and ctx.args.baseline_jobs:
-        baseline_records = _log_records(read_json(Path(ctx.args.baseline_jobs)))
-        baseline = _items_per_s(baseline_records)
+        path = Path(ctx.args.baseline_jobs)
+        if path.name == "jobs.json":
+            baseline_clock = _clock_step(read_json(path.with_name("legs.json")))
+        # Both sides corrected for the clock step, or neither.
+        if clock is None or baseline_clock is None:
+            clock = baseline_clock = None
+        baseline = _items_per_s(_log_records(read_json(path)), baseline_clock)
+    ours = _items_per_s(records, clock)
+    step = clock[0] if clock else None
     if not baseline:
         return Verdict("throughput", "INFO",
                        f"{ours:.3f} items/s over {len(records)} job(s); "
                        "no baseline given (--baseline-jobs/--baseline-items-per-s)",
-                       {"items_per_s": ours, "jobs": len(records)})
+                       {"items_per_s": ours, "jobs": len(records),
+                        "clock_step_s": step})
     ratio = ours / baseline if baseline else float("inf")
     verdict = "PASS" if ratio >= ctx.args.throughput_floor else "FAIL"
     return Verdict("throughput", verdict,
                    f"{ours:.3f} items/s vs baseline {baseline:.3f} = "
                    f"{ratio:.2f}x  [floor {ctx.args.throughput_floor:.2f}x]",
                    {"items_per_s": ours, "baseline_items_per_s": baseline,
-                    "ratio": ratio, "jobs": len(records)})
+                    "ratio": ratio, "jobs": len(records),
+                    "clock_step_s": step,
+                    "baseline_clock_step_s":
+                        baseline_clock[0] if baseline_clock else None})
 
 
 def _log_records(payload: Any) -> List[Dict[str, Any]]:
@@ -1686,19 +2164,57 @@ def _log_records(payload: Any) -> List[Dict[str, Any]]:
             if isinstance(row, dict) and "total_segments" in row]
 
 
-def _items_per_s(records: List[Dict[str, Any]]) -> float:
-    items = 0.0
-    seconds = 0.0
-    for record in records:
-        items += float(record.get("total_segments") or 0)
-        start = _iso_epoch(str(record.get("start_time", "")).replace(" ", "T"))
-        end = _iso_epoch(str(record.get("end_time", "")).replace(" ", "T"))
-        if start and end and end > start:
-            seconds += end - start
-        else:
-            seconds += float(record.get("inference_time") or 0) + float(
-                record.get("data_load_time") or 0)
-    return items / seconds if seconds else 0.0
+def _clock_step(legs: Optional[Dict[str, Any]]
+                ) -> Optional[Tuple[float, float]]:
+    """How far the wall clock stepped from the first `job_start` to the
+    `job_end` after it, the job jobs.json records (their `iso` span less their
+    `t_mono` span), and that `t_mono` span; None without `t_mono`."""
+    events = iter((legs or {}).get("events") or [])
+    start = next((event for event in events
+                  if event.get("event") == "job_start"), {})
+    end = next((event for event in events
+                if event.get("event") == "job_end"), {})
+    start_wall = _iso_epoch(str(start.get("iso", "")))
+    end_wall = _iso_epoch(str(end.get("iso", "")))
+    if None in (start.get("t_mono"), end.get("t_mono"), start_wall, end_wall):
+        return None
+    job_s = end["t_mono"] - start["t_mono"]
+    return (end_wall - start_wall) - job_s, job_s
+
+
+def _items_per_s(records: List[Dict[str, Any]],
+                 clock: Optional[Tuple[float, float]] = None) -> float:
+    """Items over the server's start-to-end spans, a record's busy time
+    standing in for a span that is missing or not positive. A clock step
+    (`clock`: the step and the job's monotonic seconds) of 1 s or more comes
+    off the summed spans instead (the times are whole seconds, so a smaller
+    step is noise), unless the corrected total is over the job's monotonic
+    seconds or under the records' longer phase's busy seconds (also
+    monotonic) by over 1 s per record: the job holds the spans and the spans
+    hold that busy time, so the step fell outside them. Busy time stands in
+    for all of them when a span is missing or the corrected total is under
+    1 s per record."""
+    items = sum(float(record.get("total_segments") or 0) for record in records)
+    phases = [(float(record.get("inference_time") or 0),
+               float(record.get("data_load_time") or 0)) for record in records]
+    spans = [(_iso_epoch(str(record.get("start_time", "")).replace(" ", "T")),
+              _iso_epoch(str(record.get("end_time", "")).replace(" ", "T")),
+              sum(phase)) for record, phase in zip(records, phases)]
+    step, job_s = clock or (0.0, 0.0)
+    seconds = None
+    if abs(step) >= 1:
+        seconds = sum(busy for _, _, busy in spans)
+        if all(start is not None and end is not None for start, end, _ in spans):
+            corrected = sum(end - start for start, end, _ in spans) - step
+            least = sum(max(phase) for phase in phases) - len(spans)
+            if not least <= corrected <= job_s + len(spans):
+                seconds = None
+            elif corrected >= len(spans):
+                seconds = corrected
+    if seconds is None:
+        seconds = sum(end - start if start is not None and end is not None
+                      and end > start else busy for start, end, busy in spans)
+    return items / seconds if seconds > 0 else 0.0
 
 
 def check_persistence(ctx: Context) -> Verdict:
@@ -1778,8 +2294,71 @@ def check_persistence(ctx: Context) -> Verdict:
                     "regressions": regressions})
 
 
+def _idle_spans(legs: Optional[Dict[str, Any]]) -> List[Tuple[float, float]]:
+    """From each drained `job_end` (or the hog stop) to the next `job_start`,
+    else to the end of the recording. A job cut at `--job-cap` still runs."""
+    spans: List[Tuple[float, float]] = []
+    opened: Optional[float] = None
+    for event in (legs or {}).get("events") or []:
+        t_wall = _iso_epoch(str(event.get("iso", "")))
+        if t_wall is None:
+            continue
+        if event.get("event") == "hog_stop_requested" or (
+                event.get("event") == "job_end" and event.get("outcome") == "drained"):
+            opened = t_wall if opened is None else opened
+        elif event.get("event") == "job_start" and opened is not None:
+            spans.append((opened, t_wall))
+            opened = None
+    if opened is not None:
+        spans.append((opened, math.inf))
+    return spans
+
+
+def _void_hog_events(legs: Optional[Dict[str, Any]],
+                     hog: List[Dict[str, Any]]) -> List[str]:
+    """The hog events that asked for pressure (any leave-free level, or a hold
+    above 0 at or above what the hog held) while its `held_mb`, progress rows
+    included, rose by less than one chunk before the next event, and those
+    `legs.py` did not fire because the jobs had ended."""
+    header = next((row for row in hog if row.get("kind") == "header"), {})
+    chunk = header.get("chunk_mb") or 1
+    states = [(row["t_wall"], row.get("held_mb") or 0)
+              for row in hog if row.get("kind") in ("state", "progress", "final")]
+    requests, after_job = [], []
+    for event in (legs or {}).get("events") or []:
+        t_wall = _iso_epoch(str(event.get("iso", "")))
+        if event.get("event") == "hog_event_request" and t_wall is not None:
+            requests.append((t_wall, event))
+        elif event.get("event") == "hog_event_void":
+            after_job.append(str(event.get("label") or f"t+{event.get('at_s')}s"))
+    void = []
+    for index, (start, event) in enumerate(requests):
+        end = requests[index + 1][0] if index + 1 < len(requests) else math.inf
+        held = ([mb for t_wall, mb in states if t_wall <= start] or [0])[-1]
+        rose = max([mb for t_wall, mb in states if start < t_wall <= end],
+                   default=held) - held
+        kind, _, mb = str(event.get("query")).partition("=")
+        asked = kind == "leave_free" or kind == "mb" and int(mb) > 0 and int(mb) >= held
+        if asked and rose < chunk:
+            void.append(str(event.get("label") or f"t+{event.get('at_s')}s"))
+    return void + after_job
+
+
+def _unfinished_jobs(legs: Optional[Dict[str, Any]]) -> List[str]:
+    events = (legs or {}).get("events") or []
+    ends = [str(event.get("outcome")) for event in events
+            if event.get("event") == "job_end"]
+    starts = sum(1 for event in events if event.get("event") == "job_start")
+    return ([outcome for outcome in ends if outcome != "drained"]
+            + ["no job_end"] * max(0, starts - len(ends)))
+
+
 def check_job_outcome(ctx: Context) -> Verdict:
-    """Jobs must complete; item failures only where the scenario poisoned them."""
+    """Jobs must complete; item failures only where the scenario poisoned them.
+
+    A job legs.py stopped waiting for (`--job-cap`) or never saw end is in
+    neither jobs.json nor the queue outcomes, so `legs.json` is read too."""
+    unfinished = ctx.unfinished_jobs
     records = _log_records(ctx.jobs)
     queue_outcomes: List[Dict[str, Any]] = []
     if isinstance(ctx.jobs, dict) and isinstance(ctx.jobs.get("outcomes"), list):
@@ -1790,7 +2369,7 @@ def check_job_outcome(ctx: Context) -> Verdict:
         outcomes = (sample.get("queue") or {}).get("outcomes")
         if outcomes:
             queue_outcomes = outcomes
-    if not records and not queue_outcomes:
+    if not records and not queue_outcomes and not unfinished:
         if ctx.jobs is None:
             return Verdict("job_outcome", "SKIP",
                            "no jobs.json and no queue outcomes")
@@ -1826,8 +2405,8 @@ def check_job_outcome(ctx: Context) -> Verdict:
     # report `job_outcome FAIL` for doing exactly what it set out to do.
     expected_bad = ctx.args.expect_failed_jobs
     over_jobs = len(bad_outcomes) > expected_bad
-    verdict = ("FAIL" if (over or over_jobs or (empty and not expected_empty))
-               else "PASS")
+    verdict = ("FAIL" if (over or over_jobs or unfinished
+                          or (empty and not expected_empty)) else "PASS")
     return Verdict(
         "job_outcome", verdict,
         f"{len(records)} job record(s): {completed} completed, "
@@ -1840,10 +2419,13 @@ def check_job_outcome(ctx: Context) -> Verdict:
            if empty and expected_empty else
            f"; NO ITEMS: {', '.join(empty)} ran on 0 items, so nothing here "
            f"measures anything - check the corpus and, for a derived setter, "
-           f"that its source setter ran first" if empty else ""),
+           f"that its source setter ran first" if empty else "")
+        + (f"; legs.py saw {len(unfinished)} job(s) not drain: "
+           f"{', '.join(unfinished)}" if unfinished else ""),
         {"completed": completed, "failed": failed, "errors": errors,
          "outcomes": queue_outcomes, "records": len(records),
          "failed_jobs": len(bad_outcomes), "empty_jobs": empty,
+         "unfinished_jobs": unfinished,
          "expected_failed_jobs": expected_bad,
          "expected_empty_setters": expected_empty},
     )
@@ -1870,7 +2452,7 @@ def check_ledger_invariant(ctx: Context) -> Verdict:
     headroom it was priced against, which is the ledger over-committing and
     the only shape that FAILs. `limit_fell`: the limit dropped under a
     footprint or reservation that already existed -- external usage rose after
-    our pool grew, or a placeholder reservation on a squeezed board (the
+    our pool grew, or a placeholder reservation on a squeezed GPU (the
     second shape is closed by commit ba6708e4) -- which is WARN. The form that
     must always hold is `grant_safety`'s, restated on this row. See the
     README's "Checks".
@@ -1943,16 +2525,24 @@ def check_hog_tracking(ctx: Context) -> Verdict:
     Report-only in general: `external` is a window-boundary quantity with a
     real staleness, so a GPU that updates *late* is behaving as designed. One
     shape is not staleness and FAILs: a hog held at `HOG_STALL_MB` or more for
-    `HOG_STALL_SECONDS` while `external_mb` never moved. See the README.
+    `HOG_STALL_SECONDS` while `external_mb` never moved. A hog event that
+    applied no pressure makes it WARN. See the README.
     """
+    void = ctx.void_hog_events
+    void_note = ("; WARN: the hog event(s) " + ", ".join(void) + " applied no "
+                 "pressure: the jobs had ended, or no hog.jsonl row shows the hog "
+                 "holding one chunk more before the next event" if void else "")
     if not ctx.hog_samples or not ctx.health_samples:
-        return Verdict("hog_tracking", "SKIP", "needs hog.jsonl and healthrec.jsonl")
+        return Verdict("hog_tracking", "WARN" if void else "SKIP",
+                       "needs hog.jsonl and healthrec.jsonl" + void_note,
+                       {"void_events": void})
     header = next((row for row in ctx.hog if row.get("kind") == "header"), {})
     gpu_uuid = header.get("gpu_uuid")
     if header.get("target") == "ram":
-        return Verdict("hog_tracking", "INFO",
+        return Verdict("hog_tracking", "WARN" if void else "INFO",
                        "the hog pressured RAM, not a GPU; see the vramrec "
-                       "MemAvailable series", {"header": header})
+                       "MemAvailable and SReclaimable series" + void_note,
+                       {"header": header, "void_events": void})
     rows = []
     worst_lag = 0.0
     worst = None
@@ -1975,8 +2565,9 @@ def check_hog_tracking(ctx: Context) -> Verdict:
                      "gpu_used_mb": oracle_used,
                      "sample_age_ms": gpu.get("external_sample_age_ms")})
     if not rows:
-        return Verdict("hog_tracking", "SKIP",
-                       f"no health sample joined the hog on GPU {gpu_uuid}")
+        return Verdict("hog_tracking", "WARN" if void else "SKIP",
+                       f"no health sample joined the hog on GPU {gpu_uuid}" + void_note,
+                       {"void_events": void})
     ages = [row["sample_age_ms"] for row in rows if row["sample_age_ms"] is not None]
     max_age = max(ages) / 1000.0 if ages else None
     # Track the correlation of the two deltas rather than absolute agreement:
@@ -2023,8 +2614,9 @@ def check_hog_tracking(ctx: Context) -> Verdict:
                    + f" [FAIL needs both: > {HOG_STALL_SECONDS:.0f}s held and "
                      f"no movement at all]")
     return Verdict(
-        "hog_tracking", "FAIL" if stalled else "INFO", detail,
-        {"joined": len(rows), "steps": deltas[:20],
+        "hog_tracking", "FAIL" if stalled else ("WARN" if void else "INFO"),
+        detail + void_note,
+        {"joined": len(rows), "steps": deltas[:20], "void_events": void,
          "max_external_sample_age_s": max_age,
          "hog_held_seconds_over_threshold": round(held_seconds, 1),
          "hog_threshold_mb": HOG_STALL_MB,
@@ -2041,10 +2633,10 @@ def check_ramp_progress(ctx: Context) -> Verdict:
     rows = _budget_rows(ctx)
     if not rows:
         return Verdict("ramp_progress", "SKIP", "no workers in any health sample")
-    # A model whose working size a trial left at the seed can sit there
-    # forever and be right, so it is not a candidate for the note below.
+    # A size this leg measured can sit at the seed and be right; a size
+    # resumed from the store or opened at 64 still gets the note below.
     stalled_at_64 = [model for model, row in rows.items()
-                     if row["peak"] == 64 and not row["knee"]]
+                     if row["peak"] == 64 and not row["measured"]]
     detail = "; ".join(
         f"{model}: unit_budget {row['first']} -> peak {row['peak']} "
         f"(last {row['last']}, fit samples {row['fit_samples']}"
@@ -2067,14 +2659,9 @@ def check_calibration_learned(ctx: Context) -> Verdict:
     == 0` for some model, no `[[profile]]` in `calibration.after.toml`, a peak
     `unit_budget` no higher than the first recorded. See the README's "Checks".
 
-    **A working size a trial left in place is learning.** The seed is a
-    starting guess, not a floor: the batch size is the smallest whose rate is
-    within 5 % of the best measured, so a model that gains nothing from
-    larger batches ends *under* its seed on purpose. A worker deliberately
-    running at 3-7 units would otherwise read "peak unit_budget never left
-    the seed (seed 64, peak 64)" and FAIL for doing exactly the right thing.
-    Only a size `/health` marks `knee_is_local` counts: the size a replica
-    opened at, with no trial to show for it, is still "stuck".
+    A model with a `knee_is_local` size this leg measured (`_budget_rows`'
+    `measured`) does not count as "never left the seed"; a size resumed from
+    the store, or the size a replica opened at, still does.
     """
     learning = _declared_learning(ctx)
     profiles = (ctx.after or {}).get("profile") or []
@@ -2093,35 +2680,27 @@ def check_calibration_learned(ctx: Context) -> Verdict:
                         if row["fit_samples"] == 0)
         if no_fit:
             reasons.append("fit samples == 0 for " + ", ".join(no_fit))
+        measured = {model for model, row in rows.items() if row["measured"]}
         flat = [model for model, row in rows.items()
-                if row["peak"] <= row["first"] and not row["knee"]]
-        # The budget steps up only after a window measured at it: a job that
-        # formed every window short of the budget for want of queued work,
-        # and whose largest window stayed under the seed, cannot show it
-        # rising.
+                if row["peak"] <= row["first"] and model not in measured]
+        # The budget steps up only after a window measured at it. A window is
+        # queue-bound when it formed short of the ledger's window target
+        # (three batches at the budget); a flat model whose every window was
+        # queue-bound is not decidable.
         counts: Dict[str, Tuple[int, int]] = {}
         for sample in ctx.health_samples:
             for entry in (sample.get("health") or {}).get("models") or []:
                 counts[str(entry.get("inference_id"))] = (
                     int(entry.get("queue_bound_windows") or 0),
                     int(entry.get("total_batches") or 0))
-        largest: Dict[str, int] = {}
-        for event in ctx.log_events("settled a granted window"):
-            units = event["fields"].get("max_units_measured")
-            if isinstance(units, (int, float)):
-                model = str(event["fields"].get("model"))
-                largest[model] = max(largest.get(model, 0), int(units))
         short = {model: total for model, (bound, total) in counts.items()
                  if 0 < total == bound}
-        job_bound = {model for model in flat
-                     if model in short
-                     and 0 < largest.get(model, 0) < rows[model]["first"]}
-        unreached = sorted(f"{model} (seed {rows[model]['first']}, largest "
-                           f"window measured {largest[model]}, all "
-                           f"{short[model]} windows short of the budget)"
-                           for model in job_bound)
+        job_bound = {model for model in flat if model in short}
+        unreached = sorted(f"{model} (seed {rows[model]['first']}, all "
+                           f"{short[model]} windows)" for model in job_bound)
         if unreached:
-            notes.append("not decidable, no window reached the seed: "
+            notes.append("not decidable, every window formed short of the "
+                         "window target (three batches at the budget): "
                          + ", ".join(unreached))
         stuck = sorted(f"{model} (seed {rows[model]['first']}, peak "
                        f"{rows[model]['peak']})"
@@ -2134,9 +2713,8 @@ def check_calibration_learned(ctx: Context) -> Verdict:
             f"{rows[model]['knee_first']}, moved "
             f"{rows[model]['knee_moves']} time(s), at most "
             f"{rows[model]['knee']}, ran as low as {rows[model]['low']})"
-            for model in rows
-            if rows[model]["knee"] and
-            rows[model]["peak"] <= rows[model]["first"])
+            for model in measured
+            if rows[model]["peak"] <= rows[model]["first"])
         if braked:
             notes.append("at a working size a trial left in place: "
                          + ", ".join(braked))
@@ -2278,6 +2856,62 @@ def check_alloc_retries(ctx: Context) -> Verdict:
     )
 
 
+def check_batch_coverage(ctx: Context) -> Verdict:
+    """Batches no health sample showed, per model.
+
+    `seq` numbers each worker's batches from 1, so a number no health sample
+    showed is a batch the recording missed, and a seq that goes back starts a
+    new worker. Batches a worker runs after its last health sample are not
+    counted, so PASS means no gap between samples, not that every batch was
+    seen."""
+    if not ctx.health_samples:
+        return Verdict("batch_coverage", "SKIP", "no healthrec.jsonl")
+    held: Dict[Tuple[Any, ...], Set[int]] = {}
+    highest: Dict[Tuple[Any, ...], int] = {}
+    seen = 0
+    missed: Dict[str, int] = {}
+
+    def close(key: Tuple[Any, ...]) -> None:
+        nonlocal seen
+        count = len(held.pop(key, ()))
+        seen += count
+        lost = highest.pop(key, 0) - count
+        if lost:
+            missed[str(key[0])] = missed.get(str(key[0]), 0) + lost
+
+    for sample in ctx.health_samples:
+        health = sample.get("health") or {}
+        present: Set[Tuple[Any, ...]] = set()
+        for model in health.get("models") or []:
+            for index, replica in enumerate(model.get("replicas") or []):
+                seqs = {batch.get("seq") for batch
+                        in replica.get("recent_batches") or []
+                        if isinstance(batch.get("seq"), int)}
+                top = max(seqs, default=0)
+                key = (model.get("inference_id"), model.get("generation"), index)
+                present.add(key)
+                if top < highest.get(key, 0):
+                    close(key)
+                held.setdefault(key, set()).update(seqs)
+                highest[key] = max(highest.get(key, 0), top)
+        # /health lists loaded models only; a later worker may reuse the key.
+        if health.get("ok"):
+            for key in set(held) - present:
+                close(key)
+    for key in list(held):
+        close(key)
+    if not seen:
+        return Verdict("batch_coverage", "SKIP",
+                       "no health sample showed a measured batch")
+    lost = sum(missed.values())
+    return Verdict(
+        "batch_coverage", "WARN" if lost else "PASS",
+        f"{seen} of {seen + lost} batches appeared in a health sample"
+        + (f"; missed per model {missed}: more batches between two samples, "
+           "or in one reply, than /health's 4-entry tail" if lost else ""),
+        {"seen": seen, "missed": lost, "missed_per_model": missed})
+
+
 CHECKS: Dict[str, Callable[[Context], Verdict]] = {
     "oracle_agreement": check_oracle_agreement,
     "base_accuracy": check_base_accuracy,
@@ -2297,7 +2931,14 @@ CHECKS: Dict[str, Callable[[Context], Verdict]] = {
     "ramp_progress": check_ramp_progress,
     "calibration_learned": check_calibration_learned,
     "alloc_retries": check_alloc_retries,
+    "batch_coverage": check_batch_coverage,
 }
+
+
+#: What a split leg (`legs.py --inference-url`) is judged on: its GPU,
+#: ledger log and store are on the inference server's host, not this one.
+SPLIT_LEG_CHECKS = ("failures", "idle_liveness", "job_outcome", "peak_fds",
+                    "ramp_progress", "batch_coverage")
 
 
 # --- Plot (optional) -------------------------------------------------------
@@ -2415,6 +3056,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="whole jobs whose outcome is meant to be a "
                              "failure (a model that cannot load, and the "
                              "load-failure fixtures)")
+    parser.add_argument("--expect-deflated", action="store_true",
+                        help="this leg's model OOMs on every batch "
+                             "(`calibfixture/oom_cuda`), so its deflation "
+                             "does not return to 0 within the leg's settle")
     parser.add_argument("--expect-empty-setters", action="store_true",
                         help="this leg's setters are meant to run on no "
                              "items (`calibfixture/dies_on_load_cuda` never "
@@ -2425,7 +3070,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--throughput-floor", type=float, default=0.9)
     parser.add_argument("--utilization-floor", type=float, default=0.25)
     parser.add_argument("--idle-window", type=float, default=60.0)
-    parser.add_argument("--join-tolerance", type=float, default=1.5)
+    parser.add_argument("--join-tolerance", type=float, default=None,
+                        help="max |dt| in seconds when joining a recording "
+                             "by time (default: twice the median gap between "
+                             "that recorder's samples)")
     parser.add_argument("--base-window", type=float, default=10.0,
                         help="max |dt| between a worker admission and the "
                              "oracle sample base_accuracy compares against")
@@ -2491,20 +3139,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             probes.append(payload)
 
     legs = read_json(pick(None, "legs.json"))
-    hog_stop = next((event.get("iso") for event in (legs or {}).get("events") or []
-                     if event.get("event") == "hog_stop_requested"), None)
+    hog = read_jsonl(pick(args.hog, "hog.jsonl"))
     ctx = Context(
         args=args,
         vramrec=read_jsonl(pick(args.vramrec, "vramrec.jsonl")),
         healthrec=read_jsonl(pick(args.healthrec, "healthrec.jsonl")),
-        hog=read_jsonl(pick(args.hog, "hog.jsonl")),
+        hog=hog,
         log=parse_log(pick(args.logfile, "panoptikon.log")),
         before=read_toml(pick(args.before, "calibration.before.toml")),
         after=read_toml(pick(args.after, "calibration.after.toml")),
         jobs=read_json(pick(args.jobs, "jobs.json")),
         probes=probes,
         fds=read_fds(pick(None, "fds.jsonl")) or read_fds(pick(None, "fdrec.txt")),
-        teardown_t=_iso_epoch(hog_stop) if hog_stop else None,
+        idle_spans=_idle_spans(legs),
+        void_hog_events=_void_hog_events(legs, hog),
+        clock_step=None if args.jobs else _clock_step(legs),
+        unfinished_jobs=_unfinished_jobs(legs),
     )
 
     selected = (
@@ -2515,6 +3165,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     unknown = [name for name in selected if name not in CHECKS]
     if unknown:
         parser.error(f"unknown check(s): {', '.join(unknown)}")
+    if (legs or {}).get("inference_url"):
+        dropped = [name for name in selected if name not in SPLIT_LEG_CHECKS]
+        selected = [name for name in selected if name in SPLIT_LEG_CHECKS]
+        if dropped and not args.quiet:
+            print(f"split leg: not judged here: {', '.join(dropped)}")
 
     verdicts = [CHECKS[name](ctx) for name in selected]
 

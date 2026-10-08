@@ -3,7 +3,7 @@
 `rocm_sysfs.py` must index, key and total GPUs as `rocm.rs` does, or no
 reading here joins `/health`; its per-process figure must come from KFD only
 where KFD's PIDs are ours. The tools built on it (`vramrec.py`, `hog.py`,
-`legs.py`, `selftest.py`, `newrun.py`) and `analyze.py`'s checks of amdgpu
+`legs.py`, `selftest.py`, `newrun.py`, `ceiling_probe.py`) and `analyze.py`'s checks of amdgpu
 samples are exercised on the same trees.
 
 Run with the managed interpreter:
@@ -16,9 +16,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import types
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -36,9 +38,10 @@ def _load(name):
     return module
 
 
-rocm_sysfs, vramrec, analyze, hog, legs, selftest, newrun = (
+rocm_sysfs, vramrec, analyze, hog, legs, selftest, newrun, probe = (
     _load(name) for name in
-    ("rocm_sysfs", "vramrec", "analyze", "hog", "legs", "selftest", "newrun"))
+    ("rocm_sysfs", "vramrec", "analyze", "hog", "legs", "selftest", "newrun",
+     "ceiling_probe"))
 
 
 class Host:
@@ -58,7 +61,8 @@ class Host:
         os.symlink(rocm_sysfs.INIT_PID_NS if host_pid_ns else "pid:[4026532999]",
                    root / "proc/self/ns/pid")
         (root / "proc/meminfo").write_text(
-            "MemTotal: 134217728 kB\nMemAvailable: 8388608 kB\n")
+            "MemTotal: 134217728 kB\nMemAvailable: 8388608 kB\n"
+            "SReclaimable: 1048576 kB\n")
         if kfd_proc:
             (root / "kfd/proc").mkdir()
 
@@ -134,15 +138,23 @@ def test_inventory_indexes_openable_nodes_and_keys_like_rocm_rs(tmp_path):
 
 
 def test_a_unified_gpu_totals_and_prices_its_gtt(tmp_path):
-    """Total = carve-out + GTT; free GTT clamped by MemAvailable (8 GiB);
-    per process, fdinfo VRAM + GTT even where KFD's counter is readable."""
+    """Total = carve-out + GTT; free GTT clamped by MemAvailable less
+    SReclaimable (8 - 1 GiB); per process, fdinfo VRAM + GTT even where KFD's
+    counter is readable."""
     host = Host(tmp_path).gpu(1, 0x0300, used=256 * MIB,
                               gtt=(64 * GIB, 4 * GIB))
     host.kfd(700, 1, 100 * MIB)
     host.fdinfo(700, 5, _fd(BDF_03, 1, 200 * 1024, gtt_kib=1024 * 1024))
     (gpu,) = rocm_sysfs.inventory(host.roots)
     assert gpu.unified
-    assert rocm_sysfs.memory_mb(host.roots, gpu) == (512 + 65536, 256 + 8192)
+    assert rocm_sysfs.memory_mb(host.roots, gpu) == (512 + 65536, 256 + 7168)
+    # SReclaimable above MemAvailable leaves no free GTT.
+    (tmp_path / "proc/meminfo").write_text(
+        "MemAvailable: 1048576 kB\nSReclaimable: 2097152 kB\n")
+    assert rocm_sysfs.memory_mb(host.roots, gpu) == (512 + 65536, 256 + 0)
+    # Without an SReclaimable row, MemAvailable alone.
+    (tmp_path / "proc/meminfo").write_text("MemAvailable: 2097152 kB\n")
+    assert rocm_sysfs.memory_mb(host.roots, gpu) == (512 + 65536, 256 + 2048)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
         "fdinfo", {700: 1224}, [])
     assert legs.rocm_total_mb(0, host.roots) == 66048
@@ -151,14 +163,17 @@ def test_a_unified_gpu_totals_and_prices_its_gtt(tmp_path):
 # --- per-process sources ----------------------------------------------------
 
 
-@pytest.mark.parametrize("host_pid_ns,kfd_proc,expected", [
-    (True, True, ("kfd", {700: 300}, [])),
-    (True, False, ("fdinfo", {700: 150, 701: 64, 702: 32}, [])),
-    (False, True, ("fdinfo", {700: 150, 701: 64, 702: 32}, [])),
+@pytest.mark.parametrize("host_pid_ns,kfd_proc,gpu_id,expected", [
+    (True, True, True, ("kfd", {700: 300}, [])),
+    (True, True, False, ("fdinfo", {700: 150, 701: 64, 702: 32}, [])),
+    (True, False, True, ("fdinfo", {700: 150, 701: 64, 702: 32}, [])),
+    (False, True, True, ("fdinfo", {700: 150, 701: 64, 702: 32}, [])),
 ])
 def test_kfd_where_its_pids_are_ours_else_fdinfo(tmp_path, host_pid_ns,
-                                                 kfd_proc, expected):
-    host = Host(tmp_path, host_pid_ns, kfd_proc).gpu(1, 0x0300)
+                                                 kfd_proc, gpu_id, expected):
+    host = Host(tmp_path, host_pid_ns, kfd_proc).gpu(1, 0x0300).gpu(2, 0x0C00)
+    if not gpu_id:
+        (tmp_path / "kfd/topology/nodes/1/gpu_id").unlink()
     if kfd_proc:
         host.kfd(700, 1, 300 * MIB)
     # Two descriptors of one client count once; the older key spelling
@@ -173,8 +188,8 @@ def test_kfd_where_its_pids_are_ours_else_fdinfo(tmp_path, host_pid_ns,
     host.fdinfo(702, 3, _fd(BDF_03, None, 32 * 1024, "memory", pasid=32769))
     host.fdinfo(702, 4, _fd(BDF_03, None, 32 * 1024, "memory", pasid=32769))
     host.fdinfo(702, 5, _fd(BDF_03, None, 999 * 1024, "memory"))
-    (gpu,) = rocm_sysfs.inventory(host.roots)
-    assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == expected
+    gpus = rocm_sysfs.inventory(host.roots)
+    assert rocm_sysfs.process_vram_mb(host.roots, gpus)[gpus[0].key] == expected
 
 
 def test_in_a_container_kfd_is_found_by_the_fdinfo_pasid(tmp_path):
@@ -186,9 +201,48 @@ def test_in_a_container_kfd_is_found_by_the_fdinfo_pasid(tmp_path):
     (gpu,) = rocm_sysfs.inventory(host.roots)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
         "kfd", {700: 300}, [])
-    host.fdinfo(701, 3, _fd(BDF_03, 14, 64 * 1024, pasid=99))
+    host.kfd(4243, 1, 500 * MIB, pasid=32771)
+    host.fdinfo(701, 3, _fd(BDF_03, 12, 200 * 1024, pasid=32771))
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
-        "fdinfo", {700: 150, 701: 64}, [])
+        "kfd", {700: 300, 701: 500}, [])
+    host.fdinfo(702, 3, _fd(BDF_03, 14, 64 * 1024, pasid=99))
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
+        "fdinfo", {700: 150, 701: 200, 702: 64}, [])
+
+
+def test_a_descriptor_inherited_across_fork_counts_once(tmp_path):
+    """Parent and child both name the parent's PASID: its KFD entry is
+    credited to the lower PID only. A child with a PASID of its own is
+    credited its own entry, whether or not its parent is read, and when its
+    PID is lower than its parent's."""
+    host = Host(tmp_path, host_pid_ns=False).gpu(1, 0x0300)
+    host.kfd(4242, 1, 300 * MIB, pasid=32770)
+    for pid in (700, 701):
+        host.fdinfo(pid, 3, _fd(BDF_03, 11, 150 * 1024, pasid=32770))
+    (gpu,) = rocm_sysfs.inventory(host.roots)
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu], [701, 700])[gpu.key] == (
+        "kfd", {700: 300}, [])
+    host.kfd(4243, 1, 500 * MIB, pasid=32771)
+    host.fdinfo(701, 12, _fd(BDF_03, 12, 200 * 1024, pasid=32771))
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu], [701, 700])[gpu.key] == (
+        "kfd", {700: 300, 701: 500}, [])
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu], [701])[gpu.key] == (
+        "kfd", {701: 500}, [])
+    host.fdinfo(650, 4, _fd(BDF_03, 12, 200 * 1024, pasid=32771))
+    host.fdinfo(650, 5, _fd(BDF_03, 11, 150 * 1024, pasid=32770))
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu], [650, 700])[gpu.key] == (
+        "kfd", {650: 500, 700: 300}, [])
+
+
+def test_one_pasid_on_two_gpus_counts_on_each(tmp_path):
+    host = Host(tmp_path, kfd_proc=False).gpu(1, 0x0300).gpu(2, 0x0C00)
+    host.fdinfo(700, 3, _fd(BDF_03, None, 100 * 1024, "memory", pasid=32769))
+    host.fdinfo(700, 4, _fd(BDF_0C, None, 200 * 1024, "memory", pasid=32769),
+                target="/dev/dri/renderD129")
+    first, second = rocm_sysfs.inventory(host.roots)
+    assert rocm_sysfs.process_vram_mb(host.roots, [first, second]) == {
+        first.key: ("fdinfo", {700: 100}, []),
+        second.key: ("fdinfo", {700: 200}, [])}
 
 
 def test_a_pasid_reused_after_the_kfd_list_is_read_is_left_out(tmp_path,
@@ -248,6 +302,54 @@ def test_vramrec_rows_take_the_gateways_keys_and_name_their_source(tmp_path):
         "GPU-00ff", 24576, 1024, 23552)
     assert (row["oracle_source"], row["unreadable_pids"]) == ("amdgpu-kfd", [])
     assert [(proc["pid"], proc["used_mb"]) for proc in row["procs"]] == [(700, 300)]
+
+
+def test_used_that_moves_during_the_process_scan_is_flagged_and_not_judged(
+        tmp_path, monkeypatch):
+    host = Host(tmp_path).gpu(1, 0x0300).gpu(2, 0x0C00, used=2 * GIB)
+    host.kfd(700, 1, 300 * MIB)
+    oracle = vramrec.AmdgpuOracle(rocm_sysfs.inventory(host.roots), host.roots)
+
+    def sample():
+        rows = vramrec.build_sample(0, oracle, vramrec.ProcCache((), False),
+                                    None, 0.0)["gpus"]
+        return [(row["used_mb"], row["skew_mb"]) for row in rows]
+
+    assert sample() == [(1024, 0), (2048, 0)]
+    scan = vramrec.rocm_sysfs.process_vram_mb
+
+    def moving(*args):
+        (tmp_path / "pci" / BDF_03 / "mem_info_vram_used").write_text(
+            f"{6 * GIB}\n")
+        (tmp_path / "pci" / BDF_0C / "mem_info_vram_used").write_text(
+            f"{GIB // 2}\n")
+        return scan(*args)
+
+    monkeypatch.setattr(vramrec.rocm_sysfs, "process_vram_mb", moving)
+    assert sample() == [(6144, 5120), (512, 1536)]
+    # A failed read before the scan leaves the skew unknown.
+    failing, memory = iter([None]), vramrec.rocm_sysfs.memory_mb
+    monkeypatch.setattr(vramrec.rocm_sysfs, "memory_mb",
+                        lambda *args: next(failing, memory(*args)))
+    assert sample() == [(6144, None), (512, 0)]
+
+    # The allowance on this 24 GiB GPU is 1 GiB, on a 96 GiB one 1966 MiB; the
+    # measured difference is 3800 MiB with `external_mb` 0, 1800 MiB with 2000
+    # and 1200 with 5000.
+    ctx = _amdgpu_ctx("amdgpu-kfd", [(900, 1200)])
+    gpu = ctx.health_samples[0]["health"]["vram"][0]
+    row = ctx.vram_samples[0]["gpus"][0]
+    for external, skew, verdict in ((0, 1024, "FAIL"), (2000, 1024, "PASS"),
+                                    (5000, 1024, "PASS"), (0, 1025, "SKIP"),
+                                    (0, None, "SKIP")):
+        gpu["external_mb"], row["skew_mb"] = external, skew
+        result = analyze.check_oracle_agreement(ctx)
+        assert result.verdict == verdict, (external, skew)
+    assert result.numbers["skewed_samples"] == 1
+    gpu["total_mb"], gpu["external_mb"], row["skew_mb"] = 98304, 0, 1500
+    result = analyze.check_oracle_agreement(ctx)
+    assert result.verdict == "FAIL"
+    assert result.numbers["worst_sample"]["skew_mb"] == 1500
 
 
 def test_vramrec_selects_the_amdgpu_oracle_without_nvml(tmp_path, monkeypatch):
@@ -413,15 +515,18 @@ def test_hog_on_hip_reads_sysfs_by_torchs_pci_address(tmp_path, monkeypatch,
 # --- legs, selftest, newrun --------------------------------------------------
 
 
-def test_legs_rocm_configs_name_the_accelerator_and_drop_cudnn():
+def test_legs_rocm_configs_name_the_accelerator_and_drop_cudnn(tmp_path):
     import tomllib
 
     rendered = tomllib.loads(legs.render_config("R1", HERE.parents[1]))
     assert rendered["inference_local"]["python_env"]["accelerator"] == "rocm"
-    env = legs.config_env("R1", HERE.parents[1], {})
+    (tmp_path / "lib" / "python3.12" / "site-packages" / "nvidia" / "cudnn"
+     / "lib").mkdir(parents=True)
+    python = str(tmp_path / "bin" / "python")
+    env = legs.config_env("R1", HERE.parents[1], {}, python)
     assert "LD_LIBRARY_PATH" not in env
     assert env["RUST_LOG"].endswith(",panoptikon::db::batch_auto=debug")
-    assert "LD_LIBRARY_PATH" in legs.config_env("C1", HERE.parents[1], {})
+    assert "LD_LIBRARY_PATH" in legs.config_env("C1", HERE.parents[1], {}, python)
 
 
 @pytest.mark.parametrize("name,variable,pin", [
@@ -465,7 +570,7 @@ def test_legs_rocm_refuses_an_inherited_visibility_variable(tmp_path, monkeypatc
 def test_legs_run_refuses_an_inherited_visibility_variable(monkeypatch):
     _clear_visibility(monkeypatch)
     monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "0")
-    monkeypatch.setattr(legs, "board_total_mb", lambda device: None)
+    monkeypatch.setattr(legs, "nvml_total_mb", lambda device: None)
     monkeypatch.setattr(legs.rocm_sysfs, "inventory", lambda *roots: [])
     with pytest.raises(SystemExit, match="ROCR_VISIBLE_DEVICES is set"):
         legs.main(["--scenario", "S14", "--config", "R1", "--repo",
@@ -490,7 +595,7 @@ def test_legs_totals_a_rocm_gpu_from_sysfs(tmp_path, monkeypatch, capsys):
     (tmp_path / "pci" / BDF_0C / "mem_info_vram_total").write_text(f"{16 * GIB}\n")
     inventory, total = legs.rocm_sysfs.inventory, legs.rocm_total_mb
     _clear_visibility(monkeypatch)
-    monkeypatch.setattr(legs, "board_total_mb", lambda device: None)
+    monkeypatch.setattr(legs, "nvml_total_mb", lambda device: None)
     monkeypatch.setattr(legs.rocm_sysfs, "inventory",
                         lambda *roots: inventory(host.roots))
     monkeypatch.setattr(legs, "rocm_total_mb",
@@ -503,16 +608,221 @@ def test_legs_totals_a_rocm_gpu_from_sysfs(tmp_path, monkeypatch, capsys):
         16384, "amdgpu-sysfs")
 
 
-def test_selftest_pins_like_the_spawner(tmp_path):
-    host = Host(tmp_path).gpu(1, 0x0300).gpu(2, 0x0C00, gtt=(GIB, 0))
-    assert selftest.rocm_pin(0, {}, host.roots) == {
-        "HIP_VISIBLE_DEVICES": "0", "PANOPTIKON_DEVICE_PIN": "0"}
+def test_the_tools_pin_like_the_spawner(tmp_path, monkeypatch, capsys):
+    """selftest and ceiling_probe pin HIP device N in KFD order, an unopenable
+    node taking no index; the probe takes that GPU when NVML has none, and
+    reads it from sysfs and its own usage from KFD."""
+    host = Host(tmp_path).gpu(1, 0x0300, used=2 * GIB).gpu(2, 0x0800,
+                                                           openable=False)
+    host.gpu(3, 0x0C00, used=128 * MIB, gtt=(GIB, 0))
+
+    def pin(device, environ=None):
+        gpu = rocm_sysfs.pinned_gpu(device, environ or {}, host.roots)
+        return gpu and rocm_sysfs.pin_env(gpu)
+
+    assert pin(0) == {"HIP_VISIBLE_DEVICES": "0", "PANOPTIKON_DEVICE_PIN": "0"}
     unified = {"HIP_VISIBLE_DEVICES": "1", "PANOPTIKON_DEVICE_PIN": "1",
                "PANOPTIKON_UNIFIED_GPU": BDF_0C}
-    assert selftest.rocm_pin(1, {}, host.roots) == unified
-    assert selftest.rocm_pin(0, {"HIP_VISIBLE_DEVICES": "1"}, host.roots) == unified
-    assert selftest.rocm_pin(0, {"ROCR_VISIBLE_DEVICES": "1"}, host.roots) == {}
-    assert selftest.rocm_pin(5, {}, host.roots) == {}
+    assert pin(1) == unified
+    assert pin(0, {"HIP_VISIBLE_DEVICES": "1"}) == unified
+    assert pin(0, {"HIP_VISIBLE_DEVICES": "0,1"}) is None
+    assert pin(0, {"ROCR_VISIBLE_DEVICES": "1"}) is None
+    assert pin(0, {"GPU_DEVICE_ORDINAL": "0"}) is None
+    assert pin(5) is None
+
+    host.kfd(os.getpid(), 1, 300 * MIB)
+    host.kfd(os.getpid() + 1, 1, 700 * MIB)
+    rocm = probe.Rocm.pinned(0, {}, host.roots)
+    assert rocm.env() == pin(0)
+    assert rocm.row() == {
+        "index": 0, "uuid": f"GPU-BDF-{BDF_03}", "name": None,
+        "total_mb": 24576, "free_mb": 22528, "bdf": BDF_03, "unified": False,
+        "backend": "rocm"}
+    assert (rocm.free_mb(), rocm.own_mb(), rocm.own_sources) == (
+        22528, 300, {"kfd"})
+    # Without KFD's per-process directory the next reading is fdinfo's.
+    shutil.rmtree(tmp_path / "kfd/proc")
+    rocm.own_mb()
+    assert rocm.own_sources == {"fdinfo", "kfd"}
+    apu = probe.Rocm.pinned(1, {}, host.roots)
+    assert apu.env() == unified
+    assert (apu.row()["unified"], apu.row()["bdf"]) == (True, BDF_0C)
+    assert (apu.row()["total_mb"], apu.free_mb()) == (512 + 1024, 384 + 1024)
+    assert probe.Rocm.pinned(0, {"CUDA_VISIBLE_DEVICES": "0"}, host.roots) is None
+
+    # NVML first: a ROCm GPU is taken only where NVML has no GPU N.
+    pinned = probe.Rocm.pinned
+    _clear_visibility(monkeypatch)
+    monkeypatch.setattr(probe.Rocm, "pinned", lambda device, environ: pinned(
+        device, environ, host.roots))
+    nvml_gpu = {"index": 1, "uuid": "GPU-1"}
+    for gpus, backend, device in (([], "rocm", apu.row()),
+                                  ([nvml_gpu], "cuda", nvml_gpu)):
+        monkeypatch.setattr(probe, "Nvml", lambda: types.SimpleNamespace(
+            gpus=lambda: gpus, error=None))
+        assert probe.main(["--model", "tags/wd-vit-tagger-v3", "--device", "1",
+                           "--dry-run"]) == 0
+        plan = json.loads(capsys.readouterr().out)
+        assert (plan["backend"], plan["device"]) == (backend, device)
+
+
+@pytest.mark.parametrize("hip,bdf,nvml_gpus,count,exit_calls", [
+    ("6.4.43482", BDF_03, [], 1, None), (None, BDF_03, [], 1, ["free"]),
+    ("6.4.43482", BDF_03, [], 2, ["free", "count"]),
+    ("6.4.43482", BDF_03, [], 0, ["free", "count"]),
+    ("6.4.43482", BDF_03, [{"index": 0, "uuid": "GPU-1"}], 1, []),
+    ("6.4.43482", None, [], 1, ["free", "count", "count", "synchronize", "free"]),
+    ("6.4.43482", BDF_0C, [], 1, ["free", "count", "count", "synchronize", "free"])],
+    ids=["ok", "hip None", "count 2", "count 0", "hip on NVML",
+         "BDF mismatch", "another GPU"])
+def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(
+        tmp_path, monkeypatch, hip, bdf, nvml_gpus, count, exit_calls):
+    """A run to the JSON on a fixture ROCm host, with a stand-in torch and an
+    impl that allocates nothing. The probe exits before the load unless torch
+    is a ROCm build that sees one device, and exits on a ROCm torch pinned to
+    an NVML GPU; it exits after the priced load, before any batch, unless the
+    model loaded on the pinned GPU (`memory.device_bdf()`). The stand-in torch
+    sees one device only once `HIP_VISIBLE_DEVICES` is set. `exit_calls` is the
+    free readings and torch.cuda calls made before the exit, None for a full
+    run."""
+    host = Host(tmp_path / "host").gpu(1, 0x0300)
+    host.kfd(os.getpid(), 1, 300 * MIB)
+    pinned = probe.Rocm.pinned
+    monkeypatch.setattr(probe.Rocm, "pinned", lambda device, environ: pinned(
+        device, environ, host.roots))
+    monkeypatch.setattr(probe, "Nvml", lambda: types.SimpleNamespace(
+        gpus=lambda: nvml_gpus, error=None, handle_for_uuid=lambda uuid: None,
+        free_mb=lambda handle: None))
+    _clear_visibility(monkeypatch)
+    monkeypatch.setattr(sys, "path", [str(HERE.parents[1] / "python"), *sys.path])
+    (tmp_path / "item.txt").write_text("a caption")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"items": [{"path": "item.txt", "kind": "text"}]}))
+    (tmp_path / "registry.toml").write_text(
+        '[group.probe.inference_ids.echo]\nconfig.impl_class = "echo_test"\n')
+    zero = lambda *args: 0  # noqa: E731
+    calls = []
+    free_mb = probe.Rocm.free_mb
+    monkeypatch.setattr(probe.Rocm, "free_mb",
+                        lambda self: calls.append("free") or free_mb(self))
+    cuda = types.SimpleNamespace(
+        device_count=lambda: calls.append("count") or (
+            count if os.environ.get("HIP_VISIBLE_DEVICES") == "0" else 2),
+        get_device_name=lambda index: "AMD Radeon",
+        is_available=lambda: True,
+        is_initialized=lambda: False,
+        synchronize=lambda: calls.append("synchronize"),
+        empty_cache=lambda: None,
+        reset_peak_memory_stats=lambda: calls.append("reset_peak_memory_stats"),
+        memory_reserved=zero,
+        memory_allocated=zero,
+        max_memory_reserved=zero,
+        max_memory_allocated=zero)
+    torch = types.SimpleNamespace(
+        __version__="2.8.0+rocm6.4", cuda=cuda,
+        version=types.SimpleNamespace(hip=hip, cuda=None))
+    out = tmp_path / "probe.json"
+    argv = ["--model", "probe/echo", "--device", "0", "--repo", str(tmp_path),
+            "--registry", str(tmp_path / "registry.toml"),
+            "--impl-dir", str(HERE.parents[1] / "python/tests/inferio_worker"
+                              "/fixture_impls"),
+            "--corpus", str(tmp_path / "manifest.json"), "--max-batch", "1",
+            "--out", str(out)]
+    with mock.patch.dict(os.environ), mock.patch.dict(sys.modules,
+                                                      {"torch": torch}):
+        from inferio_worker import memory
+
+        monkeypatch.setattr(memory, "device_bdf", lambda: bdf)
+        if exit_calls is not None:
+            with pytest.raises(SystemExit):
+                probe.main(argv)
+            assert calls == exit_calls
+            return
+        assert probe.main(argv) == 0
+        assert (os.environ["HIP_VISIBLE_DEVICES"],
+                os.environ["PANOPTIKON_DEVICE_PIN"]) == ("0", "0")
+    result = json.loads(out.read_text())
+    assert result["backend"] == "rocm"
+    device = result["device"]
+    assert (device["bdf"], device["hip_visible_devices"],
+            device["own_source"]) == (BDF_03, "0", ["kfd"])
+    assert None not in (result["load"]["free_before_mb"],
+                        result["load"]["base_nvml_mb"],
+                        result["batches"][0]["gpu_free_mb"],
+                        result["batches"][0]["nvml_own_mb"])
+    assert result["gqa_check"] == "not applicable"
+
+
+def test_selftest_reasons_name_what_is_missing(tmp_path, monkeypatch):
+    def fdinfo(own_mb, hip=True, bdf=None):
+        return types.SimpleNamespace(fdinfo_own_vram_mb=lambda: own_mb,
+                                     _torch=lambda: None,
+                                     _is_hip=lambda torch: hip,
+                                     device_bdf=lambda: bdf)
+
+    host = Host(tmp_path)
+    gpu_nodes = selftest.rocm_sysfs.gpu_nodes
+    monkeypatch.setattr(selftest.rocm_sysfs, "gpu_nodes",
+                        lambda *roots: gpu_nodes(host.roots))
+    assert selftest.rocm_reason("tier") == "not a ROCm host"
+    assert selftest._fdinfo_reason(fdinfo(None)) == (
+        "no DRM fdinfo VRAM figure for this process: not a ROCm host")
+    assert selftest._free_tier_reason(fdinfo(None), "amdgpu-sysfs") == (
+        "no amdgpu sysfs: not a ROCm host")
+    host.gpu(1, 0x0300, openable=False)
+    assert selftest.rocm_reason("tier") == (
+        "KFD lists a GPU but this process cannot open its render node")
+    host.gpu(2, 0x0C00)
+    assert selftest.rocm_reason("tier") == "tier"
+    assert selftest._fdinfo_reason(fdinfo(None, hip=False)) == (
+        "the worker's torch is not a ROCm build")
+    assert selftest._free_tier_reason(
+        fdinfo(None, hip=False, bdf="0000:01:00.0"), "amdgpu-sysfs") == (
+        "the worker's torch is not a ROCm build")
+    assert selftest._free_tier_reason(
+        fdinfo(None, bdf="0000:01:00.0"), "amdgpu-sysfs") == (
+        "amdgpu sysfs present but mem_info_vram_* unreadable")
+    assert selftest._fdinfo_reason(fdinfo(None)) == (
+        "no DRM fdinfo VRAM figure for this process: "
+        "no amdgpu fdinfo record of this device parsed")
+    assert selftest._fdinfo_reason(fdinfo(900)) == (
+        "fdinfo read 900 MiB; the worker rejected it as implausible")
+    assert selftest._free_tier_reason(fdinfo(None), "amdgpu-sysfs") == (
+        "no amdgpu sysfs: no GPU resolved for this device")
+
+
+def test_selftest_reads_free_until_it_settles():
+    """On a discrete amdgpu GPU free is reread from sysfs until it holds for
+    2 s; a change or a failed read restarts the hold, and a figure that never
+    holds stops at the read bound. A unified GPU or any other source is read
+    once."""
+    reads = iter([1500, None, None] + [2000] * 9)
+    memory = types.SimpleNamespace(
+        free_total_mb=lambda: (1000, 24576, "amdgpu-sysfs"),
+        _free_mb=lambda source: (lambda free: (
+            free, None if free is None else source))(next(reads)),
+        _unified_gpu=lambda: False)
+    sleeps = []
+    assert selftest.settled_free_mb(memory, sleeps.append) == (
+        2000, "amdgpu-sysfs", 3.0, True)
+    assert sleeps == [0.25] * 12
+    reads = iter(range(1001, 2000))
+    assert selftest.settled_free_mb(memory, lambda s: None) == (
+        1040, "amdgpu-sysfs", 10.0, False)
+    reads = iter([None] * 9)
+    assert selftest.settled_free_mb(memory, lambda s: None, reads=9) == (
+        None, None, 2.25, False)
+    reads = iter([1000] * 8)
+    assert selftest.settled_free_mb(memory, lambda s: None) == (
+        1000, "amdgpu-sysfs", 2.0, True)
+    for source, unified in (("nvml", False), ("amdgpu-sysfs", True)):
+        reads = iter([1000, 2000])
+        memory = types.SimpleNamespace(
+            free_total_mb=lambda: (next(reads), 4096, source),
+            _unified_gpu=lambda: unified)
+        assert selftest.settled_free_mb(memory, sleeps.append) == (
+            1000, source, None, None)
+        assert next(reads) == 2000
 
 
 def test_newrun_records_the_gpu_nodes(tmp_path):

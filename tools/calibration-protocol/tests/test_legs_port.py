@@ -12,10 +12,14 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
+
+import pytest
 
 HERE = Path(__file__).resolve().parents[1]
 
@@ -143,3 +147,30 @@ def test_a_config_named_by_path_moves_the_same_way(tmp_path):
     assert plan["bound_ports"]["gateway"] == 17912
     assert plan["endpoints"] == [{"name": "test", "port": 17913},
                                  {"name": "legacy_ui", "port": 17909}]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_run_gateway_passes_the_port_and_the_inference_url(tmp_path):
+    env = {**os.environ, "CALIB_PYTHON": sys.executable, "CALIB_PORT": "17912",
+           "CALIB_INFERENCE_URL": "http://10.0.0.5:7777",
+           "CALIB_WORKER_PYTHON": "/opt/venv/bin/python",
+           "CALIB_LOAD_DOTENV": "0", "PANOPTIKON_BIN": str(tmp_path / "none")}
+    result = subprocess.run(
+        ["bash", str(HERE / "config" / "run-gateway.sh"), "C1", str(tmp_path)],
+        env=env, capture_output=True, text=True)
+    assert result.returncode == 3, result.stderr  # the missing binary
+    text = (tmp_path / "server-C1.toml").read_text()
+    document = tomllib.loads(text)
+    assert document["server"]["port"] == 17912
+    assert {(row["name"], row["port"]) for row in legs.endpoints_in(text)} == {
+        ("test", 17913), ("legacy_ui", 17909)}
+    assert document["upstreams"]["inference"] == [
+        {"base_url": "http://10.0.0.5:7777"}]
+    # No worker is started, so none needs a venv under `--repo`.
+    shipped = tmp_path / "repo" / "config" / "server"
+    shipped.mkdir(parents=True)
+    shutil.copy(HERE.parents[1] / "config" / "server" / "default.toml", shipped)
+    assert legs.main(["--config", "C1", "--repo", str(tmp_path / "repo"),
+                      "--no-dotenv",
+                      "--inference-url", "http://10.0.0.5:7777",
+                      "--write-config", str(tmp_path / "split")]) == 0

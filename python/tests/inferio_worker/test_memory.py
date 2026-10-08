@@ -23,7 +23,7 @@ from unittest import mock
 
 import pytest
 
-from inferio_worker import memory, packing
+from inferio_worker import memory, packing, sdpa
 
 MIB = 1024 * 1024
 
@@ -1710,6 +1710,36 @@ def test_the_pin_tripwire_fires_only_on_our_own_placement(monkeypatch) -> None:
         with isolated(module):
             monkeypatch.setenv("PANOPTIKON_DEVICE_PIN", "GPU-1a2b")
             assert (memory.pinned_device_missing() is not None) is fires
+
+
+@pytest.mark.parametrize("problem", [None, "pinned to a device torch lacks"])
+def test_after_load_checks_the_pin_then_prices_then_checks_gqa(
+    monkeypatch, problem
+) -> None:
+    # The worker's and the ceiling probe's step after `load()`: a pin problem
+    # raises before the load is priced, and the GQA check's test call comes
+    # after the pricing.
+    events: list[str] = []
+    monkeypatch.setattr(
+        memory, "pinned_device_missing", lambda: events.append("pin") or problem
+    )
+    monkeypatch.setattr(
+        sdpa,
+        "expand_kv_heads_without_fused_gqa",
+        lambda: events.append("gqa") or sdpa.PATCHED,
+    )
+
+    def price() -> dict:
+        events.append("price")
+        return {"base_mb": 512}
+
+    if problem is None:
+        assert memory.after_load(price) == ({"base_mb": 512}, sdpa.PATCHED)
+        assert events == ["pin", "price", "gqa"]
+    else:
+        with pytest.raises(RuntimeError):
+            memory.after_load(price)
+        assert events == ["pin"]
 
 
 def test_the_unified_signal_is_an_address_the_worker_verifies(

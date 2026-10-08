@@ -59,7 +59,7 @@ def fake_worker(monkeypatch: pytest.MonkeyPatch):
         state.calls.append((device, torch_module.cuda.current))
         return state.accepts
 
-    monkeypatch.setattr(sdpa, "_checked", False)
+    monkeypatch.setattr(sdpa, "_decision", None)
     monkeypatch.setattr(sdpa, "fused_kernel_accepts_gqa", test_call)
     monkeypatch.setitem(sys.modules, sdpa.SDPA_MODULE, module)
     monkeypatch.setitem(sys.modules, "torch", fake)
@@ -71,14 +71,14 @@ def test_no_fused_gqa_kernel_patches_transformers(
 ) -> None:
     fake_worker.accepts = False
     with caplog.at_level(logging.INFO, logger=sdpa.logger.name):
-        sdpa.expand_kv_heads_without_fused_gqa()
+        assert sdpa.expand_kv_heads_without_fused_gqa() == sdpa.PATCHED
     assert fake_worker.module.use_gqa_in_sdpa is sdpa._never_gqa
     assert "expanding key/value heads" in caplog.text
 
 
 def test_a_fused_gqa_kernel_leaves_transformers_untouched(fake_worker) -> None:
     fake_worker.accepts = True
-    sdpa.expand_kv_heads_without_fused_gqa()
+    assert sdpa.expand_kv_heads_without_fused_gqa() == sdpa.FUSED
     assert len(fake_worker.calls) == 1
     assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
 
@@ -97,7 +97,7 @@ def test_no_cuda_memory_means_no_call(
     would create a context."""
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(reserved=(0, 0)))
     fake_worker.accepts = False
-    sdpa.expand_kv_heads_without_fused_gqa()
+    assert sdpa.expand_kv_heads_without_fused_gqa() == sdpa.NOT_APPLICABLE
     assert fake_worker.calls == []
     assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
 
@@ -108,7 +108,7 @@ def test_uninitialised_cuda_means_no_call(
     """CPU and MPS workers, and a load that never touched CUDA."""
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(initialized=False))
     fake_worker.accepts = False
-    sdpa.expand_kv_heads_without_fused_gqa()
+    assert sdpa.expand_kv_heads_without_fused_gqa() == sdpa.NOT_APPLICABLE
     assert fake_worker.calls == []
     assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
 
@@ -117,13 +117,16 @@ def test_without_transformers_there_is_nothing_to_check(
     fake_worker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delitem(sys.modules, sdpa.SDPA_MODULE)
-    sdpa.expand_kv_heads_without_fused_gqa()
+    assert sdpa.expand_kv_heads_without_fused_gqa() == sdpa.NOT_APPLICABLE
     assert fake_worker.calls == []
 
 
 def test_the_check_runs_once_per_process(fake_worker) -> None:
-    sdpa.expand_kv_heads_without_fused_gqa()
-    sdpa.expand_kv_heads_without_fused_gqa()
+    """A later call answers the first call's decision without checking again."""
+    fake_worker.accepts = False
+    assert sdpa.expand_kv_heads_without_fused_gqa() == sdpa.PATCHED
+    fake_worker.accepts = True
+    assert sdpa.expand_kv_heads_without_fused_gqa() == sdpa.PATCHED
     assert len(fake_worker.calls) == 1
 
 
@@ -137,12 +140,12 @@ def test_the_check_never_raises(
         raise KeyError("unexpected")
 
     monkeypatch.setattr(sdpa, "fused_kernel_accepts_gqa", broken)
-    sdpa.expand_kv_heads_without_fused_gqa()
+    assert sdpa.expand_kv_heads_without_fused_gqa() == sdpa.CHECK_FAILED
     assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
 
-    monkeypatch.setattr(sdpa, "_checked", False)
+    monkeypatch.setattr(sdpa, "_decision", None)
     monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace())
-    sdpa.expand_kv_heads_without_fused_gqa()
+    assert sdpa.expand_kv_heads_without_fused_gqa() == sdpa.CHECK_FAILED
     assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
 
 

@@ -10,6 +10,7 @@ or, where that cannot be used, from DRM fdinfo parsed as
 
 from __future__ import annotations
 
+from collections import Counter
 import os
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
@@ -119,6 +120,31 @@ def inventory(roots: Roots = Roots()) -> List[Gpu]:
             else row for row in rows]
 
 
+def pinned_gpu(device: int, environ: Dict[str, str],
+               roots: Roots = Roots()) -> Optional[Gpu]:
+    """The GPU a process pinned to HIP device `device` uses. A single index
+    already in `HIP_VISIBLE_DEVICES` is kept and names the device; any other
+    visibility variable leaves the process unpinned (None)."""
+    hip = (environ.get("HIP_VISIBLE_DEVICES") or "").strip()
+    others = ("ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL")
+    if any((environ.get(name) or "").strip() for name in others) or (
+            hip and not hip.isdigit()):
+        return None
+    return next((gpu for gpu in inventory(roots)
+                 if gpu.index == (int(hip) if hip else device)), None)
+
+
+def pin_env(gpu: Gpu) -> Dict[str, str]:
+    """The variables the spawner gives a worker on `gpu`: `HIP_VISIBLE_DEVICES`
+    and `PANOPTIKON_DEVICE_PIN`, plus `PANOPTIKON_UNIFIED_GPU` on a unified
+    GPU."""
+    out = {"HIP_VISIBLE_DEVICES": str(gpu.index),
+           "PANOPTIKON_DEVICE_PIN": str(gpu.index)}
+    if gpu.unified:
+        out["PANOPTIKON_UNIFIED_GPU"] = gpu.bdf
+    return out
+
+
 def meminfo_mb(roots: Roots, key: str) -> Optional[int]:
     """One `/proc/meminfo` row in MiB (`rocm.rs::meminfo_mb`)."""
     for line in (_read(os.path.join(roots.proc, "meminfo")) or "").splitlines():
@@ -131,7 +157,8 @@ def meminfo_mb(roots: Roots, key: str) -> Optional[int]:
 
 def memory_mb(roots: Roots, gpu: Gpu) -> Optional[Tuple[int, int]]:
     """`(total_mb, free_mb)` as `rocm.rs::query_memory` computes it: on a
-    unified GPU, carve-out plus GTT, with free GTT clamped by `MemAvailable`."""
+    unified GPU, carve-out plus GTT, with free GTT clamped by the RAM the
+    kernel could deliver, `MemAvailable` less `SReclaimable`."""
     device = os.path.join(roots.pci_devices, gpu.bdf)
 
     def mb(name: str) -> Optional[int]:
@@ -147,6 +174,7 @@ def memory_mb(roots: Roots, gpu: Gpu) -> Optional[Tuple[int, int]]:
     available = meminfo_mb(roots, "MemAvailable")
     if gtt_total is None or gtt_used is None or available is None:
         return None
+    available = max(0, available - (meminfo_mb(roots, "SReclaimable") or 0))
     return (total + gtt_total,
             max(0, total - used) + min(max(0, gtt_total - gtt_used), available))
 
@@ -190,13 +218,15 @@ def _numbered(root: str) -> List[int]:
 
 
 def _drm_fdinfo(roots: Roots, pid: int) -> Optional[List[str]]:
-    """The fdinfo text of every `/dev/dri/*` descriptor this PID holds, or
-    None when its descriptors may not be read (another user's process, without
-    CAP_SYS_PTRACE). A PID that exits meanwhile holds nothing."""
+    """The fdinfo text of every `/dev/dri/*` descriptor this PID holds,
+    highest-numbered first, or None when its descriptors may not be read
+    (another user's process, without CAP_SYS_PTRACE). A PID that exits
+    meanwhile holds nothing."""
     base = os.path.join(roots.proc, str(pid))
     texts = []
     try:
-        for fd in os.listdir(os.path.join(base, "fd")):
+        for fd in sorted(os.listdir(os.path.join(base, "fd")), key=int,
+                         reverse=True):
             try:
                 if not os.readlink(os.path.join(base, "fd", fd)).startswith("/dev/dri/"):
                     continue
@@ -221,17 +251,24 @@ def _pasid(text: str) -> Optional[int]:
     return None
 
 
-def _fdinfo_bytes(texts: List[str], gpu: Gpu) -> int:
-    """Bytes on `gpu` over one PID's DRM clients, each client counted once."""
+def _fdinfo_held_mb(texts: Dict[int, Optional[List[str]]], gpu: Gpu
+                    ) -> Dict[int, int]:
+    """MiB on `gpu` per PID over its DRM clients. Each client counts once: a
+    descriptor inherited across fork names the same client in both PIDs and
+    is credited to the lower PID."""
     regions = ("vram", "gtt") if gpu.unified else ("vram",)
-    seen, total = set(), 0
-    for text in texts:
-        record = parse_fdinfo(text, regions)
-        if record is None or record[0] != gpu.bdf or record[1] in seen:
-            continue
-        seen.add(record[1])
-        total += record[2]
-    return total
+    seen, held = set(), {}
+    for pid in sorted(texts):
+        total = 0
+        for text in texts[pid] or []:
+            record = parse_fdinfo(text, regions)
+            if record is None or record[0] != gpu.bdf or record[1] in seen:
+                continue
+            seen.add(record[1])
+            total += record[2]
+        if total:
+            held[pid] = total // MIB
+    return held
 
 
 def _in_initial_pid_ns(roots: Roots) -> bool:
@@ -253,9 +290,14 @@ def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = N
 
     KFD's counter where a PID can be tied to its KFD entry: by PID in the
     initial PID namespace, else by the `pasid:` of the PID's DRM fdinfo, which
-    KFD sets to its own PASID for that process. A GPU where a PID holding
-    memory has no KFD entry is read from fdinfo, as is a unified GPU (KFD
-    counts VRAM only, not GTT).
+    KFD sets to its own PASID for that process. A unified GPU, or one without
+    a KFD `gpu_id`, is read from fdinfo (KFD counts VRAM only, not GTT), as is,
+    when PIDs are matched by PASID, a GPU where a PID holding memory has no KFD
+    entry. PIDs are taken in ascending order, and each takes the first PASID
+    whose KFD entry no lower PID took: one no other read PID names before one
+    it shares (a descriptor inherited across fork), highest-numbered descriptor
+    first. An entry two PIDs reach is credited once, and a child keeps its own
+    entry whatever its PID.
     """
     kfd_root = os.path.join(roots.kfd, "proc")
     kfd_present = os.path.isdir(kfd_root)
@@ -267,7 +309,7 @@ def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = N
         read_int(os.path.join(kfd_root, str(entry), "pasid")):
         os.path.join(kfd_root, str(entry)) for entry in _numbered(kfd_root)}
     texts: Dict[int, Optional[List[str]]] = {}
-    if not by_pid or any(gpu.unified for gpu in gpus):
+    if not by_pid or any(gpu.unified or gpu.gpu_id is None for gpu in gpus):
         texts = {pid: _drm_fdinfo(roots, pid)
                  for pid in (pids if pids is not None else _numbered(roots.proc))}
     if by_pid:
@@ -275,16 +317,20 @@ def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = N
                    for pid in (pids if pids is not None else _numbered(kfd_root))}
     else:
         entries = {}
-        for pid, pid_texts in texts.items():
-            match = next((by_pasid[pasid] for pasid in map(_pasid, pid_texts or [])
-                          if pasid and pasid in by_pasid), None)
+        pasids = {pid: [p for p in map(_pasid, pid_texts or []) if p]
+                  for pid, pid_texts in texts.items()}
+        shared = Counter(p for found in pasids.values() for p in set(found))
+        for pid in sorted(pasids):
+            match = next((by_pasid[pasid] for pasid in
+                          sorted(pasids[pid], key=lambda p: shared[p] > 1)
+                          if pasid in by_pasid
+                          and by_pasid[pasid] not in entries.values()), None)
             if match:
                 entries[pid] = match
     unreadable = sorted(pid for pid, pid_texts in texts.items() if pid_texts is None)
     out: Dict[str, Reading] = {}
     for gpu in gpus:
-        fdinfo = {pid: value // MIB for pid, pid_texts in texts.items()
-                  if pid_texts and (value := _fdinfo_bytes(pid_texts, gpu))}
+        fdinfo = _fdinfo_held_mb(texts, gpu)
         if (gpu.unified or gpu.gpu_id is None or not kfd_present
                 or not (by_pid or (entries and set(fdinfo) <= set(entries)))):
             out[gpu.key] = Reading("fdinfo", fdinfo, unreadable)

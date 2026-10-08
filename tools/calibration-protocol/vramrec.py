@@ -27,11 +27,14 @@ Line 1 is a `"kind": "header"` object: argv, interval, host, an `"nvml"` block
      "iso", "sample_ms",
      "gpus":  [{"index", "uuid", "name", "total_mb", "used_mb", "free_mb",
                 "error", "oracle_source", "oracle_age_ms",
+                "skew_mb" (ROCm only),
                 "procs": [{"pid", "used_mb", "cmdline", "comm",
                 "type": "compute"|"graphics", "gone", "rss_mb", "vmhwm_mb",
+                "ns_pid",
                 "env": {"CUDA_VISIBLE_DEVICES": str, ...}}]}],
      "mem":   {"mem_total_mb", "mem_available_mb", "mem_free_mb",
-               "swap_free_mb", "cached_mb", "source" (macOS only)},
+               "swap_free_mb", "cached_mb", "s_reclaimable_mb", "shmem_mb",
+               "source" (macOS only)},
      "procs": [{"pid", "cmdline", "comm", "rss_mb", "vmhwm_mb", "gone",
                 "env"}]}
 
@@ -50,7 +53,7 @@ Per GPU, **`oracle_source`** says which instrument priced the processes in
 that sample: `"nvml"` (NVML priced *every* process it listed and no
 `nvidia-smi` reading was used), `"nvidia-smi"` (NVML priced none and the
 fallback priced at least one), `"nvml+nvidia-smi"` (some pids priced by each)
-or `"none"` (this GPU has no complete attribution -- an idle board, a
+or `"none"` (this GPU has no complete attribution -- an idle GPU, a
 partly-priced one the fallback was not consulted for, or one where the
 fallback answered and priced nothing, which is the WDDM shape: a null fill is
 not a fill). `oracle_age_ms` is how old the reused `nvidia-smi` reading was,
@@ -109,7 +112,9 @@ by the PASID in the process's DRM fdinfo, and never used on a unified GPU (it
 counts no GTT); `"amdgpu-fdinfo"` is DRM fdinfo, the same counter the
 worker's own `fdinfo` base reads. `unreadable_pids` lists the processes whose
 descriptors could not be read (another user's, without CAP_SYS_PTRACE): what
-they hold is missing from `procs`.
+they hold is missing from `procs`. `skew_mb` is how far the GPU's `used`
+moved during the per-process scan, which reads every PID's descriptors and
+so is not one instant.
 """
 
 from __future__ import annotations
@@ -294,25 +299,30 @@ def proc_env_read(pid: int, keys: Iterable[str]) -> Tuple[Dict[str, str], bool]:
 
 
 def proc_mem(pid: int) -> Dict[str, Optional[int]]:
-    """RSS and VmHWM (lifetime high-water RSS) in MiB."""
+    """RSS and VmHWM (lifetime high-water RSS) in MiB, and `ns_pid`: the PID
+    in the process's own PID namespace, the one a container's log names."""
     raw = _read_text(f"/proc/{pid}/status")
     if raw is None:
         if _PSUTIL is not None:
             try:
                 info = _PSUTIL.Process(pid).memory_info()
-                return {"rss_mb": int(info.rss // MIB), "vmhwm_mb": None}
+                return {"rss_mb": int(info.rss // MIB), "vmhwm_mb": None,
+                        "ns_pid": None}
             except Exception:
-                return {"rss_mb": None, "vmhwm_mb": None}
-        return {"rss_mb": None, "vmhwm_mb": None}
-    rss = hwm = None
+                return {"rss_mb": None, "vmhwm_mb": None, "ns_pid": None}
+        return {"rss_mb": None, "vmhwm_mb": None, "ns_pid": None}
+    rss = hwm = ns_pid = None
     for line in raw.splitlines():
-        if line.startswith("VmRSS:"):
+        # `NSpid:` gives the PID in each namespace, innermost last, before `Vm*`.
+        if line.startswith("NSpid:"):
+            ns_pid = int(line.split()[-1])
+        elif line.startswith("VmRSS:"):
             rss = _kb_to_mib(line)
         elif line.startswith("VmHWM:"):
             hwm = _kb_to_mib(line)
         if rss is not None and hwm is not None:
             break
-    return {"rss_mb": rss, "vmhwm_mb": hwm}
+    return {"rss_mb": rss, "vmhwm_mb": hwm, "ns_pid": ns_pid}
 
 
 def _kb_to_mib(line: str) -> Optional[int]:
@@ -332,6 +342,11 @@ _MEMINFO_KEYS = {
     "Cached": "cached_mb",
     "SwapFree": "swap_free_mb",
     "SwapTotal": "swap_total_mb",
+    # The product's free host RAM is MemAvailable less SReclaimable (before any
+    # cgroup limit).
+    "SReclaimable": "s_reclaimable_mb",
+    # tmpfs and /dev/shm pages: in Cached, yet the kernel cannot drop them.
+    "Shmem": "shmem_mb",
 }
 
 
@@ -973,9 +988,10 @@ class AmdgpuOracle:
     def sample(self) -> List[Dict[str, Any]]:
         if time.monotonic() >= self._next_health:
             self._adopt_health()
+        before = [rocm_sysfs.memory_mb(self.roots, gpu) for gpu in self.gpus]
         procs = rocm_sysfs.process_vram_mb(self.roots, self.gpus)
         rows = []
-        for gpu in self.gpus:
+        for gpu, first in zip(self.gpus, before):
             memory = rocm_sysfs.memory_mb(self.roots, gpu)
             source, held, unreadable = procs[gpu.key]
             total, free = memory if memory else (None, None)
@@ -983,6 +999,8 @@ class AmdgpuOracle:
                 "index": gpu.index, "uuid": gpu.key, "name": None,
                 "total_mb": total, "free_mb": free,
                 "used_mb": None if memory is None else total - free,
+                "skew_mb": (None if memory is None or first is None
+                            else abs((total - free) - (first[0] - first[1]))),
                 "error": None if memory else "mem_info_* unreadable",
                 "oracle_source": f"amdgpu-{source}", "oracle_age_ms": None,
                 "unreadable_pids": unreadable,
@@ -1073,7 +1091,7 @@ class SmiOracle:
         self.error: Optional[str] = None
         #: set once a query has priced a GPU NVML listed but could not price,
         #: which is this host's own proof that an empty NVML list may be a
-        #: hidden answer rather than an idle board.
+        #: hidden answer rather than an idle GPU.
         self.proved_nvml_blind = False
         self._cache: Dict[str, Tuple[float, Dict[int, Optional[int]]]] = {}
 
@@ -1122,7 +1140,7 @@ def should_consult_smi(procs: List[Dict[str, Any]],
     """Whether this GPU's NVML answer is worth an `nvidia-smi` subprocess.
 
     An idle GPU lists nothing, and that is the normal state of S2's and S3's
-    board before the model loads, so an empty list only earns a subprocess
+    GPU before the model loads, so an empty list only earns a subprocess
     where NVML is known to hide the answer: on Windows, or once a fallback
     query has already out-answered NVML on this host.
     """
@@ -1271,6 +1289,7 @@ def build_sample(
                     "env": meta["env"],
                     "rss_mb": mem["rss_mb"],
                     "vmhwm_mb": mem["vmhwm_mb"],
+                    "ns_pid": mem["ns_pid"],
                     "gone": meta["cmdline"] is None and mem["rss_mb"] is None,
                 }
             )

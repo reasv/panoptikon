@@ -29,7 +29,7 @@ machine with a GPU; nothing here is specific to one host. What the keys mean:
    anywhere — it just prices and embeds the wrong audio. `--list-tiers` has
    the rest.
 4. A GPU with nothing else on it. Stop whatever else holds VRAM, confirm the
-   board reads idle, and run one probe process per GPU — never two.
+   GPU reads idle, and run one probe process per GPU — never two.
 
 ## 2. Probe
 
@@ -167,12 +167,14 @@ A measured slope also belongs in a **shipped baseline** — a profile in
 machine that has measured nothing yet. That directory's README is the file
 format; this is how the rows in it are produced.
 
-**Baselines are measured on Linux/CUDA only.** The slope travels between
+**Baselines are measured on Linux, with CUDA or ROCm.** The slope travels between
 platforms wherever the same kernels run — a Windows host fitted
 `tags/wd-vit-tagger-v3` at 29.8594 MiB/item against this host's 29.8587, a
 difference of 0.7 KiB per item — while the base does not: the same model's
 base read `free_delta` 845 MiB on Windows against NVML's 964 here. So the
-Windows rows are **generated from the Linux measurement**, and say so.
+Windows rows are **generated from the Linux/CUDA measurement**, and say so.
+A ROCm row is never copied: the rocm extra is Linux-only, and a CUDA slope
+never prices a ROCm lookup (`backend` is in the key).
 
 1. **Measure.** Run the S2 leg for the id (`tools/calibration-protocol/`,
    `legs.py`): a leg drives real windows, so its
@@ -201,10 +203,11 @@ Windows rows are **generated from the Linux measurement**, and say so.
       --out python/inferio/config/calibration/<name>.toml
    ```
 
-   It refuses any row not measured on linux/cuda, drops the local-authority
-   fields, and for each allowlisted id emits a second row with `platform =
-   "windows"`, the Linux `base_mb`, `base_platform = "linux"`, the original
-   `measured_at` and itself as `generator`. Rerunning it over its own output
+   It refuses any row not measured on linux/cuda or linux/rocm, drops the
+   local-authority fields, and for each allowlisted id's cuda row emits a
+   second row with `platform = "windows"`, the Linux `base_mb`,
+   `base_platform = "linux"`, the original `measured_at` and itself as
+   `generator`. Rerunning it over its own output
    reproduces the file, so a baseline can be regenerated after a re-measure.
 
 ### What must not be copied

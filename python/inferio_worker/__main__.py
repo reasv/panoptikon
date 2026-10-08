@@ -176,7 +176,7 @@ def _handshake(
 
 
 def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
-    from inferio_worker import memory, packing, protocol, sdpa
+    from inferio_worker import memory, packing, protocol
     from inferio_worker.inputs import prediction_input_from_frame
 
     impl_cls, batch_memory_frames = _handshake(proto_in, proto_out)
@@ -266,15 +266,12 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 # Idempotency lives in the impl's own load() guard
                 # (InferenceModel implementations early-return when loaded).
                 instance.load()
-                # A pin that named nothing is a silent CPU fallback.
-                pin_problem = memory.pinned_device_missing()
-                if pin_problem is not None:
-                    raise RuntimeError(pin_problem)
+                # Raises on a pin that named nothing (a silent CPU fallback);
+                # then prices the load and runs the GQA check.
+                report, _ = memory.after_load(
+                    lambda: memory.finish_load(before, instance)
+                )
                 loaded = True
-                report = memory.finish_load(before, instance)
-                # After the load is priced: the GQA check only runs where the
-                # load put memory on a GPU.
-                sdpa.expand_kv_heads_without_fused_gqa()
                 # Canvas and token window from the downloaded model config.
                 canvas_pixels = packing.impl_canvas_pixels(instance)
                 if canvas_pixels is not None:

@@ -64,7 +64,9 @@ one batch of `--batch` items priced by the worker's own
 `peak_reserved_mb` and `duration_ms`; then what `empty_cache()` returned. It
 ends with a `VERDICT:` line naming the degraded tiers, exits 0 either way
 (degraded is a fact about the platform, not an error) and prints the device's
-free memory after teardown, because it must never leave the GPU allocated.
+free memory after teardown, because it must never leave the GPU allocated. On
+a discrete amdgpu GPU that figure is reread until it holds for 2 s (at most
+10 s).
 
 It needs no corpus: without `--corpus` the batch's images are synthesised with
 Pillow, so it runs on a machine that has never generated one. Pass `--corpus`
@@ -81,11 +83,11 @@ bites, and this is the one-command check for it. **On
 Windows/WDDM nothing raises**: over-admission there spills to host memory
 through the driver's sysmem fallback and shows up only as a throughput
 collapse, which is what `packing._note_throughput` and `COLLAPSE_RATIO` exist
-to catch. So when the filler exhausts the board without an exception the tool
+to catch. So when the filler exhausts the GPU without an exception the tool
 runs one more real batch and compares its units/sec against the clean one, and
 reports `oom.kind = "throughput_collapse"` with both rates and no `oom_class`.
-The ladder stops 4 096 MiB past the board's total, and the flag is refused
-(exit 2) when no board total resolved — otherwise the WDDM path, the one it
+The ladder stops 4 096 MiB past the GPU's total, and the flag is refused
+(exit 2) when no GPU total resolved — otherwise the WDDM path, the one it
 exists for, would fill host RAM instead of a device. On a CPU-priced host it
 reports `kind: "unavailable"` rather than filling a GPU no section is reading.
 
@@ -99,9 +101,10 @@ per-platform checks.
 legs.py --scenario S2 --bin PATH --config C1 --results DIR
         [--run-id ID] [--gpu-total-mb 24564] [--python PATH]
         [--model ID] [--models a,b,c] [--scan-audio] [--corpus DIR]
-        [--note "..."] [--port N]
+        [--note "..."] [--port N] [--inference-url URL]
         [--legacy-port 6339] [--seed-calibration FILE] [--job-cap S]
         [--settle S] [--hog-device N] [--hog-port N] [--min-free-mb 1024]
+        [--hog-event at=S,leave_free=MIB|hold=MIB|release ...]
         [--health-full] [--repo DIR] [--no-dotenv] [--list] [--dry-run]
 ```
 
@@ -114,16 +117,21 @@ instead of `curl`, `subprocess` with an explicit termination protocol instead
 of job control, and no shell anywhere.
 
 In order: `newrun.py` for the results directory and `host.json`; `vramrec.py`;
-`hog.py` filled to its target before the gateway sees the board; `healthrec.py`;
-the binary with `--config <toml> --root <dir>/root --disable-update-check`;
-`fds.jsonl` sampled from a thread; wait for `/api/client-config`; create the
+`hog.py` filled to its target before the gateway sees the GPU; `healthrec.py`;
+a wait of up to 30 s for a sample in every recording (a
+`recorder_sample_timeout` event if one never comes); the binary with
+`--config <toml> --root <dir>/root --disable-update-check`; `fds.jsonl` sampled
+from a thread; wait for `/api/client-config`; create the
 `cal` databases and point the job config at the corpus; rescan; post the
 extraction job — one per `--models` id, in order, in the same database — and
-fire the scenario's timed hog events; wait for the queue;
+fire the scenario's timed hog events (one the jobs end before is marked
+`hog_event_void` and not fired); wait for the queue;
 snapshot jobs / failures / metadata / health and `calibration.after.toml`;
 stop everything in reverse; copy `panoptikon.log`. Then `legs.json`: every
-resolved parameter, every event with its wall clock, every process and its
-exit code, and the `analyze.py` command line for this scenario.
+resolved parameter, every event with its wall clock and monotonic `t_mono`,
+every process and its exit code, and the `analyze.py` command line for this
+scenario. SIGTERM, SIGHUP (an ssh drop; not under nohup) or SIGBREAK ends a
+leg as Ctrl-C does: the same teardown, and the outcome `interrupted`.
 
 **S14 probes every listener the config declares.** A config can name more
 than the gateway port — `[[server.endpoints]]` puts the same routes on
@@ -135,6 +143,18 @@ endpoint with `restricted_demo`). A listener that answers anything else, or
 does not answer at all, writes an `endpoint_assertion_failed` event and the
 per-endpoint rows land in `smoke.json` under `endpoints`. `--legacy-port`
 still adds a port the config does not declare.
+
+**A split gateway.** `--inference-url URL` turns `[inference_local]` off in
+the leg's copy of the config and makes `URL` its one `[[upstreams.inference]]`
+server. `healthrec.jsonl` then holds the server's report as the gateway
+forwards it, with the gateway's own `inference_clients`; a second healthrec
+polls the server directly into `healthrec-remote.jsonl`. A 504 from the
+gateway (a server it declared frozen) keeps its `inference_clients` and
+`detail`. The GPU, the ledger's log and the store are on the server's host,
+so a split leg refuses a hog, a restart and learning, and `analyze.py` judges
+it only on `failures`, `idle_liveness`, `job_outcome`, `peak_fds`,
+`ramp_progress` and `batch_coverage`. The server's memory safety is tested by
+a leg run on its own host.
 
 **S3's second job runs on its own database** (`cal2`). Re-creating `cal`
 does not empty it, so the first job's extractions are still there and the
@@ -149,7 +169,7 @@ without starting a process.
 
 **`--gpu-total-mb` and the scaling rule.** Every hog figure in the scenario
 table is a **fraction of the GPU's total**, never a number of MiB, because a
-schedule written for a 97 887 MiB board says nothing on a 24 564 MiB one:
+schedule written for a 97 887 MiB GPU says nothing on a 24 564 MiB one:
 `leave-free 12288` is comfortable on the first and more than the model plus
 its working set on the second. The rule is
 
@@ -157,26 +177,33 @@ its working set on the second. The rule is
 mib = round(fraction × gpu_total_mb)
 ```
 
-with `--gpu-total-mb` defaulting to the board NVML reports for `--hog-device`.
+with `--gpu-total-mb` defaulting to the GPU total NVML reports for `--hog-device`.
 A `leave-free` figure is then floored at `--min-free-mb` (default 1 024) so
 the model under test still fits on a small card, and a `hold` figure is capped
-at `gpu_total_mb − --min-free-mb` for the same reason. The floor is low on
-purpose: at 4 096 it bound S4a, S4c and S4d alike on a 32 GB board and made
+at `gpu_total_mb − --min-free-mb` for the same reason. The hog is also given
+the floor and takes no more once free is at it, so a hold on host RAM, which
+the GPU total does not bound, stops there too. The floor is low on
+purpose: at 4 096 it bound S4a, S4c and S4d alike on a 32 GB GPU and made
 three legs defined at different levels apply identical pressure. Whenever it
 does bind, the leg writes a `floor_bound` event into `legs.json` and prints a
 `PRECONDITION:` line naming the scaled figure and the level it was moved to,
 because the leg is then measuring the floor and not the fraction. Both the
 fraction and the resolved MiB land in `legs.json`, and `--list`'s MiB column
-is this host's reference board, so a cross-platform comparison can state
+is this host's reference GPU, so a cross-platform comparison can state
 exactly what changed. The fractions come from this host's legs: S4a `leave-free`
 12 288 / 97 887, S4b's step `hold` 30 720 / 97 887 at t+60 s, S4d
 `leave-free` 8 192 / 97 887 released at t+120 s. **S4c's spike is not a
-fraction**: its "~2 GB free" is the defensive clamp's own threshold, the
-number the scenario is defined against, so it is 2 048 MiB on every board,
-neither scaled nor floored, at t+90 s and released at t+100 s. On a 32 607 MiB
-board the four resolve to S4a 4 093, S4b 10 233, S4c 2 048 and S4d 2 729 MiB. Every event is timed **from the job's POST**, not from
-the leg's start, because what the scenario describes is a change during the
-job.
+fraction**: it squeezes the GPU to about 2 GB free, so it is 2 048 MiB on
+every GPU, not scaled, and raised only by a `--min-free-mb` above it, at
+t+90 s and released at t+100 s. On a 32 607 MiB GPU the four resolve to S4a 4 093, S4b 10 233,
+S4c 2 048 and S4d 2 729 MiB. Every event is timed **from the job's POST**,
+not from the leg's start, because what the scenario describes is a change
+during the job. `--hog-event` adds such an event in MiB to any scenario
+(`at=60,leave_free=4096`, `at=120,release`), with any `--hog-target`; its
+figures are not scaled, but bounded like every figure. Its leave-free level
+is solved once, at the event, and then held, as S4a's, so the job's own pool
+does not move it afterwards; a scenario's own events keep their re-solve. On
+a scenario without a hog of its own, one starts holding 0.
 
 **Descriptors.** `fds.jsonl` is written here, in the JSONL form
 `analyze.py::read_fds` accepts — which closes, for the bare-host case, the gap
@@ -237,8 +264,9 @@ Per sample: every GPU's `total/used/free`, every NVML compute/graphics
 process on it (`pid`, `used_mb`, cmdline, `comm`, RSS, VmHWM and the
 `CUDA_VISIBLE_DEVICES` / `PANOPTIKON_DEVICE_PIN` / `INFERIO_*` /
 `PANOPTIKON_*` variables from `/proc/<pid>/environ`), `/proc/meminfo`
-(`MemAvailable`, `MemFree`, `Cached`, swap), and the RSS/VmHWM of every process
-whose cmdline matches `--filter`. Runs until SIGINT/SIGTERM or `--duration`.
+(`MemAvailable`, `MemFree`, `Cached`, swap, `SReclaimable`, `Shmem`), and the
+RSS/VmHWM of every process whose cmdline matches `--filter`. Runs until
+SIGINT/SIGTERM or `--duration`.
 A per-process `used_mb` of `null` means NVML answered N/A (WDDM, or a container
 without `--pid=host`) — it is never silently turned into 0.
 
@@ -270,7 +298,7 @@ pid NVML never listed. Each GPU row then carries:
 | `oracle_source: "nvml"` | NVML priced *every* process it listed; `nvidia-smi` was never used |
 | `oracle_source: "nvidia-smi"` | NVML priced none of them and the fallback priced at least one — a null fill is not a fill, so **on WDDM, where its answer is itself `[N/A]`, this label never appears**: that GPU reads `"none"` |
 | `oracle_source: "nvml+nvidia-smi"` | some by each (a mixed GPU, or `--smi always`) |
-| `oracle_source: "none"` | no complete attribution — an idle board, a partly-priced one the fallback was not consulted for, or one where the fallback ran and priced nothing (the WDDM shape; the `oracle_age_ms` beside it says the query ran) |
+| `oracle_source: "none"` | no complete attribution — an idle GPU, a partly-priced one the fallback was not consulted for, or one where the fallback ran and priced nothing (the WDDM shape; the `oracle_age_ms` beside it says the query ran) |
 | `oracle_age_ms` | how old the reused `nvidia-smi` reading was, recorded whenever that reading was consulted; `null` when NVML answered |
 
 **Never read a `used_mb` without the `oracle_source` beside it.** `--smi never`
@@ -305,8 +333,9 @@ and raising the cadence would silently reintroduce the fault.
 
 ```
 hog.py [--target gpu|ram|mps] [--device N] [--chunk-mb 128] [--tick 0.5]
-       [--reeval 2] [--progress-every 2] [--duration S] [--port N]
-       [--touch-period S] [--out FILE] [--hold-at-end] [--quiet] <schedule>
+       [--reeval 2] [--min-free-mb 0] [--progress-every 2] [--duration S]
+       [--port N] [--touch-period S] [--out FILE] [--hold-at-end] [--quiet]
+       <schedule>
 
   hold MB
   step MB,SECONDS [MB,SECONDS ...]
@@ -318,10 +347,19 @@ hog.py [--target gpu|ram|mps] [--device N] [--chunk-mb 128] [--tick 0.5]
 ```
 
 Control endpoint on `127.0.0.1:<port>`: `GET /state`, `POST /set?mb=N`,
-`POST /set?leave_free=N`, `POST /resume`, `POST /stop`. Every allocation is
+`POST /set?leave_free=N` (with `&pin=1`, solved once and then held),
+`POST /resume`, `POST /stop`. Every allocation is
 touched; every shrink calls `torch.cuda.empty_cache()` so the driver sees the
 release. An allocation failure increments `oom`, records `last_error`, holds
-what it got and keeps serving.
+what it got and keeps serving. A fill stops once free is at the level: the
+leave-free level or `--min-free-mb`, whichever is higher. It re-reads free
+once it has taken a quarter of the level since the last read (at least one
+chunk, at most 1 GiB), so after a reading above the level the hog takes less
+than that plus one chunk, and what others allocate meanwhile adds to that.
+That stop is what ends the fill where allocating past physical memory
+succeeds (WSL, WDDM's system-memory fallback) and no failure would. On
+`--target ram`, free is `MemAvailable` less `SReclaimable`, as the product
+reads it.
 
 **On macOS the hog stops being counted, and `--touch-period` does not fix
 it.** A page touched once and then left idle is aged onto the inactive queue
@@ -428,7 +466,10 @@ loadgen.py [--base URL] --out FILE [--corpus manifest.json]
 
 `interval=S` paces the *starts* of one slot's requests S seconds apart (a
 model's rate is `concurrency / interval`), which is what a soak's low-rate
-background load needs; without it a slot runs flat out.
+background load needs; without it a slot runs flat out. `mode=text` sends
+the corpus's text items only (a `kind` other than `text` is refused). Items
+are read relative to the manifest's directory, so a copied corpus is read
+from the copy (`ceiling_probe.py` does the same).
 
 Records per request: latency, status, item count, the corpus item ids, the
 summed units in every dimension, the output count and any
@@ -491,6 +532,16 @@ small: wd-vit at batch 128 on the M3 Max read **16 460 MiB post-batch against
 whose device total *is* host RAM and which must therefore never actually be
 filled.
 
+**ROCm**: where NVML has no GPU `N`, `--device N` is the HIP device index in
+KFD order (a single-index `HIP_VISIBLE_DEVICES` wins), pinned as the spawner
+pins a ROCm worker: `HIP_VISIBLE_DEVICES`, plus `PANOPTIKON_UNIFIED_GPU=<bdf>`
+on an APU. Free and total come from amdgpu sysfs and `nvml_own_mb`/`base_nvml_mb`
+from KFD's per-process counter or DRM fdinfo, as `rocm_sysfs.py` reads them for
+`vramrec.py`; `device.own_source` lists which were read. The torch figures
+are HIP's. The probe exits unless torch is a ROCm build that sees one device
+and the model loads on the pinned GPU (`memory.device_bdf()`), and exits on a
+ROCm torch pinned to an NVML GPU.
+
 `--mode audio-npy` is required for the `whisper` and `clap` groups: those
 impls read their input with `deserialize_array`
 (`np.load(allow_pickle=False)`), so what a probe must hand them is the mono
@@ -517,12 +568,16 @@ ceiling_probe.py --model calibfixture/oom_second_batch_cuda \
 #### The probe's output
 
 `<out>.json` is `{"schema": "ceiling_probe/1", "model", "impl_class",
-"config", "torch", "dtype", "python"}` plus these blocks:
+"config", "torch", "transformers", "dtype", "dtype_method", "gqa_check",
+"python"}` plus these blocks. `dtype`/`dtype_method` are what the worker's load
+response reports (`inferio_worker.memory.resolved_dtype`), and `gqa_check` is
+the worker's post-load attention check, run at the same point: `patched`,
+`fused`, `not applicable` or `check failed`.
 
 | block | fields |
 |---|---|
 | `cost` | `unit`, `aggregation`, `seed_units`, `epoch`, `canvas_pixels`, `canvas_pixels_in_force`, `max_tokens`, `max_tokens_in_force` |
-| `device` | `index`, `uuid`, `name`, `total_mb`, `cuda_visible_devices`. On `--device mps`: `index` null, `uuid` the orchestrator's `GPU-MPS`, `total_mb` the recommended-max, `backend: "mps"` |
+| `device` | `index`, `uuid`, `name`, `total_mb`, `cuda_visible_devices`. On `--device mps`: `index` null, `uuid` the orchestrator's `GPU-MPS`, `total_mb` the recommended-max, `backend: "mps"`. On ROCm: `hip_visible_devices` instead of `cuda_visible_devices`, `uuid` the orchestrator's device key, `bdf`, `unified`, `free_mb`, `own_source` (the sources read, sorted: `fdinfo`, `kfd`), `backend: "rocm"` |
 | `load` | `seconds`, `base_nvml_mb`, `base_free_delta_mb`, `reserved_at_load_mb`, `allocated_at_load_mb`, `free_before_mb`, `free_after_mb` |
 | `batches[]` | `batch`, `repeat`, `units`, `items`, `ok`, `oom`, `error`, `absorbed_halvings`, `index_limit_events`, `duration_ms`, `peak_reserved_mb`, `peak_allocated_mb`, `delta_mb`, `reserved_before_mb`, `reserved_after_mb`, `nvml_own_mb` (on MPS the `driver_allocated_memory()` own figure), `gpu_free_mb`, and `oom_class` (`source`, `exception`, `device`, `free_mb_at_failure`) or `null`; on MPS with the sampler on, also `sampled_peak_mb`, `sampled_samples`, `gc_bias_mb`, `gc_bias_pct` |
 | `fit` | `basis` (`peak_allocated_mb`; `peak_reserved_mb` on MPS, where there is no allocated peak to read), `slope_mb_per_unit`, `intercept_mb`, `residual_mb`, `samples` — or `null` |
@@ -626,9 +681,10 @@ analyze.py --scenario results/<run>/<scenario>
            [--checks all|a,b,c] [--list-checks] [--learning]
            [--expect-ooms N] [--expect-deaths N] [--expect-failures N]
            [--expect-failed-jobs N] [--expect-empty-setters]
+           [--expect-deflated]
            [--baseline-jobs FILE | --baseline-items-per-s F]
            [--throughput-floor 0.9] [--utilization-floor 0.25]
-           [--idle-window 60] [--join-tolerance 1.5] [--base-window 10]
+           [--idle-window 60] [--join-tolerance S] [--base-window 10]
            [--worker-pattern RE] [--probe FILE ...]
            [--json FILE] [--plot FILE] [--quiet]
            # or point at each file: --vramrec/--healthrec/--hog/--log/
@@ -650,11 +706,17 @@ clause**, which joins every `issued a memory grant` line to the latest
 `vramrec.jsonl` sample at or before it (a later one can already hold the
 granted batch) and compares the grant with the GPU's *live free memory* at that
 instant. A grant over that free memory is a FAIL, unless the next sample,
-within `--join-tolerance` of the grant, shows a release that covers the
-shortfall: the release may have come first, so the grant is listed and the
-check reads **WARN**. Only processes other than the requester that are still
-alive count as releasing; the requester emptying its cache after an
-out-of-memory error, or a worker that died, is a consequence of the grant. A
+within `--join-tolerance` of the grant (default: twice the median gap
+between `vramrec.py`'s samples; with one sample, twice its header's
+`interval_s`, else 1.5 s), shows a release that covers the shortfall:
+the release may have come first, so the grant is listed and the check reads
+**WARN**. Only processes other than the requester that are still alive count
+as releasing; the requester emptying its cache after an out-of-memory error,
+or a worker that died, is a consequence of the grant. When no spawn line names
+the grant's model, or the PID it names is not on the GPU (another PID
+namespace), the release is computed once with no requester and once with each
+of our workers no spawn line ties to another model; covered under some of them
+and not all is a WARN naming the model, uncovered under all a FAIL. A
 grant with no sample within `--join-tolerance` before it is not decidable, and
 also keeps the check at WARN. Grants on the CPU device are left out: the oracle
 records GPUs only. That
@@ -682,7 +744,10 @@ last one closes a hole in `base_accuracy` itself):
   1 GB free), needs the second knob or it reports `job_outcome FAIL` for
   succeeding at its own point. `--expect-empty-setters` is the same escape
   for the zero-item clause: `calibfixture/dies_on_load_cuda` never becomes
-  resident, so its setter records 0 items by construction.
+  resident, so its setter records 0 items by construction, and
+  `--expect-deflated` for `deflation_recovery`: `calibfixture/oom_cuda` runs
+  no clean window, so its deflation does not return to 0 within the leg's
+  settle, and the model is unloaded when its job ends.
 - **`ledger_invariant` has two forms and reports both.** The strict form —
   Σ charges + load reservations ≤ `limit_mb` — cannot hold on a nearly-full
   GPU, because `limit = total − external × (1 + margin)` reaches **0** while
@@ -703,7 +768,7 @@ last one closes a hole in `base_accuracy` itself):
 - **`utilization` scores the budget a grant carried, not the published one.**
   `/health`'s `unit_budget` is what the ledger offers; the `issued a memory
   grant` lines say what it admitted, and the two part company on a squeezed
-  board — an S4a leg published 512 while every window ran 1 unit and the check
+  GPU — an S4a leg published 512 while every window ran 1 unit and the check
   read 0.80 PASS, where the largest budget any grant carried was 34 (0.05,
   FAIL). The published figure stands in only for a recording with no grant
   lines, and the detail says so.
@@ -722,13 +787,11 @@ last one closes a hole in `base_accuracy` itself):
   by naming `calibration_learned` in `--checks`; `--checks all` declares
   nothing). Under that declaration `calibration_learned` FAILs on any of:
   `fit samples == 0`, no `[[profile]]` in `calibration.after.toml`, or a peak
-  `unit_budget` that never rose above the first value recorded **and no
-  plateau knee was learned** (a budget held at its knee is learning, not a
-  stall). A budget the job itself never filled (every window formed short of
-  it for want of queued work, `queue_bound_windows == total_batches`, and the
-  settle lines' largest `max_units_measured` below the seed) cannot rise, and
-  reads INFO, not FAIL, unless the budget was held at a rung the ring never
-  certified. The three
+  `unit_budget` that never rose above the first value recorded **and no local
+  size this leg measured** (a budget held where a trial left it is learning,
+  not a stall). A model whose every window formed short of the ledger's
+  window target, three batches at the budget (`queue_bound_windows ==
+  total_batches`), is not decidable and reads INFO, not FAIL. The three
   numbers are exactly the ones `ramp_progress` prints as INFO — the check only
   promotes them to a verdict, which is what closes the whole class of "the
   instrument stopped reporting" faults. Undeclared, the row is report-only.
@@ -781,23 +844,24 @@ that move them are in `analyze.py --help`.
 
 | check | compares | threshold | tiers |
 |---|---|---|---|
-| `oracle_agreement` | the ledger's `external_mb` against (GPU `used` − the NVML usage of our own worker PIDs), up to `legs.py`'s hog stop (the idle gateway keeps its last figure after it) | ±1 GiB or 2 % | PASS/FAIL, SKIP without both recordings **and SKIP where the oracle priced no PID** (WDDM: subtracting nothing would report our own footprint as the disagreement) |
+| `oracle_agreement` | the ledger's `external_mb` against (GPU `used` − the NVML usage of our worker PIDs). Skipped from a drained `job_end` (or the hog stop) in `legs.json` to the next `job_start`: the idle gateway keeps its last figure. Skipped where `used` moved past the allowance, or by an unknown amount, during a ROCm per-process scan (`skew_mb`). Skipped where the ledger's free reading (`external_sample_age_ms`) is over 10 s old (`stale_samples`): such a reading is due a refresh, and grant_safety judges any grant priced from it. Skipped where a release was still leaving `used` or the hog moved past the allowance between that reading and the oracle sample. A release window runs from the oracle sample before a process's figure falls until `used` does too, at least 40 ms per GiB and at most 2 s more. A death logged at most 10 s before a worker's PID leaves opens its window. Another process's window counts when it meets that span; one of ours only when it holds either reading. A failed process read opens no window, nor does a PID the row lists as unreadable. Below the allowance, the largest of skew, release and move is subtracted. `read_age_samples` counts those skipped only because the ledger read before both samples | ±1 GiB or 2 % | PASS/FAIL, SKIP without both recordings **and SKIP where the oracle priced no PID** (WDDM: subtracting nothing would report our own footprint as the disagreement) |
 | `base_accuracy` | a replica's reported `base_mb` against the oracle's per-process reading for *its* process | ±10 % (`nvml` method, or `fdinfo` against `amdgpu-kfd`; one oracle source per window, KFD preferred) | PASS/FAIL; INFO when the window is empty or the pair is neither |
 | `footprint_agreement` | per GPU, `footprints_mb` against the summed NVML usage of our PIDs | ±1 GiB or 2 % | PASS/FAIL |
 | `slope_accuracy` | the persisted slope against `ceiling_probe.py`'s **allocated** slope (`fit` where `fit.basis` names it, else the probe's whole-batch `peak_allocated_mb` rows refitted here) | −30 % .. +100 % | PASS/FAIL; WARN (FAIL under `--learning`) when no store was written; SKIP when no probe was passed, or when no probe names a model the store holds |
-| `grant_safety` | every grant against the headroom it was priced against **and** against the oracle's live free memory | no grant over either | PASS/FAIL; WARN without `vramrec.jsonl`, or when a grant has no sample before it or is over free with a covering release |
-| `failures` | OOM negatives, worker deaths and merged-window fallbacks in the log | `--expect-ooms` / `--expect-deaths` | PASS/FAIL |
-| `deflation_recovery` | how long deflation takes to return to 0 | 3 clean windows per level | PASS/FAIL |
+| `grant_safety` | every grant against the headroom it was priced against **and** against the oracle's live free memory | no grant over either | PASS/FAIL; WARN without `vramrec.jsonl`, or when a grant has no sample before it or is over free with a covering release (net of both samples' `skew_mb`; an unknown skew covers nothing) |
+| `failures` | OOM negatives, worker deaths and merged-window fallbacks in the log | `--expect-ooms` / `--expect-deaths` (at least one when declared; for OOMs, not when a DEBUG log has no grant line) | PASS/FAIL |
+| `deflation_recovery` | each worker's deflation, from the settle and time-repay lines (`/health` samples when the log has no DEBUG ledger line); a worker that died restarts at 0, and one that left keeps its last value; the window that repays a level does not count toward the next | a level repaid within 3 clean windows; 0 at the end, unless `--expect-deflated` | FAIL on a level held through 3 clean windows, or on a worker still deflated in a health sample read 30 s per level after the negative that set it (the latest due time on the model and GPU): time alone repays it by then; WARN when the recording ended deflated; with `--expect-deflated`, FAIL when it never deflated |
 | `idle_liveness` | `grants_outstanding` in the trailing `--idle-window` | must reach 0 | PASS/FAIL |
-| `utilization` | the largest `unit_budget` a grant actually carried against the probe's OOM boundary (or knee) | `--utilization-floor` (0.25) | PASS/FAIL; the same result-versus-omission split as `slope_accuracy` |
-| `throughput` | items/s from the job `LogRecord`s against a C0 baseline | `--throughput-floor` (0.9) | PASS/FAIL; INFO without a baseline |
+| `utilization` | the largest `unit_budget` a grant actually carried against the probe's OOM boundary (or knee), the boundary less the least a hog on that GPU held while the model ran (with its context; a RAM hog only on a unified device) and the least `reserve_mb` on the model's grant lines, over the probe's reserved slope | `--utilization-floor` (0.25) | PASS/FAIL; a model the hog left no room for one unit, or whose probe has no reserved slope to price the hog, is not decidable; the same result-versus-omission split as `slope_accuracy` |
+| `throughput` | items/s from the job `LogRecord`s against a C0 baseline, their start-to-end spans less the wall-clock step `legs.json`'s marks measured (`iso` against `t_mono`, the first job's `job_start` to `job_end`; not with an explicit `--jobs`, nor a step under 1 s, since the times are whole seconds, nor when the corrected spans exceed that job's `t_mono` time, or fall short of the records' longer phase (`inference_time` or `data_load_time`, both monotonic), by over 1 s per record, a step outside them; busy time when a span is missing or the corrected spans average under 1 s); both sides corrected, or neither when one recording has no `t_mono` or the baseline file is not a `jobs.json` | `--throughput-floor` (0.9) | PASS/FAIL; INFO without a baseline |
 | `persistence` | the store write against the anchor advance that queued it | within 30 s | PASS/FAIL; same split again |
-| `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) unless the leg declared it | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs), `--expect-empty-setters` | PASS/FAIL |
+| `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) unless the leg declared it, and so does a job `legs.json` shows did not drain (`job_end` outcome other than `drained`, e.g. cut at `--job-cap`, or no `job_end`) | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs), `--expect-empty-setters` | PASS/FAIL |
 | `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | FAIL on an `over_grant` breach, WARN on a `limit_fell` one |
 | `peak_fds` | peak open descriptors and sockets against the process's own limit | — | INFO; SKIP when nothing recorded them |
-| `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form |
+| `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form; WARN when a hog event applied no pressure: it set a leave-free level, or a hold above 0 at or above what the hog held, and no `hog.jsonl` row (none when the file is missing) shows `held_mb` one chunk higher before the next event, or the jobs ended before it fired, also when the check otherwise SKIPs |
 | `ramp_progress` | `unit_budget` / `fit_samples` / the working size over time | — | INFO |
 | `calibration_learned` | the same three numbers, as a verdict | see below | FAIL only under `--learning` |
+| `batch_coverage` | the `seq` of each replica's `recent_batches` across health samples: a number no sample showed is a batch the recording missed; batches a worker runs after its last sample are not counted, so PASS means no gap between samples, not that every batch was seen | none missed | PASS/WARN; SKIP without `healthrec.jsonl` or when no sample showed a batch |
 
 `ledger_invariant` has two forms and reports both. The strict form — Σ charges
 + load reservations ≤ `limit_mb` — cannot hold on a nearly-full GPU: `limit =
@@ -811,7 +875,7 @@ old zero-limit carve-out was unreachable). Each breach is therefore classified
 by cause: `over_grant` — a grant issued in that sample beyond the headroom it
 was priced against, the ledger over-committing — **FAILs**; `limit_fell` — the
 limit dropping under a footprint or reservation already held, external usage
-rising after our pool grew or a placeholder reservation on a squeezed board
+rising after our pool grew or a placeholder reservation on a squeezed GPU
 (closed by commit `ba6708e4`) — is **WARN**. The form that must always hold is
 the one
 `grant_safety` measures, restated inline on this row so the two read together.
@@ -842,22 +906,29 @@ healthrec's default 500 ms that is within a sample of admission, and a leg
 that ramps at all leaves it far behind (an S2 leg: 8 → 1024).
 
 **A working size a trial left in place is not a stall.** The seed is a
-starting guess, not a floor: the batch size is the smallest whose rate is
-within 5 % of the best a trial measured, so a model that gains nothing from
-larger batches ends *under* its seed on purpose and stays there, trying the
-sizes next to it every so often. A model whose `knee_units` `/health` marks
-`knee_is_local` is therefore never counted as "never left the seed"; the
-detail instead names the seed, the size a trial first left in place, how many
-times it moved and how low the budget actually ran, and `ramp_progress`
-withholds its `REQUEST_UNIT_BUDGET` note for the same models.
+starting guess, not a floor: a batch grows only on a measured gain, so a model
+that gains nothing from larger batches stays at or *under* its seed on purpose,
+trying the sizes next to it every so often. A model whose `knee_units`
+`/health` marks `knee_is_local`, and which this leg measured (the size moved,
+turned local after its worker's first sample, or an `a batch size trial is
+over` line names its model and GPU), is therefore never counted as "never
+left the seed"; the detail instead names the seed, the size a trial first
+left in place, how many times it moved and how low the budget actually ran,
+and `ramp_progress` withholds its `REQUEST_UNIT_BUDGET` note for the same
+models.
 
 **A size no trial has left in place is a stall.** `knee_units` alone is not
 evidence: it is set the moment a replica opens, and it may come from a shipped
 profile. `knee_is_local` is false for both; a leg that ends that way at its
 seed has measured nothing and is
-named as "never left the seed". `utilization` reads the same flag: only a size
-a trial left in place lowers its denominator from the probe boundary to the
-largest batch that ran.
+named as "never left the seed". So is a size `knee_is_local` from its worker's
+first sample (a worker is a model on one GPU), never moved and with no trial
+line: this machine's store resumed it, and this leg measured nothing. A trial
+line with no local size is not enough either: a failed or put-off trial logs
+it too. `utilization` reads the same flag, a resumed size included: a size a
+trial left in place, on this leg or an earlier one, lowers its denominator
+from the probe boundary to the largest size this leg's trials ran, or to the
+size itself when no trial ran.
 
 `peak_fds` is report-only and exists because, with local
 inference every in-flight predict is loopback HTTP inside one process and so
@@ -886,7 +957,11 @@ cmdline and an empty env for its whole life (815 of 815 samples of an 8 h
 soak),
 which made a resident nemotron worker holding up to 66 GiB count as
 *external*. `vramrec.py` no longer memoises that negative, but the log route
-is what lets a recording already on disk be re-analysed correctly.
+is what lets a recording already on disk be re-analysed correctly. A gateway
+in a container logs its workers' PIDs in the container's PID namespace;
+`vramrec.py` records each process's PID there as `ns_pid`, and a spawn line's
+PID is read as the first process with that `ns_pid` to appear on a GPU from
+2 s before it on.
 
 **Which of our PIDs is *this* replica.** The pid the log states, when it
 states one: the spawn line carries `inference_id=` and `pid=` as two fields
@@ -1132,7 +1207,7 @@ $V $T/analyze.py --scenario $T/results/<run>/S2 --checks all --learning \
 |---|---|---|---|
 | interpreter | `python/.venv/bin/python` | same | `python\.venv\Scripts\python.exe` |
 | binary | `target/release/panoptikon` | same | `target\release\panoptikon.exe` |
-| the oracle | NVML per-process (`oracle_source: "nvml"`). On ROCm, `mem_info_vram_*` (+`gtt` on a unified GPU) with the gateway's arithmetic, keyed from `/health` `gpus[]` under `--health-url` (which `legs.py` passes on ROCm), so `oracle_agreement` is a consistency check there; per process, KFD's `proc/<pid>/vram_<gpu_id>` (`"amdgpu-kfd"`, discrete GPUs only; found by PID in the host PID namespace, else by the PASID in the process's DRM fdinfo) or DRM fdinfo (`"amdgpu-fdinfo"`, the worker's own counter, so `base_accuracy` reports an `fdinfo` base against it without judging). A row whose `unreadable_pids` (another user's processes, without CAP_SYS_PTRACE) names one of our workers prices no PID for `oracle_agreement` | no per-process GPU counter at all. `vramrec.py` runs its darwin branch with no NVML: one `GPU-MPS` row whose free is `min(total, RAM available)`, per-sample RAM from psutil or `vm_stat`, and our workers listed with RSS only — `oracle_source: "mps-ram"`. Its **total is the worker's recommended-max**, resolved best-first and named in `gpu_total_source`: the gateway's `/health` `vram` row under `--health-url` (which `legs.py` passes on macOS), else `torch.mps.recommended_max_memory()` in a child process, else `sysctl iogpu.wired_limit_mb`, else `hw.memsize × 0.75` — the last a seed that under-states (98 304 against the M3 Max's real 110 100) and failed `grant_safety` on seven legs of an idle machine, on which `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. The GPU-side self-reports are `selftest.py`'s `mps` tier (`torch.mps.driver_allocated_memory()`, per-process by construction) and the worker's own `driver_allocated` from `/health` | **no per-process oracle at all**: NVML answers N/A for every process and `nvidia-smi --query-compute-apps` answers `[N/A]` too (measured on driver 610.74), so the oracle is GPU-level used/free from NVML plus our own worker's footprint from its `/health` figures, and `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. NVML is also the only trustworthy *free* reading here: torch's `mem_get_info` over-reports free memory by the desktop's own usage (30 577 vs 25 354 MiB at the same instant, 5.2 GB), so the `torch` free tier is a last resort on WDDM, not a second opinion |
+| the oracle | NVML per-process (`oracle_source: "nvml"`). On ROCm, `mem_info_vram_*` (+`gtt` on a unified GPU) with the gateway's arithmetic, keyed from `/health` `gpus[]` under `--health-url` (which `legs.py` passes on ROCm), so `oracle_agreement` is a consistency check there; per process, KFD's `proc/<pid>/vram_<gpu_id>` (`"amdgpu-kfd"`, discrete GPUs only; found by PID in the host PID namespace, else by the PASID in the process's DRM fdinfo) or DRM fdinfo (`"amdgpu-fdinfo"`, the worker's own counter, so `base_accuracy` reports an `fdinfo` base against it without judging); a KFD entry two PIDs reach (a descriptor inherited across fork) is credited once. A row whose `unreadable_pids` (another user's processes, without CAP_SYS_PTRACE) names one of our workers prices no PID for `oracle_agreement` | no per-process GPU counter at all. `vramrec.py` runs its darwin branch with no NVML: one `GPU-MPS` row whose free is `min(total, RAM available)`, per-sample RAM from psutil or `vm_stat`, and our workers listed with RSS only — `oracle_source: "mps-ram"`. Its **total is the worker's recommended-max**, resolved best-first and named in `gpu_total_source`: the gateway's `/health` `vram` row under `--health-url` (which `legs.py` passes on macOS), else `torch.mps.recommended_max_memory()` in a child process, else `sysctl iogpu.wired_limit_mb`, else `hw.memsize × 0.75` — the last a seed that under-states (98 304 against the M3 Max's real 110 100) and failed `grant_safety` on seven legs of an idle machine, on which `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. The GPU-side self-reports are `selftest.py`'s `mps` tier (`torch.mps.driver_allocated_memory()`, per-process by construction) and the worker's own `driver_allocated` from `/health` | **no per-process oracle at all**: NVML answers N/A for every process and `nvidia-smi --query-compute-apps` answers `[N/A]` too (measured on driver 610.74), so the oracle is GPU-level used/free from NVML plus our own worker's footprint from its `/health` figures, and `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. NVML is also the only trustworthy *free* reading here: torch's `mem_get_info` over-reports free memory by the desktop's own usage (30 577 vs 25 354 MiB at the same instant, 5.2 GB), so the `torch` free tier is a last resort on WDDM, not a second opinion |
 | expected `base_method` | `nvml` (CUDA), `fdinfo` (ROCm) | `mps` (`driver_allocated_memory()` after the load — tier-1, no delta fallback on the happy path) | **`free_delta`** — the degraded tier, untested anywhere so far, and the reason this platform matters |
 | pressure | `hog.py --target gpu` | `hog.py --target mps` (torch tensors on the unified device, released with `torch.mps.empty_cache()`) **and** `--target ram` (numpy on the RAM term of the same budget). Prefer `--target ram`: an `mps` hold decays out of every free reading at ~1.5 GiB/min while holding, and `--touch-period` was measured and does not fix it | `hog.py --target gpu` |
 | over-admission looks like | an OOM exception the classifier tiers | an OOM exception, or jetsam killing the process | **a throughput collapse, never an exception** — read `throughput_collapse` and per-batch `duration_ms`, and run S4c a second time with the driver's "Prefer No Sysmem Fallback" set |

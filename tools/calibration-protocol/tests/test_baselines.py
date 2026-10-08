@@ -1,10 +1,11 @@
 """The shipped-baseline generator: what it copies, and what it refuses.
 
-`baselines.py` turns a Linux/CUDA measurement into the file that ships in
+`baselines.py` turns a Linux measurement into the file that ships in
 `python/inferio/config/calibration/`. The rules it must not lose: only
-linux/cuda rows are measurements, a copy happens only for an id the registry
-allowlists, a copy says where its base came from, local authority never
-ships, and a second run over the first run's output changes nothing.
+linux/cuda and linux/rocm rows are measurements, a copy happens only of a cuda
+row and only for an id the registry allowlists, a copy says where its base
+came from, local authority never ships, and a second run over the first run's
+output changes nothing.
 
 Run with the managed interpreter:
 
@@ -46,18 +47,22 @@ metadata.description = "not allowlisted"
 
 def _store(tmp_path: Path, *, schema: int = 3, extra: str = "",
            platform: str = "linux", inference_id: str = "tags/wd-vit-tagger-v3",
-           slope: float = 29.859099744349997) -> Path:
-    arch = 'arch = "sm_120"\n' if schema == 3 else ""
+           slope: float = 29.859099744349997, backend: str = "cuda",
+           arch: str = "sm_120") -> Path:
+    arch = f'arch = "{arch}"\n' if schema == 3 else ""
+    gpu, torch = (("AMD Radeon RX 6900 XT", "2.8.0+rocm6.4") if backend == "rocm"
+                  else ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                        "2.7.1+cu128"))
     path = tmp_path / "calibration.toml"
     path.write_text(f"""schema = {schema}
 
 [[profile]]
 inference_id = "{inference_id}"
 epoch = 1
-{arch}gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+{arch}gpu = "{gpu}"
 platform = "{platform}"
-backend = "cuda"
-torch = "2.7.1+cu128"
+backend = "{backend}"
+torch = "{torch}"
 dtype = "fp32"
 unit = "item"
 aggregation = "count"
@@ -131,10 +136,26 @@ def test_the_ratchet_anchor_travels_onto_every_shipped_row(tmp_path):
     assert [row["max_units_measured"] for row in doc["profile"]] == [768, 768]
 
 
-def test_a_row_measured_anywhere_but_linux_cuda_is_refused(tmp_path):
-    store = baselines.read_store(_store(tmp_path, platform="windows"), None)
-    with pytest.raises(baselines.BaselineError, match="linux/cuda"):
+@pytest.mark.parametrize("platform,backend", [("windows", "cuda"), ("linux", "cpu")])
+def test_a_row_measured_anywhere_but_linux_cuda_or_rocm_is_refused(
+        tmp_path, platform, backend):
+    store = baselines.read_store(
+        _store(tmp_path, platform=platform, backend=backend), None)
+    with pytest.raises(baselines.BaselineError, match=f"{platform}/{backend}"):
         baselines.generate(store, baselines.read_allowlist(_registry(tmp_path)))
+
+
+def test_a_rocm_row_is_a_measurement_and_is_never_copied(tmp_path):
+    """wd-vit allowlists a Windows copy of its cuda row; its rocm row ships as
+    measured and alone, since no other platform has the rocm extra."""
+    rocm = baselines.read_store(
+        _store(tmp_path, backend="rocm", arch="gfx1030"), None)
+    rows = baselines.generate(
+        rocm + baselines.read_store(_store(tmp_path), None),
+        baselines.read_allowlist(_registry(tmp_path)),
+    )
+    assert sorted((row["platform"], row["backend"]) for row in rows) == [
+        ("linux", "cuda"), ("linux", "rocm"), ("windows", "cuda")]
 
 
 def test_a_row_with_no_fit_is_refused_anchor_and_all(tmp_path):
@@ -179,14 +200,17 @@ metadata.cost.platform_copies = ["macos"]
 
 
 def test_the_rendered_file_is_readable_toml_with_the_schema_stamp(tmp_path):
+    """A store's intercept ships on the measured row and its copy."""
     rows = baselines.generate(
-        baselines.read_store(_store(tmp_path), None),
+        baselines.read_store(_store(tmp_path, extra="intercept_mb = 385.0\n"),
+                             None),
         baselines.read_allowlist(_registry(tmp_path)),
     )
     doc = tomllib.loads(baselines.render(rows))
     assert doc["schema"] == baselines.SCHEMA
     assert len(doc["profile"]) == 2
     assert doc["profile"][1]["slope_mb_per_unit"] == 29.859099744349997
+    assert [row["intercept_mb"] for row in doc["profile"]] == [385.0, 385.0]
 
 
 def test_the_shipped_registry_allowlist_names_only_ids_that_exist(tmp_path):
