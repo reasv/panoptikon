@@ -302,7 +302,7 @@ function updateGpuMemory() {
     : memory.custom_gpus === 1 ? ' One GPU has its own margin in the config file, which applies to it instead.'
       : ` ${memory.custom_gpus} GPUs have their own margin in the config file, which applies to them instead.`;
   byId('gpu-memory-help').textContent =
-    help + ' On a Mac, a tenth of RAM (2 GiB to 16 GiB) always stays free, whatever the margin.' + gpus;
+    help + ' Inference in RAM (on the CPU, or on a Mac\'s GPU) always leaves a tenth of RAM free (2 GiB to 16 GiB), whatever the margin.' + gpus;
 }
 function readGpuMargin() {
   if (byId('gpu-memory-mode').value === 'default') return null;
