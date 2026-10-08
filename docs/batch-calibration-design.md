@@ -2201,8 +2201,9 @@ reserve = ceil(external × margin)                          # margin configured
 reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
 reserve = max(reserve, min(1024 MiB, 3 % of total))        # unset, any GPU but Apple's
 reserve = 1024 MiB                                         # unset, CUDA GPU that spills
-reserve = max(reserve, clamp(total / 10, min(2 GiB, total / 4), 16 GiB))  # CPU device and Mac GPU (total = hw.memsize), always
+reserve = max(reserve, clamp(total / 10, min(2 GiB, total / 4), 16 GiB))  # CPU device and Mac GPU, of RAM (hw.memsize on a Mac), always
 limit   = min(total × cap_fraction, total − external − reserve)
+limit   = min(total × cap_fraction, hw.memsize − external − reserve, total)  # Mac GPU (total = Metal's ceiling)
 ```
 
 - A margin the user wrote down is honoured **verbatim**, exactly as before —
