@@ -85,8 +85,9 @@ pub struct GpuMemoryView {
     pub margin: Option<ConfigField<f64>>,
     /// The default keeps 1 GiB free on each NVIDIA GPU where the driver spills
     /// to system RAM (Windows, WSL2: the Server's test); elsewhere 10 % of
-    /// what other programs use, at most 1 GiB and, except on a Mac, at least
-    /// 3 % of the GPU.
+    /// what other programs use, at most 1 GiB and at least 3 % of the GPU; in
+    /// RAM (the CPU device, or a Mac's GPU) a tenth of RAM, 2 GiB to 16 GiB,
+    /// whatever the margin.
     pub flat_default: bool,
     /// GPUs with their own `margin` in the file, which the Desktop leaves
     /// as written.

@@ -69,9 +69,7 @@ fn oom_at_the_one_item_floor_declares_the_replica_unrunnable() {
         "the window's room, named: {verdict}"
     );
     assert!(
-        verdict
-            .to_string()
-            .contains("9901 MiB free before the reserve"),
+        verdict.to_string().contains("room for 9901 MiB"),
         "and what it will be refused under: {verdict}"
     );
 }

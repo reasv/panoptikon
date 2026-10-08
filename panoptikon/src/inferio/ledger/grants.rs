@@ -268,8 +268,9 @@ impl VramLedger {
         // Logged after the lock is dropped.
         let external_mb = Self::external_locked(&state, &gpu).unwrap_or(0);
         let (reserve_mb, reserve_rule) = self.reserve_locked(&state, &gpu, external_mb, margin);
-        // The worker's clamp keeps the CPU device's reserve free.
-        let ram_reserve_mb = if gpu == cpu::DEVICE_KEY {
+        // The worker's clamp keeps the host RAM reserve free: its device's
+        // own when that is host RAM, else the CPU device's for a RAM booking.
+        let ram_reserve_mb = if Self::host_ram_mb_locked(&state, &gpu).is_some() {
             reserve_mb
         } else if ram_new_mb > 0 {
             let external = Self::external_locked(&state, cpu::DEVICE_KEY).unwrap_or(0);
@@ -302,6 +303,7 @@ impl VramLedger {
                 external_mb,
                 reserve_mb,
                 reserve_rule,
+                ram_reserve_mb,
                 pre_fit,
                 working_units,
                 deflation,
@@ -615,8 +617,10 @@ pub struct Grant {
     /// Host RAM a GPU replica's window may add to its resident set: its
     /// booking on the CPU device less the growth it already holds; 0 if none.
     pub ram_mb: u64,
-    /// Free host RAM the worker's live clamp leaves alone: the CPU device's
-    /// reserve, for a replica priced or booked in host RAM; 0 otherwise.
+    /// Free host RAM the worker's live clamp leaves alone: the reserve of the
+    /// grant's device when that device is host RAM (the CPU device, or the
+    /// Mac GPU against `hw.memsize`), otherwise the CPU device's reserve for
+    /// a RAM booking; 0 when neither.
     pub ram_reserve_mb: u64,
 }
 

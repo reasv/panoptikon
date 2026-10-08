@@ -77,7 +77,7 @@ impl VramLedger {
     ///
     /// Condemning remembers the model's working set on this GPU: the next load
     /// is refused while the refusal room ([`Self::refusal_room_locked`],
-    /// reserve not deducted) is below it.
+    /// margin reserve not deducted) is below it.
     pub(super) fn note_floor_oom_locked(
         &self,
         state: &mut LedgerState,
@@ -310,7 +310,7 @@ pub struct UnrunnableReplica {
     /// refusal.
     pub needs_mb: u64,
     /// The GPU's limit with the reserve deducted, which a window is priced
-    /// against; the refusal room and `needs_mb` leave the reserve out.
+    /// against; the refusal room and `needs_mb` leave the margin reserve out.
     pub room_mb: u64,
     /// The last strike was a worker death, not an out-of-memory error:
     /// `needs_mb` is 0 and the refusal lapses ([`DEATH_VERDICT_LAPSE`]).
@@ -335,8 +335,8 @@ impl std::fmt::Display for UnrunnableReplica {
             "model {} ran out of memory on GPU {} at a one-item batch {} \
              windows running: its base is {} MiB of the {} MiB this GPU lends \
              a window after its reserve, and one item on top of it did not \
-             fit; the next load of it here is refused unless the card has {} \
-             MiB free before the reserve",
+             fit; the next load of it here is refused until this GPU has room \
+             for {} MiB",
             self.inference_id,
             self.gpu,
             OOM_WINDOWS_AT_FLOOR,

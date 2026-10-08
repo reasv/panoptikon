@@ -22,9 +22,10 @@
 //!
 //! On the CPU device `reserved` is the live resident set and no growth is
 //! reusable: `charge(w) = footprint(w) + Σ grants(w)` and `room(w) = headroom`.
-//! Its reserve is never below [`cpu::ram_reserve_mb`]. A replica whose process
-//! dies mid-window there, or with host RAM booked, caps later batches of its
-//! (model, device) at half that batch ([`VramLedger::note_death_locked`]).
+//! Its reserve, and on a Mac the MPS device's, is never below
+//! [`cpu::ram_reserve_mb`]. A replica whose process dies mid-window there, or
+//! with host RAM booked, caps later batches of its (model, device) at half
+//! that batch ([`VramLedger::note_death_locked`]).
 //!
 //! A worker with no reported base contributes only growth; the rest of its
 //! memory reads as `external`. The batch size moves only on measured rates
@@ -418,27 +419,21 @@ impl From<VramBudget> for VramBudgets {
     }
 }
 
-/// Fill the CPU device's unset budget values with its shipped defaults (a
-/// `cap_fraction`, since running out of RAM gets a process killed, and a
-/// wider knee band). GPUs are untouched.
+/// Fill the CPU device's unset knee band with its wider shipped default.
+/// GPUs are untouched.
 fn with_shipped_gpu_defaults(inventory: &GpuInventory, mut budgets: VramBudgets) -> VramBudgets {
     for gpu in inventory.gpus().unwrap_or(&[]) {
         if gpu.uuid != super::cpu::DEVICE_KEY {
             continue;
         }
         let configured = budgets.for_gpu(&gpu.uuid);
-        if configured.cap_fraction.is_some() && configured.knee_max_bucket_dispersion.is_some() {
+        if configured.knee_max_bucket_dispersion.is_some() {
             continue;
         }
         budgets = budgets.with_gpu(
             gpu.uuid.clone(),
             VramBudget {
-                cap_fraction: configured
-                    .cap_fraction
-                    .or(Some(super::cpu::DEFAULT_CAP_FRACTION)),
-                knee_max_bucket_dispersion: configured
-                    .knee_max_bucket_dispersion
-                    .or(Some(super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION)),
+                knee_max_bucket_dispersion: Some(super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION),
                 ..configured
             },
         );

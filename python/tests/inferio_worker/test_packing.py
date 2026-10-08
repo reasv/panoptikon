@@ -964,6 +964,22 @@ def test_an_mps_worker_credits_the_metal_pool():
         assert packing.clamp_to_live_memory(4, 20_000).units == 2, "8200/20000"
 
 
+def test_an_mps_worker_keeps_the_ram_reserve_free():
+    """On unified memory the reserve is kept in RAM: an MPS reading spends
+    Metal's ceiling or the RAM above the reserve, whichever is less."""
+    with mps_host(available_mb=8_000) as mps:
+        mps.allocate(1_000, driver_mb=1_200)
+        live = packing.clamp_to_live_memory(4, 8_100, ram_reserve_mb=2_000)
+        assert live.units == 3, "6 000 above the reserve plus 200 of pool"
+    with mps_host(available_mb=120 * 1024):
+        live = packing.clamp_to_live_memory(8, 128 * 1024, ram_reserve_mb=13_107)
+        assert live.units == 6, "the 96 GiB ceiling binds, not the reserve"
+    with mps_host(available_mb=1_000) as mps:
+        mps.allocate(1_000, driver_mb=5_000)
+        live = packing.clamp_to_live_memory(8, 8_000, ram_reserve_mb=2_000)
+        assert live.units == 3, "4 000 of pool less the 1 000 below the reserve"
+
+
 def test_a_rocm_worker_uses_the_cuda_arm_of_the_credit(fake_rocm_torch):
     """HIP is `torch.cuda` under another name, so ROCm needs no arm of its own
     — the same `reserved - allocated` answers."""

@@ -526,7 +526,7 @@ fn a_grant_one_mib_short_of_a_batchs_price_does_not_cover_it() {
 /// the 8900 MiB held.
 #[test]
 fn memory_a_cpu_replica_keeps_is_not_reserved_again() {
-    const RAM_MB: u64 = 25_200;
+    const RAM_MB: u64 = 21_000;
     let ledger = VramLedger::new(
         &crate::inferio::gpu::GpuInventory::known_cpu(RAM_MB),
         VramBudget::default().into(),

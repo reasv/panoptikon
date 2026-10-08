@@ -248,12 +248,16 @@ impl VramLedger {
         )
     }
 
-    /// `hw.memsize` from the freshest free reading's [`RamBasis`], on a Metal
-    /// allocator; `None` otherwise.
+    /// `hw.memsize` on a Metal allocator: from the freshest free reading's
+    /// [`RamBasis`], or the inventory's when there is no reading; `None`
+    /// otherwise.
     fn ram_domain_locked(state: &LedgerState, gpu_ledger: &GpuLedger) -> Option<u64> {
         state
             .metal_allocator
-            .then(|| gpu_ledger.free.as_ref()?.ram.map(|ram| ram.total_mb))
+            .then(|| match &gpu_ledger.free {
+                Some(sample) => sample.ram.map(|ram| ram.total_mb),
+                None => gpu_ledger.unified_ram_mb,
+            })
             .flatten()
     }
 
@@ -279,7 +283,8 @@ impl VramLedger {
     /// Apple's at least [`DEFAULT_RESERVE_FLOOR_FRACTION`] of the card (that
     /// cap at most), and exactly the cap on a CUDA GPU that spills to system
     /// RAM. A margin of 0 reserves nothing.
-    /// On the CPU device the reserve is never below [`cpu::ram_reserve_mb`],
+    /// On a device whose memory is host RAM ([`Self::host_ram_mb_locked`])
+    /// the reserve is never below [`cpu::ram_reserve_mb`] of that RAM,
     /// whatever the margin. See docs/batch-calibration-design.md, "The
     /// reserve, and why an unset margin is not the same as `margin = 0.10`".
     pub(super) fn reserve_locked(
@@ -312,15 +317,25 @@ impl VramLedger {
                 (capped, RESERVE_RULE_CAPPED_DEFAULT)
             }
         };
-        let floor = if gpu == cpu::DEVICE_KEY {
-            cpu::ram_reserve_mb(total_mb)
-        } else {
-            0
-        };
+        let floor = Self::host_ram_mb_locked(state, gpu).map_or(0, cpu::ram_reserve_mb);
         if reserve < floor {
             (floor, RESERVE_RULE_RAM_FLOOR)
         } else {
             (reserve, rule)
+        }
+    }
+
+    /// The host RAM behind a device that allocates from it directly: the CPU
+    /// device and, on a Metal allocator, the MPS device. `None` for every
+    /// other GPU, an APU included.
+    pub(super) fn host_ram_mb_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
+        let device = state.gpus.get(gpu)?;
+        if gpu == cpu::DEVICE_KEY {
+            Some(device.total_mb)
+        } else if state.metal_allocator {
+            device.unified_ram_mb
+        } else {
+            None
         }
     }
 
@@ -364,9 +379,10 @@ impl VramLedger {
         limit
     }
 
-    /// The room a load is refused against, with no reserve: what the card
-    /// has left over other processes, or on a unified-memory device its whole
-    /// capacity, since other processes' RAM there is transient.
+    /// The room a load is refused against, with no margin reserve: what the
+    /// card has left over other processes, or on a unified-memory device its
+    /// whole capacity, since other processes' RAM there is transient. A
+    /// device whose memory is host RAM keeps [`cpu::ram_reserve_mb`] of it.
     pub(super) fn refusal_room_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
         let unified = state
             .gpus
@@ -377,7 +393,8 @@ impl VramLedger {
         } else {
             Self::external_locked(state, gpu).unwrap_or(0)
         };
-        self.limit_over_locked(state, gpu, external, 0)
+        let reserve = Self::host_ram_mb_locked(state, gpu).map_or(0, cpu::ram_reserve_mb);
+        self.limit_over_locked(state, gpu, external, reserve)
     }
 
     pub(super) fn headroom_locked(&self, state: &LedgerState, gpu: &str) -> u64 {

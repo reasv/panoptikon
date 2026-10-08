@@ -639,11 +639,10 @@ and on a Mac the Metal device and the CPU exist side by side. So the device
 model is per replica, not per host:
 
 - **Every inventory carries the CPU device** (`cpu.rs`: key `CPU`, total =
-  physical RAM bounded by the cgroup limit in force, the shipped
-  `cap_fraction = 0.75`, a reserve of at least a tenth of RAM; see "Host RAM
-  on the CPU device"), appended after whatever accelerators the probe
-  found. A host with no accelerator at all is the degenerate case of that,
-  not a separate world.
+  physical RAM bounded by the cgroup limit in force, a reserve of at least
+  a tenth of RAM; see "Host RAM on the CPU device"), appended after whatever
+  accelerators the probe found. A host with no accelerator at all is the
+  degenerate case of that, not a separate world.
 - **The memory backend is per device.** The accelerators keep the host's
   backend exactly as before — NVML/nvidia-smi, amdgpu sysfs, Metal — and the
   CPU device reads the machine's RAM statistics wherever it lives. One
@@ -699,7 +698,7 @@ at grant time and needs no frame for: each device's `external_mb` nets the
 *pair's* footprints out of its free reading rather than only its own, and each
 device's headroom subtracts the pair's charges and load reservations. `limit_mb`
 stays per device — it is that allocator's own ceiling, `recommended_max_memory()`
-on Metal and `cap_fraction × RAM` on the CPU device — and the shared room is
+on Metal and RAM on the CPU device — and the shared room is
 enforced in `headroom_mb`, so on either device `headroom + Σ charges` stays
 inside `memsize − external`. The ledger lock serialises grant issuance, which
 is what makes "the other device's headroom drops immediately" true rather than
@@ -742,12 +741,14 @@ therefore differs from a GPU in six ways.
   It scales with the machine because what it covers does: the kernel's
   watermarks, slab, and other processes' short-lived growth. So on this
   device `margin = 0` and `cap_fraction = 1.0` do not mean "all of RAM": the
-  floor is still kept. The cap
-  (`cap_fraction`, 0.75) limits how much of an idle machine we take; it does
-  nothing once other processes hold more than a quarter of RAM, and there
-  the reserve is the only margin. A load is refused against the room with no
-  reserve deducted, so the reserve refuses no load. A replica left with less
-  headroom than one unit still runs, one unit per batch, unpriced.
+  floor is still kept. No `cap_fraction` is set by default: the reserve, the
+  live free reading and the worker's per-batch clamp already bound what a
+  batch takes, and a fixed share of RAM would only idle memory on a machine
+  nothing else uses. With a cap configured, the limit is the smaller of the
+  cap and what is left after the reserve. A load is refused against all of
+  RAM less the floor (at most the cap), not against the free reading. A
+  replica left with less headroom than one unit still runs, one unit per
+  batch, unpriced.
 - **The worker keeps the same reserve.** The grant carries it
   (`ram_reserve_mb`) and the worker's per-batch clamp spends
   `free − reserve + pool`. Without it the clamp would size the batch to all
@@ -815,7 +816,10 @@ therefore differs from a GPU in six ways.
 
 The reserve and the free reading apply to every replica whose host RAM is
 booked on the CPU device, GPU replicas included (next section), and to the
-CPU device on Windows and macOS. The MPS device keeps the GPU rule.
+CPU device on Windows and macOS. On a Mac the MPS device keeps the same
+reserve of `hw.memsize`, whatever the margin, and the grant carries it to
+the worker's clamp: both devices spend the same RAM, and unified memory is
+held to the RAM rule, not to the GPU's 1 GiB cap.
 
 Known limits:
 - A Linux unified-memory GPU (an APU) clamps its unclaimed GTT by the same
@@ -1695,8 +1699,12 @@ Worker, per batch within its window:
   (1.88×, 545 MiB at 16 units after 32 against 289 on the ramp).
   `accelerator_env.rs` pins `MALLOC_MMAP_THRESHOLD_` and
   `MALLOC_TRIM_THRESHOLD_` to 128 KiB in the CPU worker's environment,
-  which held the floor at 678 MiB and reproduced every size to ≤ 4 MiB;
-  off Linux/glibc, where those are ignored, the residue is an over-read
+  which held the floor at 678 MiB and reproduced every size to ≤ 4 MiB.
+  A value the operator set is kept. A larger one keeps freed blocks
+  resident: the ledger charges them to the replica as its footprint, and a
+  batch after a larger one reads back the larger footprint, so later
+  batches are booked above their need and other replicas get less room.
+  Off Linux/glibc, where those are ignored, the residue is an over-read
   the free intercept and `residual_mb` absorb (7 % on the slope at worst,
   measured un-mitigated).
   `max_memory_allocated` has no caching hysteresis, so **every** clean
@@ -2193,8 +2201,9 @@ reserve = ceil(external × margin)                          # margin configured
 reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
 reserve = max(reserve, min(1024 MiB, 3 % of total))        # unset, any GPU but Apple's
 reserve = 1024 MiB                                         # unset, CUDA GPU that spills
-reserve = max(reserve, clamp(total / 10, min(2 GiB, total / 4), 16 GiB))  # the CPU device, always
+reserve = max(reserve, clamp(total / 10, min(2 GiB, total / 4), 16 GiB))  # CPU device and Mac GPU, of RAM (hw.memsize on a Mac), always
 limit   = min(total × cap_fraction, total − external − reserve)
+limit   = min(total × cap_fraction, hw.memsize − external − reserve, total)  # Mac GPU (total = Metal's ceiling)
 ```
 
 - A margin the user wrote down is honoured **verbatim**, exactly as before —
@@ -2228,9 +2237,8 @@ limit   = min(total × cap_fraction, total − external − reserve)
   - Once other processes hold 30 % of the card, a tenth of their usage is the
     larger figure and nothing changes. A flat 1 GiB would take 15–47 % of the
     room left on an 8 GB card shared with a 2–6 GB tenant.
-  - Not on the CPU device (its own floor, below) and not on Apple Silicon,
-    whose limit is counted in RAM, where other usage is never small, and
-    which has the memory-pressure rules.
+  - Not on the CPU device or Apple Silicon, whose memory is RAM: both keep
+    the RAM floor instead ("Host RAM on the CPU device").
   - A GPU carved out of host RAM on Linux (an APU) has the floor like a
     discrete card. That is by reasoning, not measurement: with RAM to
     spare its other usage reads small and a batch is granted to the last

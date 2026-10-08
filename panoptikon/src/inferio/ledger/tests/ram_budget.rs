@@ -93,8 +93,9 @@ fn the_ram_reserve_scales_with_the_machine() {
     assert_eq!(row.reserve_rule, RESERVE_RULE_USER_MARGIN);
 }
 
-/// On a small host the reserve leaves less to grant but refuses no load and
-/// stalls no model: with no headroom a window still runs one unit at a time.
+/// On a small host the reserve leaves less to grant and refuses no load
+/// below RAM less the reserve, and it stalls no model: with no headroom a
+/// window still runs one unit at a time.
 #[test]
 fn a_small_host_still_runs_under_the_reserve() {
     // (RAM, used by others, model base, reserve, units granted at 20 MiB each)
@@ -113,8 +114,8 @@ fn a_small_host_still_runs_under_the_reserve() {
             let state = ledger.lock();
             assert_eq!(
                 ledger.refusal_room_locked(&state, cpu::DEVICE_KEY),
-                ram_mb * 3 / 4,
-                "a load is refused against the cap alone, as without a reserve"
+                ram_mb - reserve_mb,
+                "a load is refused against RAM less the reserve"
             );
         }
         let handle = cpu_worker(ram_mb, base_mb, base_mb);

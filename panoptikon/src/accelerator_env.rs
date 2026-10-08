@@ -29,7 +29,9 @@ pub const DEVICE_ENV_VAR: &str = "INFERIO_DEVICE";
 /// measured as resident set, whatever the host's accelerator. Fixed at
 /// 128 KiB so large blocks stay on `mmap` and a free returns them to the OS;
 /// glibc's dynamic threshold would keep them, and a batch would read the
-/// previous larger batch's footprint. glibc only.
+/// previous larger batch's footprint. glibc only. Each is kept when the
+/// operator set it: a larger value keeps freed memory resident, which is
+/// charged to the replica and books later batches above their need.
 const GLIBC_MALLOC_ENV: [(&str, &str); 2] = [
     ("MALLOC_MMAP_THRESHOLD_", "131072"),
     ("MALLOC_TRIM_THRESHOLD_", "131072"),
@@ -61,10 +63,20 @@ pub fn worker_env(accelerator: Accelerator, python: &Path) -> Vec<(String, Strin
 }
 
 /// The env of a replica on the CPU device: [`DEVICE_ENV_VAR`] and the CPU
-/// malloc thresholds.
+/// malloc thresholds the operator did not set.
 pub fn cpu_device_env() -> Vec<(String, String)> {
+    cpu_device_env_over(|key| env::var_os(key).is_some())
+}
+
+/// [`cpu_device_env`], with `operator_set` telling which variables the
+/// operator set.
+fn cpu_device_env_over(operator_set: impl Fn(&str) -> bool) -> Vec<(String, String)> {
     std::iter::once((DEVICE_ENV_VAR, "cpu"))
-        .chain(GLIBC_MALLOC_ENV)
+        .chain(
+            GLIBC_MALLOC_ENV
+                .into_iter()
+                .filter(|(key, _)| !operator_set(key)),
+        )
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect()
 }
@@ -410,15 +422,11 @@ mod tests {
         );
         // Unresolved auto must not inject; callers resolve first.
         assert!(worker_env(Accelerator::Auto, &bare_python()).is_empty());
-        // `cpu` carries the device marker and the glibc thresholds, and
-        // nothing else — no HIP paths, no MPS watermarks.
+        // `cpu` carries the CPU device env and nothing else — no HIP paths,
+        // no MPS watermarks.
         assert_eq!(
             worker_env(Accelerator::Cpu, &bare_python()),
-            vec![
-                ("INFERIO_DEVICE".to_string(), "cpu".to_string()),
-                ("MALLOC_MMAP_THRESHOLD_".to_string(), "131072".to_string()),
-                ("MALLOC_TRIM_THRESHOLD_".to_string(), "131072".to_string()),
-            ]
+            cpu_device_env()
         );
         // Rocm may be empty of HIP libs on hosts without ROCm, but on Linux
         // still carries MIOpen defaults when those env vars are unset. Off
@@ -502,15 +510,6 @@ mod tests {
     /// footprint.
     #[test]
     fn only_a_cpu_host_pins_the_glibc_malloc_thresholds() {
-        let cpu = worker_env(Accelerator::Cpu, &bare_python());
-        for (key, value) in GLIBC_MALLOC_ENV {
-            assert_eq!(
-                cpu.iter()
-                    .find(|(name, _)| name == key)
-                    .map(|(_, set)| set.as_str()),
-                Some(value)
-            );
-        }
         for accelerator in [
             Accelerator::Cuda,
             Accelerator::Rocm,
@@ -526,16 +525,26 @@ mod tests {
         }
     }
 
-    /// An operator's own `MALLOC_ARENA_MAX` reaches the worker unchanged:
-    /// the cap is added only where none is set.
+    /// An operator's own malloc settings reach the worker unchanged: the
+    /// arena cap and each CPU threshold are added only where none is set.
     #[test]
-    fn the_arena_cap_never_overrides_the_operators_value() {
+    fn malloc_settings_never_override_the_operators_values() {
         let env = vec![("A".to_owned(), "1".to_owned())];
         assert_eq!(with_gpu_arena_cap(env.clone(), true), env);
         #[cfg(target_os = "linux")]
         assert_eq!(
             with_gpu_arena_cap(env.clone(), false)[1..],
             [("MALLOC_ARENA_MAX".to_owned(), "4".to_owned())]
+        );
+
+        let marker = (DEVICE_ENV_VAR.to_owned(), "cpu".to_owned());
+        assert_eq!(cpu_device_env_over(|_| true), std::slice::from_ref(&marker));
+        assert_eq!(
+            cpu_device_env_over(|key| key == "MALLOC_MMAP_THRESHOLD_"),
+            [
+                marker,
+                ("MALLOC_TRIM_THRESHOLD_".to_owned(), "131072".to_owned())
+            ]
         );
     }
 

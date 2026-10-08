@@ -194,11 +194,12 @@ fn gpu_pair(headroom: u64, seeds: [u32; 2], percent: u64) -> (Arc<VramLedger>, V
 }
 
 /// `count` cold replicas on a 16 GB CPU-only host under the shipped budget
-/// (limit 12 000 MiB), `headroom` MiB over their bases. A seed batch grows
-/// the resident set by `percent` of its design cost and hands it back.
+/// (limit 13 952 MiB, RAM less its reserve), `headroom` MiB over their bases.
+/// A seed batch grows the resident set by `percent` of its design cost and
+/// hands it back.
 fn cpu_host(count: u64, headroom: u64, percent: u64) -> (Arc<VramLedger>, Vec<Cold>) {
     const RAM_MB: u64 = 16_000;
-    let base_mb = (12_000 - headroom) / count;
+    let base_mb = (RAM_MB - cpu::ram_reserve_mb(RAM_MB) - headroom) / count;
     let ledger = VramLedger::new(
         &GpuInventory::known_cpu(RAM_MB),
         VramBudget::default().into(),
@@ -248,11 +249,15 @@ fn mac(pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>) {
     const RAM_MB: u64 = 16_384;
     const RECOMMENDED_MAX_MB: u64 = RAM_MB / 4 * 3;
     const BASE_MB: u64 = 2500;
-    let ledger = VramLedger::new(
-        &GpuInventory::known_mps(RAM_MB),
-        VramBudget::default().into(),
-        None,
+    // The CPU device capped at Metal's three quarters: the same room on both.
+    let budgets = VramBudgets::default().with_gpu(
+        cpu::DEVICE_KEY,
+        VramBudget {
+            cap_fraction: Some(0.75),
+            ..VramBudget::default()
+        },
     );
+    let ledger = VramLedger::new(&GpuInventory::known_mps(RAM_MB), budgets, None);
     ledger.install_probe_stub(None);
     let mut replicas = Vec::new();
     for (model, device, handle) in [
@@ -288,8 +293,21 @@ fn mac(pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>) {
             open: None,
         });
     }
-    // Nothing else holds RAM: both bases are ours.
-    ledger.record_free_for_test(MPS_GPU, RECOMMENDED_MAX_MB - 2 * BASE_MB);
+    // Nothing else holds RAM: both bases are ours. The MPS reading carries
+    // its RAM domain, as every Metal reading does.
+    VramLedger::record_free_locked(
+        &mut ledger.lock(),
+        MPS_GPU,
+        RECOMMENDED_MAX_MB - 2 * BASE_MB,
+        "mps".to_owned(),
+        std::time::Instant::now(),
+        None,
+        None,
+        Some(RamBasis {
+            total_mb: RAM_MB,
+            available_mb: RAM_MB - 2 * BASE_MB,
+        }),
+    );
     ledger.record_free_for_test(cpu::DEVICE_KEY, RAM_MB - 2 * BASE_MB);
     assert_eq!(ledger.headroom_mb(MPS_GPU), 7288);
     assert_eq!(ledger.headroom_mb(cpu::DEVICE_KEY), 7288);
