@@ -3110,11 +3110,12 @@ fn while_the_mac_pages_the_deficit_comes_off_the_pool_held_once() {
     assert_eq!((grant.mb, grant.unit_budget), (40, 7));
 }
 
-/// At warning with free RAM below the reserve the grant keeps the pool the
-/// replica holds and says macOS is not paging, so the worker's clamp keeps
-/// it too (`test_packing.py`, the same figures); while paging it says so.
+/// With free RAM below the reserve, only at warning does the grant keep the
+/// pool the replica holds and say so; at normal pressure and while paging
+/// the deficit comes off it. The worker's clamp reads the same figures the
+/// same way (`test_packing.py`).
 #[test]
-fn at_warning_a_grant_below_the_reserve_keeps_the_pool_and_says_so() {
+fn only_at_warning_a_grant_below_the_reserve_keeps_the_pool() {
     let (ledger, handle, admission) = ramped_mac_replica();
     let grant = |pressure| {
         ledger.set_memory_pressure_for_test(pressure);
@@ -3125,26 +3126,26 @@ fn at_warning_a_grant_below_the_reserve_keeps_the_pool_and_says_so() {
             .expect("granted");
         let grant = *token.grant();
         drop(token);
-        grant
-    };
-    let warning = grant(mps::MemoryPressure::Warning);
-    assert_eq!(
         (
-            warning.unit_budget,
-            warning.mb,
-            warning.fixed_mb,
-            warning.ram_reserve_mb,
-            warning.paging
-        ),
-        (64, 740, 100, 13_107, false)
-    );
+            grant.unit_budget,
+            grant.mb,
+            grant.fixed_mb,
+            grant.ram_reserve_mb,
+            grant.keep_pool,
+        )
+    };
     assert_eq!(mac_reserve(), 13_107);
-    let paging = grant(mps::MemoryPressure::Paging);
     assert_eq!(
-        (paging.unit_budget, paging.mb, paging.paging),
-        (8, 180, true),
-        "the 180 MiB of pool above the reserve"
+        grant(mps::MemoryPressure::Warning),
+        (64, 740, 100, 13_107, true)
     );
+    for pressure in [mps::MemoryPressure::Normal, mps::MemoryPressure::Paging] {
+        assert_eq!(
+            grant(pressure),
+            (8, 180, 100, 13_107, false),
+            "{pressure:?}: the 180 MiB of pool above the reserve"
+        );
+    }
 }
 
 /// At warning with nothing being paged out the replica keeps its working

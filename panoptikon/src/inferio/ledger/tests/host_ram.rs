@@ -316,7 +316,7 @@ fn plentiful_host_ram_changes_no_grant() {
         let gpu_side = Grant {
             ram_mb: 0,
             ram_reserve_mb: 0,
-            paging: false,
+            keep_pool: false,
             ..granted
         };
         assert_eq!(gpu_side, expected, "window {window}");

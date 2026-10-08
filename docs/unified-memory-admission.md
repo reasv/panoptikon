@@ -310,8 +310,9 @@ Single synthetic device:
     memory, not only by dropping clean file pages, so a grant priced on the
     file cache swaps someone else out. That price applies to new memory
     only: a deficit against the reserve does not come out of the pool a
-    replica holds, as it does while paging. The grant says which applies
-    (`paging`), and the worker's live clamp follows it.
+    replica holds, as it does while paging and at normal pressure. The grant
+    says when the pool is kept (`keep_pool`), and the worker's live clamp
+    follows it.
   - **Any window above normal** (the ledger reads `MemoryPressure` itself at
     grant and at settle and keeps the higher) earns no ramp step, feeds no
     knee, does not count as the size the ramp reached or toward a knee's

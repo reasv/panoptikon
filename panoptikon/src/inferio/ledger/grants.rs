@@ -141,7 +141,8 @@ impl VramLedger {
         };
         // At warning without paging a replica keeps the pool it holds: a
         // deficit against the reserve comes out of new memory only.
-        let own_headroom = if pressure == mps::MemoryPressure::Warning {
+        let keep_pool = pressure == mps::MemoryPressure::Warning;
+        let own_headroom = if keep_pool {
             signed_headroom.max(0)
         } else {
             signed_headroom
@@ -400,7 +401,7 @@ impl VramLedger {
                 fixed_mb: fixed_mb.min(mb),
                 ram_mb: ram_new_mb,
                 ram_reserve_mb,
-                paging: pressure.paging(),
+                keep_pool,
             },
             settled: false,
         })
@@ -701,10 +702,10 @@ pub struct Grant {
     /// or the Mac GPU against `hw.memsize`), otherwise the CPU device's
     /// reserve for a RAM booking; 0 when neither.
     pub ram_reserve_mb: u64,
-    /// macOS is paging: free RAM below `ram_reserve_mb` comes off the pool
-    /// the worker holds, as it did in this grant. Otherwise it comes out of
-    /// new memory only.
-    pub paging: bool,
+    /// At macOS warning: free RAM below `ram_reserve_mb` comes out of new
+    /// memory only and the pool the worker holds is kept, as in this grant.
+    /// Otherwise that deficit comes off the pool.
+    pub keep_pool: bool,
 }
 
 /// A held grant. Dropping it releases the reservation as an abort;

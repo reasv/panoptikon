@@ -1028,57 +1028,56 @@ def test_an_mps_worker_keeps_the_ram_reserve_free():
         assert live.units == 6, "the 96 GiB ceiling binds, not the reserve"
     with mps_host(available_mb=1_000) as mps:
         mps.allocate(1_000, driver_mb=5_000)
-        live = packing.clamp_to_live_memory(
-            8, 8_000, ram_reserve_mb=2_000, paging=True
-        )
-        assert live.units == 3, "4 000 of pool less the 1 000 below the reserve"
         live = packing.clamp_to_live_memory(8, 8_000, ram_reserve_mb=2_000)
-        assert live.units == 4, "not paging: the 4 000 of pool is kept"
+        assert live.units == 3, "4 000 of pool less the 1 000 below the reserve"
+        live = packing.clamp_to_live_memory(
+            8, 8_000, ram_reserve_mb=2_000, keep_pool=True
+        )
+        assert live.units == 4, "kept: the 4 000 of pool"
 
 
-def test_at_warning_an_mps_clamp_keeps_the_pool_the_grant_kept():
-    """The grant the ledger issues at warning with no RAM available and
-    13 287 MiB of pool, 180 above the 13 107 MiB reserve
-    (`at_warning_a_grant_below_the_reserve_keeps_the_pool_and_says_so`): the
-    clamp keeps it whole. A grant that says macOS is paging takes the
-    deficit off the pool, which leaves the 180 MiB, 8 units."""
-    grant_figures = {"unit_budget": 64, "mb": 740, "fixed_mb": 100}
+def test_an_mps_clamp_keeps_the_pool_only_where_the_grant_did():
+    """The grants the ledger issues with no RAM available and 13 287 MiB of
+    pool, 180 above the 13 107 MiB reserve
+    (`only_at_warning_a_grant_below_the_reserve_keeps_the_pool`): at warning
+    64 units on 740 MiB, which keep the pool, and the clamp keeps it whole;
+    at normal pressure and while paging 8 units on 180 MiB, and the clamp
+    takes the deficit off the pool as well, leaving the 180 MiB."""
     with mps_host(available_mb=0) as mps:
         mps.allocate(0, driver_mb=13_107 + 180)
-        for paging, units in [(False, 64), (True, 8)]:
+        for (units, mb, keep_pool), expected in [
+            ((64, 740, True), 64),
+            ((8, 180, False), 8),
+            # The warning grant if the pool were not kept: the deficit cuts it.
+            ((64, 740, False), 8),
+        ]:
             live = packing.clamp_to_live_memory(
-                grant_figures["unit_budget"],
-                grant_figures["mb"],
-                ram_reserve_mb=13_107,
-                fixed_mb=grant_figures["fixed_mb"],
-                paging=paging,
+                units, mb, ram_reserve_mb=13_107, fixed_mb=100, keep_pool=keep_pool
             )
-            assert live.units == units, paging
-    # The grant's own `paging` reaches the clamp; absent reads as false. The
-    # pool, far above these grants, is not released between the windows.
-    for paging, first in [(True, 8), (None, 64)]:
-        wire = grant(**grant_figures, ram_reserve_mb=13_107)
-        if paging is not None:
-            wire["paging"] = paging
+            assert live.units == expected, (units, mb, keep_pool)
+    # The grant's own `keep_pool` reaches the clamp; absent reads as false.
+    # The pool, far above these grants, is not released between the windows.
+    for keep_pool, first in [(True, 64), (None, 8)]:
+        wire = grant(unit_budget=64, mb=740, fixed_mb=100, ram_reserve_mb=13_107)
+        if keep_pool is not None:
+            wire["keep_pool"] = keep_pool
         with mps_host(available_mb=0) as mps, mock.patch.object(
             packing, "maybe_shrink", return_value=False
         ):
             mps.allocate(0, driver_mb=13_107 + 180)
             model = Recorder()
             packing.run_window(model, items(64), wire)
-        assert len(model.batches[0]) == first, paging
+        assert len(model.batches[0]) == first, keep_pool
 
 
 def test_the_mps_clamp_log_says_how_far_ram_is_below_the_reserve(caplog):
-    """While paging with RAM 1 000 MiB below a 2 000 MiB reserve and 200 MiB
-    of pool, nothing is left to spend: the log states the shortfall and a
-    remainder of 0, never a negative figure."""
+    """With RAM 1 000 MiB below a 2 000 MiB reserve and 200 MiB of pool,
+    nothing is left to spend: the log states the shortfall and a remainder
+    of 0, never a negative figure."""
     with mps_host(available_mb=1_000) as mps:
         mps.allocate(1_000, driver_mb=1_200)
         with caplog.at_level(logging.INFO, logger="inferio_worker.packing"):
-            live = packing.clamp_to_live_memory(
-                8, 8_000, ram_reserve_mb=2_000, paging=True
-            )
+            live = packing.clamp_to_live_memory(8, 8_000, ram_reserve_mb=2_000)
     assert live.units == 1
     (message,) = [
         record.getMessage()
