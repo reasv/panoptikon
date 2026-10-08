@@ -707,6 +707,62 @@ fn log_open_problem(
     }
 }
 
+/// Starts a write transaction. When SQLite refuses it because a file it
+/// writes is read-only (for example a `-shm` another user left behind),
+/// logs why each file the connection writes cannot be written, once per file.
+pub(crate) async fn begin_immediate(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    let result = sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await;
+    let code = result.as_ref().err().and_then(|err| {
+        let code = err.as_database_error()?.code()?;
+        code.parse::<i32>().ok()
+    });
+    // SQLITE_READONLY is 8; extended codes keep it in the low byte.
+    if code.is_some_and(|code| code & 0xff == 8) {
+        log_read_only_files(conn).await;
+    }
+    result.map(drop)
+}
+
+/// The database files whose read-only write failure was logged.
+static READ_ONLY_WRITES: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+async fn log_read_only_files(conn: &mut SqliteConnection) {
+    let Ok(schemas) = sqlx::query_as::<_, (i64, String, String)>("PRAGMA database_list")
+        .fetch_all(&mut *conn)
+        .await
+    else {
+        return;
+    };
+    let Ok(mut handle) = conn.lock_handle().await else {
+        return;
+    };
+    let db = handle.as_raw_handle().as_ptr();
+    for (_, schema, file) in schemas {
+        let Ok(schema) = std::ffi::CString::new(schema) else {
+            continue;
+        };
+        // SAFETY: `db` is the open connection, locked by `handle`, and
+        // `schema` is NUL-terminated.
+        if unsafe { libsqlite3_sys::sqlite3_db_readonly(db, schema.as_ptr()) } != 0 {
+            continue;
+        }
+        let file = PathBuf::from(file);
+        let name = file.file_name().and_then(|name| name.to_str());
+        let folder_and_name = file.parent().zip(name);
+        let Some(reason) = folder_and_name
+            .and_then(|(folder, name)| crate::ownership::database_problem(folder, name))
+        else {
+            continue;
+        };
+        let mut logged = READ_ONLY_WRITES
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if logged.insert(file.clone()) {
+            tracing::warn!(reason, db = %file.display(), "cannot write a database");
+        }
+    }
+}
+
 /// After an open of `paths` succeeds, a problem with each of its files in an
 /// open of the same kind is logged again.
 fn log_open_success(
@@ -1142,6 +1198,47 @@ mod tests {
             fs::set_permissions(file, fs::Permissions::from_mode(0o644)).unwrap();
             assert!(opened.is_err(), "{}", file.display());
         }
+    }
+
+    /// A write open succeeds beside a `-shm` another user left behind, but
+    /// its writes fail, and the first failure names that file and its owner.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_refused_by_another_users_shm_names_the_owner() {
+        use crate::ownership::tests::{DENIED_OWNER, owned_by_another_user};
+        use std::os::unix::fs::PermissionsExt as _;
+        let _env = crate::test_utils::test_data_dir();
+        let name = "foreign_shm";
+        let paths = db_paths(name, name).unwrap();
+        let index = open_index_db_write_no_user_data(name).await.unwrap();
+        index.close().await.unwrap();
+        fs::write(&paths.user_db_file, "").unwrap();
+        let user_data = open_user_data_write(name, name).await.unwrap();
+        user_data.close().await.unwrap();
+        let mut shm = paths.user_db_file.clone().into_os_string();
+        shm.push("-shm");
+        let shm = PathBuf::from(shm);
+        // Not empty: SQLite changes an empty `-shm` to the database's mode,
+        // which it cannot do to another user's file.
+        fs::write(&shm, [0; 32768]).unwrap();
+        fs::set_permissions(&shm, fs::Permissions::from_mode(0o444)).unwrap();
+        if fs::OpenOptions::new().write(true).open(&shm).is_ok() {
+            return;
+        }
+        let (_guard, reasons) = crate::test_utils::warned_reasons();
+        DENIED_OWNER.set(Some(0));
+        let mut conn = open_user_data_write(name, name).await.unwrap();
+        let failed = [
+            begin_immediate(&mut conn).await.is_err(),
+            begin_immediate(&mut conn).await.is_err(),
+        ];
+        DENIED_OWNER.set(None);
+        drop(conn);
+        fs::remove_file(&shm).unwrap();
+        assert_eq!(failed, [true, true]);
+        let folder = paths.user_db_file.parent().unwrap();
+        let expected = owned_by_another_user(&shm, 0, folder);
+        assert_eq!(*reasons.lock().unwrap(), [Some(expected)]);
     }
 
     /// A read pool whose connections are all busy times out and is kept.

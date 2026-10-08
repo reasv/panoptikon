@@ -1945,13 +1945,10 @@ impl TxFailure {
 }
 
 async fn begin_tx(conn: &mut SqliteConnection) -> ApiResult<()> {
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = ?err, "failed to begin transaction");
-            ApiError::internal("Failed to begin transaction")
-        })?;
+    crate::db::begin_immediate(conn).await.map_err(|err| {
+        tracing::error!(error = ?err, "failed to begin transaction");
+        ApiError::internal("Failed to begin transaction")
+    })?;
     Ok(())
 }
 
