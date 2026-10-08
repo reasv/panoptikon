@@ -5,9 +5,12 @@ tests (Python and Rust alike) can prove it ran exactly when prewarm was
 requested. load() asserts nothing about prepare having run — the protocol
 guarantees load works with or without a prior prewarm — and predict()
 reports the flag so the pooled flow (prewarm -> park -> configure -> load
--> predict) is observable end to end.
+-> predict) is observable end to end, and reports the `INFERIO_DEVICE`
+marker it was spawned with, which only a fresh spawn for the CPU device
+carries.
 """
 
+import os
 import sys
 
 PREPARED = False
@@ -37,7 +40,8 @@ class PrepareModel:
         self.load_called = True
 
     def predict(self, inputs):
-        return [{"prepared": PREPARED} for _ in inputs]
+        device = os.environ.get("INFERIO_DEVICE")
+        return [{"prepared": PREPARED, "device": device} for _ in inputs]
 
     def unload(self) -> None:
         pass

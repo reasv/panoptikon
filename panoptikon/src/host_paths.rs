@@ -303,7 +303,7 @@ pub fn find_html_renderer() -> Option<PathBuf> {
         if let Some(home) = env::var_os("HOME") {
             roots.push(PathBuf::from(home).join("Applications"));
         }
-        return first_runnable_under(
+        first_runnable_under(
             &roots,
             &[
                 "Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -319,7 +319,7 @@ pub fn find_html_renderer() -> Option<PathBuf> {
                 "Microsoft Edge Dev.app/Contents/MacOS/Microsoft Edge Dev",
                 "Microsoft Edge Canary.app/Contents/MacOS/Microsoft Edge Canary",
             ],
-        );
+        )
     }
     #[cfg(windows)]
     {

@@ -16,6 +16,9 @@ use crate::db::extraction_log::{LogRecord, get_all_data_logs, get_setters_total_
 use crate::db::file_scans::get_all_file_scans;
 use crate::db::folders::get_folders_from_database;
 use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
+use crate::db::job_failures::{
+    JobFailureFilters, count_failed_jobs, count_job_failures, list_failed_jobs, list_job_failures,
+};
 use crate::db::ledger::ERROR_CLASSES;
 use crate::db::scan_errors::{ScanErrorFilters, count_scan_errors, list_scan_errors};
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
@@ -36,7 +39,7 @@ use crate::jobs::queue::{
 pub(crate) struct InferenceQuery {
     /// Inference ID List
     inference_ids: Vec<String>,
-    /// Batch Size
+    /// Max Batch Size: optional cap on items processed at once; null = auto.
     #[param(nullable)]
     batch_size: Option<i64>,
     /// Confidence Threshold
@@ -143,9 +146,7 @@ pub(crate) async fn enqueue_data_extraction(
     conn: DbConnection<ReadOnly>,
 ) -> Result<(StatusCode, Json<Vec<JobModel>>), ApiError> {
     // Validate the models and resolve effective batch_size/threshold at
-    // enqueue time (mirrors Python): a bad inference ID fails this request
-    // instead of a job hours later, and the queue status shows the values
-    // the job will actually run with.
+    // enqueue time, so a bad inference ID fails this request.
     let store = SystemConfigStore::from_env();
     let config = store.load(&conn.index_db)?;
     validate_external_inputs(&job_inference_context().primary, &query.inference_ids).await?;
@@ -163,7 +164,8 @@ pub(crate) async fn enqueue_data_extraction(
             index_db: conn.index_db.clone(),
             user_data_db: conn.user_data_db.clone(),
             metadata: Some(inference_id),
-            batch_size: Some(defaults.batch_size),
+            // The resolved cap, `None` = auto.
+            batch_size: defaults.batch_size,
             threshold: defaults.threshold,
             log_id: None,
             tag: None,
@@ -287,11 +289,8 @@ pub(crate) async fn enqueue_update_folders(
 pub(crate) async fn enqueue_maintenance(
     conn: DbConnection<ReadOnly>,
 ) -> Result<(StatusCode, Json<JobModel>), ApiError> {
-    // 409 rather than a 200 "skipped" body: unlike the cron and reconcile
-    // triggers this route's success body is a JobModel, and there is no job to
-    // report when the request adds nothing. Reachable only for a *running*
-    // pass — a queued one is upgraded and returned, so the promise this
-    // endpoint makes ("this will recount") is kept.
+    // 409 rather than a 200 body: there is no job to report. Only a running
+    // pass reaches this; a queued one is upgraded and returned.
     let job = enqueue_db_maintenance(&conn.index_db, &conn.user_data_db)
         .await?
         .ok_or_else(|| {
@@ -469,25 +468,13 @@ pub(crate) async fn update_config(
         )));
     }
     // External-input validation is scoped to the cron-job models this save
-    // ADDS. The stored config already schedules the rest, and every other
-    // key (scan toggles, folders, thumbnail formats...) has nothing to do
-    // with inference — so a save of any of them must not depend on the
-    // inference upstream being reachable. Before this comparison an
-    // unreachable upstream failed every save (a 500 in-process, a 508 loop
-    // when the upstream defaulted to the gateway's own API URL), which is
-    // exactly the "commit path rejects unrelated saves" failure CLAUDE.md
-    // rules out.
+    // ADDS, so an unreachable upstream never fails an unrelated save.
     let store = SystemConfigStore::from_env();
     let before = store.load_readonly(&conn.index_db)?;
     let added = newly_scheduled_inference_ids(&before, &config);
     validate_external_inputs(&job_inference_context().primary, &added).await?;
-    // Normalize retired quantizer kinds into the section that gets SAVED —
-    // the load path already reads `binary` as `int8`, so rewriting the file
-    // is what makes it converge and stops the load-time warning; rejecting
-    // it here instead would 400 every unrelated settings save on a DB whose
-    // section predates the int8 remap. Genuinely invalid sections are still
-    // rejected at save time: the load-time paths treat them as inert, which
-    // would silently strand the profiles.
+    // Normalize retired quantizer kinds in the saved section; rejecting them
+    // would 400 unrelated saves. Invalid sections are still rejected.
     let mut config = config;
     if let Some(quants) = &mut config.vector_quants {
         if crate::db::vector_quants::normalize_retired(quants) {
@@ -504,10 +491,7 @@ pub(crate) async fn update_config(
     let config = store.load(&conn.index_db)?;
     let _ = continuous_scan::notify_config_change(&conn.index_db).await;
     let _ = cron::notify_config_change(&conn.index_db).await;
-    // Commit semantics: the TOML write, the discrepancy check, and its
-    // consequence (synchronous metadata sync or a reconcile job) are one
-    // action — there is no state where the config was written but the work
-    // was not scheduled.
+    // The TOML write, the discrepancy check and its consequence are one action.
     crate::jobs::vector_quants::check_and_schedule(&conn.index_db, &conn.user_data_db).await;
     let resync_needed = is_resync_needed(&conn.index_db, &conn.user_data_db, &config).await?;
     if resync_needed {
@@ -526,10 +510,8 @@ pub(crate) async fn update_config(
     Ok(Json(config))
 }
 
-/// The cron-job inference IDs that `after` schedules and `before` does not,
-/// in `after`'s order and without duplicates. These are the only models a
-/// config save has to validate against the inference upstream: everything
-/// `before` already scheduled went through this check when it was added.
+/// Cron-job inference IDs that `after` schedules and `before` does not, in
+/// `after`'s order, deduplicated.
 fn newly_scheduled_inference_ids(before: &SystemConfig, after: &SystemConfig) -> Vec<String> {
     let known = before
         .cron_jobs
@@ -546,13 +528,8 @@ fn newly_scheduled_inference_ids(before: &SystemConfig, after: &SystemConfig) ->
 }
 
 /// Validate declarations when the upstream supports the additive endpoint.
-/// Older remote Python Inferio servers do not have it, so a 404 preserves
-/// their previous behavior; every other discovery failure is surfaced.
-/// Load-time Inferio validation remains authoritative for current servers.
-///
-/// With nothing to validate the upstream is never contacted: callers pass
-/// only the models a request introduces, so a request that introduces none
-/// must succeed even when the inference server is down.
+/// A 404 from older remote Python servers is accepted; other discovery
+/// failures surface. With nothing to validate the upstream is not contacted.
 async fn validate_external_inputs(
     client: &crate::inferio_client::InferenceApiClient,
     inference_ids: &[String],
@@ -564,9 +541,14 @@ async fn validate_external_inputs(
         Ok(Some(status)) => status,
         Ok(None) => return Ok(()),
         Err(error) => {
-            tracing::error!(%error, "failed to validate inference external inputs");
-            return Err(ApiError::internal(
-                "Failed to validate inference external inputs",
+            tracing::error!(
+                error = %format_args!("{error:#}"),
+                "failed to validate inference external inputs"
+            );
+            return Err(crate::inference_errors::upstream_api_error(
+                &error,
+                client.base_url(),
+                || ApiError::internal("Failed to validate inference external inputs"),
             ));
         }
     };
@@ -646,19 +628,13 @@ pub(crate) async fn get_setter_data_count(
 #[into_params(parameter_in = Query)]
 pub(crate) struct ExtractionFailuresQuery {
     /// Only failures recorded for this setter. Deliberately *not* validated
-    /// against the known setters: the vocabulary is free-form and depends on
-    /// which models the user has ever run, so there is no closed list to check
-    /// against. A typo therefore answers "no failures", which is acceptable
-    /// here — unlike `error_class`, whose vocabulary is closed and enforced,
-    /// because a mistyped class silently reading as "nothing is wrong" is
-    /// exactly what an audit surface must not do.
+    /// against the known setters, so a typo answers "no failures".
     #[param(nullable)]
     setter: Option<String>,
     /// `input`, `blocked` or `resource`. Anything else is a 400.
     #[param(nullable)]
     error_class: Option<String>,
-    /// `prepare` (the gateway could not produce the model's input) or
-    /// `inference` (the worker rejected it).
+    /// `prepare`, `inference` or `output` (`output` only on `job_failures`).
     #[param(nullable)]
     stage: Option<String>,
     /// Prefix of the recorded mime type, e.g. `image/`.
@@ -677,8 +653,7 @@ pub(crate) struct ExtractionFailuresQuery {
 }
 
 /// Filters for the filescan failure ledger. Deliberately *not* the extraction
-/// query type: a scan failure predates every setter, so offering a `setter`
-/// filter here would document a parameter that can only ever answer "none".
+/// query type: scan failures have no setter.
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub(crate) struct ScanFailuresQuery {
@@ -707,15 +682,10 @@ pub(crate) struct ScanFailuresQuery {
 /// One recorded extraction failure, as served to the audit surface.
 #[derive(serde::Serialize, ToSchema)]
 pub(crate) struct ExtractionFailure {
-    /// Ledger row id. Stable for as long as the row lives, which is what the
-    /// UI keys rows on.
+    /// Ledger row id, stable for as long as the row lives; the UI keys on it.
     id: i64,
     sha256: String,
-    /// One of the paths this item is stored under, chosen deterministically
-    /// (an available file first, then the lexicographically smallest path).
-    /// An item can have several files and the ledger keys on the item, so
-    /// this is a representative, not the whole story. Null when every file of
-    /// the item has gone away.
+    /// A representative path (an available file first); null if none remain.
     path: Option<String>,
     /// The item's mime type as recorded when the failure happened.
     mime_type: String,
@@ -733,13 +703,10 @@ pub(crate) struct ExtractionFailure {
     skip_after: i64,
     attempts: i64,
     /// `attempts >= skip_after`: the verdict is confirmed and the work query
-    /// is skipping this item. False means the verdict is recorded but
-    /// unconfirmed and will be retried.
+    /// is skipping this item. False means it is recorded but unconfirmed.
     active: bool,
     /// The last job that saw this failure. Null only when it was recorded
-    /// outside a job. This is *not* a foreign key and nothing nulls it when
-    /// job rows are cleaned up, so the id may name a job that no longer
-    /// exists — the ledger has to outlive the job history it refers to.
+    /// outside a job; not a foreign key, so the job may no longer exist.
     last_job_id: Option<i64>,
     first_seen: String,
     last_seen: String,
@@ -764,29 +731,56 @@ pub(crate) struct ScanFailure {
     attempts: i64,
     /// `attempts >= skip_after`: the verdict is confirmed. Not the same as
     /// "this path will be skipped": the walker also requires the file to still
-    /// have the `last_modified`/`file_size` the failure was recorded against,
-    /// so a file that has been repaired or otherwise modified since is
-    /// re-attempted on the next scan even though this reads true.
-    ///
-    /// A `decode`-stage row never suppresses anything at any `attempts`: its
-    /// file *is* indexed (only the visuals failed), so the row is audit-only
-    /// and retry scheduling is the visuals cache's, not this ledger's.
+    /// have the `last_modified`/`file_size` the failure was recorded against. A
+    /// `decode`-stage row is audit-only.
     active: bool,
     /// The last scan that saw this failure. Null only when it was recorded
-    /// outside a scan. This is *not* a foreign key and nothing nulls it when
-    /// `file_scans` rows are cleaned up, so the id may name a scan that no
-    /// longer exists.
+    /// outside a scan; not a foreign key, so the scan may no longer exist.
     last_scan_id: Option<i64>,
     first_seen: String,
     last_seen: String,
 }
 
+/// One item a job could not process and has no verdict for. Unlike an
+/// [`ExtractionFailure`] it suppresses nothing: the next run selects it again.
+// See docs/failed-media-retry-design.md, "The other half: failures with no
+// verdict" (a plain comment, so it stays out of the OpenAPI description).
+#[derive(serde::Serialize, ToSchema)]
+pub(crate) struct JobItemFailure {
+    /// Row id, stable for as long as the row lives.
+    id: i64,
+    /// The `data_jobs` id of the job that failed the item; see `FailedJob`.
+    job_id: i64,
+    sha256: String,
+    /// A representative path of the item; null if none remain.
+    path: Option<String>,
+    mime_type: String,
+    /// The model whose job failed the item.
+    setter_name: String,
+    /// `prepare`, `inference` or `output`.
+    stage: String,
+    /// The error text, clamped when it was recorded.
+    error: String,
+    /// Whether the item had already been re-submitted once.
+    requeued: bool,
+    /// When the item failed (not when the record was written).
+    occurred_at: String,
+}
+
 #[derive(serde::Serialize, ToSchema)]
 pub(crate) struct ExtractionFailuresResponse {
-    /// How many failures match the filters, ignoring the page window — the
-    /// denominator for `limit`/`offset` paging.
+    /// Recorded media verdicts matching the filters, ignoring the page window.
     total: i64,
+    /// The retry ledger: media a setter has already rejected.
     failures: Vec<ExtractionFailure>,
+    /// Per-job item failures matching the filters, ignoring the page window.
+    job_failures_total: i64,
+    /// Unexplained failures, paged like `failures`; verdict filters empty it.
+    job_failures: Vec<JobItemFailure>,
+    /// Jobs that ended `partial`, `failed` or `cancelled`, ignoring the page.
+    failed_jobs_total: i64,
+    /// The failures' jobs, newest first; not narrowed by `setter` or `stage`.
+    failed_jobs: Vec<crate::db::job_failures::FailedJobRecord>,
 }
 
 #[derive(serde::Serialize, ToSchema)]
@@ -798,9 +792,7 @@ pub(crate) struct ScanFailuresResponse {
 
 /// A class outside the vocabulary is a typo, and silently answering "no
 /// failures" to it is the one thing an audit surface must not do. Deliberately
-/// *not* applied to `stage`: the two ledgers have different stage vocabularies
-/// and new ones are expected to appear, so a stage filter that matches nothing
-/// is a legitimate answer.
+/// *not* applied to `stage`, whose vocabularies differ between the ledgers.
 fn validate_error_class(error_class: Option<String>) -> Result<Option<String>, ApiError> {
     if let Some(class) = &error_class
         && !ERROR_CLASSES.contains(&class.as_str())
@@ -819,10 +811,16 @@ fn validate_error_class(error_class: Option<String>) -> Result<Option<String>, A
     path = "/api/jobs/data/failures",
     tag = "jobs",
     summary = "List recorded data extraction failures",
-    description = "The extraction failure ledger: media a setter has already rejected, which the \
-        work query therefore skips. Read-only by design — a row is cleared when the file's \
-        content changes, when a missing dependency appears, or by a shipped retry directive, \
-        never by an API call. Newest first, paginated with limit/offset against `total`.",
+    description = "Everything a data extraction has failed on, in three lists. `failures` is \
+        the extraction failure ledger: media a setter has already rejected, which the work \
+        query therefore skips. Read-only by design — a row is cleared when the file's content \
+        changes, when a missing dependency appears, or by a shipped retry directive, never by \
+        an API call. `job_failures` is the opposite: items a job attempted and could not \
+        finish, with nothing on record explaining why (the inference worker died mid-request, \
+        the server was down, a write failed); those items are untouched and the next run \
+        selects them again. `failed_jobs` is the jobs behind them, `partial` included — a \
+        partial job ran to the end with some of its items left undone. All three are newest \
+        first and share the limit/offset window, each against its own total.",
     params(DbQueryParams, ExtractionFailuresQuery),
     responses(
         (status = 200, description = "Recorded extraction failures", body = ExtractionFailuresResponse)
@@ -832,21 +830,65 @@ pub(crate) async fn get_extraction_failures(
     Query(query): Query<ExtractionFailuresQuery>,
     mut conn: DbConnection<ReadOnly>,
 ) -> Result<Json<ExtractionFailuresResponse>, ApiError> {
+    let error_class = validate_error_class(query.error_class)?;
+    // Verdict-only filters cannot describe unexplained failures, so the
+    // job-side lists are omitted for them (documented on the schema).
+    let verdict_only = error_class.is_some() || query.mime_prefix.is_some();
     let filters = ExtractionErrorFilters {
-        setter: query.setter,
-        error_class: validate_error_class(query.error_class)?,
-        stage: query.stage,
+        setter: query.setter.clone(),
+        error_class,
+        stage: query.stage.clone(),
         mime_prefix: query.mime_prefix,
         limit: query.limit,
         offset: query.offset.unwrap_or(0),
     };
     // Count first, then the page: a row written between the two shows up as a
-    // total one larger than the page can explain, which is the harmless
-    // direction. The reverse would page past a total that no longer covers it.
+    // total one larger than the page explains, which is the harmless direction.
     let total = count_extraction_errors(&mut conn.conn, &filters).await?;
     let rows = list_extraction_errors(&mut conn.conn, &filters).await?;
+
+    let (job_failures_total, job_failure_rows, failed_jobs_total, failed_jobs) = if verdict_only {
+        (0, Vec::new(), 0, Vec::new())
+    } else {
+        let job_filters = JobFailureFilters {
+            setter: query.setter,
+            stage: query.stage,
+            limit: query.limit,
+            offset: filters.offset,
+        };
+        let job_failures_total = count_job_failures(&mut conn.conn, &job_filters).await?;
+        let job_failure_rows = list_job_failures(&mut conn.conn, &job_filters).await?;
+        // Not setter-filtered: a job record already names its setter.
+        let failed_jobs_total = count_failed_jobs(&mut conn.conn).await?;
+        let failed_jobs = list_failed_jobs(&mut conn.conn, query.limit, filters.offset).await?;
+        (
+            job_failures_total,
+            job_failure_rows,
+            failed_jobs_total,
+            failed_jobs,
+        )
+    };
+
     Ok(Json(ExtractionFailuresResponse {
         total,
+        job_failures_total,
+        job_failures: job_failure_rows
+            .into_iter()
+            .map(|row| JobItemFailure {
+                id: row.id,
+                job_id: row.job_id,
+                sha256: row.item_sha256,
+                path: row.path,
+                mime_type: row.mime_type,
+                setter_name: row.setter_name,
+                stage: row.stage,
+                error: row.error,
+                requeued: row.requeued,
+                occurred_at: row.occurred_at,
+            })
+            .collect(),
+        failed_jobs_total,
+        failed_jobs,
         failures: rows
             .into_iter()
             .map(|row| ExtractionFailure {
@@ -940,10 +982,8 @@ pub(crate) struct VectorQuantRebuildRequest {
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub(crate) struct VectorQuantStatusQuery {
-    /// Include per-setter vector/quantized counts (progress and size on
-    /// disk). These are full index scans over each setter's rows; pass
-    /// false from latency-sensitive surfaces that only need profile names
-    /// and states. Defaults to true.
+    /// Include per-setter vector/quantized counts. These are full index scans;
+    /// pass false when only names and states are needed.
     #[serde(default = "default_true")]
     counts: bool,
 }
@@ -982,13 +1022,8 @@ pub(crate) async fn get_vector_quants(
     // creates drift also enqueues the reconcile that resolves it. Report the
     // in-flight job so the card can say "converging" instead of "act now".
     //
-    // The two reads can't be taken atomically, so bracket the DB read with
-    // them and take either. Sampling the queue only afterwards makes the
-    // one failure that matters: a job that finishes *during* the DB read
-    // leaves drift in the snapshot and nothing in the queue, which is
-    // exactly the "act now" banner flashing as the job completes. Bracketed,
-    // the worst case is the harmless direction — one extra poll reading
-    // "converging" after the work is already done.
+    // The two reads can't be atomic, so bracket the DB read with them; the
+    // worst case is one extra poll reading "converging" after the work is done.
     let pending_before = reconcile_job_pending(&conn.index_db).await?;
     let mut status =
         crate::db::vector_quants::load_status(&mut conn.conn, desired, params.counts).await?;
@@ -1383,17 +1418,22 @@ mod tests {
         let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
         drop(dead);
-        let unreachable = crate::inferio_client::InferenceApiClient::new_with_metadata_cache(
-            format!("http://{dead_addr}"),
-            false,
-        )
-        .unwrap();
+        let dead_url = format!("http://{dead_addr}");
+        let unreachable =
+            crate::inferio_client::InferenceApiClient::new_with_metadata_cache(&dead_url, false)
+                .unwrap();
         validate_external_inputs(&unreachable, &[]).await.unwrap();
+        let error = validate_external_inputs(&unreachable, &["tags/new".to_string()])
+            .await
+            .unwrap_err();
         assert!(
-            validate_external_inputs(&unreachable, &["tags/new".to_string()])
-                .await
-                .is_err()
+            error.detail().starts_with(&format!(
+                "Could not reach the inference server at {dead_url}: "
+            )),
+            "{}",
+            error.detail()
         );
+        assert_eq!(error.into_response().status(), StatusCode::BAD_GATEWAY);
     }
 
     /// The UI sends list params FastAPI-style
@@ -1461,6 +1501,168 @@ mod tests {
         assert_eq!(q.stage.as_deref(), Some("decode"));
         assert_eq!(q.mime_prefix.as_deref(), Some("video/"));
         assert_eq!((q.limit, q.offset), (Some(10), None));
+    }
+
+    /// The failures endpoint end to end, on a database holding one of each:
+    /// a recorded media verdict, an item a job could not process and has no
+    /// verdict for, and the partial job behind it.
+    #[tokio::test]
+    async fn the_failures_endpoint_lists_items_verdicts_and_the_jobs_behind_them() {
+        use crate::db::migrations::setup_test_databases;
+
+        let mut dbs = setup_test_databases().await;
+        sqlx::query(
+            r#"
+            INSERT INTO items (id, sha256, md5, type, time_added)
+            VALUES (1, 'sha_one', 'md5_one', 'image/png', '2026-09-04T00:00:00')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO setters (id, name) VALUES (1, 'clip/model-a')")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO file_scans (id, start_time, path) \
+             VALUES (1, '2026-09-04T00:00:00', '/media')",
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO files (
+                id, sha256, item_id, path, filename, last_modified, scan_id, available
+            )
+            VALUES (1, 'sha_one', 1, '/media/one.png', 'one.png', '2026-09-04T00:00:00', 1, 1)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO data_jobs (id, completed) VALUES (5, 1)")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO data_log (
+                id, job_id, start_time, end_time, type, setter, batch_size,
+                total_segments, errors, input_errors, total_remaining,
+                completed, outcome, failure_reason
+            )
+            VALUES (1, 5, '2026-09-04T10:00:00', '2026-09-04T10:11:00', 'clip',
+                    'clip/model-a', 0, 320, 4, 1, 3, 1, 'partial',
+                    '3 of 100 attempted items could not be processed and are still owed')
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        // A recorded verdict about the media...
+        crate::db::extraction_errors::upsert_extraction_error(
+            &mut dbs.index_conn,
+            &crate::db::extraction_errors::ExtractionErrorRecord {
+                item_sha256: "sha_one".to_string(),
+                setter_name: "clip/model-a".to_string(),
+                stage: crate::db::extraction_errors::STAGE_PREPARE.to_string(),
+                kind: crate::api_error::ApiErrorKind::Input,
+                error: "truncated png".to_string(),
+                skip_after: 1,
+                job_id: Some(5),
+            },
+        )
+        .await
+        .unwrap();
+        // ...and work that simply did not happen.
+        crate::db::job_failures::record_job_failures(
+            &mut dbs.index_conn,
+            5,
+            &[crate::db::job_failures::JobItemFailureRecord {
+                item_sha256: "sha_one".to_string(),
+                setter_name: "clip/model-a".to_string(),
+                stage: crate::db::extraction_errors::STAGE_INFERENCE.to_string(),
+                error: "inferio worker clip/model-a failed fatally: early eof".to_string(),
+                requeued: true,
+                occurred_at: "2026-09-04T11:22:33".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let crate::db::migrations::InMemoryDatabases {
+            index_conn,
+            storage_conn,
+            user_data_conn,
+        } = dbs;
+        let _attached = (storage_conn, user_data_conn);
+        let db = DbConnection::<ReadOnly>::for_tests(index_conn, "test", "test");
+
+        let uri: Uri = "/api/jobs/data/failures".parse().unwrap();
+        let query = Query::<ExtractionFailuresQuery>::try_from_uri(&uri).unwrap();
+        let Json(response) = get_extraction_failures(query, db).await.expect("failures");
+
+        assert_eq!(response.total, 1, "the retry ledger's verdict");
+        assert_eq!(response.failures[0].error_class, "input");
+
+        assert_eq!(response.job_failures_total, 1);
+        let failure = &response.job_failures[0];
+        assert_eq!(failure.job_id, 5);
+        assert_eq!(failure.sha256, "sha_one");
+        assert_eq!(failure.path.as_deref(), Some("/media/one.png"));
+        assert_eq!(failure.setter_name, "clip/model-a");
+        assert_eq!(failure.stage, "inference");
+        assert!(failure.error.contains("failed fatally"));
+        assert!(failure.requeued, "the spent re-queue is visible");
+        assert_eq!(
+            failure.occurred_at, "2026-09-04T11:22:33",
+            "the endpoint serves when the item failed, not when the batch was written"
+        );
+
+        assert_eq!(response.failed_jobs_total, 1);
+        let job = &response.failed_jobs[0];
+        assert_eq!(job.outcome, "partial");
+        assert_eq!(job.job_id, Some(5));
+        assert_eq!(job.failed_items, 3, "errors minus recorded verdicts");
+        assert_eq!(job.total_segments, 320);
+        assert_ne!(
+            job.end_time, job.start_time,
+            "a job that did not complete carries a real end_time"
+        );
+        assert!(
+            job.failure_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("still owed")
+        );
+    }
+
+    /// A filter that can only describe a recorded verdict must not be
+    /// answered with unfiltered job failures. The two job-side lists are
+    /// omitted instead — documented on the schema, so an empty list is never
+    /// read as "there are none".
+    #[tokio::test]
+    async fn a_verdict_only_filter_omits_the_job_side_lists() {
+        use crate::db::migrations::setup_test_databases;
+
+        let dbs = setup_test_databases().await;
+        let crate::db::migrations::InMemoryDatabases {
+            index_conn,
+            storage_conn,
+            user_data_conn,
+        } = dbs;
+        let _attached = (storage_conn, user_data_conn);
+        let db = DbConnection::<ReadOnly>::for_tests(index_conn, "test", "test");
+
+        let uri: Uri = "/api/jobs/data/failures?error_class=input".parse().unwrap();
+        let query = Query::<ExtractionFailuresQuery>::try_from_uri(&uri).unwrap();
+        let Json(response) = get_extraction_failures(query, db).await.expect("failures");
+        assert_eq!(response.job_failures_total, 0);
+        assert!(response.job_failures.is_empty());
+        assert_eq!(response.failed_jobs_total, 0);
+        assert!(response.failed_jobs.is_empty());
     }
 
     /// A mistyped class must not answer "no recorded failures" — on an audit

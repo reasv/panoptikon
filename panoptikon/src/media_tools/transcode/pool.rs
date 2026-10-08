@@ -990,7 +990,10 @@ pub(crate) async fn transcode_cache() -> ApiResult<Arc<TranscodeCache>> {
                 .await
                 .map(Arc::new)
                 .map_err(|err| {
-                    tracing::error!(error = %err, "failed to open the transcode artifact cache");
+                    tracing::error!(
+                        error = format!("{err:#}"),
+                        "failed to open the transcode artifact cache"
+                    );
                     ApiError::internal("Failed to open the transcode artifact cache")
                 })?;
             // The hardware probe spawns ffmpeg twice on its first call and is

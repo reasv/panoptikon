@@ -37,6 +37,7 @@ class FasterWhisperModel(InferenceModel):
         return "faster_whisper"
 
     def load(self) -> None:
+        import ctranslate2
         from faster_whisper import WhisperModel
 
         if self._model_loaded:
@@ -46,12 +47,22 @@ class FasterWhisperModel(InferenceModel):
         self.devices = [
             self.devices[0]
         ]  # Disable multi-GPU due to https://github.com/SYSTRAN/faster-whisper/issues/149
+        # The resolved device decides, not CTranslate2's probe. A `cuda`
+        # device runs on the CPU when this CT2 build sees no GPU (the PyPI
+        # wheel has no ROCm backend).
+        cuda = (
+            self.devices[0].type == "cuda"
+            and ctranslate2.get_cuda_device_count() > 0
+        )
+        kind = "cuda" if cuda else "cpu"
         self.model = WhisperModel(
             model_size_or_path=self.model_name,
-            device="auto",
+            # `auto` for CUDA: it falls back to the CPU on a CT2 build without
+            # CUDA, where an explicit `cuda` would raise.
+            device="auto" if kind == "cuda" else "cpu",
             # device_index=[i for i in range(len(self.devices))],
             compute_type=select_ct2_compute_type(
-                "float16", explicit=self.compute_type
+                "float16", explicit=self.compute_type, device_kind=kind
             ),
             # num_workers=len(self.devices),
             **self.init_args,

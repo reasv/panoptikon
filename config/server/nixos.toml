@@ -30,9 +30,51 @@ local = true
 [inference_local]
 enabled = true
 
+# How many models may load their weights into one GPU at a time. Default 1;
+# every unpinned model uses the same default GPU, so loads are serialized.
+# Raising it is safe: each load reserves its expected memory up front.
+# max_concurrent_loads = 1
+
+# Per-model cooldown after a failed load, in seconds: doubles per consecutive
+# failure up to the max and clears on a successful load. While it is armed,
+# predict and load answer 503 + Retry-After. 0 disables it.
+# load_failure_cooldown_secs = 2
+# load_failure_cooldown_max_secs = 300
+
 [inference_local.python_env]
 accelerator = "${PANOPTIKON_ACCELERATOR:-auto}"
 auto_setup = "${PANOPTIKON_AUTO_SETUP:-true}"
+
+# How much of each GPU the inference orchestrator may admit work into. When
+# both limits are set, the lower budget wins. Keep this header live (the table
+# may stay empty) so uncommented keys land in the right table.
+[inference_local.vram]
+# Margin over other processes' VRAM usage, as a fraction (not a percentage:
+# values above 1.0 are clamped with a warning). Unset is NOT the same as 0.10:
+# unset uses 0.10 but withholds at most 1 GiB and, except on a Mac, at least
+# 3 % of the GPU (exactly 1 GiB on an NVIDIA GPU under Windows or WSL2), a
+# set value applies as written.
+# The "CPU" device, a Mac's GPU and an AMD APU (all host RAM) always keep a
+# tenth of RAM free (at most 16 GiB; at least 2 GiB, or a quarter of RAM under
+# 8 GiB). A margin can raise that, never lower it: even margin = 0 and a
+# cap_fraction of 1.0 there keep it.
+# GET /api/inference/health reports the rule in effect (`reserve_rule`).
+# margin = 0.10
+# Hard ceiling as a fraction of the GPU's total VRAM, for sharing one card
+# between services. Default: off.
+# cap_fraction = 0.90
+# How far throughput measurements in one batch-size bucket may disagree
+# (relative MAD) before the batch-size knee is not fitted. Default 0.20 on a
+# GPU, 0.35 on the CPU; a value here applies to both, so to change a single
+# device use its override table below.
+# knee_max_bucket_dispersion = 0.20
+
+# Per-device overrides, keyed by GPU UUID (`nvidia-smi -L`) or "CPU"; absent
+# keys inherit the section above. Uncomment a header together with its keys.
+# [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
+# margin = 0.25
+# [inference_local.vram.gpu."CPU"]
+# knee_max_bucket_dispersion = 0.35
 
 [search]
 # Tunable default lives in serde; comment so upgrades track code defaults.

@@ -686,13 +686,10 @@ fn default_true() -> bool {
 /// the write lock up front routes the contention through the busy handler
 /// instead, with the telemetry write as the loser.
 async fn begin_transaction(conn: &mut sqlx::SqliteConnection) -> ApiResult<()> {
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(conn)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to start transaction");
-            ApiError::internal("Failed to start transaction")
-        })?;
+    crate::db::begin_immediate(conn).await.map_err(|err| {
+        tracing::error!(error = %err, "failed to start transaction");
+        ApiError::internal("Failed to start transaction")
+    })?;
     Ok(())
 }
 
@@ -716,12 +713,9 @@ async fn rollback_transaction(conn: &mut sqlx::SqliteConnection) -> ApiResult<()
 mod tests {
     use super::*;
     use crate::db::migrations::setup_test_databases;
+    use crate::test_utils::temp_path;
     use serde_json::json;
     use sqlx::Row;
-    use std::{
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
 
     async fn setup_user_data_db() -> crate::db::migrations::InMemoryDatabases {
         setup_test_databases().await
@@ -765,14 +759,6 @@ mod tests {
         .await
         .unwrap();
         dbs
-    }
-
-    fn temp_path(label: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("panoptikon_{label}_{stamp}"))
     }
 
     // Ensures the bookmark namespaces response only returns namespaces for the default user.

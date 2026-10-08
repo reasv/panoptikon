@@ -11,7 +11,7 @@ use std::{
 use axum::{
     Extension, Json,
     extract::{Path as AxumPath, State},
-    http::{HeaderMap, Method, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -21,9 +21,7 @@ use utoipa::ToSchema;
 use crate::{
     api_error::ApiError,
     db::{
-        DbConnection, ReadOnly,
-        migrations::migrate_databases_on_disk,
-        open_index_db_read,
+        DbConnection, ReadOnly, open_index_db_read,
         setup::{
             FolderValidation, is_ready_for_desktop, validate_continuous_folders, validate_folders,
         },
@@ -33,7 +31,7 @@ use crate::{
         continuous_scan, cron, extraction::resolve_model_metadata,
         inference_pool::job_inference_context, queue::JobModel,
     },
-    policy::PolicyContext,
+    policy::{PolicyContext, request_authority},
     proxy::ProxyState,
 };
 
@@ -233,12 +231,9 @@ async fn desktop_bridge_request(
             ApiError::internal("Desktop shell is unavailable")
         })?;
     let client = reqwest::Client::builder()
-        // The bridge is an authenticated process-local channel. Never send
-        // its bearer credential to a proxy selected from the environment.
+        // Never send the bridge's bearer credential to an environment proxy.
         .no_proxy()
-        // A bridge response is authoritative only for the exact loopback
-        // endpoint Desktop created. Do not carry the request (or its bearer
-        // credential) through an HTTP redirect.
+        // Never follow a redirect with the credential.
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -261,7 +256,7 @@ async fn desktop_bridge_request(
     operation_id = "desktop_update_status",
     path = "/api/desktop/update-status",
     tag = "desktop",
-    responses((status = 200, description = "Desktop update awareness state", body = JsonValue))
+    responses((status = 200, description = "Desktop update state and the NVIDIA sysmem fallback notice", body = JsonValue))
 )]
 pub(crate) async fn update_status(
     State(state): State<Arc<ProxyState>>,
@@ -284,6 +279,7 @@ pub(crate) async fn update_status(
 async fn desktop_bridge_action(
     state: Arc<ProxyState>,
     context: PolicyContext,
+    uri: Uri,
     headers: HeaderMap,
     path: &'static str,
     body: Option<JsonValue>,
@@ -291,7 +287,7 @@ async fn desktop_bridge_action(
     // Preserve the policy boundary first: callers without the Desktop client
     // opt-in still see this route as unavailable, independent of headers.
     let bridge = ensure_desktop_shell_policy(&state, &context)?;
-    ensure_same_origin_desktop_action(&headers)?;
+    ensure_same_origin_desktop_action(&uri, &headers)?;
     let response = desktop_bridge_request(&bridge, Method::POST, path, body).await?;
     if response.status().is_success() {
         Ok(StatusCode::NO_CONTENT)
@@ -303,7 +299,11 @@ async fn desktop_bridge_action(
     }
 }
 
-fn ensure_same_origin_desktop_action(headers: &HeaderMap) -> Result<(), ApiError> {
+/// The browser authority comes from `policy::request_authority`, so the guard
+/// and the policy layer judge a request by the same name; none, or a duplicated
+/// `Host`, is refused. Forwarded headers are ignored: the authority must be
+/// loopback, so a proxied deployment fails closed.
+fn ensure_same_origin_desktop_action(uri: &Uri, headers: &HeaderMap) -> Result<(), ApiError> {
     fn forbidden() -> ApiError {
         ApiError::new(
             StatusCode::FORBIDDEN,
@@ -327,11 +327,12 @@ fn ensure_same_origin_desktop_action(headers: &HeaderMap) -> Result<(), ApiError
         return Err(forbidden());
     }
 
-    let mut host_values = headers.get_all(header::HOST).iter();
-    let expected = host_values
-        .next()
-        .and_then(|value| value.to_str().ok())
-        .and_then(|host| reqwest::Url::parse(&format!("http://{host}/")).ok())
+    // A second `Host` is refused whichever source wins (malformed either way).
+    if headers.get_all(header::HOST).iter().nth(1).is_some() {
+        return Err(forbidden());
+    }
+    let expected = request_authority(uri, headers)
+        .and_then(|authority| reqwest::Url::parse(&format!("http://{authority}/")).ok())
         .ok_or_else(forbidden)?;
     let expected_is_loopback = match expected.host() {
         Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
@@ -339,16 +340,13 @@ fn ensure_same_origin_desktop_action(headers: &HeaderMap) -> Result<(), ApiError
         Some(url::Host::Ipv6(address)) => address.is_loopback(),
         None => false,
     };
-    if host_values.next().is_some()
-        || !expected.username().is_empty()
+    if !expected.username().is_empty()
         || expected.password().is_some()
         || expected.path() != "/"
         || expected.query().is_some()
         || expected.fragment().is_some()
-        // Origin/Host equality alone is vulnerable to DNS rebinding: an
-        // attacker-owned hostname can remain same-origin while resolving to
-        // this listener. Desktop opens only localhost, so require the browser
-        // authority itself to name a loopback host.
+        // Origin/authority equality alone is vulnerable to DNS rebinding, so
+        // require the browser authority itself to name a loopback host.
         || !expected_is_loopback
         || origin.origin() != expected.origin()
     {
@@ -371,21 +369,24 @@ fn ensure_same_origin_desktop_action(headers: &HeaderMap) -> Result<(), ApiError
 pub(crate) async fn open_update_window(
     State(state): State<Arc<ProxyState>>,
     Extension(context): Extension<PolicyContext>,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    desktop_bridge_action(state, context, headers, "/open", None).await
+    desktop_bridge_action(state, context, uri, headers, "/open", None).await
 }
 
 #[utoipa::path(post, operation_id = "snooze_desktop_update_ribbon", path = "/api/desktop/update-ribbon/snooze", tag = "desktop", request_body = DesktopUpdateSnoozeRequest, responses((status = 204, description = "Ribbon snoozed for 24 hours"), (status = 403, description = "Same-origin browser request required"), (status = 409, description = "Available update version changed")))]
 pub(crate) async fn snooze_update_ribbon(
     State(state): State<Arc<ProxyState>>,
     Extension(context): Extension<PolicyContext>,
+    uri: Uri,
     headers: HeaderMap,
     Json(request): Json<DesktopUpdateSnoozeRequest>,
 ) -> Result<StatusCode, ApiError> {
     desktop_bridge_action(
         state,
         context,
+        uri,
         headers,
         "/snooze",
         Some(json!({ "version": request.version })),
@@ -397,15 +398,53 @@ pub(crate) async fn snooze_update_ribbon(
 pub(crate) async fn dismiss_update_ribbon(
     State(state): State<Arc<ProxyState>>,
     Extension(context): Extension<PolicyContext>,
+    uri: Uri,
     headers: HeaderMap,
     Json(request): Json<DesktopUpdateDismissRequest>,
 ) -> Result<StatusCode, ApiError> {
     desktop_bridge_action(
         state,
         context,
+        uri,
         headers,
         "/dismiss",
         Some(json!({ "version": request.version })),
+    )
+    .await
+}
+
+#[utoipa::path(post, operation_id = "dismiss_desktop_sysmem_fallback_notice", path = "/api/desktop/sysmem-fallback-notice/dismiss", tag = "desktop", responses((status = 204, description = "NVIDIA sysmem fallback notice dismissed permanently"), (status = 403, description = "Same-origin browser request required")))]
+pub(crate) async fn dismiss_sysmem_fallback_notice(
+    State(state): State<Arc<ProxyState>>,
+    Extension(context): Extension<PolicyContext>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    desktop_bridge_action(
+        state,
+        context,
+        uri,
+        headers,
+        "/sysmem-fallback-notice/dismiss",
+        None,
+    )
+    .await
+}
+
+#[utoipa::path(post, operation_id = "open_desktop_gpu_memory_setting", path = "/api/desktop/gpu-memory-setting/open", tag = "desktop", responses((status = 204, description = "Desktop settings opened at the GPU memory setting"), (status = 403, description = "Same-origin browser request required")))]
+pub(crate) async fn open_gpu_memory_setting(
+    State(state): State<Arc<ProxyState>>,
+    Extension(context): Extension<PolicyContext>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    desktop_bridge_action(
+        state,
+        context,
+        uri,
+        headers,
+        "/gpu-memory-setting/open",
+        None,
     )
     .await
 }
@@ -462,13 +501,19 @@ async fn desktop_external_input_registry(
             ApiError::internal("Failed to read inference external inputs")
         });
     }
-    job_inference_context()
+    let context = job_inference_context();
+    context
         .primary
         .get_external_inputs()
         .await
         .map_err(|error| {
-            tracing::error!(%error, "failed to read remote inference external inputs");
-            ApiError::internal("Failed to read inference external inputs")
+            tracing::error!(
+                error = %format_args!("{error:#}"),
+                "failed to read remote inference external inputs"
+            );
+            crate::inference_errors::upstream_api_error(&error, context.primary.base_url(), || {
+                ApiError::internal("Failed to read inference external inputs")
+            })
         })
 }
 
@@ -590,6 +635,22 @@ mod desktop_bridge_tests {
     use axum::routing::post;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Origin-form HTTP/1.1: the URI carries no authority, so `Host` is the
+    /// only source for the browser's authority.
+    fn origin_form() -> Uri {
+        Uri::from_static("/api/desktop/update-window/open")
+    }
+
+    /// HTTP/2: the `:authority` pseudo-header lands on the URI.
+    fn h2_target(authority: &str) -> Uri {
+        Uri::builder()
+            .scheme("http")
+            .authority(authority)
+            .path_and_query("/api/desktop/update-window/open")
+            .build()
+            .unwrap()
+    }
+
     fn browser_headers(origin: &str, host: &str, fetch_site: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
@@ -600,9 +661,8 @@ mod desktop_bridge_tests {
         headers
     }
 
-    /// The private shell hop accepts only the literal IPv4/IPv6 loopback
-    /// HTTP addresses Desktop creates, with an explicit nonzero port and no
-    /// URL components that could redirect a supposedly local credential.
+    /// The private shell hop accepts only the literal loopback addresses
+    /// Desktop creates, with a nonzero port and no redirecting URL components.
     #[test]
     fn desktop_bridge_base_is_strictly_loopback() {
         assert!(parse_desktop_bridge_base("http://127.0.0.1:49152").is_some());
@@ -627,8 +687,7 @@ mod desktop_bridge_tests {
     }
 
     /// The real reqwest bridge path reaches the loopback listener with the
-    /// bearer credential and exact version JSON that the Desktop snooze
-    /// handler validates, rather than dropping the browser's target.
+    /// bearer credential and the version JSON the snooze handler validates.
     #[tokio::test]
     async fn desktop_bridge_request_forwards_authenticated_version_body() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -669,8 +728,7 @@ mod desktop_bridge_tests {
         let _ = server.await;
     }
 
-    /// The bearer-authenticated private hop must never follow a response to a
-    /// second URL, even when the redirect remains on the loopback listener.
+    /// The bearer-authenticated private hop never follows a redirect.
     #[tokio::test]
     async fn desktop_bridge_request_does_not_follow_redirects() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -709,9 +767,7 @@ mod desktop_bridge_tests {
         let _ = server.await;
     }
 
-    /// A normal same-origin fetch is admitted, including URL normalization
-    /// and absent optional Fetch Metadata, so supported browsers can invoke
-    /// the Desktop action without an application-specific CSRF token.
+    /// A normal same-origin fetch is admitted, with no CSRF token needed.
     #[test]
     fn desktop_action_accepts_same_origin_browser_request() {
         let headers = browser_headers(
@@ -719,27 +775,25 @@ mod desktop_bridge_tests {
             "localhost:6342",
             Some("same-origin"),
         );
-        ensure_same_origin_desktop_action(&headers).unwrap();
+        ensure_same_origin_desktop_action(&origin_form(), &headers).unwrap();
 
         let headers = browser_headers("http://localhost", "localhost:80", None);
-        ensure_same_origin_desktop_action(&headers).unwrap();
+        ensure_same_origin_desktop_action(&origin_form(), &headers).unwrap();
 
         let headers = browser_headers("http://127.0.0.1:6342", "127.0.0.1:6342", None);
-        ensure_same_origin_desktop_action(&headers).unwrap();
+        ensure_same_origin_desktop_action(&origin_form(), &headers).unwrap();
 
         let headers = browser_headers("http://[::1]:6342", "[::1]:6342", None);
-        ensure_same_origin_desktop_action(&headers).unwrap();
+        ensure_same_origin_desktop_action(&origin_form(), &headers).unwrap();
     }
 
-    /// Cross-origin forms/fetches, scheme mismatches, opaque or missing
-    /// origins, and contradictory Fetch Metadata are all rejected before a
-    /// request can receive the private bridge credential.
+    /// Cross-origin fetches, scheme mismatches, opaque origins and
+    /// contradictory Fetch Metadata are refused before the bridge credential.
     #[test]
     fn desktop_action_rejects_cross_origin_browser_request() {
         for headers in [
             browser_headers("https://attacker.example", "127.0.0.1:6342", None),
-            // Matching Origin and Host is insufficient when an attacker can
-            // rebind its own hostname to this loopback listener.
+            // Matching Origin and Host is insufficient against rebinding.
             browser_headers(
                 "http://attacker.example:6342",
                 "attacker.example:6342",
@@ -767,8 +821,175 @@ mod desktop_bridge_tests {
                 headers
             },
         ] {
-            assert!(ensure_same_origin_desktop_action(&headers).is_err());
+            assert!(ensure_same_origin_desktop_action(&origin_form(), &headers).is_err());
         }
+    }
+
+    /// One request has exactly one authority, resolved through
+    /// `policy::request_authority`, and the loopback (anti-rebinding)
+    /// requirement applies to it whether it arrived as an HTTP/2 `:authority`
+    /// or an HTTP/1.1 `Host`.
+    #[test]
+    fn desktop_action_is_judged_by_the_request_authority() {
+        fn origin_only(origin: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+            headers
+        }
+
+        // HTTP/2 shape: authority, no `Host`. Admitted like HTTP/1.1.
+        ensure_same_origin_desktop_action(
+            &h2_target("127.0.0.1:6342"),
+            &origin_only("http://127.0.0.1:6342"),
+        )
+        .unwrap();
+        ensure_same_origin_desktop_action(
+            &h2_target("localhost:6342"),
+            &origin_only("http://LOCALHOST:6342"),
+        )
+        .unwrap();
+        ensure_same_origin_desktop_action(
+            &h2_target("[::1]:6342"),
+            &origin_only("http://[::1]:6342"),
+        )
+        .unwrap();
+
+        // The authority is the name that is judged: a rebound hostname, a
+        // mismatched port, a non-loopback authority behind a loopback `Host`
+        // and a userinfo prefix are all refused.
+        for (uri, headers) in [
+            (
+                h2_target("attacker.example:6342"),
+                origin_only("http://attacker.example:6342"),
+            ),
+            (
+                h2_target("127.0.0.1:6342"),
+                origin_only("http://127.0.0.1:6343"),
+            ),
+            (
+                // HTTP/1.1 absolute-form: the guard must not be satisfied
+                // by the loopback `Host` beside `attacker.example`.
+                h2_target("attacker.example:6342"),
+                browser_headers("http://127.0.0.1:6342", "127.0.0.1:6342", None),
+            ),
+            (
+                h2_target("user@127.0.0.1:6342"),
+                origin_only("http://127.0.0.1:6342"),
+            ),
+            // Neither an authority nor a `Host`: fail closed.
+            (origin_form(), origin_only("http://127.0.0.1:6342")),
+        ] {
+            assert!(ensure_same_origin_desktop_action(&uri, &headers).is_err());
+        }
+
+        // ...and where the two sources disagree the authority wins, the same
+        // precedence the policy layer applies.
+        ensure_same_origin_desktop_action(
+            &h2_target("127.0.0.1:6342"),
+            &browser_headers("http://127.0.0.1:6342", "attacker.example:6342", None),
+        )
+        .unwrap();
+    }
+
+    /// Settings for the h2c test below: one policy admitting any named host and
+    /// opting into the Desktop client, so the guard alone decides.
+    const DESKTOP_H2C_SETTINGS: &str = r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+
+[rulesets.allow_all]
+allow_all = true
+
+[[policies]]
+name = "any-host"
+ruleset = "allow_all"
+
+[policies.match]
+hosts = ["*"]
+
+[policies.client]
+desktop = true
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#;
+
+    /// The same over a real HTTP/2 cleartext connection, behind the real
+    /// `PolicyLayer`: the `:authority` must survive hyper, the policy layer's
+    /// URI rewrite, the router and the extractors to reach this guard. The
+    /// guard answers 409 rather than 403 so a policy refusal upstream cannot be
+    /// mistaken for its verdict.
+    #[tokio::test]
+    async fn desktop_action_over_real_h2c_is_judged_by_its_authority() {
+        async fn guard(uri: Uri, headers: HeaderMap) -> StatusCode {
+            match ensure_same_origin_desktop_action(&uri, &headers) {
+                Ok(()) => StatusCode::NO_CONTENT,
+                Err(_) => StatusCode::CONFLICT,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        std::fs::write(&path, DESKTOP_H2C_SETTINGS).unwrap();
+        let settings = Arc::new(crate::config::Settings::load(Some(path)).unwrap());
+        let token_key = Arc::new(crate::policy_token::TokenKey::random());
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route("/api/desktop/update-window/open", post(guard))
+            .layer(crate::policy::PolicyLayer::new(settings, token_key));
+        // `axum::serve` uses the production connection builder: h2c here.
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .resolve("attacker.example", address)
+            .build()
+            .unwrap();
+        let target = |host: &str| {
+            format!(
+                "http://{host}:{}/api/desktop/update-window/open",
+                address.port()
+            )
+        };
+        let origin = |host: &str| format!("http://{host}:{}", address.port());
+
+        let response = client
+            .post(target("127.0.0.1"))
+            .header(header::ORIGIN, origin("127.0.0.1"))
+            .send()
+            .await
+            .unwrap();
+        // A silent fallback to HTTP/1.1 would make this check vacuous.
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = client
+            .post(target("attacker.example"))
+            .header(header::ORIGIN, origin("attacker.example"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        server.abort();
+        let _ = server.await;
     }
 }
 
@@ -980,14 +1201,30 @@ fn validate_new_database_name(name: &str) -> Result<(), ApiError> {
     responses((status = 200, body = DesktopSetupCompleteResponse))
 )]
 pub(crate) async fn complete_setup(
-    mut conn: DbConnection<ReadOnly>,
+    conn: DbConnection<ReadOnly>,
     Json(request): Json<DesktopSetupCompleteRequest>,
 ) -> Result<Json<DesktopSetupCompleteResponse>, ApiError> {
     ensure_desktop_managed()?;
-    // Setup is a write workflow throughout (folder config, per-DB settings,
-    // and — with new_index_db — database creation via migrations). In
-    // readonly mode the migration DDL must not run, and the later writes
-    // would only fail with opaque internal errors; refuse up front instead.
+    let (index_db, user_data_db) = configure_setup(conn, request).await?;
+    let _ = continuous_scan::notify_config_change(&index_db).await;
+    let _ = cron::notify_config_change(&index_db).await;
+    let jobs = match cron::run_initial_cronjob(&index_db, &user_data_db).await? {
+        cron::CronRunOutcome::Enqueued(jobs) => jobs,
+        cron::CronRunOutcome::Skipped => Vec::new(),
+    };
+
+    Ok(Json(DesktopSetupCompleteResponse { index_db, jobs }))
+}
+
+/// Validates the setup, creates the new index database if one is named, and
+/// saves the index database's config. Returns the index and user-data
+/// database names.
+async fn configure_setup(
+    mut conn: DbConnection<ReadOnly>,
+    request: DesktopSetupCompleteRequest,
+) -> Result<(String, String), ApiError> {
+    // Setup writes throughout (and may run migration DDL), so refuse up front
+    // in readonly mode.
     crate::db::ensure_migrations_allowed()?;
     if request
         .included_folders
@@ -1037,24 +1274,11 @@ pub(crate) async fn complete_setup(
 
     let (index_db, user_data_db) = if let Some(new_index_db) = request.new_index_db.as_deref() {
         validate_new_database_name(new_index_db)?;
-        let new_index_db = new_index_db.to_owned();
-        let selected_user_data_db = conn.user_data_db.clone();
-        let handle = tokio::runtime::Handle::current();
-        let paths = tokio::task::spawn_blocking(move || {
-            handle.block_on(migrate_databases_on_disk(
-                Some(&new_index_db),
-                Some(&selected_user_data_db),
-            ))
-        })
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "failed to join Desktop database creation task");
-            ApiError::internal("Failed to create index database")
-        })?
-        .map_err(|error| {
-            tracing::error!(%error, "failed to create Desktop index database");
-            ApiError::internal("Failed to create index database")
-        })?;
+        let paths = crate::api::db::create_databases(
+            Some(new_index_db.to_owned()),
+            Some(conn.user_data_db.clone()),
+        )
+        .await?;
         (paths.index_db, paths.user_data_db)
     } else {
         (conn.index_db.clone(), conn.user_data_db.clone())
@@ -1103,26 +1327,125 @@ pub(crate) async fn complete_setup(
     config.scan_pdf = request.scan_pdf;
     config.scan_html = request.scan_html;
     config.detect_outros = request.detect_outros;
-    config.cron_jobs = request.cron_jobs;
+    config.cron_jobs = if request.new_index_db.is_some() {
+        // A database created by this run has no prior schedule to preserve.
+        request.cron_jobs
+    } else {
+        merge_cron_batch_caps(request.cron_jobs, &config.cron_jobs)
+    };
     config.enable_cron_job = request.enable_cron_job;
     config.cron_schedule = request.cron_schedule;
     store.save(&index_db, &config)?;
-    let _ = continuous_scan::notify_config_change(&index_db).await;
-    let _ = cron::notify_config_change(&index_db).await;
-    let jobs = match cron::run_initial_cronjob(&index_db, &user_data_db).await? {
-        cron::CronRunOutcome::Enqueued(jobs) => jobs,
-        cron::CronRunOutcome::Skipped => Vec::new(),
-    };
+    Ok((index_db, user_data_db))
+}
 
-    Ok(Json(DesktopSetupCompleteResponse { index_db, jobs }))
+/// Carries existing per-model batch caps across a wizard rerun, which no longer
+/// sends `batch_size`: an incoming `None` keeps the stored cap.
+fn merge_cron_batch_caps(incoming: Vec<CronJob>, existing: &[CronJob]) -> Vec<CronJob> {
+    incoming
+        .into_iter()
+        .map(|mut job| {
+            if job.batch_size.is_none()
+                && let Some(stored) = existing
+                    .iter()
+                    .find(|candidate| candidate.inference_id == job.inference_id)
+            {
+                job.batch_size = stored.batch_size;
+            }
+            job
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+
+    /// Setup with a new index database creates it with the selected
+    /// user-data database and saves the chosen folder in its config.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setup_creates_a_new_index_database_with_the_selected_user_data() {
+        use sqlx::Connection as _;
+        let env = crate::test_utils::test_data_dir();
+        let folder = tempfile::tempdir().unwrap();
+        let folder = folder.path().to_string_lossy().into_owned();
+        let conn = sqlx::SqliteConnection::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let conn = DbConnection::for_tests(conn, "default", "setup_user");
+        let request = serde_json::from_value(json!({
+            "included_folders": [folder],
+            "new_index_db": "setup_index",
+        }))
+        .unwrap();
+        let names = configure_setup(conn, request).await.unwrap();
+        let user_data = env.path().join("user_data/setup_user.db");
+        let created = user_data.is_file();
+        let config = SystemConfigStore::from_env().load("setup_index").unwrap();
+        std::fs::remove_dir_all(env.path().join("index/setup_index")).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", user_data.display()));
+        }
+        let expected = ("setup_index".to_owned(), "setup_user".to_owned());
+        assert_eq!(names, expected);
+        assert!(created);
+        let folders = crate::db::system_config::normalize_folder_list(&[folder]);
+        assert_eq!(config.included_folders, folders);
+    }
+}
+
+#[cfg(test)]
+mod cron_cap_merge_tests {
+    use super::*;
+
+    fn job(inference_id: &str, batch_size: Option<i64>, threshold: Option<f64>) -> CronJob {
+        CronJob {
+            inference_id: inference_id.to_string(),
+            batch_size,
+            threshold,
+        }
+    }
+
+    // A wizard rerun keeps the cap the user set on the Scan page, per model,
+    // and does not invent one for models that never had a cap.
+    #[test]
+    fn a_rerun_without_batch_sizes_preserves_the_stored_caps() {
+        let existing = vec![
+            job("clip/ViT-H-14", Some(8), Some(0.1)),
+            job("tags/wd-v1", None, None),
+            job("gone/model", Some(32), None),
+        ];
+        let incoming = vec![
+            job("clip/ViT-H-14", None, Some(0.4)),
+            job("tags/wd-v1", None, None),
+            job("new/model", None, None),
+        ];
+
+        let merged = merge_cron_batch_caps(incoming, &existing);
+
+        assert_eq!(merged[0].batch_size, Some(8));
+        // The wizard still owns the threshold it sends.
+        assert_eq!(merged[0].threshold, Some(0.4));
+        assert_eq!(merged[1].batch_size, None);
+        assert_eq!(merged[2].batch_size, None);
+        // A model dropped from the schedule stays dropped.
+        assert_eq!(merged.len(), 3);
+    }
+
+    // An explicit incoming cap is intent and wins over the stored one.
+    #[test]
+    fn an_explicit_cap_overrides_the_stored_one() {
+        let existing = vec![job("clip/ViT-H-14", Some(8), None)];
+        let merged = merge_cron_batch_caps(vec![job("clip/ViT-H-14", Some(4), None)], &existing);
+        assert_eq!(merged[0].batch_size, Some(4));
+    }
 }
 
 #[cfg(test)]
 mod external_input_tests {
     use super::*;
 
-    /// Updating one declaration preserves unrelated content, while an
-    /// explicit removal deletes only the requested declaration.
+    /// Updating one declaration preserves unrelated content; removal is exact.
     #[test]
     fn dotenv_update_preserves_unrelated_lines_and_removes_explicitly() {
         let dir = tempfile::tempdir().unwrap();
@@ -1144,8 +1467,7 @@ mod external_input_tests {
         assert!(text.contains("OTHER=value"));
     }
 
-    /// Empty API edits are discarded, so they cannot replace an existing
-    /// declaration; non-empty edits remain available to the dotenv writer.
+    /// Empty API edits are discarded; non-empty ones reach the dotenv writer.
     #[test]
     fn dotenv_empty_edit_keeps_existing_value() {
         let mut values = HashMap::from([

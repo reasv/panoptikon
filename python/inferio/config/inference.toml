@@ -1,3 +1,6 @@
+# The shipped inference model registry. Setting `metadata.cost`: see
+# docs/model-cost-measurement.md and docs/batch-calibration-design.md.
+
 [external_inputs.saucenao_api_key]
 label = "SauceNAO API key"
 description = "Authenticates image lookup requests to SauceNAO."
@@ -52,6 +55,21 @@ target_entities = ["items"]
 output_type = "tags"
 input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
 
+# Cost dimension for batch calibration. unit: item | pixel | token |
+# audio-second | none; aggregation: count | sum | max-times-count. Bumping
+# `epoch` invalidates stored calibration for the model; `seed_units` is the
+# first batch on unknown hardware; `canvas_pixels` / `max_tokens` cap the
+# per-item price. Per-id blocks override these key by key, except that an id
+# changing `unit` inherits no `seed_units`, `canvas_pixels` or `max_tokens`.
+# The WD v3 taggers resize every image to a fixed 448px square.
+[group.tags.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 8
+# Per-id `seed_units` throughout: 2048 MiB / the measured MiB per unit, rounded
+# down.
+
 [group.tags.metadata.input_spec]
 handler = "image_frames"
 opts.max_frames = 4
@@ -68,22 +86,32 @@ opts.slice_settings.minimum_size = 2048
 [group.tags.inference_ids.wd-swinv2-tagger-v3]
 config.model_repo = "SmilingWolf/wd-swinv2-tagger-v3"
 metadata.description = "(Recommended) SwinV2 Based Tagger"
+metadata.cost.seed_units = 16
+metadata.cost.platform_copies = ["windows"]
 
 [group.tags.inference_ids.wd-convnext-tagger-v3]
 config.model_repo = "SmilingWolf/wd-convnext-tagger-v3"
 metadata.description = "ConvNext Based Tagger"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tags.inference_ids.wd-vit-tagger-v3]
 config.model_repo = "SmilingWolf/wd-vit-tagger-v3"
 metadata.description = "ViT Based Tagger"
+metadata.cost.seed_units = 64
+# `platform_copies`: the Linux baseline also stands for these platforms, set per
+# id (docs/model-cost-measurement.md, "Producing a shipped baseline").
+metadata.cost.platform_copies = ["windows"]
 
 [group.tags.inference_ids.wd-eva02-large-tagger-v3]
 config.model_repo = "SmilingWolf/wd-eva02-large-tagger-v3"
 metadata.description = "(Recommended Large) Eva02 Based Tagger (Large Version)"
+metadata.cost.seed_units = 32
+metadata.cost.platform_copies = ["windows"]
 
 [group.tags.inference_ids.wd-vit-large-tagger-v3]
 config.model_repo = "SmilingWolf/wd-vit-large-tagger-v3"
 metadata.description = "ViT Based Tagger (Large Version)"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tags.inference_ids."moondream-2b-25-03"]
 config.impl_class = "moondream_tagger"
@@ -94,6 +122,11 @@ config.sub_namespace = "general"
 config.enable_rating = true
 metadata.description = """(Experimental) Moondream 2B Based Tagger. This tagger works \
   for general items and has an open vocabulary as it is a VLM"""
+# The impl runs one image at a time (`enable_batching = False`), so a batch's
+# peak is one image's: nothing to price.
+metadata.cost.unit  = "none"
+# epoch 2: reclassified from pixel/sum.
+metadata.cost.epoch = 2
 
 [group.tags.inference_ids."moondream-2b-25-03-clothing"]
 config.impl_class = "moondream_tagger"
@@ -107,6 +140,9 @@ config.prompt = """List all visible articles of clothing in this image. \
 metadata.description = """(Experimental) Moondream 2B Based Tagger prompted to only \
   list items of clothing as tags. This tagger works for general items and \
   has an open vocabulary as it is a VLM"""
+# As the id above.
+metadata.cost.unit  = "none"
+metadata.cost.epoch = 2
 
 
 # ===================================================================
@@ -129,6 +165,10 @@ default_inference_id = "danbooru"
 target_entities = ["items"]
 output_type = "tags"
 input_mime_types = ["image/", "video/"]
+
+# Network lookups only (num_gpus = 0): nothing to price, nothing to calibrate.
+[group.tagmatch.metadata.cost]
+unit = "none"
 
 [group.tagmatch.metadata.input_spec]
 handler = "md5"
@@ -170,6 +210,15 @@ target_entities      = ["items"]
 output_type          = "text"
 input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
 
+# Fixed per item: detection resizes each page to a fixed canvas (db_resnet50:
+# 1024x1024) and recognition each word crop to 32x128, so a text-dense page
+# costs a few times a photo, not orders of magnitude. dots_ocr, easyocr deviate.
+[group.doctr.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 8
+
 [group.doctr.metadata.input_spec]
 handler = "image_frames"
 opts.max_frames                = 4
@@ -189,61 +238,89 @@ config.temperature = 0.7
 config.top_p = 0.9
 metadata.description = "DotsOCR - rednote-hilab/dots.ocr (FlashAttention 2 is required for this model!)"
 # bf16 + FlashAttention 2 both need Ampere (sm_80); the gateway marks the
-# model unavailable on older GPUs and jobs refuse to start it.
+# model unavailable on older NVIDIA GPUs and jobs refuse to start it.
 metadata.min_compute_capability = 8.0
+# FlashAttention 2 has no CPU or MPS kernels.
+metadata.accelerators = ["cuda", "rocm"]
+# Variable-resolution VLM: memory scales with decoded pixels.
+metadata.cost.unit        = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units  = 2000000
+# No `canvas_pixels`: the worker reads `max_pixels` off the loaded processor,
+# which follows the downloaded model revision.
+# epoch 2: the per-item canvas cap changed the unit.
+metadata.cost.epoch       = 2
 
 [group.doctr.inference_ids.easyocr_standard_en]
 config.impl_class = "easyocr"
 config.languages  = ["en"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English Text, Standard Recog Network"
+# `enable_batching = false` reads page by page, so memory is flat in the batch.
+# Enabling batching needs `pixel` / `max-times-count` / `seed_units` /
+# `canvas_pixels = 6553600` (the CRAFT detector's 2560px canvas) / `epoch = 2`.
+metadata.cost.unit = "none"
 
 [group.doctr.inference_ids.easyocr_standard_en_ja]
 config.impl_class = "easyocr"
 config.languages  = ["en", "ja"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English/Japanese Text, Standard Recog Network"
+# `none` for the reason in `easyocr_standard_en` above.
+metadata.cost.unit = "none"
 
 [group.doctr.inference_ids.easyocr_standard_en_ch_sim]
 config.impl_class = "easyocr"
 config.languages  = ["en", "ch_sim"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English/Chinese Simplified Text, Standard Recog Network"
+# `none` for the reason in `easyocr_standard_en` above.
+metadata.cost.unit = "none"
 
 [group.doctr.inference_ids.db_resnet50_crnn_mobilenet_v3_small]
 config.detection_model  = "db_resnet50"
 config.recognition_model = "crnn_mobilenet_v3_small"
 metadata.description    = "(Recommended) CRNN MobileNet V3 Small"
+metadata.cost.seed_units = 128
+metadata.cost.platform_copies = ["windows"]
 
 [group.doctr.inference_ids.db_resnet50_crnn_mobilenet_v3_large]
 config.detection_model  = "db_resnet50"
 config.recognition_model = "crnn_mobilenet_v3_large"
 metadata.description    = "CRNN MobileNet V3 Large"
+metadata.cost.platform_copies = ["windows"]
 
 [group.doctr.inference_ids.db_resnet50_crnn_vgg16_bn]
 config.detection_model  = "db_resnet50"
 config.recognition_model = "crnn_vgg16_bn"
 metadata.description    = "CRNN VGG16 BN OCR"
+metadata.cost.platform_copies = ["windows"]
 
 [group.doctr.inference_ids.db_resnet50_master]
 config.detection_model  = "db_resnet50"
 config.recognition_model = "master"
 metadata.description    = "MASTER"
+metadata.cost.platform_copies = ["windows"]
 
 [group.doctr.inference_ids.db_resnet50_vitstr_small]
 config.detection_model  = "db_resnet50"
 config.recognition_model = "vitstr_small"
 metadata.description    = "ViTSTR Small"
+metadata.cost.platform_copies = ["windows"]
 
 [group.doctr.inference_ids.db_resnet50_vitstr_base]
 config.detection_model  = "db_resnet50"
 config.recognition_model = "vitstr_base"
 metadata.description    = "ViTSTR Base"
+metadata.cost.seed_units = 128
+metadata.cost.platform_copies = ["windows"]
 
 [group.doctr.inference_ids.db_resnet50_parseq]
 config.detection_model  = "db_resnet50"
 config.recognition_model = "parseq"
 metadata.description    = "PARSEQ"
+metadata.cost.seed_units = 128
+metadata.cost.platform_copies = ["windows"]
 
 
 # ===================================================================
@@ -262,6 +339,14 @@ target_entities      = ["items"]
 output_type          = "text"
 input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
 
+# The processor resizes to a fixed 768x768; the generation budget is fixed per
+# task prompt.
+[group.florence2.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 4
+
 [group.florence2.metadata.input_spec]
 handler = "image_frames"
 opts.max_frames                = 4
@@ -276,21 +361,25 @@ opts.slice_settings.pixel_max_size    = 10000
 config.model_name  = "florence-community/Florence-2-large-ft"
 config.task_prompt = "<MORE_DETAILED_CAPTION>"
 metadata.description = "(Detailed Captioning) (Size: Large) Microsoft's original Florence 2 Large Model"
+metadata.cost.platform_copies = ["windows"]
 
 [group.florence2.inference_ids.msft_large-caption]
 config.model_name  = "florence-community/Florence-2-large-ft"
 config.task_prompt = "<CAPTION>"
 metadata.description = "(Captioning) (Size: Large) Microsoft's original Florence 2 Large Model"
+metadata.cost.platform_copies = ["windows"]
 
 [group.florence2.inference_ids.msft_large-detailed]
 config.model_name  = "florence-community/Florence-2-large-ft"
 config.task_prompt = "<DETAILED_CAPTION>"
 metadata.description = "(Medium Detail Captioning) (Size: Large)  Microsoft's original Florence 2 Large Model"
+metadata.cost.platform_copies = ["windows"]
 
 [group.florence2.inference_ids.msft_large-ocr]
 config.model_name  = "florence-community/Florence-2-large"
 config.task_prompt = "<OCR>"
 metadata.description = "(OCR) (Size: Large) (Recommended)  Microsoft's original Florence 2 Large Model"
+metadata.cost.platform_copies = ["windows"]
 
 # --- Fine-tuned Florence 2 Models (Deprecated due to changes in HF Transformers making them incompatible)---
 
@@ -385,6 +474,12 @@ target_entities      = ["items"]
 output_type          = "text"
 input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
 
+# The impl runs one image at a time (`enable_batching = False`).
+[group.vlm.metadata.cost]
+unit  = "none"
+# epoch 2: reclassified from pixel/sum.
+epoch = 2
+
 [group.vlm.metadata.input_spec]
 handler = "image_frames"
 opts.max_frames                = 4
@@ -463,6 +558,16 @@ default_inference_id = "all-mpnet-base-v2"
 target_entities      = ["text"]
 output_type          = "text-embedding"
 
+# sentence_transformers splits inputs into max_seq_length chunks and pads each
+# batch to its longest member. No `max_tokens`: the worker reads it off the
+# loaded model.
+# epoch 2: the per-item token cap changed the unit.
+[group.textembed.metadata.cost]
+unit        = "token"
+aggregation = "max-times-count"
+epoch       = 2
+seed_units  = 4000
+
 [group.textembed.metadata.input_spec]
 handler = "extracted_text"
 
@@ -471,20 +576,27 @@ handler = "extracted_text"
 [group.textembed.inference_ids.all-mpnet-base-v2]
 config.model_name  = "all-mpnet-base-v2"
 metadata.description = "MPNet-based Sentence Transformer (Recommended)"
+metadata.cost.seed_units = 41000
 
 [group.textembed.inference_ids.all-MiniLM-L6-v2]
 config.model_name  = "all-MiniLM-L6-v2"
 metadata.description = "MiniLM-based Sentence Transformer"
+metadata.cost.seed_units = 120000
 
 [group.textembed.inference_ids.stella_en_400M_v5]
 config.model_name = "dunzhang/stella_en_400M_v5"
 config.query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query" }
+# Remote code (needs `trust_remote_code`), which asserts xformers unless these
+# two flags are off (the model card's fallback).
+config.init_args.trust_remote_code = true
+config.init_args.config_kwargs = { use_memory_efficient_attention = false, unpad_inputs = false }
 metadata.description = "Stella English 400M Sentence Transformer"
 
 [group.textembed.inference_ids."stella_en_1.5B_v5"] # Quotes required due to '.'
 config.model_name = "dunzhang/stella_en_1.5B_v5"
 config.query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query" }
 metadata.description = "Stella English 1.5B Sentence Transformer"
+metadata.cost.seed_units = 13000
 
 [group.textembed.inference_ids.jina-embeddings-v3-api]
 config.model_name    = "jina-embeddings-v3"
@@ -499,6 +611,8 @@ metadata.description = """Not local (API-based). You must set the JINA_API_KEY \
   env var (or the api_key config option) before using this model. \
   jina-embeddings-v3 is a multilingual multi-task text embedding model \
   designed for a variety of NLP applications."""
+# Remote API: no local GPU memory to price.
+metadata.cost.unit = "none"
 
 [group.textembed.inference_ids.jina-embeddings-v3-api.external_inputs.jina_api_key]
 [group.textembed.inference_ids.jina-embeddings-v3-api.external_inputs.jina_max_retries]
@@ -522,8 +636,16 @@ target_entities      = ["items"]
 output_type          = "text"
 input_mime_types     = ["video/", "audio/"]
 
+# CTranslate2 processes 30s windows sequentially, outside torch's allocator:
+# VRAM is about constant per model.
+[group.whisper.metadata.cost]
+unit = "none"
+
 [group.whisper.metadata.input_spec]
-handler = "audio_tracks" # { handler="audio_tracks", opts={ max_tracks = 1, sample_rate = 16000 } }
+handler = "audio_tracks"
+# Handler defaults: one audio track per item (the main track), at 16 kHz.
+# opts.max_tracks  = 1
+# opts.sample_rate = 16000
 
 # --- Inference IDs for Whisper ---
 
@@ -608,6 +730,15 @@ default_inference_id = "ViT-H-14-378-quickgelu_dfn5b"
 target_entities      = ["items"]
 output_type          = "clip"
 
+# openclip preprocesses to a fixed resolution per model, so cost is per item
+# (`canvas_pixels` has no effect under `item`). qwen3-vl, nemotron and jina
+# deviate.
+[group.clip.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 8
+
 [group.clip.metadata.input_spec]
 handler = "image_frames"
 opts.max_frames                = 4
@@ -626,6 +757,8 @@ config.model_name = "ViT-H-14-378-quickgelu"
 config.pretrained = "dfn5b"
 metadata.description = """(Recommended) ViT-H-14 (378px) model pretrained on \
   DFN5B. Has highest ImageNet 1K 0-shot accuracy (84.4%)."""
+metadata.cost.seed_units = 64
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.qwen3-vl-embedding-8b]
 config.impl_class = "qwen3-vl-embedding"
@@ -633,8 +766,19 @@ config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-8B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 8B (text+image) multimodal embedding \
   model. Leads MMEB-V2 across natural images and visual documents. Heavier \
-  than CLIP (roughly 16 GB VRAM in bf16); consider smaller batch sizes."""
+  than CLIP (roughly 16 GB VRAM in bf16; pre-Ampere GPUs, Macs and CPU load \
+  fp32 at about twice that); consider smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
+# Variable resolution, batched in one forward; the vision tower packs patches
+# rather than padding them, hence `sum`.
+metadata.cost.unit        = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units  = 9100000
+# epoch 2: the per-item canvas cap changed the unit; epoch 3: bf16, not fp32.
+metadata.cost.epoch       = 3
+# MAX_PIXELS = 1800 * 32 * 32 (impl/deps/qwen_3_vl_embedding.py).
+metadata.cost.canvas_pixels = 1843200
+metadata.cost.platform_copies = ["windows"]
 
 
 [group.clip.inference_ids.qwen3-vl-embedding-2b]
@@ -643,9 +787,16 @@ config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-2B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embedding \
   model. Strong on visual documents/screenshots as well as natural images \
-  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16); consider \
-  smaller batch sizes."""
+  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16; pre-Ampere \
+  GPUs, Macs and CPU load fp32 at about twice that); consider smaller batch \
+  sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
+metadata.cost.unit        = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units  = 10000000
+metadata.cost.epoch       = 3
+metadata.cost.canvas_pixels = 1843200   # the same MAX_PIXELS as the 8B id
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.PE-Core-L-14-336_meta]
 config.model_name = "PE-Core-L-14-336"
@@ -655,6 +806,8 @@ metadata.description = """Perception Encoder Core L/14 (336px) by Meta (2025). \
   57.1 vs 55.6) at ~1.3 GB VRAM in fp16 and roughly twice the speed. Note: \
   32-token text context, long queries are truncated."""
 metadata.link = "https://huggingface.co/facebook/PE-Core-L14-336"
+metadata.cost.seed_units = 128
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.PE-Core-bigG-14-448_meta]
 config.model_name = "PE-Core-bigG-14-448"
@@ -663,6 +816,8 @@ metadata.description = """Perception Encoder Core bigG/14 (448px) by Meta \
   (2025). The largest and strongest PE model (COCO T2I R@1 58.1), but very \
   heavy: ~4.6 GB VRAM in fp16 for marginal benchmark gains over PE-Core-L."""
 metadata.link = "https://huggingface.co/facebook/PE-Core-G14-448"
+metadata.cost.seed_units = 32
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.ViT-B-16-SigLIP2-384_webli]
 config.model_name = "ViT-B-16-SigLIP2-384"
@@ -672,29 +827,38 @@ metadata.description = """SigLIP 2 B/16 (384px) by Google (2025). Nearly \
   at ~0.75 GB VRAM in fp16. Multilingual. Recommended if resources are \
   limited."""
 metadata.link = "https://huggingface.co/timm/ViT-B-16-SigLIP2-384"
+metadata.cost.seed_units = 128
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.ViT-H-14-quickgelu_dfn5b]
 config.model_name = "ViT-H-14-quickgelu"
 config.pretrained = "dfn5b"
 metadata.description = "ViT-H-14 (224px) model pretrained on DFN5B"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.apple_MobileCLIP-B-LT]
 config.model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP"
 metadata.description = """MobileCLIP-B-LT model by Apple. Great 0-shot accuracy \
   (77.2%) for the size. Recommended if resources are limited."""
 metadata.link = "https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP"
+metadata.cost.seed_units = 256
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.apple_MobileCLIP-S2]
 config.model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP"
 metadata.description = """MobileCLIP-S2-LT model by Apple. Good 0-shot accuracy \
   (74.4%) for the size. Recommended if resources are limited."""
 metadata.link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP"
+metadata.cost.seed_units = 192
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.apple_MobileCLIP-S1]
 config.model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP"
 metadata.description = """MobileCLIP-S1-LT model by Apple. Adequate 0-shot \
   accuracy (72.6%) for the size. Recommended if resources are very limited."""
 metadata.link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP"
+metadata.cost.seed_units = 192
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.nemotron-embed-vl-1b-v2]
 config.impl_class = "nemotron-embed-vl"
@@ -708,6 +872,15 @@ metadata.description = """NVIDIA Llama Nemotron Embed VL 1B v2: unified \
   always embedded as a search query, so use it for image embeddings only \
   and do not pair it with a CLIP Text Embeddings (tclip) run."""
 metadata.link = "https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2"
+# Tiles images at their native aspect ratio, so memory follows decoded pixels.
+metadata.cost.unit        = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units  = 12000000
+# epoch 2: the per-item canvas cap changed the unit.
+metadata.cost.epoch       = 2
+# (max_input_tiles = 6, plus the thumbnail) * 512^2.
+metadata.cost.canvas_pixels = 1835008
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.jina-clip-v2-api]
 config.model_name     = "jina-clip-v2"
@@ -724,6 +897,9 @@ metadata.description  = """Not local (API-based). You must set the JINA_API_KEY 
   jina-clip-v2 is a general-purpose multilingual multimodal embedding model \
   for text & images."""
 
+# Remote API: no local GPU memory to price.
+metadata.cost.unit = "none"
+
 [group.clip.inference_ids.jina-clip-v2-api.external_inputs.jina_api_key]
 [group.clip.inference_ids.jina-clip-v2-api.external_inputs.jina_max_retries]
 [group.clip.inference_ids.jina-clip-v2-api.external_inputs.jina_timeout]
@@ -732,81 +908,101 @@ metadata.description  = """Not local (API-based). You must set the JINA_API_KEY 
 config.model_name = "ViT-SO400M-14-SigLIP-384"
 config.pretrained = "webli"
 metadata.description = "ViT-SO400M-14-SigLIP-384 (384px) model pretrained on WebLI"
+metadata.cost.seed_units = 96
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.ViT-SO400M-14-SigLIP_webli]
 config.model_name = "ViT-SO400M-14-SigLIP"
 config.pretrained = "webli"
 metadata.description = "ViT-SO400M-14-SigLIP (224px) model pretrained on WebLI"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.ViT-B-32-256_datacomp_s34b_b86k]
 config.model_name = "ViT-B-32-256"
 config.pretrained = "datacomp_s34b_b86k"
 metadata.description = """ViT-B-32-256 model pretrained on DataComp S34B (b86k). \
   ViT-B-32 are the least resource intensive ViT model type."""
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.ViT-B-32_datacomp_xl_s13b_b90k]
 config.model_name = "ViT-B-32"
 config.pretrained = "datacomp_xl_s13b_b90k"
 metadata.description = """ViT-B-32 model pretrained on DataComp XL (s13b_b90k). \
   ViT-B-32 are the least resource intensive ViT model type."""
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.ViT-g-14_laion2b_s34b_b88k]
 config.model_name = "ViT-g-14"
 config.pretrained = "laion2b_s34b_b88k"
 metadata.description = """ViT-g-14 model pretrained on LAION2B (s34b_b88k). \
   ViT-G-14 are the largest ViT model type, however not currently the best performing."""
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.ViT-L-14_openai]
 config.model_name = "ViT-L-14"
 config.pretrained = "openai"
 metadata.description = "Original CLIP model trained by OpenAI"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.ViT-B-32_openai]
 config.model_name = "ViT-B-32"
 config.pretrained = "openai"
 metadata.description = """ViT-B-32 model trained by OpenAI. ViT-B-32 are the \
   least resource intensive ViT model type."""
+metadata.cost.seed_units = 256
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.coca_ViT-B-32_mscoco_finetuned_laion2b_s13b_b90k]
 config.model_name = "coca_ViT-B-32"
 config.pretrained = "mscoco_finetuned_laion2b_s13b_b90k"
 metadata.description = "CoCa ViT-B-32 model fine-tuned on MSCOCO"
+metadata.cost.seed_units = 256
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.coca_ViT-L-14_mscoco_finetuned_laion2b_s13b_b90k]
 config.model_name = "coca_ViT-L-14"
 config.pretrained = "mscoco_finetuned_laion2b_s13b_b90k"
 metadata.description = "CoCa ViT-L-14 model fine-tuned on MSCOCO"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.convnext_xxlarge_laion2b_s34b_b82k_augreg_soup]
 config.model_name = "convnext_xxlarge"
 config.pretrained = "laion2b_s34b_b82k_augreg_soup"
 metadata.description = "ConvNeXT xxlarge model pretrained on LAION2B (s34b_b82k_augreg_soup)"
+metadata.cost.seed_units = 48
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.convnext_large_d_320_laion2b_s29b_b131k_ft_soup]
 config.model_name = "convnext_large_d_320"
 config.pretrained = "laion2b_s29b_b131k_ft_soup"
 metadata.description = "ConvNeXT large d 320 model pretrained on LAION2B (s29b_b131k_ft_soup)"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.convnext_base_w_320_laion_aesthetic_s13b_b82k_augreg]
 config.model_name = "convnext_base_w_320"
 config.pretrained = "laion_aesthetic_s13b_b82k_augreg"
 metadata.description = "ConvNeXT base wide 320 model pretrained on LAION Aesthetic (s13b_b82k_augreg)"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.convnext_base_w_laion2b_s13b_b82k_augreg]
 config.model_name = "convnext_base_w"
 config.pretrained = "laion2b_s13b_b82k_augreg"
 metadata.description = "ConvNeXT base wide model pretrained on LAION2B (s13b_b82k_augreg)"
+metadata.cost.seed_units = 128
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.convnext_base_laion400m_s13b_b51k]
 config.model_name = "convnext_base"
 config.pretrained = "laion400m_s13b_b51k"
 metadata.description = "ConvNeXT base model pretrained on LAION400M (s13b_b51k)"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.mrzjy_GenshinImpact-ViT-SO400M-14_SigLIP-384]
 config.model_name = "hf-hub:mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384"
 metadata.description = """A simple open-sourced SigLIP model fine-tuned on \
   Genshin Impact's image-text pairs."""
 metadata.link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.mrzjy_GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K]
 config.model_name = "hf-hub:mrzjy/GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K"
@@ -814,6 +1010,7 @@ metadata.description = """Much smaller variant of the ViT-SO400M-14 size model. 
   A simple and small-size open-sourced CLIP model fine-tuned on Genshin Impact's \
   image-text pairs."""
 metadata.link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.marqo-fashionCLIP]
 config.model_name = "hf-hub:Marqo/marqo-fashionCLIP"
@@ -823,6 +1020,7 @@ metadata.description = """Marqo-FashionCLIP leverages Generalised Contrastive \
   fine-details to provide highly relevant search results on fashion products. \
   The model was fine-tuned from ViT-B-16 (laion2b_s34b_b88k)."""
 metadata.link = "https://huggingface.co/Marqo/marqo-fashionCLIP"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.marqo-fashionSigLIP]
 config.model_name = "hf-hub:Marqo/marqo-fashionSigLIP"
@@ -832,11 +1030,13 @@ metadata.description = """Marqo-FashionSigLIP leverages Generalised Contrastive 
   fine-details to provide highly relevant search results on fashion products. \
   The model was fine-tuned from ViT-B-16-SigLIP (webli)."""
 metadata.link = "https://huggingface.co/Marqo/marqo-fashionSigLIP"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.open-clip-vit-h-nsfw-finetune]
 config.model_name = "hf-hub:woweenie/open-clip-vit-h-nsfw-finetune"
 metadata.description = "CLIP model finetuned for NSFW detection."
 metadata.link = "https://huggingface.co/woweenie/open-clip-vit-h-nsfw-finetune?not-for-all-audiences=true"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.imageomics_bioclip]
 config.model_name = "hf-hub:imageomics/bioclip"
@@ -850,6 +1050,7 @@ metadata.description = """BioCLIP is a foundation model for the tree of life, \
   learned a hierarchical representation aligned to the tree of life, which \
   demonstrates its potential for robust generalizability."""
 metadata.link = "https://huggingface.co/imageomics/bioclip"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clip.inference_ids.microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224]
 config.model_name = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
@@ -861,6 +1062,7 @@ metadata.description = """BiomedCLIP is a biomedical vision-language foundation 
   perform various vision-language processing (VLP) tasks such as cross-modal \
   retrieval, image classification, and visual question answering."""
 metadata.link = "https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+metadata.cost.platform_copies = ["windows"]
 
 # ===================================================================
 #  TCLIP Group: CLIP Text Embeddings (for Cross-Modal Search)
@@ -882,6 +1084,14 @@ default_batch_size   = 64
 target_entities      = ["text"]
 output_type          = "text-embedding"
 
+# CLIP text towers have a fixed context length, so cost is per item. qwen3-vl
+# and jina deviate.
+[group.tclip.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 8
+
 [group.tclip.metadata.input_spec]
 handler = "extracted_text"
 
@@ -892,6 +1102,8 @@ config.model_name = "ViT-H-14-378-quickgelu"
 config.pretrained = "dfn5b"
 metadata.description = """(Recommended) ViT-H-14 (378px) model pretrained on \
   DFN5B. Has highest ImageNet 0-shot accuracy (84.4%)."""
+metadata.cost.seed_units = 256
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.qwen3-vl-embedding-8b]
 config.impl_class = "qwen3-vl-embedding"
@@ -899,8 +1111,18 @@ config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-8B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 8B (text+image) multimodal embedding \
   model. Leads MMEB-V2 across natural images and visual documents. Heavier \
-  than CLIP (roughly 16 GB VRAM in bf16); consider smaller batch sizes."""
+  than CLIP (roughly 16 GB VRAM in bf16; pre-Ampere GPUs, Macs and CPU load \
+  fp32 at about twice that); consider smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
+# Text tower: the processor truncates at MAX_LENGTH = 8192 and pads the batch to
+# its longest member, so a batch costs longest x count.
+metadata.cost.unit        = "token"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.seed_units  = 21000
+metadata.cost.max_tokens  = 8192
+# epoch 2: reclassified from item/count; epoch 3: the `max_tokens` cap;
+# epoch 4: bf16, not fp32.
+metadata.cost.epoch       = 4
 
 
 [group.tclip.inference_ids.qwen3-vl-embedding-2b]
@@ -909,9 +1131,16 @@ config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-2B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embedding \
   model. Strong on visual documents/screenshots as well as natural images \
-  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16); consider \
-  smaller batch sizes."""
+  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16; pre-Ampere \
+  GPUs, Macs and CPU load fp32 at about twice that); consider smaller batch \
+  sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
+# As the 8B id above.
+metadata.cost.unit        = "token"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.seed_units  = 43000
+metadata.cost.max_tokens  = 8192
+metadata.cost.epoch       = 4
 
 [group.tclip.inference_ids.PE-Core-L-14-336_meta]
 config.model_name = "PE-Core-L-14-336"
@@ -920,6 +1149,7 @@ metadata.description = """Perception Encoder Core L/14 (336px) by Meta (2025). \
   Outperforms ViT-H-14-378 (DFN5B) on retrieval benchmarks at ~1.3 GB VRAM \
   in fp16. Note: 32-token text context, longer text is truncated."""
 metadata.link = "https://huggingface.co/facebook/PE-Core-L14-336"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.PE-Core-bigG-14-448_meta]
 config.model_name = "PE-Core-bigG-14-448"
@@ -928,6 +1158,7 @@ metadata.description = """Perception Encoder Core bigG/14 (448px) by Meta \
   (2025). The largest and strongest PE model, but very heavy: ~4.6 GB VRAM \
   in fp16 for marginal benchmark gains over PE-Core-L."""
 metadata.link = "https://huggingface.co/facebook/PE-Core-G14-448"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.ViT-B-16-SigLIP2-384_webli]
 config.model_name = "ViT-B-16-SigLIP2-384"
@@ -936,29 +1167,36 @@ metadata.description = """SigLIP 2 B/16 (384px) by Google (2025). Nearly \
   matches ViT-H-14-378 (DFN5B) retrieval quality at ~0.75 GB VRAM in fp16. \
   Multilingual. Recommended if resources are limited."""
 metadata.link = "https://huggingface.co/timm/ViT-B-16-SigLIP2-384"
+metadata.cost.seed_units = 256
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.ViT-H-14-quickgelu_dfn5b]
 config.model_name = "ViT-H-14-quickgelu"
 config.pretrained = "dfn5b"
 metadata.description = "ViT-H-14 (224px) model pretrained on DFN5B"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.apple_MobileCLIP-B-LT]
 config.model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP"
 metadata.description = """MobileCLIP-B-LT model by Apple. Great 0-shot accuracy \
   (77.2%) for the size. Recommended if resources are limited."""
 metadata.link = "https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP"
+metadata.cost.seed_units = 256
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.apple_MobileCLIP-S2]
 config.model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP"
 metadata.description = """MobileCLIP-S2-LT model by Apple. Good 0-shot accuracy \
   (74.4%) for the size. Recommended if resources are limited."""
 metadata.link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.apple_MobileCLIP-S1]
 config.model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP"
 metadata.description = """MobileCLIP-S1-LT model by Apple. Adequate 0-shot \
   accuracy (72.6%) for the size. Recommended if resources are very limited."""
 metadata.link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.jina-clip-v2-api]
 config.model_name     = "jina-clip-v2"
@@ -975,6 +1213,9 @@ metadata.description  = """Not local (API-based). You must set the JINA_API_KEY 
   jina-clip-v2 is a general-purpose multilingual multimodal embedding model \
   for text & images."""
 
+# Remote API: no local GPU memory to price.
+metadata.cost.unit = "none"
+
 [group.tclip.inference_ids.jina-clip-v2-api.external_inputs.jina_api_key]
 [group.tclip.inference_ids.jina-clip-v2-api.external_inputs.jina_max_retries]
 [group.tclip.inference_ids.jina-clip-v2-api.external_inputs.jina_timeout]
@@ -983,81 +1224,96 @@ metadata.description  = """Not local (API-based). You must set the JINA_API_KEY 
 config.model_name = "ViT-SO400M-14-SigLIP-384"
 config.pretrained = "webli"
 metadata.description = "ViT-SO400M-14-SigLIP-384 (384px) model pretrained on WebLI"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.ViT-SO400M-14-SigLIP_webli]
 config.model_name = "ViT-SO400M-14-SigLIP"
 config.pretrained = "webli"
 metadata.description = "ViT-SO400M-14-SigLIP (224px) model pretrained on WebLI"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.ViT-B-32-256_datacomp_s34b_b86k]
 config.model_name = "ViT-B-32-256"
 config.pretrained = "datacomp_s34b_b86k"
 metadata.description = """ViT-B-32-256 model pretrained on DataComp S34B (b86k). \
   ViT-B-32 are the least resource intensive ViT model type."""
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.ViT-B-32_datacomp_xl_s13b_b90k]
 config.model_name = "ViT-B-32"
 config.pretrained = "datacomp_xl_s13b_b90k"
 metadata.description = """ViT-B-32 model pretrained on DataComp XL (s13b_b90k). \
   ViT-B-32 are the least resource intensive ViT model type."""
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.ViT-g-14_laion2b_s34b_b88k]
 config.model_name = "ViT-g-14"
 config.pretrained = "laion2b_s34b_b88k"
 metadata.description = """ViT-g-14 model pretrained on LAION2B (s34b_b88k). \
   ViT-G-14 are the largest ViT model type, however not currently the best performing."""
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.ViT-L-14_openai]
 config.model_name = "ViT-L-14"
 config.pretrained = "openai"
 metadata.description = "Original CLIP model trained by OpenAI"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.ViT-B-32_openai]
 config.model_name = "ViT-B-32"
 config.pretrained = "openai"
 metadata.description = """ViT-B-32 model trained by OpenAI. ViT-B-32 are the \
   least resource intensive ViT model type."""
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.coca_ViT-B-32_mscoco_finetuned_laion2b_s13b_b90k]
 config.model_name = "coca_ViT-B-32"
 config.pretrained = "mscoco_finetuned_laion2b_s13b_b90k"
 metadata.description = "CoCa ViT-B-32 model fine-tuned on MSCOCO"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.coca_ViT-L-14_mscoco_finetuned_laion2b_s13b_b90k]
 config.model_name = "coca_ViT-L-14"
 config.pretrained = "mscoco_finetuned_laion2b_s13b_b90k"
 metadata.description = "CoCa ViT-L-14 model fine-tuned on MSCOCO"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.convnext_xxlarge_laion2b_s34b_b82k_augreg_soup]
 config.model_name = "convnext_xxlarge"
 config.pretrained = "laion2b_s34b_b82k_augreg_soup"
 metadata.description = "ConvNeXT xxlarge model pretrained on LAION2B (s34b_b82k_augreg_soup)"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.convnext_large_d_320_laion2b_s29b_b131k_ft_soup]
 config.model_name = "convnext_large_d_320"
 config.pretrained = "laion2b_s29b_b131k_ft_soup"
 metadata.description = "ConvNeXT large d 320 model pretrained on LAION2B (s29b_b131k_ft_soup)"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.convnext_base_w_320_laion_aesthetic_s13b_b82k_augreg]
 config.model_name = "convnext_base_w_320"
 config.pretrained = "laion_aesthetic_s13b_b82k_augreg"
 metadata.description = "ConvNeXT base wide 320 model pretrained on LAION Aesthetic (s13b_b82k_augreg)"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.convnext_base_w_laion2b_s13b_b82k_augreg]
 config.model_name = "convnext_base_w"
 config.pretrained = "laion2b_s13b_b82k_augreg"
 metadata.description = "ConvNeXT base wide model pretrained on LAION2B (s13b_b82k_augreg)"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.convnext_base_laion400m_s13b_b51k]
 config.model_name = "convnext_base"
 config.pretrained = "laion400m_s13b_b51k"
 metadata.description = "ConvNeXT base model pretrained on LAION400M (s13b_b51k)"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.mrzjy_GenshinImpact-ViT-SO400M-14_SigLIP-384]
 config.model_name = "hf-hub:mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384"
 metadata.description = """A simple open-sourced SigLIP model fine-tuned on \
   Genshin Impact's image-text pairs."""
 metadata.link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.mrzjy_GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K]
 config.model_name = "hf-hub:mrzjy/GenshinImpact-CLIP-ViT-B-16-laion2B-s34B-b88K"
@@ -1065,6 +1321,7 @@ metadata.description = """Much smaller variant of the ViT-SO400M-14 size model. 
   A simple and small-size open-sourced CLIP model fine-tuned on Genshin Impact's \
   image-text pairs."""
 metadata.link = "https://huggingface.co/mrzjy/GenshinImpact-ViT-SO400M-14-SigLIP-384"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.marqo-fashionCLIP]
 config.model_name = "hf-hub:Marqo/marqo-fashionCLIP"
@@ -1074,6 +1331,7 @@ metadata.description = """Marqo-FashionCLIP leverages Generalised Contrastive \
   fine-details to provide highly relevant search results on fashion products. \
   The model was fine-tuned from ViT-B-16 (laion2b_s34b_b88k)."""
 metadata.link = "https://huggingface.co/Marqo/marqo-fashionCLIP"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.marqo-fashionSigLIP]
 config.model_name = "hf-hub:Marqo/marqo-fashionSigLIP"
@@ -1083,11 +1341,13 @@ metadata.description = """Marqo-FashionSigLIP leverages Generalised Contrastive 
   fine-details to provide highly relevant search results on fashion products. \
   The model was fine-tuned from ViT-B-16-SigLIP (webli)."""
 metadata.link = "https://huggingface.co/Marqo/marqo-fashionSigLIP"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.open-clip-vit-h-nsfw-finetune]
 config.model_name = "hf-hub:woweenie/open-clip-vit-h-nsfw-finetune"
 metadata.description = "CLIP model finetuned for NSFW detection."
 metadata.link = "https://huggingface.co/woweenie/open-clip-vit-h-nsfw-finetune?not-for-all-audiences=true"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.imageomics_bioclip]
 config.model_name = "hf-hub:imageomics/bioclip"
@@ -1101,6 +1361,7 @@ metadata.description = """BioCLIP is a foundation model for the tree of life, \
   learned a hierarchical representation aligned to the tree of life, which \
   demonstrates its potential for robust generalizability."""
 metadata.link = "https://huggingface.co/imageomics/bioclip"
+metadata.cost.platform_copies = ["windows"]
 
 [group.tclip.inference_ids.microsoft_BiomedCLIP-PubMedBERT_256-vit_base_patch16_224]
 config.model_name = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
@@ -1112,6 +1373,7 @@ metadata.description = """BiomedCLIP is a biomedical vision-language foundation 
   perform various vision-language processing (VLP) tasks such as cross-modal \
   retrieval, image classification, and visual question answering."""
 metadata.link = "https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+metadata.cost.platform_copies = ["windows"]
 
 # ===================================================================
 #  CLAP Group: Audio Embeddings
@@ -1119,6 +1381,9 @@ metadata.link = "https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_
 
 [group.clap]
 config.impl_class = "clap"
+# Kept equal to input_spec.opts.sample_rate below: the handler decodes at that
+# rate and the impl declares it to the processor, which raises on a mismatch.
+config.sample_rate = 48000
 
 [group.clap.metadata]
 name                 = "CLAP Audio Embeddings"
@@ -1130,33 +1395,50 @@ target_entities      = ["items"]
 output_type          = "clip"
 input_mime_types     = ["video/", "audio/"]
 
+# ClapProcessor pads/truncates every clip to a fixed 10 s window, so every item
+# costs the same.
+[group.clap.metadata.cost]
+unit        = "item"
+aggregation = "count"
+epoch       = 1
+seed_units  = 8
+
 [group.clap.metadata.input_spec]
 handler = "audio_tracks"
 # CLAP's feature extractor only ever consumes ~10 s of audio per embedding,
 # so decoding whole multi-hour tracks is pure transport/decode waste (a raw
-# f32 mono track at 16 kHz is ~230 MiB/hour). Cap the decode at 10 minutes;
+# f32 mono track at 48 kHz is ~660 MiB/hour). Cap the decode at 10 minutes;
 # models that need the full track (e.g. whisper) simply do not set this.
 opts.max_duration = 600
+# Every shipped CLAP checkpoint expects 48 kHz; the handler defaults to 16 kHz,
+# which would silently produce wrong embeddings.
+opts.sample_rate = 48000
 
 # --- Inference IDs for CLAP Audio Embeddings ---
 
 [group.clap.inference_ids.clap-htsat-unfused]
 config.model_name = "laion/clap-htsat-unfused"
 metadata.description = "CLAP: Contrastive Language-Audio Pretraining"
+metadata.cost.seed_units = 64
+metadata.cost.platform_copies = ["windows"]
 
 [group.clap.inference_ids.larger_clap_music]
 config.model_name = "laion/larger_clap_music"
 metadata.description = "This is an improved CLAP checkpoint, specifically trained on music"
+metadata.cost.platform_copies = ["windows"]
 
 [group.clap.inference_ids.larger_clap_music_and_speech]
 config.model_name = "laion/larger_clap_music_and_speech"
 metadata.description = """This is an improved CLAP checkpoint, specifically trained \
   on music and speech."""
+metadata.cost.platform_copies = ["windows"]
 
 [group.clap.inference_ids.larger_clap_general]
 config.model_name = "laion/larger_clap_general"
 metadata.description = """This is an improved CLAP checkpoint, specifically trained \
   on general audio, music and speech."""
+metadata.cost.seed_units = 48
+metadata.cost.platform_copies = ["windows"]
 
 # More CLIP models
 

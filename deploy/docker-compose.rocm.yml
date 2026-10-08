@@ -1,0 +1,64 @@
+# Panoptikon — self-contained Docker deployment, AMD GPU (ROCm) variant.
+# Inference runs on an AMD GPU through ROCm. No repo clone needed — save this
+# file into an empty directory, record the host's `render` group id (the GPU
+# device nodes belong to it, and the container user must share it), then
+# start it:
+#
+#   echo "RENDER_GID=$(getent group render | cut -d: -f3)" > .env
+#   docker compose -f docker-compose.rocm.yml up -d
+#
+# then open http://localhost:6342. First boot creates the databases and
+# unpacks the web UI (a few seconds); models are downloaded on first use.
+#
+# REQUIREMENTS: a Linux host with the amdgpu kernel driver loaded (/dev/kfd
+# present) and a GPU supported by ROCm 7.2. The image carries its own ROCm
+# user-space libraries; nothing ROCm needs to be installed on the host.
+#
+# Everything else (the two listeners, volumes, media mounts) matches the CPU
+# compose — see docker-compose.yml for the full port/security notes:
+#
+#   6342  PRIVATE admin — full API, NEVER expose to untrusted networks
+#         (mapped to 127.0.0.1 below). Reach it via SSH tunnel / VPN.
+#   6339  PUBLIC restricted — policy-locked to search + file/thumbnail serving
+#         + bookmarks. Still serves your files: add auth at a reverse proxy
+#         before exposing beyond your LAN.
+
+services:
+  panoptikon:
+    image: ghcr.io/reasv/panoptikon:latest-rocm
+    container_name: panoptikon
+    restart: unless-stopped
+    # Every AMD GPU on the host. To limit it, list single render nodes
+    # (e.g. /dev/dri/renderD128) instead of /dev/dri.
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "${RENDER_GID:?set RENDER_GID to the host render group id (getent group render)}"
+    ports:
+      # PRIVATE admin listener — keep the 127.0.0.1 prefix (see above).
+      - "127.0.0.1:6342:6342"
+      # PUBLIC restricted listener.
+      - "6339:6339"
+    volumes:
+      # Index databases, user data, thumbnails.
+      - panoptikon-data:/app/data
+      # Gateway config + custom inference model registries (config/inference/).
+      - panoptikon-config:/app/config
+      # Model weights (Hugging Face cache) — survives container updates.
+      - panoptikon-cache:/home/ubuntu/.cache
+      # YOUR MEDIA: mount every directory you want indexed (read-only), then
+      # add the container-side paths (e.g. /media/pictures) as allowed
+      # folders in the UI and run a file scan. The container runs as uid
+      # 1000; bind-mounted media must be readable by that uid.
+      # - /path/to/your/pictures:/media/pictures:ro
+      # - /path/to/your/videos:/media/videos:ro
+    # environment:
+    #   - LOGLEVEL=DEBUG
+    #   # A GPU ROCm does not list, run as the nearest supported target:
+    #   - HSA_OVERRIDE_GFX_VERSION=10.3.0
+
+volumes:
+  panoptikon-data:
+  panoptikon-config:
+  panoptikon-cache:

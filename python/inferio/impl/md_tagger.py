@@ -19,6 +19,10 @@ from inferio.inferio_types import PredictionInput
 logger = logging.getLogger(__name__)
 
 class MoondreamTagger(InferenceModel):
+    # `predict` runs one image at a time, so the packing harness must not price
+    # a batch: False sends it down the grantless path.
+    enable_batching = False
+
     def __init__(
         self,
         model_repo: str = "vikhyatk/moondream2",

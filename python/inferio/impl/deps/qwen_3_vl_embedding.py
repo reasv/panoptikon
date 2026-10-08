@@ -137,6 +137,7 @@ class Qwen3VLEmbedder():
     def __init__(
         self, 
         model_name_or_path: str, 
+        device: torch.device,
         max_length: int = MAX_LENGTH,
         min_pixels: int = MIN_PIXELS,
         max_pixels: int = MAX_PIXELS,
@@ -147,8 +148,6 @@ class Qwen3VLEmbedder():
         default_instruction: str = "Represent the user's input.",
         **kwargs
     ):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         self.max_length = max_length
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
@@ -328,7 +327,8 @@ class Qwen3VLEmbedder():
         processed_inputs = {k: v.to(self.model.device) for k, v in processed_inputs.items()}
 
         outputs = self.forward(processed_inputs)
-        embeddings = self._pooling_last(outputs['last_hidden_state'], outputs['attention_mask'])
+        # Normalize in fp32 so a bf16 model still yields unit-length vectors.
+        embeddings = self._pooling_last(outputs['last_hidden_state'], outputs['attention_mask']).float()
 
         # Normalize the embeddings if specified
         if normalize:

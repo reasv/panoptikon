@@ -1,10 +1,8 @@
 //! Host accelerator environment for inference workers and setup probes.
 //!
 //! Callers pass a **resolved** [`Accelerator`] (not `auto` — use
-//! [`crate::setup::effective_accelerator`]). Today the only non-empty
-//! worker env is ROCm/HIP; `cpu`/`cuda` stay empty so host HIP trees do
-//! not alter linking. [`probe_after_setup`] is the extension point for
-//! post-sync validation (ROCm torch probe now; others later).
+//! [`crate::setup::effective_accelerator`]). [`probe_after_setup`] is the
+//! extension point for post-sync validation.
 
 use std::env;
 use std::ffi::OsString;
@@ -13,31 +11,190 @@ use std::process::Stdio;
 
 use crate::config::Accelerator;
 
-/// Env vars for an inference worker for a **resolved** accelerator.
-///
-/// HIP/HSA injection only for [`Accelerator::Rocm`]. `auto` is treated as
-/// empty (resolve first). Explicit `cpu`/`cuda` never inject, even if
-/// `/opt/rocm` exists on the host.
-pub fn worker_env(accelerator: Accelerator) -> Vec<(String, String)> {
-    if accelerator == Accelerator::Rocm {
-        hip_worker_env()
-    } else {
-        Vec::new()
+/// MPS allocator watermarks as a fraction of `recommendedMaxWorkingSetSize`
+/// (the MPS device's budget). 1.0 makes torch raise out-of-memory at that
+/// boundary instead of letting macOS swap; low is pinned too because torch
+/// requires `high >= low`.
+const MPS_WATERMARK_ENV: [(&str, &str); 2] = [
+    ("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "1.0"),
+    ("PYTORCH_MPS_LOW_WATERMARK_RATIO", "1.0"),
+];
+
+/// The device an impl must run on, read by `inferio.impl.utils.get_device`
+/// before probing the machine, so the model runs on the device it was priced
+/// against. Only `cpu` is defined; the worker ignores unknown values.
+pub const DEVICE_ENV_VAR: &str = "INFERIO_DEVICE";
+
+/// glibc malloc thresholds for a replica on the CPU device, whose memory is
+/// measured as resident set, whatever the host's accelerator. Fixed at
+/// 128 KiB so large blocks stay on `mmap` and a free returns them to the OS;
+/// glibc's dynamic threshold would keep them, and a batch would read the
+/// previous larger batch's footprint. glibc only. Each is kept when the
+/// operator set it: a larger value keeps freed memory resident, which is
+/// charged to the replica and books later batches above their need.
+const GLIBC_MALLOC_ENV: [(&str, &str); 2] = [
+    ("MALLOC_MMAP_THRESHOLD_", "131072"),
+    ("MALLOC_TRIM_THRESHOLD_", "131072"),
+];
+
+/// glibc arenas for a CUDA or ROCm worker: few enough that host memory a
+/// batch freed is reused across threads, so the trim after the batch takes
+/// the resident set back to its load level. Not the CPU worker's thresholds,
+/// which slow host-side preprocessing. Kept when the operator set it.
+const GPU_WORKER_ARENA_MAX: (&str, &str) = ("MALLOC_ARENA_MAX", "4");
+
+/// Env vars for an inference worker spawned with `python`, for a resolved
+/// accelerator: HIP paths for ROCm, the NVIDIA wheel library path for CUDA
+/// (never HIP paths, even with `/opt/rocm` present), the arena cap for both,
+/// watermarks for MPS, [`DEVICE_ENV_VAR`] and malloc thresholds for CPU;
+/// empty for `auto`.
+pub fn worker_env(accelerator: Accelerator, python: &Path) -> Vec<(String, String)> {
+    let operator_arenas = env::var_os(GPU_WORKER_ARENA_MAX.0).is_some();
+    match accelerator {
+        Accelerator::Rocm => with_gpu_arena_cap(hip_worker_env(), operator_arenas),
+        Accelerator::Cuda => with_gpu_arena_cap(cuda_worker_env(python), operator_arenas),
+        Accelerator::Mps => MPS_WATERMARK_ENV
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect(),
+        Accelerator::Cpu => cpu_device_env(),
+        Accelerator::Auto => Vec::new(),
     }
 }
 
-/// Post-`uv sync` accelerator checks. No-op for cpu/cuda/auto; ROCm runs
-/// a trivial HIP kernel probe (soft-ok with no GPU).
+/// The env of a replica on the CPU device: [`DEVICE_ENV_VAR`] and the CPU
+/// malloc thresholds the operator did not set.
+pub fn cpu_device_env() -> Vec<(String, String)> {
+    cpu_device_env_over(|key| env::var_os(key).is_some())
+}
+
+/// [`cpu_device_env`], with `operator_set` telling which variables the
+/// operator set.
+fn cpu_device_env_over(operator_set: impl Fn(&str) -> bool) -> Vec<(String, String)> {
+    std::iter::once((DEVICE_ENV_VAR, "cpu"))
+        .chain(
+            GLIBC_MALLOC_ENV
+                .into_iter()
+                .filter(|(key, _)| !operator_set(key)),
+        )
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+/// Whether [`worker_env`] writes `key` for the device: the device marker or a
+/// malloc setting. A replica moved to another device drops these first.
+pub fn is_device_env(key: &str) -> bool {
+    key == DEVICE_ENV_VAR
+        || key == GPU_WORKER_ARENA_MAX.0
+        || GLIBC_MALLOC_ENV.iter().any(|(name, _)| *name == key)
+}
+
+/// `env` plus [`GPU_WORKER_ARENA_MAX`] on Linux, unless the operator set it.
+fn with_gpu_arena_cap(mut env: Vec<(String, String)>, operator_set: bool) -> Vec<(String, String)> {
+    if cfg!(target_os = "linux") && !operator_set {
+        let (key, value) = GPU_WORKER_ARENA_MAX;
+        env.push((key.to_owned(), value.to_owned()));
+    }
+    env
+}
+
+/// Prepend the interpreter's NVIDIA wheel library dirs
+/// (`site-packages/nvidia/*/lib`) to the worker's `LD_LIBRARY_PATH`, for
+/// libraries without torch's RPATH (CTranslate2 cannot find cuDNN
+/// otherwise). Must be set at spawn: the loader reads it only at startup.
+/// Empty off Linux and when the interpreter has no such wheels.
+fn cuda_worker_env(python: &Path) -> Vec<(String, String)> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = python;
+        Vec::new()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match merge_ld_library_path(&nvidia_wheel_lib_dirs(python)) {
+            Some(joined) => vec![(
+                "LD_LIBRARY_PATH".to_owned(),
+                joined.to_string_lossy().into_owned(),
+            )],
+            None => Vec::new(),
+        }
+    }
+}
+
+/// The `site-packages/nvidia/*/lib` dirs containing a `.so`, under `lib` and
+/// `lib64` of `python`'s prefix. Sorted, canonicalized and de-duplicated, so
+/// the value is stable across spawns.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn nvidia_wheel_lib_dirs(python: &Path) -> Vec<PathBuf> {
+    let Some(prefix) = python.parent().and_then(Path::parent) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    for libdir in ["lib", "lib64"] {
+        for version in sorted_dir_entries(&prefix.join(libdir)) {
+            if !version
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("python"))
+            {
+                continue;
+            }
+            let nvidia = version.join("site-packages").join("nvidia");
+            for component in sorted_dir_entries(&nvidia) {
+                let lib = component.join("lib");
+                if !contains_shared_object(&lib) {
+                    continue;
+                }
+                let lib = lib.canonicalize().unwrap_or(lib);
+                if !out.contains(&lib) {
+                    out.push(lib);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `dir`'s subdirectories, sorted by name; empty when it cannot be read.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn sorted_dir_entries(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    out.sort();
+    out
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn contains_shared_object(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.contains(".so"))
+    })
+}
+
+/// Post-`uv sync` accelerator checks: no-op except on ROCm, which runs a
+/// trivial HIP kernel probe (soft-ok with no GPU).
 pub async fn probe_after_setup(accelerator: Accelerator, interpreter: &Path) -> anyhow::Result<()> {
     match accelerator {
         Accelerator::Rocm => probe_rocm_torch(interpreter).await,
-        Accelerator::Cpu | Accelerator::Cuda | Accelerator::Auto => Ok(()),
+        Accelerator::Cpu | Accelerator::Cuda | Accelerator::Mps | Accelerator::Auto => Ok(()),
     }
 }
 
 // The HIP helpers below are only reachable from the `target_os = "linux"`
 // arm of `hip_worker_env` (and its tests); allow dead_code elsewhere so
-// non-Linux builds stay warning-free (see the rustc dead-code ICE history).
+// non-Linux builds stay warning-free.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn hip_library_dirs() -> Vec<PathBuf> {
     #[cfg(not(target_os = "linux"))]
@@ -93,7 +250,8 @@ fn is_hip_related_lib_dir(dir: &Path) -> bool {
 
 /// Prepend HIP dirs to `LD_LIBRARY_PATH`; default `ROCM_PATH`/`HIP_PATH` to
 /// `/opt/rocm` when unset. Also sets MIOpen find/cache defaults so conv/GEMM
-/// solver search does not stall (EasyOCR/CRAFT: IsEnoughWorkspace size 0).
+/// solver search does not stall (EasyOCR/CRAFT: IsEnoughWorkspace size 0),
+/// and its log level to errors.
 /// Empty on non-Linux.
 fn hip_worker_env() -> Vec<(String, String)> {
     #[cfg(not(target_os = "linux"))]
@@ -109,37 +267,36 @@ fn hip_worker_env() -> Vec<(String, String)> {
                 joined.to_string_lossy().into_owned(),
             ));
         }
-        if env::var_os("ROCM_PATH").is_none() && Path::new("/opt/rocm").is_dir() {
-            out.push(("ROCM_PATH".to_owned(), "/opt/rocm".to_owned()));
-        }
-        if env::var_os("HIP_PATH").is_none() {
-            if let Ok(rocm) = env::var("ROCM_PATH") {
-                out.push(("HIP_PATH".to_owned(), rocm));
-            } else if Path::new("/opt/rocm").is_dir() {
-                out.push(("HIP_PATH".to_owned(), "/opt/rocm".to_owned()));
+        // Defaults only: a variable the operator set is kept.
+        fn push_if_unset(out: &mut Vec<(String, String)>, key: &str, value: String) {
+            if env::var_os(key).is_none() {
+                out.push((key.to_owned(), value));
             }
+        }
+        let opt_rocm = Path::new("/opt/rocm").is_dir();
+        if opt_rocm {
+            push_if_unset(&mut out, "ROCM_PATH", "/opt/rocm".to_owned());
+        }
+        // HIP_PATH: the ambient ROCM_PATH, else /opt/rocm.
+        if let Some(hip) = env::var("ROCM_PATH")
+            .ok()
+            .or_else(|| opt_rocm.then(|| "/opt/rocm".to_owned()))
+        {
+            push_if_unset(&mut out, "HIP_PATH", hip);
         }
         // MIOpen defaults (only if unset so operators can override):
         // FAST (2): FindDb hit or immediate fallback — avoids exhaustive
         // GemmFwdRest evaluation with workspace ptr=0 that stalls OCR for
         // tens of seconds until the unload grace kills the worker.
         // See ROCm/TheRock#3077, rocm-libraries#4071.
-        if env::var_os("MIOPEN_FIND_MODE").is_none() {
-            out.push(("MIOPEN_FIND_MODE".to_owned(), "FAST".to_owned()));
-        }
+        push_if_unset(&mut out, "MIOPEN_FIND_MODE", "FAST".to_owned());
+        // Errors only (3): MIOpen's per-call workspace warnings would flood
+        // the gateway log.
+        push_if_unset(&mut out, "MIOPEN_LOG_LEVEL", "3".to_owned());
         if let Some(cache) = miopen_cache_dir() {
-            if env::var_os("MIOPEN_USER_DB_PATH").is_none() {
-                out.push((
-                    "MIOPEN_USER_DB_PATH".to_owned(),
-                    cache.join("db").to_string_lossy().into_owned(),
-                ));
-            }
-            if env::var_os("MIOPEN_CUSTOM_CACHE_DIR").is_none() {
-                out.push((
-                    "MIOPEN_CUSTOM_CACHE_DIR".to_owned(),
-                    cache.join("cache").to_string_lossy().into_owned(),
-                ));
-            }
+            let path = |leaf: &str| cache.join(leaf).to_string_lossy().into_owned();
+            push_if_unset(&mut out, "MIOPEN_USER_DB_PATH", path("db"));
+            push_if_unset(&mut out, "MIOPEN_CUSTOM_CACHE_DIR", path("cache"));
         }
         out
     }
@@ -243,26 +400,181 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// An interpreter path with no environment around it, so every arm is
+    /// judged on the accelerator alone.
+    fn bare_python() -> PathBuf {
+        PathBuf::from("/nonexistent/venv/bin/python")
+    }
+
+    /// The arena cap a GPU worker gets on this host: none off Linux or when
+    /// the operator set one.
+    fn gpu_arena_cap() -> Vec<(String, String)> {
+        #[cfg(target_os = "linux")]
+        if env::var_os("MALLOC_ARENA_MAX").is_none() {
+            return vec![("MALLOC_ARENA_MAX".to_owned(), "4".to_owned())];
+        }
+        Vec::new()
+    }
+
     #[test]
     fn worker_env_only_for_resolved_rocm() {
-        assert!(worker_env(Accelerator::Cpu).is_empty());
-        assert!(worker_env(Accelerator::Cuda).is_empty());
+        // No NVIDIA wheels under this interpreter, so the CUDA arm carries
+        // the arena cap alone — no loader path.
+        assert_eq!(
+            worker_env(Accelerator::Cuda, &bare_python()),
+            gpu_arena_cap()
+        );
         // Unresolved auto must not inject; callers resolve first.
-        assert!(worker_env(Accelerator::Auto).is_empty());
+        assert!(worker_env(Accelerator::Auto, &bare_python()).is_empty());
+        // `cpu` carries the CPU device env and nothing else — no HIP paths,
+        // no MPS watermarks.
+        assert_eq!(
+            worker_env(Accelerator::Cpu, &bare_python()),
+            cpu_device_env()
+        );
         // Rocm may be empty of HIP libs on hosts without ROCm, but on Linux
         // still carries MIOpen defaults when those env vars are unset. Off
         // Linux the whole HIP env is empty by design.
-        let rocm = worker_env(Accelerator::Rocm);
+        let rocm = worker_env(Accelerator::Rocm, &bare_python());
         #[cfg(target_os = "linux")]
-        if env::var_os("MIOPEN_FIND_MODE").is_none() {
-            assert!(
-                rocm.iter()
-                    .any(|(k, v)| k == "MIOPEN_FIND_MODE" && v == "FAST"),
-                "expected MIOPEN_FIND_MODE=FAST in {rocm:?}"
-            );
+        for (key, value) in [("MIOPEN_FIND_MODE", "FAST"), ("MIOPEN_LOG_LEVEL", "3")] {
+            if env::var_os(key).is_none() {
+                assert!(
+                    rocm.iter().any(|(k, v)| k == key && v == value),
+                    "expected {key}={value} in {rocm:?}"
+                );
+            }
         }
         #[cfg(not(target_os = "linux"))]
         assert!(rocm.is_empty(), "non-Linux HIP env must be empty: {rocm:?}");
+    }
+
+    /// An MPS worker gets the allocator watermarks that make torch raise at
+    /// the recommended-max boundary instead of running on into macOS's
+    /// compression/swap regime, where nothing raises at all — **both** of
+    /// them, because torch asserts `high >= low` at allocator init and an
+    /// ambient low above 1.0 would otherwise fail every worker at startup.
+    #[test]
+    fn an_mps_worker_gets_the_allocator_watermarks() {
+        assert_eq!(
+            worker_env(Accelerator::Mps, &bare_python()),
+            vec![
+                (
+                    "PYTORCH_MPS_HIGH_WATERMARK_RATIO".to_string(),
+                    "1.0".to_string()
+                ),
+                (
+                    "PYTORCH_MPS_LOW_WATERMARK_RATIO".to_string(),
+                    "1.0".to_string()
+                )
+            ]
+        );
+        for accelerator in [Accelerator::Cpu, Accelerator::Cuda, Accelerator::Auto] {
+            assert!(
+                !worker_env(accelerator, &bare_python())
+                    .iter()
+                    .any(|(key, _)| key.starts_with("PYTORCH_MPS")),
+                "{accelerator:?} must not carry MPS tuning"
+            );
+        }
+    }
+
+    /// Device coherence (docs/unified-memory-admission.md, backend C): a host
+    /// priced against system RAM must run its impls on the CPU, and no other
+    /// host may be told to. The `mps` case is the one that would otherwise
+    /// bite — an `accelerator = "cpu"` Mac is priced as a CPU device
+    /// and would run on Metal without this, while an `mps` Mac must not be
+    /// forced off it.
+    #[test]
+    fn only_a_cpu_host_pins_the_workers_device() {
+        assert_eq!(
+            worker_env(Accelerator::Cpu, &bare_python())
+                .iter()
+                .find(|(key, _)| key == DEVICE_ENV_VAR)
+                .map(|(_, value)| value.as_str()),
+            Some("cpu")
+        );
+        for accelerator in [
+            Accelerator::Cuda,
+            Accelerator::Rocm,
+            Accelerator::Mps,
+            Accelerator::Auto,
+        ] {
+            assert!(
+                !worker_env(accelerator, &bare_python())
+                    .iter()
+                    .any(|(key, _)| key == DEVICE_ENV_VAR),
+                "{accelerator:?} must not pin the worker's device"
+            );
+        }
+    }
+
+    /// The glibc thresholds ride with the device pin and nowhere else: a CPU
+    /// worker's fit basis is the live resident set, and a dynamic mmap
+    /// threshold makes the batch after a larger one report the larger one's
+    /// footprint.
+    #[test]
+    fn only_a_cpu_host_pins_the_glibc_malloc_thresholds() {
+        for accelerator in [
+            Accelerator::Cuda,
+            Accelerator::Rocm,
+            Accelerator::Mps,
+            Accelerator::Auto,
+        ] {
+            assert!(
+                !worker_env(accelerator, &bare_python())
+                    .iter()
+                    .any(|(key, _)| GLIBC_MALLOC_ENV.iter().any(|(name, _)| name == key)),
+                "{accelerator:?} must not carry the CPU worker's thresholds"
+            );
+        }
+    }
+
+    /// An operator's own malloc settings reach the worker unchanged: the
+    /// arena cap and each CPU threshold are added only where none is set.
+    #[test]
+    fn malloc_settings_never_override_the_operators_values() {
+        let env = vec![("A".to_owned(), "1".to_owned())];
+        assert_eq!(with_gpu_arena_cap(env.clone(), true), env);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            with_gpu_arena_cap(env.clone(), false)[1..],
+            [("MALLOC_ARENA_MAX".to_owned(), "4".to_owned())]
+        );
+
+        let marker = (DEVICE_ENV_VAR.to_owned(), "cpu".to_owned());
+        assert_eq!(cpu_device_env_over(|_| true), std::slice::from_ref(&marker));
+        assert_eq!(
+            cpu_device_env_over(|key| key == "MALLOC_MMAP_THRESHOLD_"),
+            [
+                marker,
+                ("MALLOC_TRIM_THRESHOLD_".to_owned(), "131072".to_owned())
+            ]
+        );
+    }
+
+    /// A GPU worker's host memory is booked from its resident set; with
+    /// glibc's default arena count, pages a batch freed on one thread stay
+    /// fragmented where the trim after the batch cannot return them.
+    #[test]
+    fn only_a_gpu_worker_gets_the_arena_cap() {
+        for accelerator in [Accelerator::Cuda, Accelerator::Rocm] {
+            let env = worker_env(accelerator, &bare_python());
+            let cap: Vec<_> = env
+                .iter()
+                .filter(|(key, _)| key == "MALLOC_ARENA_MAX")
+                .cloned()
+                .collect();
+            assert_eq!(cap, gpu_arena_cap(), "{accelerator:?}");
+        }
+        for accelerator in [Accelerator::Cpu, Accelerator::Mps, Accelerator::Auto] {
+            assert!(
+                !worker_env(accelerator, &bare_python())
+                    .iter()
+                    .any(|(key, _)| key == "MALLOC_ARENA_MAX"),
+                "{accelerator:?} must not carry the arena cap"
+            );
+        }
     }
 
     #[test]
@@ -286,6 +598,58 @@ mod tests {
             hip.clone(),
         ]);
         assert_eq!(selected, vec![hip, driver]);
+    }
+
+    /// The CUDA arm's whole job: the loader path a `dlopen("libcudnn_ops.so.9")`
+    /// inside the worker will actually search. Only wheel dirs that hold a
+    /// shared object are named (an `include`-only component is not a library
+    /// dir), a `lib64 -> lib` symlink contributes one entry, and an
+    /// interpreter with no such wheels contributes nothing at all — the
+    /// system-CUDA and CPU-venv hosts, which were already correct.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cuda_worker_gets_the_venvs_nvidia_wheel_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let venv = tmp.path().join("venv");
+        let python = venv.join("bin/python");
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, b"").unwrap();
+
+        let packages = venv.join("lib/python3.12/site-packages/nvidia");
+        let with_so = |component: &str, soname: &str| {
+            let lib = packages.join(component).join("lib");
+            fs::create_dir_all(&lib).unwrap();
+            fs::write(lib.join(soname), b"").unwrap();
+            lib
+        };
+        let cudnn = with_so("cudnn", "libcudnn_ops.so.9");
+        let cublas = with_so("cublas", "libcublas.so.12");
+        // Headers only: a real component layout, and not a loader path.
+        fs::create_dir_all(packages.join("cuda_nvcc/include")).unwrap();
+        fs::create_dir_all(packages.join("cuda_nvcc/lib")).unwrap();
+        // The venv's usual lib64 alias must not double every entry.
+        std::os::unix::fs::symlink("lib", venv.join("lib64")).unwrap();
+
+        assert_eq!(
+            nvidia_wheel_lib_dirs(&python),
+            vec![cublas.clone(), cudnn.clone()]
+        );
+
+        let env = worker_env(Accelerator::Cuda, &python);
+        let (key, value) = env.first().expect("one LD_LIBRARY_PATH entry");
+        assert_eq!(env[1..], gpu_arena_cap());
+        assert_eq!(key, "LD_LIBRARY_PATH");
+        let parts: Vec<PathBuf> = env::split_paths(value).collect();
+        assert_eq!(parts.first(), Some(&cublas));
+        assert_eq!(parts.get(1), Some(&cudnn));
+
+        // An interpreter that ships no NVIDIA wheels injects no loader path,
+        // so an ambient LD_LIBRARY_PATH is neither rewritten nor re-exported.
+        let plain = tmp.path().join("plain/bin/python");
+        fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        fs::write(&plain, b"").unwrap();
+        assert!(nvidia_wheel_lib_dirs(&plain).is_empty());
+        assert_eq!(worker_env(Accelerator::Cuda, &plain), gpu_arena_cap());
     }
 
     #[test]

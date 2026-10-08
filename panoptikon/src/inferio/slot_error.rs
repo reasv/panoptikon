@@ -116,6 +116,34 @@ impl std::fmt::Display for ProtocolViolation {
 
 impl std::error::Error for ProtocolViolation {}
 
+/// The request never reached a model (its replica died, the model was
+/// unloaded, or the dispatcher had ended), so its items are untouched and one
+/// re-submission is correct. `http.rs::classify_predict_failure` downcasts
+/// this before falling back to message substrings.
+///
+/// It carries the message rather than wrapping it, so the rendered text is
+/// unchanged. Over HTTP the same fact is the `{"kind": "worker_died"}` detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unattempted {
+    pub message: String,
+}
+
+impl Unattempted {
+    pub fn error(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            message: message.into(),
+        })
+    }
+}
+
+impl std::fmt::Display for Unattempted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Unattempted {}
+
 /// Builds a slot error from the two wire fields, rejecting anything the
 /// protocol does not define. Shared by the msgpack (worker) and JSON (HTTP)
 /// decoders so both are strict in exactly the same way.

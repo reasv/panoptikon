@@ -13,6 +13,9 @@ dependencies = [
     "requests",
     "psutil>=7.0.0",
     "msgpack>=1.0",
+    # NVML bindings for per-process GPU memory (pure Python). Without them the
+    # worker degrades to free-memory deltas.
+    "nvidia-ml-py>=12.535",
     # Not imported by the worker: the Rust server resolves the UI's Node.js
     # runtime from this venv (see docs/architecture.md, tech debt register).
     "nodejs-wheel>=24.0.0,<25",
@@ -46,6 +49,7 @@ cu128 = [
     "nvidia-cudnn-cu12>=9.1.0.70; sys_platform == 'linux' or sys_platform == 'win32'",
 ]
 # ROCm 7.2 multi-arch (pytorch.org; not AMD .lw). Torch 2.11; cpu/cu128 stay 2.7.1.
+# Its gfx targets are listed in panoptikon/src/inferio/gpu.rs (ROCM_WHEEL_GFX).
 rocm = [
     "torch==2.11.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchvision==0.26.0; sys_platform == 'linux' and platform_machine == 'x86_64'",

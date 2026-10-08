@@ -20,6 +20,104 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 logger = logging.getLogger(__name__)
 
 
+def _norm_module_types() -> tuple:
+    """Modules whose parameters must stay fp32 in a low-precision model."""
+    import torch
+
+    types = [
+        torch.nn.LayerNorm,
+        torch.nn.GroupNorm,
+        torch.nn.modules.batchnorm._BatchNorm,
+    ]
+    rms_norm = getattr(torch.nn, "RMSNorm", None)
+    if rms_norm is not None:
+        types.append(rms_norm)
+    return tuple(types)
+
+
+def finish_lp_conversion(model, precision: str, logger=logger) -> List[str]:
+    """Cast the fp32 parameters open_clip's fp16/bf16 conversion leaves behind.
+
+    `convert_weights_to_lp` leaves bare `nn.Parameter`s in fp32; CoCa feeds some
+    (`attn_pool.query`, `cls_emb`) straight into half-precision attention,
+    which raises a dtype mismatch. Normalization parameters stay fp32, as in
+    open_clip's timm branch. Returns the names of the parameters it cast.
+    """
+    import torch
+
+    dtypes = {"fp16": torch.float16, "bf16": torch.bfloat16}
+    dtype = dtypes.get(precision)
+    if dtype is None:  # fp32, or a pure_* mode that cast everything already
+        return []
+
+    norms = _norm_module_types()
+    converted: List[str] = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, norms):
+            continue
+        for name, param in module.named_parameters(recurse=False):
+            if param.dtype is not torch.float32:
+                continue
+            param.data = param.data.to(dtype)
+            converted.append(f"{module_name}.{name}" if module_name else name)
+
+    if converted:
+        logger.debug(
+            "Cast %d parameter(s) open_clip left in fp32 to %s: %s",
+            len(converted),
+            precision,
+            ", ".join(converted),
+        )
+    return converted
+
+
+def promote_plain_layernorms(model, precision: str, logger=logger) -> List[str]:
+    """Replace plain LayerNorms still holding fp32 weights with `LayerNormFp32`.
+
+    A half input with fp32 weights fails in `F.layer_norm` on CUDA (CPU
+    tolerates it). open_clip's `AttentionalPooler` is built with plain
+    `LayerNorm` (`attn_pool.ln_q`/`ln_k`) whatever the precision. The weight and
+    bias tensors are reused, so no value changes. Returns the promoted names.
+    """
+    import torch
+
+    if precision not in ("fp16", "bf16"):
+        return []
+
+    try:
+        from open_clip.transformer import LayerNormFp32
+    except ImportError:  # pragma: no cover - open_clip is a hard dep of load()
+        return []
+
+    promoted: List[str] = []
+    for parent_name, parent in list(model.named_modules()):
+        for name, child in list(parent.named_children()):
+            if not isinstance(child, torch.nn.LayerNorm):
+                continue
+            if isinstance(child, LayerNormFp32):
+                continue
+            if child.weight is None or child.weight.dtype is not torch.float32:
+                continue
+            replacement = LayerNormFp32(
+                child.normalized_shape,
+                eps=child.eps,
+                elementwise_affine=child.elementwise_affine,
+            )
+            replacement.weight = child.weight
+            replacement.bias = child.bias
+            replacement.training = child.training
+            setattr(parent, name, replacement)
+            promoted.append(f"{parent_name}.{name}" if parent_name else name)
+
+    if promoted:
+        logger.debug(
+            "Promoted %d plain LayerNorm(s) to LayerNormFp32: %s",
+            len(promoted),
+            ", ".join(promoted),
+        )
+    return promoted
+
+
 class ClipModel(InferenceModel):
     def __init__(
         self,
@@ -69,6 +167,9 @@ class ClipModel(InferenceModel):
 
         # open_clip builds and converts on CPU; moving afterwards transfers
         # half the bytes, so a low-precision load is faster, not slower.
+        # Finish the low-precision conversion there too.
+        finish_lp_conversion(self.model, precision, logger=logger)
+        promote_plain_layernorms(self.model, precision, logger=logger)
         self.model.eval().to(self.device)
         self.input_dtype = self._input_dtype()
         self.tokenizer = open_clip.get_tokenizer(

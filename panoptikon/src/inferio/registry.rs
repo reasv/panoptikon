@@ -1,9 +1,7 @@
 //! Model registry: parses the inferio inference TOML registry and resolves
 //! per-inference-id spawn specs (impl class + constructor kwargs).
 //!
-//! This is a faithful port of the legacy Python `inferio/config.py`
-//! (python-legacy branch). The semantics that
-//! matter (verified against the Python source, cited by line):
+//! A port of the legacy Python `inferio/config.py`. The semantics that matter:
 //!
 //! - Config folders are scanned for `*.toml` in alphabetical order, built-in
 //!   folder first, then the user folder (`load_config`, config.py:100-101).
@@ -37,20 +35,18 @@
 //! (`clean_dict` is a no-op for TOML-derived plain data). `ray_config` is
 //! therefore *not* forwarded to workers, matching Python.
 //!
-//! Rust-orchestrator extension (design §8, Phase 3): `config.replicas` and
-//! `config.devices` configure the per-model WorkerSet. Both are stripped
-//! from spawn kwargs exactly like `ray_config` (they are orchestrator
-//! directives, not impl constructor arguments) and, being ordinary config
-//! keys, inherit from group config like everything else. Resolution
+//! Rust-orchestrator extension (design §8): `config.replicas` and
+//! `config.devices` configure the per-model WorkerSet; both inherit from group
+//! config and are stripped from spawn kwargs like `ray_config`. Resolution
 //! (`resolve_device_pins`):
-//! - `devices = ["3", "7"]` -> 2 replicas, replica i pinned
-//!   `CUDA_VISIBLE_DEVICES=devices[i]`;
+//! - `devices = ["3", "7"]` -> 2 replicas, replica i pinned to `devices[i]`;
 //! - `replicas = N` alone -> N replicas pinned `"0"`..`"N-1"`;
 //! - neither -> 1 replica, no pin (today's behavior);
-//! - both with mismatched lengths, a non-positive/non-integer `replicas`,
-//!   or a non-array-of-strings/empty `devices` -> **registry load error**
-//!   (explicit beats silent), validated per id at load time against the
-//!   merged config so the error names the offending inference id.
+//! - mismatched lengths or invalid values -> registry load error naming the id.
+//!
+//! A `devices` index is a position in nvidia-smi order, not a CUDA-runtime
+//! index; `gpu.rs` resolves it to the backend's pin form (see
+//! docs/batch-calibration-design.md, "Every worker is pinned to exactly one GPU").
 //!
 //! JSON object key order IS semantic here: Python dicts preserve insertion
 //! order, FastAPI serializes `/metadata` in that order, and the web UI
@@ -156,9 +152,8 @@ pub struct SpawnSpec {
     /// and the orchestrator-only `replicas`/`devices` keys
     /// (process_model.py:209-211 for the Python-parity part).
     pub config_kwargs: JsonValue,
-    /// Per-replica `CUDA_VISIBLE_DEVICES` pins (design §8): one entry per
-    /// replica to spawn, `None` = no pin (inherit the parent env). Always
-    /// non-empty; `vec![None]` is the single-replica default.
+    /// One device pin per replica as written in the registry (`None` = no
+    /// pin); never empty.
     pub device_pins: Vec<Option<String>>,
     /// Declared environment-backed external inputs, resolved immediately
     /// before this worker is spawned and applied explicitly to the child.
@@ -295,10 +290,7 @@ impl Registry {
         // mode; Python strips it before instantiation (process_model.py:211)
         // and it is NOT forwarded to workers.
         kwargs.remove("ray_config");
-        // replicas/devices are orchestrator directives (WorkerSet shape,
-        // design §8), stripped from kwargs exactly like ray_config. Load
-        // already validated them; this re-resolution can only fail if the
-        // registry was constructed without going through load().
+        // Validated at load; fails only for a Registry built without load().
         let device_pins = resolve_device_pins(&kwargs).with_context(|| {
             format!("invalid replicas/devices config for inference id '{full_inference_id}'")
         })?;
@@ -362,13 +354,10 @@ impl Registry {
 }
 
 /// Resolve the WorkerSet shape from a merged id config (design §8; see the
-/// module docs for the rules). Returns one entry per replica: the
-/// `CUDA_VISIBLE_DEVICES` value to pin at spawn, or `None` for no pin.
+/// module docs for the rules): one device pin (or `None`) per replica.
 fn resolve_device_pins(config: &JsonMap<String, JsonValue>) -> Result<Vec<Option<String>>> {
     // Hard ceiling on the WorkerSet size: each replica is a full Python
-    // process, so anything past this is a config typo, and the pin vector is
-    // materialized eagerly at registry load (an unbounded value would OOM at
-    // boot instead of producing a load error).
+    // process, and an unbounded value would OOM at load instead of failing it.
     const MAX_REPLICAS: usize = 64;
     let replicas = match config.get("replicas") {
         None => None,

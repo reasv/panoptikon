@@ -7,7 +7,9 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
@@ -41,28 +43,21 @@ fn logs_file_path(settings: &Settings) -> Option<PathBuf> {
     }
 }
 
-fn open_logs_file(settings: &Settings) -> Option<(PathBuf, fs::File)> {
-    let path = logs_file_path(settings)?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && let Err(err) = fs::create_dir_all(parent)
-    {
-        eprintln!(
-            "failed to create log directory {}: {err}; file logging disabled",
-            parent.display()
-        );
-        return None;
-    }
-    match fs::OpenOptions::new().append(true).create(true).open(&path) {
-        Ok(file) => Some((path, file)),
-        Err(err) => {
-            eprintln!(
-                "failed to open log file {}: {err}; file logging disabled",
-                path.display()
-            );
-            None
-        }
-    }
+/// Opens the log file for appending. A failure names another user owning,
+/// or a read-only filesystem holding, the file or the folder it is made in;
+/// the folder to hand over is the data folder, when the file is in it.
+fn open_logs_file(path: &Path, settings: &Settings) -> anyhow::Result<fs::File> {
+    let folder = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let opened = fs::create_dir_all(folder)
+        .with_context(|| format!("failed to create log directory {}", folder.display()))
+        .and_then(|()| {
+            let file = fs::OpenOptions::new().append(true).create(true).open(path);
+            file.with_context(|| format!("failed to open log file {}", path.display()))
+        });
+    opened.map_err(|err| crate::ownership::explain_create(err, &settings.data_folder, path))
 }
 
 /// Initializes tracing with a console layer and, unless disabled, an appending
@@ -78,7 +73,14 @@ pub(crate) fn init(settings: &Settings) -> Option<WorkerGuard> {
         .with(env_filter(&settings.logging.level))
         .with(console_layer);
 
-    match open_logs_file(settings) {
+    let file = logs_file_path(settings).and_then(|path| match open_logs_file(&path, settings) {
+        Ok(file) => Some((path, file)),
+        Err(err) => {
+            eprintln!("{err:#}; file logging disabled");
+            None
+        }
+    });
+    match file {
         Some((path, file)) => {
             let (writer, guard) = tracing_appender::non_blocking(file);
             let file_layer = tracing_subscriber::fmt::layer()
@@ -128,6 +130,41 @@ base_url = "http://127.0.0.1:6342"
         settings.logging = logging;
         settings.data_folder = PathBuf::from(data_folder);
         settings
+    }
+
+    /// A log file that cannot be opened names another user owning its folder,
+    /// and names the data folder as the one to hand over when the file is in
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn a_log_folder_another_user_owns_is_named() {
+        use crate::ownership::tests::{
+            foreign_folder, not_writable_by_current_user, owned_by_another_user,
+        };
+        let Some((folder, owner)) = foreign_folder(false) else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let link = root.path().join("logs");
+        std::os::unix::fs::symlink(folder, &link).unwrap();
+        let share = link.join("share");
+        if !share.is_dir() {
+            return;
+        }
+        let file = share.join("panoptikon.log");
+        let [in_data, outside] = [share.clone(), root.path().join("data")].map(|data_folder| {
+            let logging = crate::config::LoggingConfig {
+                file: None,
+                level: "INFO".into(),
+            };
+            settings_with(logging, data_folder.to_str().unwrap())
+        });
+        let error = format!("{:#}", open_logs_file(&file, &in_data).unwrap_err());
+        let expected = owned_by_another_user(&share, owner, &share);
+        assert!(error.starts_with(&expected), "{error}");
+        let error = format!("{:#}", open_logs_file(&file, &outside).unwrap_err());
+        let expected = not_writable_by_current_user(&share, owner);
+        assert!(error.starts_with(&format!("{expected}: ")), "{error}");
     }
 
     /// `[logging].file` resolution preserves the old LOGS_FILE semantics:

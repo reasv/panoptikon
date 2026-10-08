@@ -1,0 +1,13 @@
+# R3 user registry: MobileCLIP-S1 pinned to HIP device 0, which under R3's
+# `ROCR_VISIBLE_DEVICES=1` is physical device 1.
+#
+# Restates the shipped clip/apple_MobileCLIP-S1 entry, because a redefinition
+# replaces the id's config and metadata wholesale (see ../README.md).
+allow_override = true
+
+[group.clip.inference_ids.apple_MobileCLIP-S1]
+config.model_name             = "hf-hub:apple/MobileCLIP-S1-OpenCLIP"
+config.devices                = ["0"]
+metadata.description          = "Apple MobileCLIP-S1 pinned to HIP device 0"
+metadata.cost.seed_units      = 192
+metadata.cost.platform_copies = ["windows"]
