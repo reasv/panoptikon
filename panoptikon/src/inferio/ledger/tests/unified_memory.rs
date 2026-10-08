@@ -468,6 +468,7 @@ fn an_apu_replica_is_admitted_on_either_total() {
             "and the budget is the ledger's own figure either way — the \
              report identifies the GPU, it does not re-price it"
         );
+        assert_eq!(gpu.limit_mb, APU_TOTAL_MB - 1_024);
     }
     // A figure that is neither is still a refusal.
     let ledger = apu_ledger(vec![apu_device(0), dgpu.clone()]);
