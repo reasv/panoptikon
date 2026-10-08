@@ -936,11 +936,12 @@ def clamp_to_live_memory(
             reserve_mb = free_mb - room_mb
         elif free_source == "mps":
             # Metal's ceiling, or the RAM above the reserve when that is less;
-            # RAM below the reserve comes off the pool unless the grant keeps
-            # it, as in the grant.
+            # RAM below the reserve comes off the pool, as in the grant. A
+            # grant that keeps the pool (at warning) keeps it only until this
+            # reading shows macOS paging, where the grant would not.
             reserve_mb = ram_reserve_mb
             room_mb = min(free_mb, reading.ram_available_mb - reserve_mb)
-            if keep_pool:
+            if keep_pool and not memory.mac_pages_at_last_reading():
                 room_mb = max(room_mb, 0)
         else:
             reserve_mb = ram_reserve_mb if free_source == "ram" else 0

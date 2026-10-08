@@ -1070,6 +1070,43 @@ def test_an_mps_clamp_keeps_the_pool_only_where_the_grant_did():
         assert len(model.batches[0]) == first, keep_pool
 
 
+def test_a_kept_pool_is_kept_only_until_macos_pages():
+    """A window granted at warning keeps the pool (64 units, as in
+    `test_an_mps_clamp_keeps_the_pool_only_where_the_grant_did`) until a
+    reading shows macOS paging: swap-outs during the first batch cut the
+    second to the 180 MiB above the reserve, 8 units, as a grant issued
+    while paging would. None during the second, and the third keeps it."""
+    clock = [0.0]
+
+    def counters():
+        swapouts = 500 + 100 * (clock[0] >= 5)
+        ram = 128 * 1024 * MIB
+        return (ram, 0, 0, ram, memory.MAC_PRESSURE_WARNING, swapouts, 0)
+
+    class Slow:
+        def predict(self, inputs):
+            clock[0] += 90
+            return [item.data for item in inputs]
+
+    mps = FakeMpsAllocator()
+    mps.allocate(0, driver_mb=13_107 + 180)
+    wire = grant(
+        unit_budget=64, mb=740, fixed_mb=100, ram_reserve_mb=13_107, keep_pool=True
+    )
+    with (
+        isolated(fake_mps_torch_module(mps)),
+        mock.patch.object(memory, "_mac_memory_counters", side_effect=counters),
+        mock.patch("time.monotonic", side_effect=lambda: 1000.0 + clock[0]),
+        mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN),
+        mock.patch.object(packing, "maybe_shrink", return_value=False),
+    ):
+        payload = packing.run_window(Slow(), items(128), wire)
+        memory.count_paging_from_last_reading(False)
+    first, cut, after = payload["measurements"]
+    assert (first["items"], cut["items"], after["items"]) == (64, 8, 56)
+    assert cut["clamped"] == {"from_units": 64, "to_units": 8, "free_mb": 0}
+
+
 def test_the_mps_clamp_log_says_how_far_ram_is_below_the_reserve(caplog):
     """With RAM 1 000 MiB below a 2 000 MiB reserve and 200 MiB of pool,
     nothing is left to spend: the log states the shortfall and a remainder
