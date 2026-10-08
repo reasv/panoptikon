@@ -1689,6 +1689,56 @@ fn an_apus_ram_floor_is_taken_within_the_cgroup_limit() {
     }
 }
 
+/// An APU's load is refused against the smaller of its total and its
+/// carve-out plus host RAM less the RAM floor: with GTT raised past that RAM,
+/// a base that fits the total but not the RAM is refused.
+#[tokio::test]
+async fn an_apus_load_is_refused_inside_the_ram_floor() {
+    const RAM: u64 = 128 * 1024 - APU_CARVEOUT_MB;
+    let raised = || crate::inferio::gpu::GpuInfo {
+        total_mb: APU_CARVEOUT_MB + 124 * 1024,
+        ..apu_device(0)
+    };
+    let below_floor = APU_CARVEOUT_MB + RAM - cpu::ram_reserve_mb(RAM);
+    // (device, CPU total, room)
+    for (device, cpu_total, room) in [
+        (raised(), RAM, below_floor),
+        (apu_device(0), RAM, APU_TOTAL_MB),
+        (apu_device(0), 16 * 1024, APU_CARVEOUT_MB + 14 * 1024),
+    ] {
+        let total = device.total_mb;
+        let ledger = apu_host(vec![device], cpu_total, VramBudget::default());
+        assert_eq!(
+            ledger.refusal_room_locked(&ledger.lock(), AMD_A),
+            room,
+            "a {total} MiB APU beside {cpu_total} MiB of RAM"
+        );
+    }
+    assert_eq!(below_floor, 118_016);
+    let ledger = apu_host(vec![raised()], RAM, VramBudget::default());
+    let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_CARVEOUT_MB + 124 * 1024));
+    handle
+        .lock()
+        .unwrap()
+        .load
+        .as_mut()
+        .expect("a load report")
+        .value
+        .base_mb = Some(120_000);
+    drop(
+        ledger
+            .register_worker("g/apu", item_cost(4), &handle, None)
+            .expect("registers"),
+    );
+    let Err(refusal) = ledger
+        .reserve_load("g/apu", item_cost(4), AMD_A, None)
+        .await
+    else {
+        panic!("a base that only fits inside the RAM floor is refused");
+    };
+    assert_eq!((refusal.needs_mb, refusal.room_mb), (120_000, below_floor));
+}
+
 /// A grant on an APU, or on the CPU device beside one, reads the RAM they
 /// share first: the last reading may predate memory the other kept after its
 /// own grant settled.

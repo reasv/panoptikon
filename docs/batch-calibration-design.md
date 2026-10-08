@@ -715,7 +715,10 @@ it (carve-out plus host RAM, over VRAM free plus deliverable RAM, with the
 others' memory netted and their charges taken off the room as above, under
 the RAM floor, of which it withholds at most the deliverable RAM). Its free
 reading carries the GTT and RAM terms for this (`gtt_free_mb`,
-`ram_available_mb`). A discrete GPU's VRAM is its own.
+`ram_available_mb`). A load on it is refused against the smaller of its total
+and its carve-out plus host RAM less the floor: with GTT raised close to all
+of RAM, the total alone would admit a model that only fits inside the floor.
+A discrete GPU's VRAM is its own.
 
 **What still relies on frames: other processes' memory.** `external_mb` is only
 as fresh as the last free reading *that device* received, and the two devices

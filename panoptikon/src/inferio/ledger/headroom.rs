@@ -537,26 +537,22 @@ impl VramLedger {
     /// card has left over other processes, or on a unified-memory device its
     /// whole capacity, since other processes' RAM there is transient. A
     /// device whose memory is host RAM keeps [`cpu::ram_reserve_mb`] of it.
+    /// An APU's room is the smaller of its total (carve-out plus GTT) and its
+    /// carve-out plus that RAM less the reserve.
     pub(super) fn refusal_room_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
-        let unified = state
-            .gpus
-            .get(gpu)
-            .is_some_and(|gpu| gpu.unified_ram_mb.is_some());
-        let external = if unified {
+        let device = state.gpus.get(gpu);
+        let external = if device.is_some_and(|gpu| gpu.unified_ram_mb.is_some()) {
             0
         } else {
             self.external_locked(state, gpu).unwrap_or(0)
         };
-        // An APU's own room is its carve-out and GTT, not host RAM.
-        let apu = state
-            .gpus
-            .get(gpu)
-            .is_some_and(|gpu| gpu.vram_carveout_mb.is_some());
-        let reserve = match Self::host_ram_mb_locked(state, gpu) {
-            Some(ram) if !apu => cpu::ram_reserve_mb(ram),
-            _ => 0,
-        };
-        self.limit_over_locked(state, gpu, None, external.saturating_add(reserve), 0)
+        let ram = Self::host_ram_mb_locked(state, gpu);
+        let room = device
+            .and_then(|gpu| gpu.vram_carveout_mb)
+            .zip(ram)
+            .map(|(carveout, ram)| carveout.saturating_add(ram));
+        let reserve = ram.map_or(0, cpu::ram_reserve_mb);
+        self.limit_over_locked(state, gpu, room, external.saturating_add(reserve), 0)
     }
 
     pub(super) fn headroom_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
