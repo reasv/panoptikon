@@ -977,7 +977,7 @@ def test_an_mps_worker_keeps_the_ram_reserve_free():
     with mps_host(available_mb=1_000) as mps:
         mps.allocate(1_000, driver_mb=5_000)
         live = packing.clamp_to_live_memory(8, 8_000, ram_reserve_mb=2_000)
-        assert live.units == 4, "RAM below the reserve takes nothing from the pool"
+        assert live.units == 3, "4 000 of pool less the 1 000 below the reserve"
 
 
 def test_a_rocm_worker_uses_the_cuda_arm_of_the_credit(fake_rocm_torch):

@@ -862,9 +862,10 @@ def clamp_to_live_memory(
 
     Free host RAM counts only above `ram_reserve_mb`, which the orchestrator
     keeps free: in a RAM-priced worker's reading, in the RAM an MPS reading
-    is clamped by, and for a GPU worker whose grant books `ram_grant_mb` of
-    host RAM, which is scaled the same way against free RAM and runs at the
-    smaller of the two budgets.
+    is clamped by (RAM below the reserve there comes off the pool), and for
+    a GPU worker whose grant books `ram_grant_mb` of host RAM, which is
+    scaled the same way against free RAM and runs at the smaller of the two
+    budgets.
     """
     reading = memory.free_total_reading()
     free_mb, free_source = reading.free_mb, reading.source
@@ -877,13 +878,14 @@ def clamp_to_live_memory(
     if grant_mb and grant_mb > 0 and free_mb is not None:
         reserve_mb = ram_reserve_mb if free_source in ("ram", "mps") else 0
         if free_source == "mps":
-            # Metal's ceiling, or the RAM above the reserve when that is less.
-            above_mb = max(min(free_mb, reading.ram_available_mb - reserve_mb), 0)
+            # Metal's ceiling, or the RAM above the reserve when that is less;
+            # RAM below the reserve comes off the pool, as in the grant.
+            above_mb = min(free_mb, reading.ram_available_mb - reserve_mb)
         else:
             above_mb = max(free_mb - reserve_mb, 0)
         pool_mb = memory.releasable_pool_mb() or 0
         held_mb = min(fixed_mb, memory.held_since_load_mb())
-        spendable_mb = above_mb + pool_mb + held_mb
+        spendable_mb = max(above_mb + pool_mb + held_mb, 0)
         shrunk = _scaled(unit_budget, spendable_mb, grant_mb, fixed_mb)
         if shrunk < unit_budget:
             logger.info(
