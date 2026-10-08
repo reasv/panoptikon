@@ -13,6 +13,7 @@ Run with the managed interpreter:
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -926,6 +927,20 @@ def test_selftest_asks_every_base_tier_of_the_worker(monkeypatch):
     _, degraded = selftest.verdict_line({"base": {"base_method": "kfd"}})
     assert [d for d in degraded if d.startswith("base:")] == []
 
+
+def test_every_memory_name_selftest_uses_exists(monkeypatch):
+    # `_safe` swallows the AttributeError of a renamed worker function, so a
+    # GPU-only path would read a unified GPU as discrete without failing.
+    monkeypatch.syspath_prepend(str(HERE.parents[1] / "python"))
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    from inferio_worker import memory
+
+    tree = ast.parse((HERE / "selftest.py").read_text())
+    used = {node.attr for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name) and node.value.id == "memory"}
+    assert "unified_gpu" in used
+    assert sorted(name for name in used if not hasattr(memory, name)) == []
 
 def test_newrun_records_the_gpu_nodes(tmp_path):
     host = Host(tmp_path).gpu(1, 0x0300).gpu(2, 0x0C00, openable=False)
