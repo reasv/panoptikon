@@ -1225,6 +1225,7 @@ mod tests {
             fixed_mb: 0,
             ram_mb: 0,
             ram_reserve_mb: 0,
+            paging: false,
         }
     }
 

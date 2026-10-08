@@ -194,6 +194,7 @@ ignores them per the unknown-key rule and behaves exactly as before.
 | `user_cap_items` | optional per-request cap on **item count** per batch (the user-facing "max batch size"). Never converted to units; enforced as an additional bound at pack time |
 | `fixed_mb` | the part of `mb` a batch costs whatever its size (the fitted cost's intercept); 0 before the cost is fitted, and absent from an older orchestrator, which means 0. The clamp scales only the rest: `unit_budget × (spendable − fixed_mb) / (mb − fixed_mb)`. What the worker still holds allocated since its load, up to `fixed_mb`, counts as spendable, because the batch does not allocate it again |
 | `ram_reserve_mb` | free host RAM the orchestrator keeps for the rest of the machine: the reserve of the grant's device when that device is host RAM (the CPU device, an APU, or the Mac GPU against `hw.memsize`), otherwise the CPU device's reserve for a RAM booking. The clamp counts free RAM only above it. 0 on a grant neither priced nor booked in host RAM |
+| `paging` | `true` while macOS is paging: free RAM below `ram_reserve_mb` then comes off the pool the replica holds, in the grant and in an MPS worker's clamp. Otherwise, and when absent (an older orchestrator), the clamp keeps the pool and counts no RAM below the reserve |
 | `ram_mb` | host RAM a CUDA or ROCm worker's window may add to its resident set: its booking on the CPU device less the growth it already holds. 0 when nothing is booked. The clamp scales the batch by `(free RAM − ram_reserve_mb) / ram_mb` as well, and the batch runs at the smaller of the two budgets |
 | `max_tokens` | **new (2026-09-06)**: the model's *sequence window* — the most tokens of one input that ever occupy the GPU at once, whatever the input's length. Integer tokens; nil when there is none; meaningful only for a `token`-priced model. When present the worker prices every input at `min(raw_tokens, max_tokens)` before packing. Resolved and denominated exactly as `canvas_pixels` is, and on the same both-sides rule |
 | `canvas_pixels` | **new (2026-09-04)**: the model's *canvas* — the largest number of decoded pixels one input can actually cost it, whatever resolution the input was submitted at. Integer pixels; nil when there is none; meaningful only for a `pixel`-priced model. When present the worker prices every input at `min(raw_pixels, canvas_pixels)` before packing. It is the figure the orchestrator resolved for this model — `metadata.cost.canvas_pixels` from the registry, else the canvas the worker itself reported on its `load` response — and it is what the orchestrator's *own* window pricing used, so both sides denominate one quantity |
@@ -497,9 +498,11 @@ high-water and a freed page is already in the free reading; there the free
 reading counts only above `grant.ram_reserve_mb`
 (`spendable = free − reserve + pool`), so a batch cannot take the RAM the
 ledger left free. On a Mac the `"mps"` reading likewise counts RAM only above
-the reserve, and RAM below it comes off the pool
+the reserve. While the grant says macOS is paging (`grant.paging`), RAM below
+it comes off the pool
 (`spendable = max(min(free, RAM available − reserve) + pool + held, 0)`), as
-the ledger's grant does. On an APU the reserve comes off the RAM term of its
+the ledger's grant does; otherwise the pool is kept
+(`spendable = min(free, max(RAM available − reserve, 0)) + pool + held`). On an APU the reserve comes off the RAM term of its
 reading only (`spendable = VRAM free + min(GTT free, max(RAM − reserve, 0)) +
 pool`), so where GTT is short it withholds nothing. A discrete GPU worker's own
 free reading is the device's and has no reserve taken from it; its host RAM is

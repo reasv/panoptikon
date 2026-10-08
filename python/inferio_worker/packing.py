@@ -894,6 +894,7 @@ def clamp_to_live_memory(
     ram_reserve_mb: int = 0,
     ram_grant_mb: int = 0,
     fixed_mb: int = 0,
+    paging: bool = False,
 ) -> LiveBudget:
     """Shrink the budget if the memory this batch can spend has fallen below
     what the grant assumed.
@@ -908,7 +909,8 @@ def clamp_to_live_memory(
 
     Free host RAM counts only above `ram_reserve_mb`, which the orchestrator
     keeps free: in a RAM-priced worker's reading, in the RAM an MPS reading
-    is clamped by (RAM below the reserve there comes off the pool), in an
+    is clamped by (while the grant says macOS is paging, RAM below the
+    reserve there comes off the pool), in an
     APU's RAM term (its free VRAM and GTT do not shrink by it), and for a GPU
     worker whose grant books `ram_grant_mb` of host RAM, which is scaled the
     same way against free RAM and runs at the smaller of the two budgets.
@@ -934,9 +936,12 @@ def clamp_to_live_memory(
             reserve_mb = free_mb - room_mb
         elif free_source == "mps":
             # Metal's ceiling, or the RAM above the reserve when that is less;
-            # RAM below the reserve comes off the pool, as in the grant.
+            # while macOS pages RAM below the reserve comes off the pool, as
+            # in the grant.
             reserve_mb = ram_reserve_mb
             room_mb = min(free_mb, reading.ram_available_mb - reserve_mb)
+            if not paging:
+                room_mb = max(room_mb, 0)
         else:
             reserve_mb = ram_reserve_mb if free_source == "ram" else 0
             room_mb = max(free_mb - reserve_mb, 0)
@@ -1400,6 +1405,7 @@ def run_window(
     ram_grant_mb = int(ram_grant_mb) if isinstance(ram_grant_mb, int) else 0
     fixed_mb = grant.get("fixed_mb")
     fixed_mb = max(0, int(fixed_mb)) if isinstance(fixed_mb, int) else 0
+    paging = grant.get("paging") is True
 
     # Reactive shrink: the one point where nothing is in flight.
     trimmed = maybe_shrink(grant_mb)
@@ -1445,7 +1451,7 @@ def run_window(
     while pending:
         # Re-plan per batch: the clamp can shrink the budget mid-window.
         live = clamp_to_live_memory(
-            budget, grant_mb, ram_reserve_mb, ram_grant_mb, fixed_mb
+            budget, grant_mb, ram_reserve_mb, ram_grant_mb, fixed_mb, paging
         )
         remaining_units = [units[index] for index in pending]
         remaining_raw = [raw_units[index] for index in pending]

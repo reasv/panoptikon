@@ -1953,6 +1953,7 @@ fn encode_grant(grant: &Grant) -> Value {
             Value::from("ram_reserve_mb"),
             Value::from(grant.ram_reserve_mb),
         ),
+        (Value::from("paging"), Value::Boolean(grant.paging)),
     ])
 }
 
@@ -2179,6 +2180,7 @@ mod tests {
             fixed_mb: 0,
             ram_mb: 0,
             ram_reserve_mb: 0,
+            paging: false,
         }
     }
 
@@ -3339,6 +3341,7 @@ mod tests {
             fixed_mb: 0,
             ram_mb: 0,
             ram_reserve_mb: 0,
+            paging: false,
         };
         let on_the_wire = |key: &str, canvas_pixels, max_tokens| {
             let encoded = encode_grant(&grant(canvas_pixels, max_tokens));
@@ -3366,12 +3369,13 @@ mod tests {
             "present and nil, not absent"
         );
 
-        // The fixed part of the price, the host RAM a window may take and
-        // the reserve its clamp keeps.
+        // The fixed part of the price, the host RAM a window may take, the
+        // reserve its clamp keeps and whether macOS is paging.
         let encoded = encode_grant(&Grant {
             fixed_mb: 35,
             ram_mb: 4_100,
             ram_reserve_mb: 6_553,
+            paging: true,
             ..grant(None, None)
         });
         let Value::Map(map) = &encoded else {
@@ -3380,6 +3384,12 @@ mod tests {
         assert_eq!(map_get(map, "fixed_mb"), Some(&Value::from(35u64)));
         assert_eq!(map_get(map, "ram_mb"), Some(&Value::from(4_100u64)));
         assert_eq!(map_get(map, "ram_reserve_mb"), Some(&Value::from(6_553u64)));
+        assert_eq!(map_get(map, "paging"), Some(&Value::Boolean(true)));
+        let encoded = encode_grant(&grant(None, None));
+        let Value::Map(map) = &encoded else {
+            panic!("a grant encodes as a map, got {encoded:?}");
+        };
+        assert_eq!(map_get(map, "paging"), Some(&Value::Boolean(false)));
     }
 
     /// The other direction: the canvas the worker resolved for the model it

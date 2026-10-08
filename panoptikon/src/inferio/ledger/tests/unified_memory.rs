@@ -3068,6 +3068,43 @@ fn while_the_mac_pages_a_pre_fit_batch_fits_the_pool_held() {
     assert_eq!(grant.unit_budget, 16, "at warning the batch size is held");
 }
 
+/// At warning with free RAM below the reserve the grant keeps the pool the
+/// replica holds and says macOS is not paging, so the worker's clamp keeps
+/// it too (`test_packing.py`, the same figures); while paging it says so.
+#[test]
+fn at_warning_a_grant_below_the_reserve_keeps_the_pool_and_says_so() {
+    let (ledger, handle, admission) = ramped_mac_replica();
+    let grant = |pressure| {
+        ledger.set_memory_pressure_for_test(pressure);
+        push_ram(&handle, MAC_TOTAL_MB, 0, mac_reserve() + 180, 0);
+        ledger.health();
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let grant = *token.grant();
+        drop(token);
+        grant
+    };
+    let warning = grant(mps::MemoryPressure::Warning);
+    assert_eq!(
+        (
+            warning.unit_budget,
+            warning.mb,
+            warning.fixed_mb,
+            warning.ram_reserve_mb,
+            warning.paging
+        ),
+        (64, 740, 100, 13_107, false)
+    );
+    assert_eq!(mac_reserve(), 13_107);
+    let paging = grant(mps::MemoryPressure::Paging);
+    assert_eq!(
+        (paging.unit_budget, paging.mb, paging.paging),
+        (8, 180, true),
+        "the 180 MiB of pool above the reserve"
+    );
+}
+
 /// At warning with nothing being paged out the replica keeps its working
 /// size: the trial of the next one is put off, and there is no growth and
 /// no throughput sample. A squeeze there is not kept once its cause is

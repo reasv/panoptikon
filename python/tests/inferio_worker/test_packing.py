@@ -1027,8 +1027,45 @@ def test_an_mps_worker_keeps_the_ram_reserve_free():
         assert live.units == 6, "the 96 GiB ceiling binds, not the reserve"
     with mps_host(available_mb=1_000) as mps:
         mps.allocate(1_000, driver_mb=5_000)
-        live = packing.clamp_to_live_memory(8, 8_000, ram_reserve_mb=2_000)
+        live = packing.clamp_to_live_memory(
+            8, 8_000, ram_reserve_mb=2_000, paging=True
+        )
         assert live.units == 3, "4 000 of pool less the 1 000 below the reserve"
+        live = packing.clamp_to_live_memory(8, 8_000, ram_reserve_mb=2_000)
+        assert live.units == 4, "not paging: the 4 000 of pool is kept"
+
+
+def test_at_warning_an_mps_clamp_keeps_the_pool_the_grant_kept():
+    """The grant the ledger issues at warning with no RAM available and
+    13 287 MiB of pool, 180 above the 13 107 MiB reserve
+    (`at_warning_a_grant_below_the_reserve_keeps_the_pool_and_says_so`): the
+    clamp keeps it whole. A grant that says macOS is paging takes the
+    deficit off the pool, which leaves the 180 MiB, 8 units."""
+    grant_figures = {"unit_budget": 64, "mb": 740, "fixed_mb": 100}
+    with mps_host(available_mb=0) as mps:
+        mps.allocate(0, driver_mb=13_107 + 180)
+        for paging, units in [(False, 64), (True, 8)]:
+            live = packing.clamp_to_live_memory(
+                grant_figures["unit_budget"],
+                grant_figures["mb"],
+                ram_reserve_mb=13_107,
+                fixed_mb=grant_figures["fixed_mb"],
+                paging=paging,
+            )
+            assert live.units == units, paging
+    # The grant's own `paging` reaches the clamp; absent reads as false. The
+    # pool, far above these grants, is not released between the windows.
+    for paging, first in [(True, 8), (None, 64)]:
+        wire = grant(**grant_figures, ram_reserve_mb=13_107)
+        if paging is not None:
+            wire["paging"] = paging
+        with mps_host(available_mb=0) as mps, mock.patch.object(
+            packing, "maybe_shrink", return_value=False
+        ):
+            mps.allocate(0, driver_mb=13_107 + 180)
+            model = Recorder()
+            packing.run_window(model, items(64), wire)
+        assert len(model.batches[0]) == first, paging
 
 
 def test_paging_during_a_long_batch_cuts_the_next_one():
