@@ -666,32 +666,17 @@ def test_the_tools_pin_like_the_spawner(tmp_path, monkeypatch, capsys):
         assert (plan["backend"], plan["device"]) == (backend, device)
 
 
-@pytest.mark.parametrize("hip,bdf,nvml_gpus,count,exit_calls", [
-    ("6.4.43482", BDF_03, [], 1, None), (None, BDF_03, [], 1, ["free"]),
-    ("6.4.43482", BDF_03, [], 2, ["free", "count"]),
-    ("6.4.43482", BDF_03, [], 0, ["free", "count"]),
-    ("6.4.43482", BDF_03, [{"index": 0, "uuid": "GPU-1"}], 1, []),
-    ("6.4.43482", None, [], 1, ["free", "count", "count", "synchronize", "free"]),
-    ("6.4.43482", BDF_0C, [], 1, ["free", "count", "count", "synchronize", "free"])],
-    ids=["ok", "hip None", "count 2", "count 0", "hip on NVML",
-         "BDF mismatch", "another GPU"])
-def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(
-        tmp_path, monkeypatch, hip, bdf, nvml_gpus, count, exit_calls):
-    """A run to the JSON on a fixture ROCm host, with a stand-in torch and an
-    impl that allocates nothing. The probe exits before the load unless torch
-    is a ROCm build that sees one device, and exits on a ROCm torch pinned to
-    an NVML GPU; it exits after the priced load, before any batch, unless the
-    model loaded on the pinned GPU (`memory.device_bdf()`). The stand-in torch
-    sees one device only once `HIP_VISIBLE_DEVICES` is set. `exit_calls` is the
-    free readings and torch.cuda calls made before the exit, None for a full
-    run."""
-    host = Host(tmp_path / "host").gpu(1, 0x0300)
-    host.kfd(os.getpid(), 1, 300 * MIB)
+def _rocm_probe(tmp_path, monkeypatch, host, hip="6.4.43482", nvml_gpus=(),
+                count=1):
+    """A probe run on the fixture `host` with a stand-in torch and an impl that
+    allocates nothing: its argv (`--max-batch 1`), the torch to put in
+    `sys.modules`, and the list the free readings and torch.cuda calls are
+    appended to."""
     pinned = probe.Rocm.pinned
     monkeypatch.setattr(probe.Rocm, "pinned", lambda device, environ: pinned(
         device, environ, host.roots))
     monkeypatch.setattr(probe, "Nvml", lambda: types.SimpleNamespace(
-        gpus=lambda: nvml_gpus, error=None, handle_for_uuid=lambda uuid: None,
+        gpus=lambda: list(nvml_gpus), error=None, handle_for_uuid=lambda uuid: None,
         free_mb=lambda handle: None))
     _clear_visibility(monkeypatch)
     monkeypatch.setattr(sys, "path", [str(HERE.parents[1] / "python"), *sys.path])
@@ -728,6 +713,33 @@ def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(
                               "/fixture_impls"),
             "--corpus", str(tmp_path / "manifest.json"), "--max-batch", "1",
             "--out", str(out)]
+    return argv, torch, calls
+
+
+@pytest.mark.parametrize("hip,bdf,nvml_gpus,count,exit_calls", [
+    ("6.4.43482", BDF_03, [], 1, None), (None, BDF_03, [], 1, ["free"]),
+    ("6.4.43482", BDF_03, [], 2, ["free", "count"]),
+    ("6.4.43482", BDF_03, [], 0, ["free", "count"]),
+    ("6.4.43482", BDF_03, [{"index": 0, "uuid": "GPU-1"}], 1, []),
+    ("6.4.43482", None, [], 1, ["free", "count", "count", "synchronize", "free"]),
+    ("6.4.43482", BDF_0C, [], 1, ["free", "count", "count", "synchronize", "free"])],
+    ids=["ok", "hip None", "count 2", "count 0", "hip on NVML",
+         "BDF mismatch", "another GPU"])
+def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(
+        tmp_path, monkeypatch, hip, bdf, nvml_gpus, count, exit_calls):
+    """A run to the JSON on a fixture ROCm host, with a stand-in torch and an
+    impl that allocates nothing. The probe exits before the load unless torch
+    is a ROCm build that sees one device, and exits on a ROCm torch pinned to
+    an NVML GPU; it exits after the priced load, before any batch, unless the
+    model loaded on the pinned GPU (`memory.device_bdf()`). The stand-in torch
+    sees one device only once `HIP_VISIBLE_DEVICES` is set. `exit_calls` is the
+    free readings and torch.cuda calls made before the exit, None for a full
+    run."""
+    host = Host(tmp_path / "host").gpu(1, 0x0300)
+    host.kfd(os.getpid(), 1, 300 * MIB)
+    argv, torch, calls = _rocm_probe(tmp_path, monkeypatch, host, hip,
+                                     nvml_gpus, count)
+    out = tmp_path / "probe.json"
     with mock.patch.dict(os.environ), mock.patch.dict(sys.modules,
                                                       {"torch": torch}):
         from inferio_worker import memory
@@ -751,6 +763,36 @@ def test_the_probe_measures_the_pinned_rocm_gpu_or_exits(
                         result["batches"][0]["gpu_free_mb"],
                         result["batches"][0]["nvml_own_mb"])
     assert result["gqa_check"] == "not applicable"
+
+
+def test_the_probe_starts_no_batch_on_a_unified_gpu_below_the_ram_reserve(
+        tmp_path, monkeypatch):
+    """On a unified GPU no sweep or bisect batch starts while free memory is
+    below the CPU device's reserve, a tenth of the fixture's 128 GiB of RAM.
+    Free memory drops once batch 2 has run: the sweep stops before batch 4,
+    and the bisect runs no batch."""
+    host = Host(tmp_path / "host").gpu(1, 0x0300, gtt=(64 * GIB, 0))
+    argv, torch, _ = _rocm_probe(tmp_path, monkeypatch, host)
+    argv[argv.index("--max-batch") + 1] = "8"
+    ran = []
+    build_inputs = probe.build_inputs
+    monkeypatch.setattr(probe, "build_inputs", lambda items, count, *rest: (
+        ran.append(count) or build_inputs(items, count, *rest)))
+    monkeypatch.setattr(probe.Rocm, "free_mb",
+                        lambda self: 1000 if 2 in ran else 20000)
+    with mock.patch.dict(os.environ), mock.patch.dict(sys.modules,
+                                                      {"torch": torch}):
+        from inferio_worker import memory
+
+        monkeypatch.setattr(memory, "device_bdf", lambda: BDF_03)
+        assert probe.main([*argv, "--bisect-oom"]) == 0
+    result = json.loads((tmp_path / "probe.json").read_text())
+    assert [batch["items"] for batch in result["batches"]] == [1, 2]
+    assert result["bisect"]["trace"] == []
+    stops = [{"items": items, "free_mb": 1000} for items in (4, 1, 512)]
+    assert result["ram_floor"] == {"floor_mb": 13107, "stopped_before": stops}
+    assert [probe.ram_reserve_mb(mb) for mb in (3900, 16384, 32768, 163840)] == [
+        975, 2048, 3276, 16384]
 
 
 def test_selftest_reasons_name_what_is_missing(tmp_path, monkeypatch):

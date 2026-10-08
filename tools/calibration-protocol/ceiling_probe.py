@@ -410,6 +410,12 @@ class Nvml:
 # --- ROCm (amdgpu sysfs and KFD, as the other tools read them) -------------
 
 
+def ram_reserve_mb(total_mb: int) -> int:
+    """RAM the product's CPU device always keeps free (`cpu.rs`): a tenth of
+    `total_mb`, at most 16 GiB and at least 2 GiB, or a quarter under 8 GiB."""
+    return min(max(total_mb // 10, min(2048, total_mb // 4)), 16384)
+
+
 class Rocm:
     """One amdgpu GPU in HIP device order: its row, free and total from
     amdgpu sysfs, and this process's own usage from KFD or DRM fdinfo."""
@@ -1071,6 +1077,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     price, canvas_in_force, tokens_in_force = batch_pricer(
         packing, resolved["cost"], instance)
 
+    # A unified GPU's batches take host RAM, and past it the kernel kills a
+    # process; no batch starts with free memory below the CPU device's reserve.
+    ram_floor_mb = 0
+    if rocm is not None and rocm.gpu.unified:
+        ram_mb = rocm_sysfs.meminfo_mb(rocm.roots, "MemTotal") or 0
+        ram_floor_mb = ram_reserve_mb(ram_mb)
+    ram_floor_stops: List[Dict[str, int]] = []
+
+    def below_ram_floor(count: int) -> bool:
+        free = device_free_mb() if ram_floor_mb else None
+        if free is None or free >= ram_floor_mb:
+            return False
+        ram_floor_stops.append({"items": count, "free_mb": free})
+        print(f"ceiling_probe: not running batch {count}: free {free} MiB is "
+              f"below the host-RAM reserve {ram_floor_mb} MiB", file=sys.stderr)
+        return True
+
     def run_batch(count: int, repeat: int) -> Dict[str, Any]:
         inputs = build_inputs(items, count, args.mode, data_template,
                               args.audio_sample_rate)
@@ -1161,6 +1184,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     records: List[Dict[str, Any]] = []
     for count in batches:
+        if below_ram_floor(count):
+            break
         if args.empty_cache_between_sizes:
             # Each size then starts from a released allocator rather than
             # inheriting the previous, larger size's cached blocks — the
@@ -1247,6 +1272,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Grow first: double until something fails or the ceiling is hit.
         probe = max(1, args.bisect_start)
         while probe <= args.bisect_max:
+            if below_ram_floor(probe):
+                break
             record = run_batch(probe, -2)
             bisect["trace"].append({"items": probe, "ok": ran_whole_batch(record),
                                     "units": record["units"], "oom": record["oom"],
@@ -1271,6 +1298,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 bisect["stopped_early"] = True
                 break
             mid = (low + high) // 2
+            if below_ram_floor(mid):
+                break
             record = run_batch(mid, -2)
             bisect["trace"].append({"items": mid, "ok": ran_whole_batch(record),
                                     "units": record["units"], "oom": record["oom"],
@@ -1315,6 +1344,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         "fit_reserved": fit_reserved,
         "bisect": bisect,
     }
+    if ram_floor_mb:
+        result["ram_floor"] = {"floor_mb": ram_floor_mb,
+                               "stopped_before": ram_floor_stops}
     if mps:
         result["fit_sampled"] = fit_sampled
         result["mps_watermark"] = {
