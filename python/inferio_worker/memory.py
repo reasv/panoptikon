@@ -9,9 +9,11 @@ the device reports no `base_mb` rather than 0. Imports are stdlib only.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import re
+import struct
 import sys
 import threading
 import time
@@ -27,8 +29,11 @@ logger = logging.getLogger("inferio_worker.memory")
 
 _MIB = 1024 * 1024
 
-# Accelerator-context allowance when this process could not measure its own.
-CONTEXT_ESTIMATE_MB = 500
+# Accelerator-context allowance when this process could not measure its own,
+# at least the largest context measured on each backend (CUDA 668 MiB, HIP
+# 286 MiB). 700 is the default for every backend without a figure of its own.
+CONTEXT_ESTIMATE_MB = 700
+HIP_CONTEXT_ESTIMATE_MB = 300
 
 # Plausible band (MiB) for a measured context; outside it the estimate is used.
 CONTEXT_MIN_MB = 64
@@ -59,6 +64,7 @@ _logged: dict[str, bool] = {
     "hip_uuid_suppressed": False,
     "fdinfo_identity": False,
     "fdinfo_under_reported": False,
+    "per_process_over_total": False,
 }
 
 # This worker's GPU PCI address, memoized on success only.
@@ -66,6 +72,16 @@ _bdf_state: dict[str, Any] = {"bdf": None}
 
 # This process's DRM clients (Linux only).
 FDINFO_ROOT = "/proc/self/fdinfo"
+
+# KFD's tree: `proc/<pid>/vram_<gpu_id>` per process, `topology/nodes` per GPU.
+KFD_ROOT = "/sys/class/kfd/kfd"
+
+# Every process's `/proc/<pid>`.
+PROC_ROOT = "/proc"
+
+# `/proc/self/ns/pid` in the initial PID namespace, the only one where KFD's
+# `proc/<pid>` names are our PIDs.
+INIT_PID_NS = "pid:[4026531836]"
 
 # amdgpu per-GPU VRAM counters (`<root>/<bdf>/mem_info_vram_{total,used}`), the
 # same files the orchestrator reads.
@@ -328,7 +344,7 @@ def _hip_pinned() -> bool:
     return any(entry.strip() for entry in value.split(","))
 
 
-def _unified_gpu() -> bool:
+def unified_gpu() -> bool:
     """Whether this worker is on a unified-memory device. The spawner's
     `PANOPTIKON_UNIFIED_GPU=<pci address>` is checked against `_identity_bdf`.
     """
@@ -342,7 +358,7 @@ def _memory_regions() -> tuple[str, ...]:
     """DRM regions this worker's usage is summed over: VRAM, plus GTT on a
     unified-memory device (an APU spills into GTT once the carve-out fills).
     """
-    return ("vram", "gtt") if _unified_gpu() else ("vram",)
+    return ("vram", "gtt") if unified_gpu() else ("vram",)
 
 
 def pinned_device_missing() -> str | None:
@@ -585,6 +601,16 @@ def _props_bdf(props: Any) -> str | None:
     return f"{domain:04x}:{bus:02x}:{device:02x}.0"
 
 
+def gpu_integrated() -> bool | None:
+    """HIP's `integrated` for this worker's GPU (torch's `is_integrated`), or
+    None off ROCm; the host checks it against its own APU verdict.
+    """
+    if _ram_currency() or not _is_hip(_torch()):
+        return None
+    integrated = _prop(_device_props(), "is_integrated")
+    return None if integrated is None else bool(integrated)
+
+
 def gpu_total_mb() -> int | None:
     """Total device memory in MiB per torch, or None; the orchestrator
     cross-checks it against the driver. On MPS it is `recommended_max_memory()`.
@@ -738,48 +764,156 @@ def fdinfo_own_vram_mb(root: str | None = None) -> int | None:
     return own_mb if own_mb else None
 
 
-def _fdinfo_base_mb(
+def _drm_pasids(texts: Iterable[str]) -> set[int]:
+    """The non-zero amdgpu `pasid:` of each DRM client in `texts`."""
+    pasids: set[int] = set()
+    for text in texts:
+        for line in text.splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() == "pasid" and value.strip().isdigit():
+                pasids.add(int(value))
+    pasids.discard(0)
+    return pasids
+
+
+def _in_initial_pid_ns() -> bool:
+    try:
+        link = os.readlink(os.path.join(PROC_ROOT, "self", "ns", "pid"))
+    except OSError:
+        return False
+    return link == INIT_PID_NS
+
+
+def _kfd_gpu_id(bdf: str) -> int | None:
+    """KFD's id for the GPU at `bdf`, from its topology node."""
+    nodes = os.path.join(KFD_ROOT, "topology", "nodes")
+    try:
+        names = os.listdir(nodes)
+    except OSError:
+        return None
+    for name in names:
+        path = os.path.join(nodes, name, "properties")
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                fields = [line.split() for line in handle.read().splitlines()]
+        except OSError:
+            continue
+        props = {pair[0]: pair[1] for pair in fields if len(pair) > 1}
+        try:
+            domain, location = int(props["domain"]), int(props["location_id"])
+        except (KeyError, ValueError):
+            continue
+        # `location_id` is bus << 8 | device << 3, as `rocm.rs` decodes it.
+        node_bdf = (
+            f"{domain:04x}:{(location >> 8) & 0xFF:02x}:"
+            f"{(location >> 3) & 0x1F:02x}.0"
+        )
+        if node_bdf == bdf:
+            return _sysfs_bytes(os.path.join(nodes, name, "gpu_id"))
+    return None
+
+
+def _kfd_own_dir() -> str | None:
+    """This process's entry under KFD's `proc`: by PID in the initial PID
+    namespace, elsewhere by the PASID KFD gives our DRM clients. None when
+    the entry is not ours alone: another process here holding the PASID is a
+    fork, and the entry could be either's.
+    """
+    entries = os.path.join(KFD_ROOT, "proc")
+    if _in_initial_pid_ns():
+        own = os.path.join(entries, str(os.getpid()))
+        return own if os.path.isdir(own) else None
+    pasids = _drm_pasids(_fdinfo_texts(FDINFO_ROOT))
+    try:
+        matches = [
+            os.path.join(entries, name)
+            for name in os.listdir(entries)
+            if _sysfs_bytes(os.path.join(entries, name, "pasid")) in pasids
+        ]
+        others = [
+            os.path.join(PROC_ROOT, name, "fdinfo")
+            for name in os.listdir(PROC_ROOT)
+            if name.isdigit() and name != str(os.getpid())
+        ]
+    except OSError:
+        return None
+    if len(matches) != 1:
+        return None
+    pasid = _sysfs_bytes(os.path.join(matches[0], "pasid"))
+    if any(pasid in _drm_pasids(_fdinfo_texts(other)) for other in others):
+        return None
+    return matches[0]
+
+
+def kfd_own_vram_mb() -> int | None:
+    """This process's VRAM on its GPU per KFD's counter, in MiB, or None."""
+    bdf = _identity_bdf()
+    gpu_id = _kfd_gpu_id(bdf) if bdf is not None else None
+    own = _kfd_own_dir() if gpu_id is not None else None
+    if own is None:
+        return None
+    return _mb(_sysfs_bytes(os.path.join(own, f"vram_{gpu_id}"))) or None
+
+
+def _rocm_base(
     reserved_mb: int | None,
     reserved_delta: int | None,
-    root: str | None = None,
-) -> int | None:
-    """`fdinfo_own_vram_mb` if plausible, ROCm only. Older kernels under-report
-    compute memory, so the reading must not fall below our own absolute
-    post-load allocator pool (`reserved_mb`).
+) -> tuple[int, str] | None:
+    """This process's VRAM and its source, ROCm only, if plausible: the
+    larger of DRM fdinfo, which under-reads on some kernels, and KFD's
+    per-process counter, once any reading at or above the GPU's total is
+    dropped. A unified GPU keeps fdinfo, whose figure includes GTT; KFD's
+    counts VRAM alone. Older kernels under-report compute memory, so the
+    reading must not fall below our own absolute post-load allocator pool
+    (`reserved_mb`).
     """
     if not _is_hip(_torch()):
         return None
-    own = fdinfo_own_vram_mb(root)
-    if own is None:
-        return None
+    unified = unified_gpu()
+    candidates = [(fdinfo_own_vram_mb(), "fdinfo")]
+    if not unified:
+        candidates.append((kfd_own_vram_mb(), "kfd"))
     # On a unified GPU HIP may report only the carve-out as `total_memory`,
     # while the reading includes GTT.
-    total_mb = amdgpu_device_total_mb() if _unified_gpu() else gpu_total_mb()
-    if total_mb is not None and total_mb > 0 and own >= total_mb:
-        logger.debug(
-            "DRM fdinfo reports this process holding %d MiB of a %d MiB GPU; "
-            "rejecting the reading and falling back to the memory deltas",
-            own,
-            total_mb,
-        )
+    total_mb = amdgpu_device_total_mb() if unified else gpu_total_mb()
+    plausible: list[tuple[int, str]] = []
+    for own, method in candidates:
+        if own is None:
+            continue
+        if total_mb is not None and total_mb > 0 and own >= total_mb:
+            if not _logged["per_process_over_total"]:
+                _logged["per_process_over_total"] = True
+                logger.info(
+                    "%s reports this process holding %d MiB of a %d MiB GPU; "
+                    "rejecting the reading",
+                    method,
+                    own,
+                    total_mb,
+                )
+            continue
+        plausible.append((own, method))
+    if not plausible:
         return None
+    # max() keeps fdinfo on a tie: KFD only where it is larger.
+    own, method = max(plausible, key=lambda candidate: candidate[0])
     pool = reserved_mb if reserved_mb is not None else reserved_delta
     floor = (pool or 0) - FDINFO_UNDERREPORT_SLACK_MB
     if own < floor:
         if not _logged["fdinfo_under_reported"]:
             _logged["fdinfo_under_reported"] = True
-            logger.debug(
-                "DRM fdinfo reports this process holding %d MiB of VRAM while "
-                "our own allocator pool is %d MiB (-%d MiB tolerance); "
-                "rejecting the reading as an under-report (fdinfo memory stats "
-                "for compute allocations need a recent kernel) and falling "
-                "back to the memory deltas",
+            logger.info(
+                "%s reports this process holding %d MiB of VRAM while our own "
+                "allocator pool is %d MiB (-%d MiB tolerance); rejecting the "
+                "reading as an under-report (per-process memory stats for "
+                "compute allocations need a recent kernel) and falling back "
+                "to the memory deltas",
+                method,
                 own,
                 pool or 0,
                 FDINFO_UNDERREPORT_SLACK_MB,
             )
         return None
-    return own
+    return (own, method)
 
 
 # --- amdgpu sysfs (device-wide free/total for this worker's GPU) ---
@@ -788,26 +922,40 @@ def _fdinfo_base_mb(
 def amdgpu_free_total_mb(root: str | None = None) -> tuple[int | None, int | None]:
     """Device-wide `(free_mb, total_mb)` for this worker's GPU from amdgpu sysfs
     (the files the orchestrator reads), or `(None, None)`. On a unified-memory
-    device GTT is added, its free part clamped by available RAM (less
-    reclaimable slab, as `rocm.rs` reads it).
+    device GTT is added, its free part clamped by available RAM
+    (`_ram_bounds_bytes`, as `rocm.rs` reads it).
     """
+    reading = _amdgpu_reading(root)
+    return (reading.free_mb, reading.total_mb)
+
+
+def _amdgpu_reading(root: str | None = None) -> FreeReading:
+    """`amdgpu_free_total_mb` as a reading; on a unified-memory device with
+    both terms of its GTT clamp, unclaimed GTT and deliverable RAM."""
     bdf = _identity_bdf()
     if bdf is None:
-        return (None, None)
+        return FreeReading(None, None, None)
     device = _pci_device_dir(PCI_DEVICES_ROOT if root is None else root, bdf)
     total = _sysfs_bytes(os.path.join(device, "mem_info_vram_total"))
     used = _sysfs_bytes(os.path.join(device, "mem_info_vram_used"))
     if total is None or used is None:
-        return (None, None)
-    if _unified_gpu():
+        return FreeReading(None, None, None)
+    if unified_gpu():
         gtt_total = _sysfs_bytes(os.path.join(device, "mem_info_gtt_total"))
         gtt_used = _sysfs_bytes(os.path.join(device, "mem_info_gtt_used"))
-        available = _ram_available_bytes()
+        available = _ram_bounds_bytes()[1]
         if gtt_total is None or gtt_used is None or available is None:
-            return (None, None)
-        free = max(total - used, 0) + min(max(gtt_total - gtt_used, 0), available)
-        return (_mb(free), _mb(total + gtt_total))
-    return (_mb(total - used), _mb(total))
+            return FreeReading(None, None, None)
+        gtt_free = max(gtt_total - gtt_used, 0)
+        free = max(total - used, 0) + min(gtt_free, available)
+        return FreeReading(
+            _mb(free),
+            _mb(total + gtt_total),
+            "amdgpu-sysfs",
+            ram_available_mb=_mb(available),
+            gtt_free_mb=_mb(gtt_free),
+        )
+    return FreeReading(_mb(total - used), _mb(total), "amdgpu-sysfs")
 
 
 def amdgpu_device_total_mb(root: str | None = None) -> int | None:
@@ -819,7 +967,7 @@ def amdgpu_device_total_mb(root: str | None = None) -> int | None:
     total = _sysfs_bytes(os.path.join(device, "mem_info_vram_total"))
     if total is None:
         return None
-    if _unified_gpu():
+    if unified_gpu():
         gtt_total = _sysfs_bytes(os.path.join(device, "mem_info_gtt_total"))
         if gtt_total is None:
             return None
@@ -936,10 +1084,11 @@ def _mps_free_with_basis() -> tuple[int | None, int | None, int | None, int | No
     `recommended_max_memory()`; `free` is `min(total, ram_available)`.
     """
     total = _mps_call("recommended_max_memory")
+    read_at = time.monotonic()
     facts = _mac_memory_counters()
     if not total or facts is None:
         return (None, None, None, None)
-    available = _mac_available(facts)
+    available = _mac_available(facts, read_at)
     return (_mb(min(total, available)), _mb(total), _mb(facts[0]), _mb(available))
 
 
@@ -959,52 +1108,65 @@ def mac_available_bytes() -> int | None:
     """RAM a new allocation could get on macOS, or None off it
     (`_mac_available`). psutil's `available` does not track MPS allocations.
     """
+    read_at = time.monotonic()
     facts = _mac_memory_counters()
     if facts is None:
         return None
-    return _mac_available(facts)
+    return _mac_available(facts, read_at)
 
 
-def _mac_available(facts: tuple[int, int, int, int, int, int]) -> int:
-    """Total RAM minus wired, compressed and anonymous pages; 0 at critical
-    memory pressure, and at warning while the kernel is paging
-    (`_mac_paging`): the file cache this formula counts as available is not
-    free then. Warning without paging only means memory is held compressed.
-    Same as `mps.rs::available_bytes`.
+def _mac_available(facts: tuple[int, ...], read_at: float) -> int:
+    """Total RAM minus wired, compressed and anonymous pages, and at warning
+    the file cache too: macOS then makes room by compressing and swapping
+    other memory, not only by dropping it. 0 at critical memory pressure, and
+    at warning while the kernel is paging (`_mac_paging`). Same as
+    `mps.rs::available_bytes`.
     """
-    ram, wired, compressed, anonymous, pressure, swapouts = facts
-    paging = _mac_paging(swapouts)
+    ram, wired, compressed, anonymous, pressure, swapouts, file_backed = facts
+    paging = _mac_paging(swapouts, read_at)
     if pressure >= MAC_PRESSURE_CRITICAL:
         return 0
     if pressure >= MAC_PRESSURE_WARNING and paging:
         return 0
-    return max(0, ram - wired - compressed - anonymous)
+    taken = wired + compressed + anonymous
+    if pressure >= MAC_PRESSURE_WARNING:
+        taken += file_backed
+    return max(0, ram - taken)
 
 
-def _mac_paging(swapouts: int) -> bool:
-    """Whether macOS swapped pages out between the previous reading and this
-    one, or within `MAC_PAGING_SECONDS` before it. A first reading, or one
-    whose predecessor is older than `MAC_PAGING_STALE_SECONDS`, has nothing
-    to compare with and is not paging.
+def _mac_paging(swapouts: int, read_at: float) -> bool:
+    """Whether macOS swapped pages out within `MAC_PAGING_SECONDS` before
+    `read_at`, the monotonic time taken before reading `swapouts`, or after
+    `_swapouts["since"]` (`count_paging_from_last_reading`). A rise is dated
+    by the earlier reading of the pair that saw it: it happened after that
+    reading. Same as `mps.rs::Swapouts`.
     """
-    now = time.monotonic()
-    previous, read_at = _swapouts["count"], _swapouts["read_at"]
-    _swapouts["count"], _swapouts["read_at"] = swapouts, now
-    if (
-        previous is not None
-        and swapouts > previous
-        and now - read_at <= MAC_PAGING_STALE_SECONDS
-    ):
-        _swapouts["rose_at"] = now
-    rose_at = _swapouts["rose_at"]
-    return rose_at is not None and now - rose_at <= MAC_PAGING_SECONDS
+    if _swapouts["count"] is not None and swapouts > _swapouts["count"]:
+        _swapouts["rose_after"] = _swapouts["read_at"]
+    _swapouts["count"], _swapouts["read_at"] = swapouts, read_at
+    rose_after, since = _swapouts["rose_after"], _swapouts["since"]
+    return rose_after is not None and (
+        read_at - rose_after <= MAC_PAGING_SECONDS
+        or (since is not None and rose_after >= since)
+    )
+
+
+def count_paging_from_last_reading(counted: bool) -> None:
+    """While `counted`, a swap-out rise after the latest reading is paging
+    however long ago it was (`_mac_paging`). Set as each batch of a window
+    starts, so the next batch's reading counts paging during this one, and
+    cleared after each predict reply, so no reading until the next window's
+    first batch counts paging from the idle time before it."""
+    _swapouts["since"] = _swapouts["read_at"] if counted else None
 
 
 # `vm_statistics64_data_t` (<mach/vm_statistics.h>) layout and the flavour
 # that fills it. Indexes: `wire_count`, `swapouts`, `compressor_page_count`,
-# `internal_page_count` (pageable anonymous pages, so wired are not counted).
+# `external_page_count` (the file cache) and `internal_page_count` (pageable
+# anonymous pages, so wired are not counted).
 _VM_STATISTICS64 = "@4I9Q2I4Q4IQ"
-_VM_WIRE, _VM_SWAPOUTS, _VM_COMPRESSOR, _VM_INTERNAL = 3, 18, 19, 22
+_VM_WIRE, _VM_SWAPOUTS, _VM_COMPRESSOR = 3, 18, 19
+_VM_EXTERNAL, _VM_INTERNAL = 21, 22
 _HOST_VM_INFO64 = 4
 
 # `kern.memorystatus_vm_pressure_level` values.
@@ -1014,15 +1176,15 @@ MAC_PRESSURE_NORMAL, MAC_PRESSURE_WARNING, MAC_PRESSURE_CRITICAL = 1, 2, 4
 # Must match `mps.rs::PAGING_WINDOW`.
 MAC_PAGING_SECONDS = 10.0
 
-# The oldest previous reading a rise is still judged against: an older one
-# cannot say when the counter rose. Longer than `MAC_PAGING_SECONDS` so that
-# batches longer than that still see the kernel paging. Must match
-# `mps.rs::PAGING_STALE`.
-MAC_PAGING_STALE_SECONDS = 60.0
-
-# The swap-out counter at the previous reading, when that was, and when the
-# counter was last seen to rise.
-_swapouts: dict[str, Any] = {"count": None, "read_at": None, "rose_at": None}
+# The swap-out counter at the last reading and when that was; the time of the
+# earlier reading of the most recent pair whose counter rose; and the instant
+# after which a rise counts as paging however long ago it was.
+_swapouts: dict[str, Any] = {
+    "count": None,
+    "read_at": None,
+    "rose_after": None,
+    "since": None,
+}
 
 
 def _mac_pressure_level() -> int:
@@ -1031,9 +1193,10 @@ def _mac_pressure_level() -> int:
     return level or MAC_PRESSURE_NORMAL
 
 
-def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
-    """`(ram, wired, compressed, anonymous)` bytes, the memory pressure level
-    and the pages swapped out since boot, from macOS; or None.
+def _mac_memory_counters() -> tuple[int, ...] | None:
+    """`(ram, wired, compressed, anonymous)` bytes, the memory pressure level,
+    the pages swapped out since boot and the file cache in bytes, from macOS;
+    or None.
     """
     if sys.platform != "darwin":
         return None
@@ -1042,9 +1205,7 @@ def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
         return None
     pressure = _mac_pressure_level()
     try:
-        import ctypes
         import ctypes.util
-        import struct
 
         libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
         size = struct.calcsize(_VM_STATISTICS64)
@@ -1058,7 +1219,9 @@ def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
         )
         if failed:
             return None
-        stats = struct.unpack(_VM_STATISTICS64, buffer.raw[:size])
+        wired, compressed, anonymous, swapouts, file_backed = _vm_statistics(
+            buffer.raw
+        )
         page = os.sysconf("SC_PAGE_SIZE")
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("macOS memory counters unreadable: %s", exc)
@@ -1067,11 +1230,25 @@ def _mac_memory_counters() -> tuple[int, int, int, int, int, int] | None:
         return None
     return (
         ram,
-        stats[_VM_WIRE] * page,
-        stats[_VM_COMPRESSOR] * page,
-        stats[_VM_INTERNAL] * page,
+        wired * page,
+        compressed * page,
+        anonymous * page,
         pressure,
+        swapouts,
+        file_backed * page,
+    )
+
+
+def _vm_statistics(raw: bytes) -> tuple[int, int, int, int, int]:
+    """`(wire_count, compressor_page_count, internal_page_count, swapouts,
+    external_page_count)` from a packed `vm_statistics64_data_t`."""
+    stats = struct.unpack(_VM_STATISTICS64, raw)
+    return (
+        stats[_VM_WIRE],
+        stats[_VM_COMPRESSOR],
+        stats[_VM_INTERNAL],
         stats[_VM_SWAPOUTS],
+        stats[_VM_EXTERNAL],
     )
 
 
@@ -1083,18 +1260,6 @@ def _virtual_memory() -> Any | None:
         return None
     try:
         return psutil.virtual_memory()
-    except Exception:
-        return None
-
-
-def _ram_available_bytes() -> int | None:
-    """psutil's `virtual_memory().available` in bytes, on Linux less
-    reclaimable slab (`_reclaimable_slab_bytes`), or None."""
-    memory = _virtual_memory()
-    if memory is None:
-        return None
-    try:
-        return max(int(memory.available) - _reclaimable_slab_bytes(), 0)
     except Exception:
         return None
 
@@ -1114,7 +1279,6 @@ def _sysctl(name: str, size: int) -> bytes | None:
     if sys.platform != "darwin":
         return None
     try:
-        import ctypes
         import ctypes.util
 
         libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
@@ -1241,10 +1405,54 @@ def _reclaimable_slab_bytes() -> int:
     return 0
 
 
+def windows_available_bytes() -> int | None:
+    """RAM a new allocation could get on Windows, or None off it: free
+    physical memory, bounded by the commit left at the pagefile's current
+    size (beyond it Windows refuses the allocation or grows the pagefile).
+    Same as `cpu.rs`.
+    """
+    status = _windows_memory_status()
+    if status is None:
+        return None
+    return min(status.ullAvailPhys, status.ullAvailPageFile)
+
+
+class _MemoryStatusEx(ctypes.Structure):
+    """`MEMORYSTATUSEX`."""
+
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def _windows_memory_status() -> _MemoryStatusEx | None:
+    """`GlobalMemoryStatusEx`, or None off Windows or on error."""
+    if sys.platform != "win32":
+        return None
+    status = _MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Windows memory status unreadable: %s", exc)
+        return None
+    return status
+
+
 def _ram_bounds_bytes(root: str | None = None) -> tuple[int | None, int | None]:
     """`(total, available)` in bytes for a CPU-priced host, or `(None, None)`:
-    psutil (macOS available from `mac_available_bytes`; Linux less
-    `SReclaimable`), bounded by the cgroup limit. Must match `cpu.rs`.
+    psutil (macOS available from `mac_available_bytes`, Windows from
+    `windows_available_bytes`; Linux less `SReclaimable`), bounded by the
+    cgroup limit. Must match `cpu.rs`.
     """
     memory = _virtual_memory()
     if memory is None:
@@ -1256,9 +1464,11 @@ def _ram_bounds_bytes(root: str | None = None) -> tuple[int | None, int | None]:
         return (None, None)
     if total <= 0:
         return (None, None)
-    mac_available = mac_available_bytes()
-    if mac_available is not None:
-        available = mac_available
+    for reader in (mac_available_bytes, windows_available_bytes):
+        value = reader()
+        if value is not None:
+            available = value
+            break
     available = max(available - _reclaimable_slab_bytes(), 0)
     limit, used = cgroup_limit_used_bytes(root)
     if limit is not None:
@@ -1370,8 +1580,6 @@ def _malloc_trim() -> Any | None:
     if not sys.platform.startswith("linux"):
         return None
     try:
-        import ctypes
-
         return ctypes.CDLL(None).malloc_trim
     except (OSError, AttributeError):
         return None
@@ -1420,6 +1628,9 @@ def device_memory_sample() -> dict[str, Any] | None:
     }
     if reading.source == "mps":
         sample["ram_total_mb"] = reading.ram_total_mb
+        sample["ram_available_mb"] = reading.ram_available_mb
+    if reading.gtt_free_mb is not None:
+        sample["gtt_free_mb"] = reading.gtt_free_mb
         sample["ram_available_mb"] = reading.ram_available_mb
     if all(value is None for value in sample.values()):
         return None
@@ -1488,55 +1699,68 @@ GROWTH_RELEASE = "growth"
 SPILL_RELEASE = "spill"
 
 # The last release, whether the next batch's pool growth is its re-grow, and
-# the largest batch (in units) run since it; None until a batch runs.
+# what ran since it: the largest batch in units and the largest grantless
+# window (`run_grantless_window`'s size); None until one runs.
 _release_state: dict[str, Any] = {
     "armed": False,
     "released_mb": None,
     "release_ms": None,
     "trigger": None,
     "largest_units": None,
+    "grantless_size": None,
 }
 
 # The WSL2 GPU device: CUDA through the Windows display driver.
 DXG_DEVICE = "/dev/dxg"
 
+# The orchestrator's verdict for this worker's GPU: "1" spills, "0" fails.
+SPILL_VERDICT_ENV = "PANOPTIKON_SPILLS_TO_RAM"
+
 
 def spill_capable() -> bool:
     """Whether a full GPU moves this worker's memory to system RAM instead of
-    failing the allocation: CUDA under the Windows display driver (native
-    Windows, or WSL2 and Docker Desktop through `/dev/dxg`)."""
+    failing the allocation: CUDA under the Windows display driver. The
+    orchestrator's per-GPU verdict decides (a TCC card on native Windows
+    fails the allocation); without one, native Windows, and WSL2 and Docker
+    Desktop through `/dev/dxg`, spill."""
     if device_kind() != "cuda":
         return False
+    verdict = os.environ.get(SPILL_VERDICT_ENV)
+    if verdict in ("0", "1"):
+        return verdict == "1"
     return sys.platform == "win32" or os.path.exists(DXG_DEVICE)
 
 
-def outgrows_pool(units: int) -> bool:
-    """Whether a batch of `units` is larger than every batch run since the
-    pool was last released. False when none has run since."""
-    largest = _release_state["largest_units"]
-    return largest is not None and units > largest
+def outgrows_pool(size: int, record: str = "largest_units") -> bool:
+    """Whether `size` is larger than every one in `record` since the pool was
+    last released. False when none has run since."""
+    largest = _release_state[record]
+    return largest is not None and size > largest
 
 
-def note_batch_units(units: int) -> None:
+def note_batch_units(size: int, record: str = "largest_units") -> None:
     """Record a batch that ran, for `outgrows_pool`."""
-    _release_state["largest_units"] = max(_release_state["largest_units"] or 0, units)
+    _release_state[record] = max(_release_state[record] or 0, size)
 
 
 def _note_release(
     released_mb: int | None, elapsed_ms: float, trigger: str, arm: bool = True
 ) -> None:
-    """Record a completed release and arm the next batch's re-grow report."""
-    _release_state["armed"] = arm
+    """Record a completed release. Unless it returned nothing, arm the next
+    batch's re-grow report and forget the batch sizes that ran before it."""
+    armed = arm and released_mb != 0
+    _release_state["armed"] = armed
     _release_state["released_mb"] = released_mb
     _release_state["release_ms"] = round(elapsed_ms, 3)
     _release_state["trigger"] = trigger
-    _release_state["largest_units"] = None
+    if released_mb != 0:
+        _release_state["largest_units"] = _release_state["grantless_size"] = None
     logger.debug(
         "released the allocator pool (%s): handed back %s MiB in %.1f ms%s",
         trigger,
         "?" if released_mb is None else released_mb,
         elapsed_ms,
-        "; the next batch pays the re-grow" if arm else "",
+        "; the next batch pays the re-grow" if armed else "",
     )
 
 
@@ -1641,13 +1865,16 @@ def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
 
 
 class FreeReading(NamedTuple):
-    """One free-memory reading, its source and, on MPS, its RAM basis."""
+    """One free-memory reading, its source and, on MPS, its RAM basis. On an
+    APU `free_mb` is free VRAM plus the smaller of `gtt_free_mb` and
+    `ram_available_mb`."""
 
     free_mb: int | None
     total_mb: int | None
     source: str | None
     ram_total_mb: int | None = None
     ram_available_mb: int | None = None
+    gtt_free_mb: int | None = None
 
 
 def _free_total_reading(source: str | None = None) -> FreeReading:
@@ -1668,9 +1895,9 @@ def _free_total_reading(source: str | None = None) -> FreeReading:
         if free is not None:
             return FreeReading(free, total, "nvml")
     if source in (None, "amdgpu-sysfs"):
-        free, total = amdgpu_free_total_mb()
-        if free is not None:
-            return FreeReading(free, total, "amdgpu-sysfs")
+        reading = _amdgpu_reading()
+        if reading.free_mb is not None:
+            return reading
     if source in (None, "mps"):
         free, total, ram_total, ram_available = _mps_free_with_basis()
         if free is not None:
@@ -1714,12 +1941,19 @@ def free_total_reading() -> FreeReading:
 
 # --- Accelerator context: measured once per process ---
 
-# The context this process measured for itself (MiB) and the running probe.
+# The context this process measured for itself (MiB), the running probe, and
+# why the context is not measured yet.
 _context_state: dict[str, Any] = {
     "measured_mb": None,
     "logged": False,
     "probe": None,
+    "unmeasured": None,
 }
+
+# Why the context went unmeasured; a reading outside the band names its figure.
+CONTEXT_NO_DRIVER_READING = "no driver free reading before the load"
+CONTEXT_INITIALISED_BEFORE = "GPU initialised before the load"
+CONTEXT_INIT_UNSEEN = "no reading across the GPU's initialisation"
 
 
 class _ContextProbe:
@@ -1818,12 +2052,9 @@ class _ContextProbe:
             return None
         measured = self._free_before - self._free_at_init - self._reserved_at_init
         if measured < CONTEXT_MIN_MB or measured > CONTEXT_MAX_MB:
-            logger.debug(
-                "discarding a %d MiB context measurement: outside the "
-                "%d-%d MiB band a context can plausibly occupy",
-                measured,
-                CONTEXT_MIN_MB,
-                CONTEXT_MAX_MB,
+            _context_state["unmeasured"] = (
+                f"a {measured} MiB reading is outside the {CONTEXT_MIN_MB}-"
+                f"{CONTEXT_MAX_MB} MiB a context can occupy"
             )
             return None
         return measured
@@ -1843,30 +2074,31 @@ def _reserved_mb_unguarded() -> int | None:
 def _start_context_probe(
     free_mb: int | None, free_source: str | None
 ) -> "_ContextProbe | None":
-    """Start the context probe, or None when no measurement is possible: no
-    driver-level reading, a RAM-priced process, CUDA already initialised, or a
-    context already measured. A leftover probe is collected first."""
-    _collect_context_probe(announce=False)
-    if free_mb is None or free_source not in ("nvml", "amdgpu-sysfs"):
-        return None
+    """Start the context probe, or None when no measurement is possible: a
+    RAM-priced process, a context already measured, no driver-level reading,
+    or CUDA already initialised. A leftover probe is collected first."""
+    _collect_context_probe()
     if _ram_currency() or _context_state["measured_mb"] is not None:
+        return None
+    if free_mb is None or free_source not in ("nvml", "amdgpu-sysfs"):
+        _context_state["unmeasured"] = CONTEXT_NO_DRIVER_READING
         return None
     torch = _torch()
     if torch is not None:
         try:
             if torch.cuda.is_initialized():
+                _context_state["unmeasured"] = CONTEXT_INITIALISED_BEFORE
                 return None
         except Exception:
             return None
+    _context_state["unmeasured"] = CONTEXT_INIT_UNSEEN
     probe = _ContextProbe(free_mb, free_source)
     probe.start()
     _context_state["probe"] = probe
     return probe
 
 
-def _collect_context_probe(
-    probe: "_ContextProbe | None" = None, announce: bool = True
-) -> None:
+def _collect_context_probe(probe: "_ContextProbe | None" = None) -> None:
     """Stop any running context probe and keep its result."""
     running = _context_state.get("probe")
     _context_state["probe"] = None
@@ -1880,7 +2112,7 @@ def _collect_context_probe(
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("could not collect the context probe: %s", exc)
             continue
-        if measured is not None or announce:
+        if measured is not None:
             _remember_context_mb(measured)
 
 
@@ -1890,7 +2122,7 @@ def abort_load(before: dict[str, Any]) -> None:
     """
     try:
         probe = before.get("context_probe") if isinstance(before, dict) else None
-        _collect_context_probe(probe, announce=False)
+        _collect_context_probe(probe)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("post-failure memory cleanup failed: %s", exc)
 
@@ -1902,6 +2134,8 @@ def context_allowance_mb() -> tuple[int, str]:
     measured = _context_state["measured_mb"]
     if measured is not None:
         return (int(measured), "measured")
+    if _is_hip(_torch()):
+        return (HIP_CONTEXT_ESTIMATE_MB, "estimate")
     return (CONTEXT_ESTIMATE_MB, "estimate")
 
 
@@ -1916,15 +2150,15 @@ def _remember_context_mb(measured: int | None) -> None:
     if source == "measured":
         logger.info(
             "measured this process's accelerator context at %d MiB across its "
-            "first CUDA initialisation; using it instead of the %d MiB estimate",
+            "first CUDA initialisation; using it instead of the estimate",
             allowance,
-            CONTEXT_ESTIMATE_MB,
         )
     else:
         logger.info(
-            "could not measure this process's accelerator context; using the "
-            "%d MiB estimate",
-            CONTEXT_ESTIMATE_MB,
+            "could not measure this process's accelerator context (%s); using "
+            "the %d MiB estimate",
+            _context_state["unmeasured"] or "no reading",
+            allowance,
         )
 
 
@@ -1961,7 +2195,7 @@ def finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
         return {}
 
 
-def after_load(price: Callable[[], Any]) -> tuple[Any, str]:
+def after_load(price: Callable[[], Any]) -> tuple[Any, dict[str, str] | str]:
     """The step after `instance.load()`, shared by the worker and the ceiling
     probe: refuse a pin that named nothing (RuntimeError), price the load with
     `price()`, then run the GQA check, after the pricing so its test call is
@@ -2032,6 +2266,9 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     total_mb = gpu_total_mb()
     if total_mb is not None:
         payload["gpu_total_mb"] = total_mb
+    integrated = gpu_integrated()
+    if integrated is not None:
+        payload["gpu_integrated"] = integrated
     version = torch_version()
     if version is not None:
         payload["torch_version"] = version
@@ -2061,7 +2298,7 @@ def _resolve_base(
     """`(base_mb, base_method)`, or `(None, None)`.
 
     1. A process that did not allocate through torch reports nothing.
-    2. A per-process figure wins: NVML, fdinfo (ROCm), or MPS
+    2. A per-process figure wins: NVML, KFD or fdinfo (ROCm), or MPS
        `driver_allocated_memory()`.
     3. Otherwise the free-memory delta, if positive and not implausibly larger
        than the pool's growth (`reserved_delta`) plus the context and slack.
@@ -2075,9 +2312,9 @@ def _resolve_base(
     own = _nvml_own_process_mb(holding_mb=reserved_mb)
     if own is not None and own > 0:
         return (own, "nvml")
-    own = _fdinfo_base_mb(reserved_mb, reserved_delta)
-    if own is not None and own > 0:
-        return (own, "fdinfo")
+    rocm = _rocm_base(reserved_mb, reserved_delta)
+    if rocm is not None and rocm[0] > 0:
+        return rocm
     # On MPS each process owns its heap, so this is its whole footprint.
     own = _mb(_mps_call("driver_allocated_memory"))
     if own is not None and own > 0:
@@ -2103,9 +2340,11 @@ def _resolve_base(
                 context_source,
                 IMPLAUSIBLE_SLACK_MB,
             )
-        return (floor + context_mb, alloc_method)
-    if free_delta >= floor:
+    elif free_delta >= floor:
         return (free_delta, "free_delta")
+    if context_source == "estimate":
+        # Log once which estimate priced this base.
+        _remember_context_mb(None)
     return (floor + context_mb, alloc_method)
 
 
@@ -2483,6 +2722,7 @@ def measure_batch(
     free_source: str | None = None,
     ram_mb: tuple[int | None, int | None] | None = None,
     clamped: dict[str, Any] | None = None,
+    gtt_mb: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """One measurement map for the batch bracketed by `state` (never raises).
 
@@ -2506,6 +2746,18 @@ def measure_batch(
         # Keep the rest of the measurement (an OOM, a live reading).
         logger.debug("batch measurement failed: %s", exc)
         reserved_after = peak_reserved = peak_allocated = None
+    # A pool emptied during the batch leaves the peak at the pre-batch pool
+    # the reset copied, which is not this batch's peak.
+    before = state.get("reserved_before_mb")
+    if (
+        sampled_pool is None
+        and peak_reserved is not None
+        and before is not None
+        and reserved_after is not None
+        and reserved_after < before
+        and peak_reserved <= before
+    ):
+        peak_reserved = None
     started = state.get("started")
     duration_ms = (
         round((time.perf_counter() - started) * 1000.0, 3)
@@ -2548,6 +2800,9 @@ def measure_batch(
         if ram_mb is not None:
             # The RAM basis of this same reading (MPS).
             measurement["ram_total_mb"], measurement["ram_available_mb"] = ram_mb
+        if gtt_mb is not None:
+            # The two terms of this same reading's GTT clamp (an APU).
+            measurement["gtt_free_mb"], measurement["ram_available_mb"] = gtt_mb
     if clamped:
         measurement["clamped"] = clamped
     if state.get("host_ram") and sampled_rss is not None:

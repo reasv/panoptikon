@@ -801,7 +801,7 @@ def test_selftest_reads_free_until_it_settles():
         free_total_mb=lambda: (1000, 24576, "amdgpu-sysfs"),
         _free_mb=lambda source: (lambda free: (
             free, None if free is None else source))(next(reads)),
-        _unified_gpu=lambda: False)
+        unified_gpu=lambda: False)
     sleeps = []
     assert selftest.settled_free_mb(memory, sleeps.append) == (
         2000, "amdgpu-sysfs", 3.0, True)
@@ -819,10 +819,29 @@ def test_selftest_reads_free_until_it_settles():
         reads = iter([1000, 2000])
         memory = types.SimpleNamespace(
             free_total_mb=lambda: (next(reads), 4096, source),
-            _unified_gpu=lambda: unified)
+            unified_gpu=lambda: unified)
         assert selftest.settled_free_mb(memory, sleeps.append) == (
             1000, source, None, None)
         assert next(reads) == 2000
+
+
+def test_selftest_asks_every_base_tier_of_the_worker(monkeypatch):
+    # The tiers are the worker's own private functions; a renamed one would
+    # only show as an except arm's "raised" reason.
+    monkeypatch.syspath_prepend(str(HERE.parents[1] / "python"))
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    from inferio_worker import memory
+
+    monkeypatch.setitem(memory._nvml_state, "module_tried", True)
+    monkeypatch.setitem(memory._nvml_state, "module", None)
+    rows = selftest.probe_base_tiers(memory, {}, 1024, 1024, 1024)
+    assert [r["reason"] for r in rows if "raised" in (r["reason"] or "")] == []
+    # A KFD base is its own row and a direct per-process figure.
+    monkeypatch.setattr(memory, "_rocm_base", lambda *args: (1600, "kfd"))
+    rows = selftest.probe_base_tiers(memory, {}, 1024, 1024, 1024)
+    assert ("kfd", 1600) in [(r["tier"], r["value_at_probe_time_mb"]) for r in rows]
+    _, degraded = selftest.verdict_line({"base": {"base_method": "kfd"}})
+    assert [d for d in degraded if d.startswith("base:")] == []
 
 
 def test_newrun_records_the_gpu_nodes(tmp_path):

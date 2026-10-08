@@ -74,12 +74,13 @@ and dictate the design that follows.
    indices only, indexing into the ROCR-filtered set when both are set.
    torch-ROCm honours `HIP_VISIBLE_DEVICES` first, then
    `ROCR_VISIBLE_DEVICES`, then `CUDA_VISIBLE_DEVICES` — and **torch < 2.6
-   crashes at init when `ROCR_VISIBLE_DEVICES` is set** (fixed by
-   pytorch#142292). There is no `CUDA_DEVICE_ORDER` analogue and no
-   FASTEST_FIRST reordering on HIP. Because HIP filters *above* ROCr, a
-   HIP-pinned process still initializes ROCr agents for (and holds render
-   nodes of) every ROCR-visible GPU — per-process kernel state is
-   **not** scoped to the HIP-visible device (review F1).
+   fails at its first GPU use while `ROCR_VISIBLE_DEVICES` is set without a
+   HIP-layer variable** (pytorch#140318, fixed in 2.6). There is no
+   `CUDA_DEVICE_ORDER` analogue and no FASTEST_FIRST reordering on HIP.
+   Because HIP filters *above* ROCr, a HIP-pinned process still initializes
+   ROCr agents for (and holds render nodes of) every ROCR-visible GPU —
+   per-process kernel state is **not** scoped to the HIP-visible device
+   (review F1).
 4. **torch 2.11+rocm7.2** (our `rocm` extra, Linux x86_64 only) has the
    full hipified `torch.cuda.*` memory API: allocator statistics are the
    same code path; `mem_get_info` maps to `hipMemGetInfo` but its "free"
@@ -172,9 +173,11 @@ Linux only:
    CPU. A render node that cannot be opened while KFD still exposes the
    GPU is different: on ROCm 7.2, with that restriction emulated, ROCr
    enumerated no GPU at all, which the worker's pin check refuses. If *no*
-   GPU node is openable, the inventory is unknown. Accepted cost: briefly opening
-   every render node at startup can resume a runtime-suspended GPU, once
-   per boot.
+   GPU node is openable, or `/dev/kfd` is missing or denied (any other
+   open error leaves the inventory unknown), the inventory is known empty
+   and models run on the CPU device. On a ROCm host, opening `/dev/kfd`
+   and every render node at startup can resume a runtime-suspended GPU,
+   and registers the gateway as a KFD process (0 VRAM) until it exits.
 4. From `/sys/bus/pci/devices/<bdf>/`: `mem_info_vram_total` → `total_mb`.
    The all-or-nothing rule (the CUDA parser's, for the same reason) covers
    the whole identity, not just that file. Any **one** of these on any
@@ -209,10 +212,14 @@ Linux only:
    Known cost, accepted for v1: one quirky node costs a hybrid host the
    whole ledger. Partial inventories are worse, because row indices must
    cover the full openable set to mean anything to HIP. Every one of these
-   paths logs a WARN naming the node or GPU; the probe additionally emits
-   one summary WARN for the three paths that name nothing (no KFD GPU
-   nodes at all, every KFD GPU node hidden by a device cgroup, and no
-   openable render node), so a ROCm host is never *silently* unpriced.
+   paths logs a WARN naming the node or GPU, so a ROCm host is never
+   *silently* unpriced. A host where this process can use no GPU (no KFD
+   GPU nodes at all, every KFD GPU node hidden by a device cgroup, or no
+   openable render node) is not a failure: ROCr enumerates nothing there
+   either, so the inventory is known empty and models run on the CPU
+   device, priced against RAM, as under a blank visibility variable. One
+   WARN says so and names the fix (`/dev/kfd`, `/dev/dri` and the render
+   group).
 5. **Device key** (the ledger/config/pin identity, `GpuInfo::uuid`):
    `GPU-<16 lower hex>` from `unique_id` when it is present, nonzero and
    unique across the **openable** GPUs (the post-filter set, i.e. the
@@ -244,16 +251,17 @@ Linux only:
 **Ambient visibility handling (review F3):** stricter than the CUDA rule.
 If *any* of `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`,
 `CUDA_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL` is set non-empty on a ROCm
-host, the inventory is blanked and workers inherit the ambient environment
-verbatim (today's behaviour). No UUID-form carve-out: an ambient ROCR
-filter *changes the HIP index space* (HIP indices count the ROCR-filtered
-set in the ambient list's order), so composing our relative index pins on
-top of it is exactly the ordinal-correlation mistake finding 1 forbids.
-CUDA can afford the UUID carve-out because its pins are absolute UUIDs;
-ROCm pins are relative indices, so "symmetric" would not be symmetric.
-Cost: ambient-restricted hosts (Slurm-style schedulers set ROCR) stay
-unpriced in v1 — safe, documented, and revisitable once the single-var
-ROCR-only composition is worth the complexity.
+host where this process can open a GPU, the inventory is blanked and
+workers inherit the ambient environment verbatim (today's behaviour). No
+UUID-form carve-out: an ambient ROCR filter *changes the HIP index space*
+(HIP indices count the ROCR-filtered set in the ambient list's order), so
+composing our relative index pins on top of it is exactly the
+ordinal-correlation mistake finding 1 forbids. CUDA can afford the UUID
+carve-out because its pins are absolute UUIDs; ROCm pins are relative
+indices, so "symmetric" would not be symmetric. Cost: ambient-restricted
+hosts (Slurm-style schedulers set ROCR) stay unpriced in v1 — safe,
+documented, and revisitable once the single-var ROCR-only composition is
+worth the complexity.
 
 Blanking the inventory withdraws the pins *we* derive; it does not decide
 what happens to a pin the **operator** wrote in the registry. That depends
@@ -323,8 +331,9 @@ is unset — the weaker of the two aliases, on exactly the hosts that are
 hardest to reason about.
 
 Why HIP and not ROCR form: torch honours HIP first on every relevant
-version, torch < 2.6 (possible in user-managed venvs) crashes outright
-when ROCR is set, and AMD documents HIP-level filtering as the
+version, torch < 2.6 (possible in user-managed venvs) fails at its first
+GPU use while ROCR is set without a HIP-layer variable (pytorch#140318),
+and AMD documents HIP-level filtering as the
 application-scoped mechanism. `CUDA_VISIBLE_DEVICES` is deliberately NOT
 also set on ROCm (it is a HIP alias; setting both is documented as
 "unintended behaviour" territory). The accelerator sentinel's HSA/MIOpen
@@ -557,11 +566,11 @@ unchanged, behind the existing `is_initialized` gates.
 - `free_source_is_authoritative` (ledger) adds `"amdgpu-sysfs"` to
   `"nvml" | "nvidia-smi"`. `"torch"` stays non-authoritative — on HIP
   doubly so given the historical process-local `hipMemGetInfo`.
-- `CONTEXT_ESTIMATE_MB = 500` stays as the HIP placeholder for the
-  alloc-delta tier: no published HIP figure exists; with the fdinfo tier
-  available the constant is rarely load-bearing, `IMPLAUSIBLE_SLACK_MB`
-  absorbs the error band, and the value is flagged as a
-  field-calibration item.
+- The alloc-delta tier charges a per-backend context estimate, each at
+  least the largest context measured on that backend:
+  `HIP_CONTEXT_ESTIMATE_MB = 300` (measured 199 MiB on gfx1030, 286 MiB on
+  gfx908) and `CONTEXT_ESTIMATE_MB = 700` for CUDA and any other backend
+  (measured 666–668 MiB).
 
 **As implemented (2026-07-31).** `inferio_worker/memory.py` gained
 `amdgpu_free_total_mb`, `fdinfo_own_vram_mb`, `_fdinfo_base_mb`,
@@ -593,7 +602,7 @@ unchanged, behind the existing `is_initialized` gates.
   `torch.version.hip` is set — or, before any impl has imported torch, when
   `HIP_VISIBLE_DEVICES` is non-empty, which our own spawner writes on every
   pinned ROCm worker and on no other kind.
-- base (`_resolve_base`): **nvml → fdinfo → free_delta → alloc_delta**.
+- base (`_resolve_base`): **nvml → kfd or fdinfo → free_delta → alloc_delta**.
 - **The free-delta rung is structurally dead on a ROCm *first* load**, which
   is worth stating because the ladder above reads as though it were live.
   `begin_load` takes its "before" reading before anything has touched torch —
@@ -604,30 +613,31 @@ unchanged, behind the existing `is_initialized` gates.
   pre-load `amdgpu-sysfs` reading to difference against, the source pin has
   nothing to pin, and the tier is skipped. NVML is why the rung lives on
   CUDA at all: it answers pre-load without a context, from the UUID pin. The
-  real ROCm first-load ladder is therefore **fdinfo → alloc_delta**, and the
-  free delta only ever appears on a *second* load into a worker that already
-  has a device. Consequence for the field pass: `CONTEXT_ESTIMATE_MB` is
-  materially more load-bearing on ROCm than the D4 text above implies —
-  whenever fdinfo is unavailable (an older kernel's VM-walk stats), every
-  first load falls straight to `alloc_delta + CONTEXT_ESTIMATE_MB`, so the
-  HIP context size is promoted from "flagged" to the first number to measure
-  on real hardware.
+  real ROCm first-load ladder is therefore **kfd or fdinfo → alloc_delta**,
+  and the free delta only ever appears on a *second* load into a worker that
+  already has a device. Consequence for the field pass:
+  `HIP_CONTEXT_ESTIMATE_MB` is materially more load-bearing on ROCm than the
+  D4 text above implies — whenever neither KFD nor fdinfo answers (an older
+  kernel's VM-walk stats), every first load falls straight to
+  `alloc_delta + HIP_CONTEXT_ESTIMATE_MB`, so the HIP context size is
+  promoted from "flagged" to the first number to measure on real hardware.
 - **Plausibility floor:** `FDINFO_UNDERREPORT_SLACK_MB = 256`, i.e. an
-  fdinfo reading below `reserved_mb - 256 MB` is rejected (one-shot debug
-  line) and the next tier answers. Rationale: the reading is *expected* above
-  the pool (HIP context + non-torch allocations ride on top), so only a
-  shortfall is suspicious, and the only innocent shortfalls are MiB
+  fdinfo reading below `reserved_mb - 256 MB` is rejected (one-shot INFO
+  line) and the next tier answers. Rationale: the reading is *expected*
+  above the pool (HIP context + non-torch allocations ride on top), so only
+  a shortfall is suspicious, and the only innocent shortfalls are MiB
   truncation on both sides and pages evicted since we committed them
   (`drm-resident-vram` counts *resident* pages). 256 covers those while
-  staying well under `CONTEXT_ESTIMATE_MB`, so a reading that missed a whole
-  HIP context can never pass as jitter. The comparand is the **absolute**
-  post-load pool, not the load window's `reserved_delta`: fdinfo reports
-  absolute whole-process VRAM, the two coincide only on a process's first
-  load, and the ledger explicitly anticipates repeat loads into one worker —
-  where a windowed comparand would wave an under-report through for no better
-  reason than that the second load was small. (`reserved_delta` stays as the
-  fallback for the case where the allocator could not be read after the load
-  at all.)
+  staying under `HIP_CONTEXT_ESTIMATE_MB`. A missed HIP context smaller
+  than 256 MiB (199 MiB was measured on gfx1030) still passes, and whether
+  KFD's per-process counter includes the HIP context is not yet measured.
+  The comparand is the **absolute** post-load pool, not the load window's
+  `reserved_delta`: fdinfo reports absolute whole-process VRAM, the two
+  coincide only on a process's first load, and the ledger explicitly
+  anticipates repeat loads into one worker — where a windowed comparand
+  would wave an under-report through for no better reason than that the
+  second load was small. (`reserved_delta` stays as the fallback for the
+  case where the allocator could not be read after the load at all.)
 - **Upper sanity bound:** a reading at or above the GPU's own
   `total_memory` is rejected too — the twin of the NVML sentinel guard that
   rejects a filled-in `-1`. A per-process figure that equals or exceeds the
@@ -672,7 +682,8 @@ side.
 
 **Extended 2026-08-01 (backend B).** A GPU the probe flagged unified reads
 its GTT counters as well and clamps the unclaimed half by `MemAvailable`
-(less `SReclaimable`, on both sides, as the CPU device reads free RAM),
+(less `SReclaimable` and within the cgroup limit, on both sides, as the CPU
+device reads free RAM),
 because an APU's budget is carve-out + GTT and the pages behind unclaimed GTT
 have to come out of RAM that exists right now
 (docs/unified-memory-admission.md, backend B). Discrete rows read exactly the
@@ -725,6 +736,13 @@ being absent, which is what it used to imply. The README states it as an
 accepted difference, so a ROCm user does not read the missing overlay as a
 bug.
 
+**Backend list (2026-10-04).** A model that loads on some backends only says
+so in its registry metadata, `accelerators = ["cuda", "rocm"]` (dots.ocr, whose
+load asks for FlashAttention 2, which has no CPU or MPS kernels), and the
+overlay marks it unavailable wherever models run on another backend: MPS or
+the CPU device. That is independent of the capability floor, which still
+filters nothing on ROCm.
+
 ### D8 (G8) — Windows machinery: structurally dormant, comparator stays
 
 ROCm-on-Windows/WSL is **out of scope and unreachable through managed
@@ -744,45 +762,45 @@ module is Linux-only by construction (`/sys/class/kfd`, `/dev/dri`) and the
 extra's markers keep ROCm torch off Windows. Both the caveat and the
 out-of-scope statement are in the README's ROCm section.
 
-**APU correction (review, 2026-07-31).** The first statement of this — "a
-node with no readable nonzero `mem_info_vram_total` makes the whole probe
-unknown, so the common integrated-graphics shape is unpriced" — was wrong
-about the *mechanism*, and therefore about the outcome. amdgpu registers
-`mem_info_vram_total` for iGPUs too: it reports the BIOS UMA carve-out (512
-MB is a common default), which is a perfectly readable nonzero number. The
-all-or-nothing VRAM rule therefore did **not** catch APUs; it admitted them
-and priced the host against the carve-out, which collapses every grant to
-batch-1 with nothing in the log to say why. APU nodes are now detected
-positively — KFD models an integrated part as a single node carrying both
-`simd_count > 0` and `cpu_cores_count > 0`, and that combination is the only
-signal there is — and any openable one makes the whole probe unknown with a
-WARN naming the node and its gfx target (D1.4). The node is not *skipped*:
-HIP still enumerates it, so excluding one row would shift every later row's
-device index. So the outcome the design always promised — an APU host is
-**unpriced**, i.e. exactly its pre-branch behaviour — is now what actually
-happens, rather than being an accident of a rule that did not apply.
+**APU correction (review, 2026-07-31).** The first statement of this — "a node
+with no readable nonzero `mem_info_vram_total` makes the whole probe unknown,
+so the common integrated-graphics shape is unpriced" — was wrong about the
+*mechanism*, and therefore about the outcome. amdgpu registers
+`mem_info_vram_total` for iGPUs too: it reports the BIOS UMA carve-out (512 MB
+is a common default), which is a perfectly readable nonzero number. The
+all-or-nothing VRAM rule therefore did **not** catch APUs; it admitted them and
+priced the host against the carve-out, which collapses every grant to batch-1
+with nothing in the log to say why. APU nodes are now detected positively — KFD
+models an integrated part as a single node carrying both `simd_count > 0` and
+`cpu_cores_count > 0` (since replaced by HIP's own test:
+unified-memory-admission.md "What counts as an APU") — and any openable one
+makes the whole probe unknown with a WARN naming the node and its gfx target
+(D1.4). The node is not *skipped*: HIP still enumerates it, so excluding one
+row would shift every later row's device index. So the outcome the design
+always promised — an APU host is **unpriced**, i.e. exactly its pre-branch
+behaviour — is now what actually happens, rather than being an accident of a
+rule that did not apply.
 
-**APUs are priced (2026-08-01).** The decline above was a v1 safety measure
-and it is gone: `docs/unified-memory-admission.md` (backend B) makes such a
-node a **unified-memory device** — total = carve-out + GTT, free = the carve-out's own
+**APUs are priced (2026-08-01).** The decline above was a v1 safety measure and
+it is gone: `docs/unified-memory-admission.md` (backend B) makes such a node a
+**unified-memory device** — total = carve-out + GTT, free = the carve-out's own
 free memory plus as much unclaimed GTT as `MemAvailable` says RAM can deliver,
 name `AMD gfx1151 APU (128 GB)` from physical RAM rather than the
 BIOS-configurable carve-out, and the `unified` flag that turns on the ledger's
 death-as-negative-sample (DP-2) and the worker's GTT-inclusive arithmetic
-(DP-5, `PANOPTIKON_UNIFIED_GPU=<the gpu's PCI address>`, which the worker
-only acts on when it is the address it resolved for itself). The positive KFD
-detection survived
-unchanged — it is the only signal an integrated part has — and so did the
+(DP-5, `PANOPTIKON_UNIFIED_GPU=<the gpu's PCI address>`, which the worker only
+acts on when it is the address it resolved for itself). The positive KFD
+detection survived into that design (since replaced:
+unified-memory-admission.md "What counts as an APU") — and so did the
 all-or-nothing rule: an APU node whose GTT total or whose `MemTotal` cannot be
 read still takes the whole probe unknown, because pricing such a GPU against
 its carve-out is precisely the batch-1 collapse the decline existed to
 prevent. Two consequences worth stating here rather than only in the other
-doc: a **dGPU+APU host is no longer sunk** (both GPUs become rows, and the
-row indices still cover the whole openable set, so they are still HIP device
-indices), and default placement compares the APU's *carve-out* (floored at an
-eighth of its unified budget) rather than its carve+GTT total, so the discrete
-GPU stays the default unless the operator gave the iGPU that memory outright
-in the BIOS.
+doc: a **dGPU+APU host is no longer sunk** (both GPUs become rows, and the row
+indices still cover the whole openable set, so they are still HIP device
+indices), and default placement compares the APU's *carve-out* rather than
+its carve+GTT total, so the discrete GPU stays the default unless the operator
+gave the iGPU that memory outright in the BIOS.
 
 **One consequence of that worth naming, because it is a behaviour change on
 hardware nobody thought of as an APU host:** a desktop with an AMD dGPU and a
@@ -965,10 +983,9 @@ whole host.
   the pin's belief too.
 - The **unpriced-probe** line — *"this host is configured for ROCm but no
   GPU inventory could be built"* (WARN), carrying `reason`, `gpu_nodes` and
-  `openable_nodes`. Emitted once at startup for the three failure paths
-  that name nothing themselves (`no KFD GPU nodes`, `every KFD GPU node is
-  hidden by a device cgroup`, `no openable render node`).
-  It is the answer to "the ledger is simply not there and nothing said why".
+  `openable_nodes`. Emitted once at startup for a failure path that names
+  nothing itself. It is the answer to "the ledger is simply not there and
+  nothing said why".
 - The per-node refusals, each naming the node or GPU that tripped: the
   partitioned-GPU warning — *"this PCI device publishes several KFD
   nodes"* — the absent `simd_count`, unreadable-properties,
@@ -1001,14 +1018,16 @@ Two more things a field pass should settle, neither of which any fixture can:
   contained; what cannot be known without hardware is which of the two paths
   a real partitioned GPU actually takes, and the dedicated test shape may
   simply never occur in the field.
-- **S6: torch < 2.6 in a user-managed venv dies at import under an
-  operator-set `ROCR_VISIBLE_DEVICES`** (pytorch#142292). This is not
-  something the design does — we never write that variable, precisely
-  because of this — but it is a documented assumption: a Slurm-style
-  scheduler sets ROCR, and a venv the user manages themselves can still hold
-  a torch old enough to crash on it. Such a host cannot run workers at all,
-  with or without this branch; the symptom is an import-time crash in the
-  worker, not an admission problem.
+- **torch < 2.6 in a user-managed venv fails at its first GPU use while an
+  operator-set `ROCR_VISIBLE_DEVICES` is set without `HIP_VISIBLE_DEVICES`
+  or `CUDA_VISIBLE_DEVICES`** (an IndexError seeding the devices;
+  pytorch#140318, fixed in 2.6). This is not something the design does — we
+  never write that variable, precisely because of this — but it is a
+  documented assumption: a scheduler that sets ROCR alone, and a venv the
+  user manages themselves can still hold a torch old enough to fail on it.
+  Our spawner writes `HIP_VISIBLE_DEVICES` on every pinned worker, so only
+  an unpinned GPU worker meets this; the worker reads torch's version from
+  its package metadata and fails the handshake naming the cause.
 
 ## Implementation order (all five landed 2026-07-31)
 

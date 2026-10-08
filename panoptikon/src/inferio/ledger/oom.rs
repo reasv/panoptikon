@@ -64,7 +64,7 @@ pub(super) struct OomEvidence {
 }
 
 impl VramLedger {
-    /// Count consecutive out-of-memory windows that carried one item into less
+    /// Count consecutive `failed` windows that carried one item into less
     /// room than one item costs ([`Self::one_unit_appetite_mb_locked`]); at
     /// [`OOM_WINDOWS_AT_FLOOR`] the replica is unrunnable. A clean window
     /// clears the count; an aborted one neither counts nor clears, nor does
@@ -332,11 +332,11 @@ impl std::fmt::Display for UnrunnableReplica {
         }
         write!(
             f,
-            "model {} ran out of memory on GPU {} at a one-item batch {} \
-             windows running: its base is {} MiB of the {} MiB this GPU lends \
-             a window after its reserve, and one item on top of it did not \
-             fit; the next load of it here is refused until this GPU has room \
-             for {} MiB",
+            "model {} did not fit in memory (out of memory, or spilled to \
+             system RAM) on GPU {} at a one-item batch {} windows running: \
+             its base is {} MiB of the {} MiB this GPU lends a window after \
+             its reserve, and one item on top of it did not fit; the next \
+             load of it here is refused until this GPU has room for {} MiB",
             self.inference_id,
             self.gpu,
             OOM_WINDOWS_AT_FLOOR,

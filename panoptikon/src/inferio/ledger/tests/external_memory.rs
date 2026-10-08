@@ -253,6 +253,7 @@ async fn a_frame_fresh_gpu_is_not_re_probed_before_a_load() {
         uuid: GPU.to_owned(),
         total_mb: 32_000,
         free_mb: 1_000,
+        gtt: None,
     }]));
     let handle = loaded(Some(1_000), Some(0));
     let _admission = ledger
@@ -264,6 +265,7 @@ async fn a_frame_fresh_gpu_is_not_re_probed_before_a_load() {
         source: "nvml".to_owned(),
         at: Instant::now() - EXTERNAL_SAMPLE_MAX_AGE - Duration::from_secs(1),
         ram: None,
+        gtt: None,
     });
     push_memory_with_total(&handle, 25_000, 0, Some(32_000), "nvml");
 
@@ -387,6 +389,69 @@ fn external_clamps_at_zero() {
     assert_eq!(gpu.headroom_mb, 1700, "9700 - 8000 footprint");
 }
 
+/// A full GPU that spills to system RAM puts part of our pool off the card:
+/// it is in our footprint but not in the GPU's used memory, so `external`
+/// reads too low. While the GPU reads full or is credited for a departure,
+/// `external` is at least its value at the last pool refresh that was
+/// neither.
+#[test]
+fn a_spilling_gpu_holds_external_while_it_reads_full() {
+    const TOTAL: u64 = 24_000;
+    let externals = |budgets: VramBudgets| {
+        let ledger = VramLedger::for_test(&[(GPU, "TEST 9000", TOTAL)], budgets);
+        let a = loaded(Some(1_000), Some(0));
+        let b = loaded(Some(1_000), Some(0));
+        let a_admission = ledger.register_worker("g/a", item_cost(4), &a, None);
+        let _b = ledger.register_worker("g/b", item_cost(4), &b, None);
+        push_memory_with_total(&b, 17_000, 1_000, Some(TOTAL), "nvml");
+        // A worker's pool and the card's free reading.
+        let read = |handle: &TelemetryHandle, free_mb, pool_mb| {
+            push_memory_with_total(handle, free_mb, pool_mb, Some(TOTAL), "nvml");
+            ledger.ingest_all_for_test();
+            let gpu = &ledger.health()[0];
+            assert_eq!(gpu.limit_mb, TOTAL - gpu.external_mb);
+            gpu.external_mb
+        };
+        let mut externals = [
+            (12_000, 1_000),
+            (17_000, 1_000),
+            (0, 19_000),
+            (500, 20_500),
+            (0, 24_000),
+        ]
+        .map(|(free_mb, pool_mb)| read(&a, free_mb, pool_mb))
+        .to_vec();
+        // A leaves while the card reads full: its spilled pool is credited too.
+        drop(a_admission);
+        externals.push(ledger.health()[0].external_mb);
+        externals.extend(
+            [(0, 22_000), (500, 15_000), (15_000, 1_000)]
+                .map(|(free_mb, pool_mb)| read(&b, free_mb, pool_mb)),
+        );
+        externals
+    };
+    // Other processes use 8 000, then 3 000, and our contexts 2 000, so a
+    // full card holds 19 000 of our pools: S of them off the card reads as
+    // 3 000 − S. Then other processes grow to 7 500.
+    let spilling = VramBudgets {
+        spilling: HashSet::from([GPU.to_owned()]),
+        ..no_margin().into()
+    };
+    assert_eq!(
+        externals(spilling),
+        [
+            8_000, 3_000, 3_000, 3_000, 3_000, 3_000, 3_000, 7_500, 7_000
+        ],
+        "the last value read with room held through the spill and A's departure; \
+         a larger reading counts; read afresh once free again"
+    );
+    assert_eq!(
+        externals(no_margin().into()),
+        [8_000, 3_000, 2_000, 0, 0, 0, 1_000, 7_500, 7_000],
+        "a GPU that fails the allocation reads what it measures"
+    );
+}
+
 /// A worker with no reported base (CTranslate2, a remote API) contributes
 /// only pool growth; its real VRAM lands in `external`.
 #[test]
@@ -420,6 +485,7 @@ fn a_frame_that_arrived_mid_window_prices_the_next_grant() {
         source: "nvml".to_owned(),
         at: Instant::now(),
         ram: None,
+        gtt: None,
     });
     push_memory_with_total(&handle, 25_000, 0, Some(TOTAL), "nvml");
 
@@ -509,7 +575,7 @@ fn a_whole_gpu_reading_outranks_a_torch_one_on_every_backend() {
     assert_eq!(
         GpuMemoryQuery::RocmSysfs {
             pci_devices: std::path::PathBuf::from("/sys/bus/pci/devices"),
-            meminfo: std::path::PathBuf::from("/proc/meminfo"),
+            ram: crate::inferio::cpu::MemRoots::default(),
             gpus: Vec::new().into(),
         }
         .free_source(),
@@ -771,6 +837,7 @@ fn a_failed_external_refresh_backs_off() {
             source: "nvml".to_owned(),
             at: Instant::now() - EXTERNAL_SAMPLE_MAX_AGE - Duration::from_secs(1),
             ram: None,
+            gtt: None,
         })
     };
     assert!(
@@ -785,6 +852,7 @@ fn a_failed_external_refresh_backs_off() {
                 source: "nvml".to_owned(),
                 at: Instant::now(),
                 ram: None,
+                gtt: None,
             }),
             None,
             false
@@ -816,6 +884,7 @@ fn a_failed_external_refresh_backs_off() {
                 source: "nvml".to_owned(),
                 at: Instant::now(),
                 ram: None,
+                gtt: None,
             }),
             failed,
             refreshing,
@@ -846,6 +915,7 @@ async fn a_load_reservation_probes_a_gpu_with_no_reading() {
         uuid: GPU.to_owned(),
         total_mb: 97_887,
         free_mb: 2_271,
+        gtt: None,
     }]));
     assert!(
         !ledger.health()[0].external_known,
@@ -898,6 +968,7 @@ async fn a_placeholder_reservation_is_clamped_to_the_headroom() {
         uuid: GPU.to_owned(),
         total_mb: 32_606,
         free_mb: 196,
+        gtt: None,
     }]));
     let (reservation, exceeds_headroom) = ledger
         .reserve_load_signalling_for_test("g/a", item_cost(4), GPU, None)
@@ -933,12 +1004,14 @@ async fn a_fresh_reading_suppresses_the_load_probe() {
         uuid: GPU.to_owned(),
         total_mb: 32_000,
         free_mb: 1_000,
+        gtt: None,
     }]));
     ledger.lock().gpus.get_mut(GPU).expect("the GPU").free = Some(FreeSample {
         free_mb: 20_000,
         source: "nvml".to_owned(),
         at: Instant::now(),
         ram: None,
+        gtt: None,
     });
 
     let (_reservation, exceeds_headroom) = ledger
@@ -997,6 +1070,7 @@ async fn a_probe_that_misses_the_pinned_gpu_backs_off_like_a_failure() {
         uuid: OTHER.to_owned(),
         total_mb: 32_000,
         free_mb: 1_000,
+        gtt: None,
     }]));
 
     let _first = ledger
@@ -1044,11 +1118,13 @@ async fn one_probe_serves_every_gpu_a_load_is_pinned_to() {
             uuid: GPU.to_owned(),
             total_mb: 32_000,
             free_mb: 2_000,
+            gtt: None,
         },
         GpuMemory {
             uuid: OTHER.to_owned(),
             total_mb: 24_000,
             free_mb: 3_000,
+            gtt: None,
         },
     ]));
 
@@ -1315,6 +1391,7 @@ async fn a_cuda_probe_before_the_first_worker_prices_as_before() {
         uuid: GPU.to_owned(),
         total_mb: TOTAL,
         free_mb: TOTAL - HOG,
+        gtt: None,
     }]));
     let (_reservation, exceeds) = ledger
         .reserve_load_signalling_for_test("g/a", item_cost(4), GPU, None)

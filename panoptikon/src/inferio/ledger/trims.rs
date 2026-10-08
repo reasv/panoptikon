@@ -260,6 +260,7 @@ impl VramLedger {
                     stamped.value.total_mb,
                     Some(&model),
                     RamBasis::of(&stamped.value),
+                    GttBasis::pair(stamped.value.gtt_free_mb, stamped.value.ram_available_mb),
                 );
             }
         }

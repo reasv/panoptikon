@@ -46,7 +46,7 @@ error):
 4. `base`      - `memory.begin_load()` / `finish_load()` around the real
    `impl.load()`: `base_mb`, `base_method`, `allocated_at_load_mb`,
    `reserved_at_load_mb`, and the same tier-by-tier table for the base chain
-   (`nvml` / `fdinfo` / `mps` / `rss` / `free_delta` / `alloc_delta`).
+   (`nvml` / `kfd` / `fdinfo` / `mps` / `rss` / `free_delta` / `alloc_delta`).
 5. `batch`     - one batch of `--batch` items priced by the worker's own
    `packing.price_inputs` / `batch_units`, measured with
    `memory.begin_batch()` / `measure_batch()`: `peak_allocated_mb`,
@@ -154,7 +154,7 @@ FREE_TIERS = ("ram", "nvml", "amdgpu-sysfs", "mps", "torch")
 # Base tiers that measure *this process* directly, as opposed to inferring it
 # from a driver-level delta. A `base_method` outside this set is a degraded
 # path.
-DIRECT_BASE_METHODS = ("nvml", "fdinfo", "mps", "rss")
+DIRECT_BASE_METHODS = ("nvml", "kfd", "fdinfo", "mps", "rss")
 
 
 # --- loading the sibling tools and the worker ------------------------------
@@ -245,7 +245,7 @@ def settled_free_mb(memory: Any, sleep: Callable[[float], None] = time.sleep,
     for `hold_s`, at most `reads` more reads; a failed read restarts the hold.
     Any other source is read once, and `seconds` and `settled` are None."""
     free_mb, _, source = memory.free_total_mb()
-    if source != "amdgpu-sysfs" or _safe(memory._unified_gpu):
+    if source != "amdgpu-sysfs" or _safe(memory.unified_gpu):
         return free_mb, source, None, None
     held_since = 0
     for taken in range(1, reads + 1):
@@ -348,8 +348,9 @@ def probe_base_tiers(
     except Exception as exc:  # pragma: no cover - defensive
         row("nvml", None, f"raised {type(exc).__name__}: {exc}"[:200])
     try:
-        value = memory._fdinfo_base_mb(reserved_mb, reserved_delta)
-        row("fdinfo", value, _fdinfo_reason(memory)
+        rocm = memory._rocm_base(reserved_mb, reserved_delta)
+        value, tier = rocm if rocm else (None, "fdinfo")
+        row(tier, value, _fdinfo_reason(memory)
             if value is None or value <= 0 else "")
     except Exception as exc:  # pragma: no cover - defensive
         row("fdinfo", None, f"raised {type(exc).__name__}: {exc}"[:200])
@@ -601,7 +602,7 @@ def induce_oom(
 
     # A unified device's "total" is host RAM: overshooting it swaps the
     # machine instead of exhausting a GPU.
-    unified = device == "mps" or bool(_safe(memory._unified_gpu))
+    unified = device == "mps" or bool(_safe(memory.unified_gpu))
     cap_mb = total_mb if unified else total_mb + FILLER_OVERSHOOT_MB
     if cap_mb_override:
         cap_mb = min(cap_mb, cap_mb_override)
@@ -1089,7 +1090,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.induce_oom:
             # A unified ROCm GPU's total is carve-out plus GTT, which HIP's
             # `total_memory` may not report; `free_total_mb` does.
-            gpu_total = ((total_mb if _safe(memory._unified_gpu) else None)
+            gpu_total = ((total_mb if _safe(memory.unified_gpu) else None)
                          or document["device"].get("gpu_total_mb") or total_mb)
             if gpu_total is None:
                 print("VERDICT: --induce-oom refused: no GPU total resolved, "

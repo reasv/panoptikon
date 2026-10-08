@@ -3,18 +3,20 @@
 
 use super::*;
 
-/// Whether this GPU's free reading is due a live driver query: not while a
-/// probe is in flight or within [`EXTERNAL_SAMPLE_MAX_AGE`] of a failed one;
-/// yes when the reading is stale, missing, or adjusted for a departed
-/// resident.
+/// Whether a probe of this GPU may start: none is in flight, and none failed
+/// within [`EXTERNAL_SAMPLE_MAX_AGE`].
+fn may_probe(gpu: &GpuLedger) -> bool {
+    !gpu.refreshing
+        && gpu
+            .last_refresh_failed_at
+            .is_none_or(|at| at.elapsed() > EXTERNAL_SAMPLE_MAX_AGE)
+}
+
+/// Whether this GPU's free reading is due a live driver query: only when
+/// [`may_probe`], and the reading is stale, missing, or adjusted for a
+/// departed resident.
 pub(super) fn refresh_due(gpu: &GpuLedger) -> bool {
-    if gpu.refreshing {
-        return false;
-    }
-    if gpu
-        .last_refresh_failed_at
-        .is_some_and(|at| at.elapsed() <= EXTERNAL_SAMPLE_MAX_AGE)
-    {
+    if !may_probe(gpu) {
         return false;
     }
     if gpu.free_adjusted_at.is_some() {
@@ -100,15 +102,58 @@ pub(super) fn free_source_is_authoritative(source: &str) -> bool {
 impl VramLedger {
     /// macOS's memory pressure level now; `Normal` on every other OS. On a
     /// Mac every device's memory is its RAM, so the level applies to all of
-    /// them. Read without the ledger lock held.
+    /// them. Read without the ledger lock held. A reading at normal ends the
+    /// pressure episode ([`LedgerState::pressure_warned`],
+    /// [`LedgerState::paging_cut_warned`]).
     pub(super) fn memory_pressure(&self) -> mps::MemoryPressure {
         #[cfg(test)]
+        let pressure = {
+            let mut state = self.lock();
+            state.pressure_read_at = Some(Instant::now());
+            state.pressure_stub
+        };
+        #[cfg(not(test))]
+        let pressure = mps::memory_pressure();
+        // Only macOS reports pressure: elsewhere no episode is ever open.
+        if cfg!(any(test, target_os = "macos")) && pressure == mps::MemoryPressure::Normal {
+            let mut state = self.lock();
+            state.pressure_warned.clear();
+            state.paging_cut_warned.clear();
+        }
+        pressure
+    }
+
+    /// [`Self::memory_pressure`], and at least paging when the swap-out
+    /// counter rose after `since` at warning or above
+    /// ([`mps::memory_pressure_since`]); in tests, the stub, at least paging
+    /// when the test's rise is at or after `since`.
+    pub(super) fn memory_pressure_since(&self, since: Instant) -> mps::MemoryPressure {
+        #[cfg(test)]
         {
-            self.lock().pressure_stub
+            let state = self.lock();
+            if state.paging_rose_at.is_some_and(|at| at >= since) {
+                state.pressure_stub.max(mps::MemoryPressure::Paging)
+            } else {
+                state.pressure_stub
+            }
         }
         #[cfg(not(test))]
         {
-            mps::memory_pressure()
+            mps::memory_pressure_since(since)
+        }
+    }
+
+    /// Whether macOS pages now, read under the ledger lock; the stub in
+    /// tests.
+    fn paging_locked(state: &LedgerState) -> bool {
+        #[cfg(test)]
+        {
+            state.pressure_stub.paging()
+        }
+        #[cfg(not(test))]
+        {
+            let _ = state;
+            mps::memory_pressure().paging()
         }
     }
 
@@ -146,8 +191,8 @@ impl VramLedger {
     /// [`free_source_is_authoritative`] and never going back in time.
     /// `reported_total_mb` is the same sample's total: an authoritative
     /// reading whose total does not match the GPU's is discarded as describing
-    /// another device. `model` is for the log only. `ram` is the same
-    /// instant's [`RamBasis`] and is stored with the reading.
+    /// another device. `model` is for the log only. `ram` and `gtt` are the
+    /// same instant's [`RamBasis`] and [`GttBasis`], stored with the reading.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_free_locked(
         state: &mut LedgerState,
@@ -158,7 +203,19 @@ impl VramLedger {
         reported_total_mb: Option<u64>,
         model: Option<&str>,
         ram: Option<RamBasis>,
+        gtt: Option<GttBasis>,
     ) {
+        // Every device of a Mac is its RAM, and while macOS pages none is
+        // available, whatever a formula reading counts as file cache.
+        let (free_mb, ram) = if state.metal_allocator && Self::paging_locked(state) {
+            let ram = ram.map(|ram| RamBasis {
+                available_mb: 0,
+                ..ram
+            });
+            (0, ram)
+        } else {
+            (free_mb, ram)
+        };
         let Some(gpu_ledger) = state.gpus.get_mut(gpu) else {
             return;
         };
@@ -221,6 +278,7 @@ impl VramLedger {
             source,
             at,
             ram,
+            gtt,
         });
     }
 
@@ -276,7 +334,27 @@ impl VramLedger {
                     stamped.value.total_mb,
                     Some(&model),
                     RamBasis::of(&stamped.value),
+                    GttBasis::pair(stamped.value.gtt_free_mb, stamped.value.ram_available_mb),
                 );
+            }
+        }
+        // With every pool figure in: the value `external_locked` holds while
+        // a spilling GPU reads full.
+        let before_full: Vec<(String, Option<u64>)> = state
+            .gpus
+            .iter()
+            .filter(|(_, gpu)| {
+                gpu.free_adjusted_at.is_none()
+                    && gpu
+                        .free
+                        .as_ref()
+                        .is_some_and(|sample| sample.free_mb >= DEFAULT_RESERVE_CAP_MB)
+            })
+            .map(|(uuid, _)| (uuid.clone(), Self::measured_external_locked(state, uuid)))
+            .collect();
+        for (uuid, external) in before_full {
+            if let Some(gpu) = state.gpus.get_mut(&uuid) {
+                gpu.external_before_full_mb = external;
             }
         }
     }
@@ -330,31 +408,51 @@ impl VramLedger {
         });
     }
 
-    /// Read the CPU device's free RAM now for a replica that books host RAM,
-    /// so its grant cannot book RAM another process took since the last
-    /// grant. Synchronous: RAM statistics are a cheap read, unlike a GPU
-    /// driver query. Skipped while a probe of the device is in flight or
-    /// backing off after a failed one.
-    pub(super) fn refresh_host_ram_now(&self, worker: WorkerId) {
-        let due = {
-            let state = self.lock();
-            state
-                .workers
-                .get(&worker)
-                .is_some_and(WorkerEntry::has_ram_side)
-                && state.gpus.get(cpu::DEVICE_KEY).is_some_and(|gpu| {
-                    !gpu.refreshing
-                        && gpu
-                            .last_refresh_failed_at
-                            .is_none_or(|at| at.elapsed() > EXTERNAL_SAMPLE_MAX_AGE)
-                })
-        };
+    /// Read `device`'s free memory now, for a grant that cannot be priced
+    /// from an older reading: host RAM another process or a RAM-domain peer
+    /// may have taken since the last grant, or any device of a Mac while it
+    /// pages. Synchronous: RAM statistics and amdgpu's sysfs counters are a
+    /// cheap read, unlike a GPU driver query. Only when [`may_probe`];
+    /// otherwise [`Self::record_paging_free_locked`].
+    pub(super) fn refresh_host_ram_now(&self, device: &str) {
+        let due = self.lock().gpus.get(device).is_some_and(may_probe);
         if !due || !self.probes_the_host() {
+            Self::record_paging_free_locked(&mut self.lock(), device);
             return;
         }
-        let gpus = self.run_memory_query(cpu::DEVICE_KEY);
-        let source = self.memory_query_for(cpu::DEVICE_KEY).free_source();
-        self.record_external_probe(cpu::DEVICE_KEY, gpus, source);
+        let gpus = self.run_memory_query(device);
+        let source = self.memory_query_for(device).free_source();
+        self.record_external_probe(device, gpus, source);
+    }
+
+    /// While a Mac pages, record `device`'s stored reading again at the
+    /// current time, which [`Self::record_free_locked`] records as 0 free:
+    /// a grant or load whose re-read was skipped (a probe of the device is
+    /// in flight or backing off) never prices from a reading taken before
+    /// the paging.
+    fn record_paging_free_locked(state: &mut LedgerState, device: &str) {
+        if !state.metal_allocator || !Self::paging_locked(state) {
+            return;
+        }
+        let Some((source, ram, gtt)) = state
+            .gpus
+            .get(device)
+            .and_then(|gpu| gpu.free.as_ref())
+            .map(|sample| (sample.source.clone(), sample.ram, sample.gtt))
+        else {
+            return;
+        };
+        Self::record_free_locked(
+            state,
+            device,
+            0,
+            source,
+            Instant::now(),
+            None,
+            None,
+            ram,
+            gtt,
+        );
     }
 
     /// Settle a probe whose blocking task never ran, which would otherwise
@@ -396,7 +494,8 @@ impl VramLedger {
     }
 
     /// Probe the host for this GPU's free memory before a load is priced,
-    /// when [`refresh_due`]; a GPU with no resident has no other trigger.
+    /// when [`refresh_due`] (a GPU with no resident has no other trigger) or
+    /// while a Mac pages, as a grant does.
     /// Awaited, since the load needs the answer. Runs on the blocking pool,
     /// not `block_in_place`: the pool retires a blocking thread after 10 s,
     /// and any worker forked from it would die with it.
@@ -404,16 +503,21 @@ impl VramLedger {
         if !self.probes_the_host() {
             return;
         }
+        let paging = self.memory_pressure().paging();
         let (reason, age_ms) = {
             let mut state = self.lock();
             Self::refresh_pools_locked(&mut state);
             let Some(gpu_ledger) = state.gpus.get_mut(gpu) else {
                 return;
             };
-            if !refresh_due(gpu_ledger) {
+            let due = refresh_due(gpu_ledger);
+            if !due && !(paging && may_probe(gpu_ledger)) {
+                Self::record_paging_free_locked(&mut state, gpu);
                 return;
             }
-            let reason = if gpu_ledger.free.is_none() {
+            let reason = if !due {
+                "macOS is paging: the last reading may count RAM that is gone"
+            } else if gpu_ledger.free.is_none() {
                 "no free sample: this GPU has never had a resident"
             } else if gpu_ledger.free_adjusted_at.is_some() {
                 "the reading was adjusted for a departed resident"
@@ -511,8 +615,8 @@ impl VramLedger {
             let found = gpus
                 .as_ref()
                 .and_then(|gpus| gpus.iter().find(|entry| entry.uuid == uuid))
-                .map(|entry| (entry.free_mb, entry.total_mb));
-            if let Some((free_mb, probe_total_mb)) = found {
+                .map(|entry| (entry.free_mb, entry.total_mb, entry.gtt));
+            if let Some((free_mb, probe_total_mb, gtt)) = found {
                 if uuid == gpu {
                     answered = true;
                 }
@@ -536,9 +640,10 @@ impl VramLedger {
                         total_mb: probe_total_mb,
                         available_mb: free_mb,
                     }),
+                    gtt,
                 );
                 let total_mb = state.gpus.get(&uuid).map_or(0, |gpu| gpu.total_mb);
-                let external_mb = Self::external_locked(&state, &uuid).unwrap_or(0);
+                let external_mb = self.external_locked(&state, &uuid).unwrap_or(0);
                 // The record may drop this reading; log whether it took.
                 let recorded = state
                     .gpus

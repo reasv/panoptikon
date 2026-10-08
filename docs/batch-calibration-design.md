@@ -695,16 +695,27 @@ the same bytes twice — measured on an M3 Max: Σ `limit_mb`
 199 915 MiB against 130 663 of RAM, and Σ headroom 1.83× of what was actually
 free. What is shared is **our own memory**, which the ledger knows in process
 at grant time and needs no frame for: each device's `external_mb` nets the
-*pair's* footprints out of its free reading rather than only its own, and each
-device's headroom subtracts the pair's charges and load reservations. `limit_mb`
-stays per device — it is that allocator's own ceiling, `recommended_max_memory()`
-on Metal and RAM on the CPU device — and the shared room is
-enforced in `headroom_mb`, so on either device `headroom + Σ charges` stays
-inside `memsize − external`. The ledger lock serialises grant issuance, which
-is what makes "the other device's headroom drops immediately" true rather than
-eventually. Only this pair cross-charges; a discrete GPU's VRAM is its own, and
-an AMD APU's carve-out/GTT split is accounted in the worker's own unified
-arithmetic instead.
+*pair's* footprints out of its free reading rather than only its own, and the
+other device's charges and load reservations come off the shared room before
+the device's own ceiling applies: `limit_mb = min(room − external − reserve −
+the other's charges, ceiling)`, the ceiling being that allocator's own,
+`recommended_max_memory()` on Metal and RAM on the CPU device, under
+`cap_fraction` where one is set. `headroom_mb` subtracts the device's own charges, so on either device
+`headroom + Σ charges` stays inside `memsize − external`, and a cap bounds
+only its own device's memory. The ledger lock serialises grant issuance,
+which is what makes "the other device's headroom drops immediately" true
+rather than eventually. An AMD APU shares only RAM with the CPU device and
+with other APUs: its carve-out is not RAM the OS manages, and its GTT is a
+bound of its own. Its memory counts on the others only beyond the carve-out
+it can still use, its footprint plus the VRAM its reading has free. The APU
+itself is priced on two sides, each under the device total and
+`cap_fraction`, and the smaller headroom binds: its VRAM and GTT (VRAM and
+GTT free, its own memory only, under the GPU's reserve), and the RAM behind
+it (carve-out plus host RAM, over VRAM free plus deliverable RAM, with the
+others' memory netted and their charges taken off the room as above, under
+the RAM floor, of which it withholds at most the deliverable RAM). Its free
+reading carries the GTT and RAM terms for this (`gtt_free_mb`,
+`ram_available_mb`). A discrete GPU's VRAM is its own.
 
 **What still relies on frames: other processes' memory.** `external_mb` is only
 as fresh as the last free reading *that device* received, and the two devices
@@ -712,8 +723,12 @@ get their own — the Metal row from a worker's `mps` frames, the CPU row from
 `ram` ones — so a device with no resident sending frames keeps a stale view of
 the rest of the machine until `EXTERNAL_SAMPLE_MAX_AGE` triggers a re-read.
 That was the shape of the observed defect (the Metal row's `external_mb` froze
-while a CPU replica grew to 11.7 GiB); what the cross-charge removes is memory
-of ours hiding in that gap, not a neighbouring process's.
+while a CPU replica grew to 11.7 GiB). The cross-charge removes our grants
+from that gap, not a neighbouring process's memory, and not growth a peer
+kept after its grant settled, which reads as external only once this device
+reads again. So a grant on a device that shares RAM with another (the CPU
+device, MPS, an APU) reads that RAM first: RAM statistics and amdgpu's
+counters are a cheap read. Between readings the worker's live clamp is the backstop.
 
 **Known transient: a load reservation can sit on the wrong device.** The
 reservation is charged before any worker exists, so it is keyed by the device
@@ -759,8 +774,10 @@ therefore differs from a GPU in six ways.
   time under a fast allocation. The reading is low by at most
   `min(SReclaimable / 2, low watermark)`, the part `MemAvailable` already
   leaves out. Shared memory is in neither figure. Windows reads
-  `ullAvailPhys` and macOS RAM less wired, compressed and anonymous pages, as
-  before.
+  `min(ullAvailPhys, ullAvailPageFile)`: free physical memory bounded by the
+  commit left at the pagefile's current size, beyond which Windows refuses
+  the allocation or grows the pagefile. macOS reads
+  `mps.rs::available_bytes`.
 - **A replica's footprint is the memory it holds now.** A CPU worker reports
   its lifetime peak resident set as `reserved` (the knee's warm/high-water
   split needs it), and its heap is trimmed after every batch, so the peak is
@@ -823,18 +840,24 @@ held to the RAM rule, not to the GPU's 1 GiB cap.
 
 Known limits:
 - A Linux unified-memory GPU (an APU) clamps its unclaimed GTT by the same
-  slab-free RAM reading, but keeps the GPU reserve. Its RAM enters inside
-  the free reading (`min(GTT free, RAM)`), so a RAM floor taken off the
-  device's limit would also withhold GTT that RAM is not short for.
+  free RAM reading, and keeps the same floor, of the RAM the OS manages
+  (`MemTotal`, the carve-out excluded) within the cgroup limit. The floor
+  comes off the RAM term only (`VRAM free + min(GTT free, max(RAM − floor,
+  0))`, in the ledger's two sides and the worker's clamp), so where GTT
+  binds it withholds none of it. Not measured: that an APU's GTT pages count
+  in its container's `memory.current`, which the RAM term assumes, and that
+  amdgpu places an APU's memory in the carve-out while it has room there,
+  which the share counted on the CPU device assumes. Memory an APU placed in
+  GTT while other processes filled the carve-out is under-counted on the CPU
+  device until a reading shows it; the CPU worker's live clamp is the
+  backstop.
 - On macOS and Windows only the exit status tells that an idle worker is
   gone. A request that arrives while a killed worker is still being torn
   down (0.4 to 2 s for a process of several GiB) still reads as a death in
   the middle of its window. On Linux the leader's zombie state shows it
   within a millisecond.
-- Windows refuses an allocation at the commit limit (RAM plus pagefile),
-  whatever is physically free. Free RAM there is `ullAvailPhys` alone, so
-  with a small pagefile a batch can fail to allocate while the reserve is
-  intact; nothing is killed.
+- On Windows prices are working set, so a batch that commits more than it
+  touches is covered only by the reserve.
 
 ### RAM ceiling for GPU models
 
@@ -1233,10 +1256,12 @@ impl's own kernels have said they cannot execute at this corpus's shapes.
   the model is resident its footprint is *ours*, `external` falls, and the card
   reports a nominal few hundred MiB of share — 292 MiB against a base of 31 150
   on the 5090, where all 8 002 out-of-memory lines were priced windows. A
-  one-item out-of-memory with room to spare stays the backstop's
-  ordinary business. A replica that *grinds* instead of failing — WDDM's sysmem
-  fallback answers an oversized window with a throughput collapse —
-  is not this rule's business and is still unhandled.
+  one-item out-of-memory with room to spare stays the backstop's ordinary
+  business. Where the driver spills instead of failing (WDDM's sysmem fallback),
+  a one-unit window whose batch spilled counts as such an out-of-memory window
+  does, against the same room. Unpriced (`none`) models have no admission, are
+  outside this rule and still run, with the grantless path's release and spill
+  handling ("Windows display driver: the pool outgrows the card").
 
   **The pre-fit price of one item.** With no slope there is no measured
   price for one item, and both obvious stand-ins fail. The whole base
@@ -1346,8 +1371,14 @@ impl's own kernels have said they cannot execute at this corpus's shapes.
   currency: the pool charged has to be the pool the worker holds now
   (`reserved_after_mb`, below). `external` is clamped at ≥ 0:
   `free` and the per-worker samples come from different moments, and
-  sampling skew must never manufacture phantom headroom. When a replica
-  leaves the GPU its footprint is credited back to the freshest free
+  sampling skew must never manufacture phantom headroom. Where a full GPU
+  spills to system RAM, the part of our pool off the card is in Σ footprint
+  but not in `total − free`, so `external` reads too low (0 once the spill
+  exceeds other processes' use). The driver spills only when the card is
+  full, so on a spilling GPU, while free reads below `DEFAULT_RESERVE_CAP_MB`
+  (1 GiB) or after a departure credit, `external` is at least its value at
+  the last pool refresh that was neither. When a replica leaves the GPU its
+  footprint is credited back to the freshest free
   reading as it drops out of the sum — nothing samples a GPU *because*
   a worker left, so without the credit the departed replica's whole
   footprint would be reattributed to `external` and margin-inflated
@@ -1937,15 +1968,16 @@ Worker, per batch within its window:
     about admission while still having to be repaid before the budget can
     move. The one spare level preserves the difference between "as deflated as
     it can be" and "one more negative just arrived".
-  - **Repay one level per 30 s of wall time**, in addition to the
-    three-clean-windows rule. Clean windows can only repay while windows are
-    flowing, and the expensive case is the one where they are not: the fault
-    storm deflates the replica, the queue drains, and nothing is left to earn
-    the halvings back. 30 s is the idle-resident trim's debounce — the interval
-    at which the machinery that *relieves* a tight GPU can act — so a level
-    survives one full relief cycle before it is handed back. Against the cap
-    the worst case is bounded: an 11-level replica is whole again in five and a
-    half minutes.
+  - **Repay one level per 30 s of wall time with no window granted**, in
+    addition to the three-clean-windows rule. A window's own time repays
+    nothing, or a failing window of 30 s or longer could never deepen it.
+    Clean windows can only repay while windows are flowing, and the expensive
+    case is the one where they are not: the fault storm deflates the replica,
+    the queue drains, and nothing is left to earn the halvings back. 30 s is the
+    idle-resident trim's debounce — the interval at which the machinery that
+    *relieves* a tight GPU can act — so a level survives one full relief cycle
+    before it is handed back. Against the cap the worst case is bounded: an
+    11-level replica is whole again in five and a half minutes.
   - **Cleared on respawn**, which holds by construction: the counter lives on
     the ledger's per-replica entry and the manager builds a fresh one. The
     (model, GPU) ratchet anchor, which is not per replica, survives.
@@ -2057,9 +2089,15 @@ than the margin within one window. The backstop covers the exceptions.
 
 ### Windows display driver: the pool outgrows the card
 
-Applies only to CUDA on native Windows (any driver model, so TCC cards pay
-the release too), and on WSL2 or Docker Desktop, where the GPU is `/dev/dxg`
-(`memory.spill_capable()`). Linux, MPS and the CPU device are unchanged.
+Applies only to CUDA GPUs under the Windows display driver model (WDDM): on
+native Windows per GPU, as nvidia-smi's `driver_model.current` reports it
+(TCC cards fail the allocation and are excluded; MCDM, unmeasured, counts as
+WDDM), and every GPU on WSL2 or Docker Desktop, where the GPU is `/dev/dxg`.
+The host decides per GPU and tells each worker (`PANOPTIKON_SPILLS_TO_RAM`,
+read by `memory.spill_capable()`). Linux, MPS and the CPU device are
+unchanged. ROCm under WSL2 is not covered: WSL exposes no amdgpu sysfs, so
+such a GPU runs unpriced and without spill handling, and the host warns at
+startup.
 
 - **Mechanism.** There `cudaMalloc` never fails. The driver moves memory to
   system RAM instead. On Linux, a full card makes the caching allocator free
@@ -2094,16 +2132,25 @@ the release too), and on WSL2 or Docker Desktop, where the GPU is `/dev/dxg`
     P − U positive. The batch's outputs are kept.
   - The worker also releases the pool and runs the rest of the window at
     half that batch's size (never above the grant), instead of more spilled
-    batches until settle. A one-item batch is neither released nor halved.
-    A spill that the release does not clear, or that no release could, is
-    live memory that does not fit (weights larger than the card): it is
-    warned of once, then logged at debug, and still flagged each batch.
+    batches until settle.
+    A spill that the release does not clear (for example weights larger than the
+    card) is warned of once, then logged at debug, and still flagged each batch.
+    Its later spills release nothing, since the next batch would only regrow the
+    pool, but still halve the rest of the window, until a batch that does not
+    spill re-arms the release and the warning.
   - A spilled batch never becomes the throughput-collapse comparator.
   - P and U must come from the same sample. A remembered P paired with a
     later NVML reading was wrong by up to 58 GB around a release.
   - **Tolerance.** The largest P − U seen without a spill was −533 MiB under
     WSL2, −717 MiB on Linux and −5986 MiB on a native-Windows display GPU.
     The spills read +2.9 to +5.4 GB on their first spilled batch.
+- **Grantless windows.** A window that runs in one `predict` call (a model
+  with no admission, or an impl with batching off, which runs one input at a
+  time) gets the same release, before a window whose size (its largest
+  input, an image's pixels else its bytes, times its input count when the
+  impl batches) is larger than any since the last release, and the same
+  backstop flag, release and warning. Nothing is halved: the window is one
+  call.
 - **Blind spot.** U also counts our CUDA context and other processes'
   resident memory, so a spill smaller than those reads as negative. A spill
   of about 1 GB ran for 165 s at 0.63× the smaller size's rate and read
@@ -2244,17 +2291,17 @@ limit   = min(total × cap_fraction, hw.memsize − external − reserve, total)
     spare its other usage reads small and a batch is granted to the last
     MiB of what the driver will deliver, where the allocation fails.
   - A margin written in the config is applied as written, 0 included.
-- On a host where a full CUDA GPU spills to system RAM instead of failing
-  the allocation (the Windows display driver: native Windows, or `/dev/dxg`
-  under WSL2 and Docker Desktop), the unset reserve is the 1 GiB cap itself,
-  on each CUDA GPU. Exact pricing lets a ramp reach the physical edge of the
-  card, and there a co-tenant's transient growth spills us without any error,
-  at a fraction of the speed; the last gigabyte buys no throughput, since the
-  knee ends the ramp before it. The host probe decides this once
-  (`GpuInventory::spills_to_ram`), with the same test the worker uses for its
-  own growth release (`memory.spill_capable()`). The CPU device is not a
-  CUDA GPU and takes its own floor ("Host RAM on the CPU device"); the
-  refusal room still reserves nothing.
+- On a CUDA GPU that spills to system RAM instead of failing a full
+  allocation (the Windows display driver model, see "Windows display driver:
+  the pool outgrows the card"), the unset reserve is the 1 GiB cap itself.
+  Exact pricing lets a ramp reach the physical edge of the card, and there a
+  co-tenant's transient growth spills us without any error, at a fraction of
+  the speed; the last gigabyte buys no throughput, since the knee ends the
+  ramp before it. The host probe decides this once per GPU
+  (`GpuInventory::spilling_gpus`, `spill_verdict`), and the worker's own
+  growth release follows the same verdict. The CPU device is not a CUDA GPU
+  and takes its own floor ("Host RAM on the CPU device"); the refusal room
+  still reserves nothing.
 
 Keeping the two distinguishable is also what makes the default *changeable*
 later without overriding somebody's deliberate `margin = 0.10`, per the

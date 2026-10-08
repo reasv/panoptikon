@@ -302,11 +302,11 @@ impl GpuLog {
 impl VramLedger {
     /// Which ledger device a load report belongs to, plus the line to log.
     /// In order: `device_kind = cpu`; a UUID match; a PCI address match that
-    /// passes the total cross-check; the only accelerator (the CPU device on
-    /// a host with none), for a report that claims a GPU but no UUID, with no
-    /// adoptable GPU left, again through the total cross-check. A PCI address
-    /// matching no row of an inventory with addresses is refused. Anything
-    /// else is unpriced. `expected_gpu` (the pin) is diagnostic only.
+    /// passes the total cross-check; the only accelerator, for a report that
+    /// claims a GPU but no UUID, with no adoptable GPU left, again through the
+    /// total cross-check. A PCI address matching no row of an inventory with
+    /// addresses is refused. Anything else is unpriced: only a `cpu` report
+    /// reaches the CPU device. `expected_gpu` (the pin) is diagnostic only.
     pub(super) fn resolve_gpu(
         state: &LedgerState,
         report: &LoadReport,
@@ -357,11 +357,9 @@ impl VramLedger {
             }
         }
         let claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb.is_some();
-        // The only accelerator, or on a host with none the CPU device.
         let accelerators: Vec<(&String, &GpuLedger)> = state.accelerators().collect();
         let only = match accelerators.as_slice() {
             [(key, gpu)] => Some((*key, *gpu)),
-            [] => state.gpus.get_key_value(super::cpu::DEVICE_KEY),
             _ => None,
         };
         // With adoptable GPUs left, "the only GPU" is not a host fact.
@@ -624,8 +622,13 @@ impl VramLedger {
         }
         let (gpu, gpu_name) = resolution.admit?;
         // The card's architecture (the profile key): first answer wins.
-        let (gpu_arch, arch_disagreement) = {
+        let (gpu_arch, arch_disagreement, integrated_disagreement) = {
             let mut state = self.lock();
+            let unified = state.gpus.get(&gpu)?.unified_ram_mb.is_some();
+            let integrated_disagreement = report
+                .gpu_integrated
+                .filter(|integrated| *integrated != unified)
+                .filter(|_| state.integrated_mismatch_logged.insert(gpu.clone()));
             let reported = report.gpu_arch.clone().filter(|arch| !arch.is_empty());
             let entry = state.gpus.get_mut(&gpu)?;
             if entry.arch.is_none() {
@@ -639,8 +642,18 @@ impl VramLedger {
             {
                 disagreement = Some((seeded.to_owned(), said.to_owned()));
             }
-            (arch, disagreement)
+            (arch, disagreement, integrated_disagreement)
         };
+        if let Some(integrated) = integrated_disagreement {
+            tracing::warn!(
+                gpu = %gpu,
+                worker_integrated = integrated,
+                "the worker's HIP runtime calls this GPU {}, but this host \
+                 priced it as {}; its memory budget may be wrong",
+                if integrated { "integrated" } else { "discrete" },
+                if integrated { "discrete" } else { "unified (an APU)" },
+            );
+        }
         if let Some((seeded, said)) = arch_disagreement {
             tracing::warn!(
                 gpu = %gpu,
@@ -690,6 +703,7 @@ impl VramLedger {
                 sample.total_mb,
                 Some(inference_id),
                 RamBasis::of(sample),
+                GttBasis::pair(sample.gtt_free_mb, sample.ram_available_mb),
             );
         }
         let seeded_from_store = seed.is_some();

@@ -571,8 +571,9 @@ ceiling_probe.py --model calibfixture/oom_second_batch_cuda \
 "config", "torch", "transformers", "dtype", "dtype_method", "gqa_check",
 "python"}` plus these blocks. `dtype`/`dtype_method` are what the worker's load
 response reports (`inferio_worker.memory.resolved_dtype`), and `gqa_check` is
-the worker's post-load attention check, run at the same point: `patched`,
-`fused`, `not applicable` or `check failed`.
+the worker's post-load attention check, run at the same point: per dtype
+(`float16`, `bfloat16`, `float32`) `fused`, `expanded` or `check failed`
+(undecided), or else `not applicable` or `check failed`.
 
 | block | fields |
 |---|---|

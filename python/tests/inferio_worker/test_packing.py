@@ -17,9 +17,22 @@ from unittest import mock
 
 import pytest
 
+from inferio.impl import utils as impl_utils
 from inferio_worker import memory, packing
 from inferio_worker.inputs import PredictionInput
-from test_memory import FakeRam, cpu_host, isolated, mps_host
+from test_memory import (
+    NO_SWAPOUTS_SEEN,
+    FakeMpsAllocator,
+    FakeRam,
+    cpu_host,
+    fake_mps_torch_module,
+    isolated,
+    mps_host,
+    pci_root,
+    rocm_host,
+    unified,
+    write_gtt,
+)
 
 MIB = 1024 * 1024
 
@@ -91,9 +104,11 @@ class FakeCuda:
 def clean_state():
     """Every test starts with no cross-window throughput comparator and no
     accumulated reactive-shrink hysteresis."""
-    packing.note_trimmed()
+    packing.reset_comparator()
+    packing.reset_shrink_state()
     yield
-    packing.note_trimmed()
+    packing.reset_comparator()
+    packing.reset_shrink_state()
 
 
 class FakeOomRetryUtils:
@@ -128,6 +143,8 @@ class FakeOomRetryUtils:
 
     def total_index_limit_events(self):
         return self.index_limits
+
+    looks_like_index_limit = staticmethod(impl_utils.looks_like_index_limit)
 
 
 @pytest.fixture(autouse=True)
@@ -866,12 +883,13 @@ def test_a_cpu_priced_worker_credits_nothing(monkeypatch):
         assert live.free_source == "ram"
 
 
-def test_a_cpu_priced_worker_keeps_the_ram_reserve_free(tmp_path):
+def test_a_cpu_priced_worker_keeps_the_ram_reserve_free(tmp_path, monkeypatch):
     """Free RAM counts only above the reserve the grant carries, so a batch
     cannot take the memory the orchestrator left for the rest of the machine.
-    A 128 GiB host with 30 605 MiB available, 6 000 of it reclaimable slab,
-    and a 12 864 MiB reserve has 11 741 MiB to spend.
+    A 128 GiB Linux host with 30 605 MiB available, 6 000 of it reclaimable
+    slab, and a 12 864 MiB reserve has 11 741 MiB to spend.
     """
+    monkeypatch.setattr(sys, "platform", "linux")
     meminfo = tmp_path / "meminfo"
     meminfo.write_text("SReclaimable:    6144000 kB\n")
     ram = FakeRam(total_mb=128_649, available_mb=30_605, rss_mb=1_200)
@@ -952,6 +970,39 @@ def test_a_gpu_worker_keeps_the_ram_reserve_free(fake_torch):
         assert [len(batch) for batch in model.batches] == [4, 4]
 
 
+def test_an_apu_keeps_the_ram_reserve_in_its_ram_term(tmp_path, monkeypatch):
+    """An APU's reading is free VRAM plus the smaller of unclaimed GTT and
+    free RAM. The grant's RAM reserve comes off the RAM term only: it bites
+    when RAM is short, withholds nothing when GTT is, and never takes free
+    VRAM."""
+    bdf = "0000:03:00.0"
+    root = pci_root(tmp_path, {bdf: (512 * MIB, 256 * MIB)})
+    with rocm_host(tmp_path, monkeypatch, pci=root):
+        write_gtt(root, bdf, 64 * 1024 * MIB, 4 * 1024 * MIB)
+        with unified(ram_available_mb=8_000):
+            ram_short = packing.clamp_to_live_memory(64, 4_000, 6_000)
+        with unified(ram_available_mb=4_000):
+            below_reserve = packing.clamp_to_live_memory(64, 4_000, 6_000)
+        write_gtt(root, bdf, 64 * 1024 * MIB, 62 * 1024 * MIB)
+        with unified(ram_available_mb=100 * 1024):
+            gtt_short = packing.clamp_to_live_memory(64, 4_000, 6_000)
+            window = packing.run_window(Recorder(), items(1), grant(unit_budget=1))
+    assert ram_short.clamped == {
+        "from_units": 64,
+        "to_units": 36,
+        "free_mb": 256 + 8_000,
+    }, "256 + 2 000 above the reserve, of 4 000"
+    assert below_reserve.units == 4, "the 256 of free VRAM, of 4 000"
+    assert gtt_short.clamped == {
+        "from_units": 64,
+        "to_units": 37,
+        "free_mb": 256 + 2 * 1024,
+    }, "all of it, of 4 000"
+    assert gtt_short.gtt_mb == (2 * 1024, 100 * 1024)
+    batch = window["measurements"][0]
+    assert (batch["gtt_free_mb"], batch["ram_available_mb"]) == gtt_short.gtt_mb
+
+
 def test_an_mps_worker_credits_the_metal_pool():
     """The Metal arm of the same credit: `driver_allocated -
     current_allocated`, 200 MiB of a 1 200 MiB driver pool."""
@@ -978,6 +1029,48 @@ def test_an_mps_worker_keeps_the_ram_reserve_free():
         mps.allocate(1_000, driver_mb=5_000)
         live = packing.clamp_to_live_memory(8, 8_000, ram_reserve_mb=2_000)
         assert live.units == 3, "4 000 of pool less the 1 000 below the reserve"
+
+
+def test_paging_during_a_long_batch_cuts_the_next_one():
+    """Swap-outs 5 s into a 90 s batch and none for its last 85 s: the next
+    batch's reading counts them, since they came after the reading the batch
+    was sized from, so that batch fits the 2000 MiB pool held. The batch
+    after it saw no rise during the one before and is not cut. Once the
+    worker clears the instant after the reply, the first batch of the next
+    window is not cut by swap-outs in the idle time before it."""
+    clock = [0.0]
+
+    def counters():
+        swapouts = 500 + 100 * (clock[0] >= 5) + 100 * (clock[0] >= 300)
+        return (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 2, swapouts, 0)
+
+    class Slow:
+        def predict(self, inputs):
+            clock[0] += 90
+            return [item.data for item in inputs]
+
+    mps = FakeMpsAllocator()
+    mps.allocate(1000, driver_mb=3000)
+    with (
+        isolated(fake_mps_torch_module(mps)),
+        mock.patch.object(memory, "_mac_memory_counters", side_effect=counters),
+        mock.patch("time.monotonic", side_effect=lambda: 1000.0 + clock[0]),
+        mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN),
+    ):
+        payload = packing.run_window(
+            Slow(), items(16), grant(unit_budget=8, mb=4000)
+        )
+        memory.count_paging_from_last_reading(False)
+        clock[0] = 400
+        next_window = packing.run_window(
+            Slow(), items(8), grant(unit_budget=8, mb=4000)
+        )
+    first, cut, after = payload["measurements"]
+    assert (first["items"], cut["items"], after["items"]) == (8, 4, 4)
+    assert cut["free_mb"] == 0
+    assert cut["clamped"] == {"from_units": 8, "to_units": 4, "free_mb": 0}
+    assert after["free_mb"] == 40 * 1024 and "clamped" not in after
+    assert next_window["measurements"][0]["free_mb"] == 40 * 1024
 
 
 def test_a_rocm_worker_uses_the_cuda_arm_of_the_credit(fake_rocm_torch):
@@ -2232,6 +2325,85 @@ def test_a_clean_pool_of_the_same_size_is_still_released(fake_torch):
     assert fake_torch.reserved == 32 * MIB, "the live tensors stayed"
 
 
+def test_after_a_release_that_returned_nothing_the_slack_must_grow_first():
+    """Metal keeps part of the pool through `empty_cache()` and publishes no
+    counter for it, so slack can be claimed that a release does not return.
+    After a release that left at least 256 MiB of its slack in the pool, or
+    more than it returned, the rule waits up to 30 s for the slack to grow
+    256 MiB past what it left, instead of releasing it again every other
+    window. A release that returned under 256 MiB keeps the comparator."""
+
+    class FragmentedMps(FakeMpsAllocator):
+        kept = 0
+
+        def empty_cache(self):
+            self.empty_cache_calls += 1
+            self.driver = min(self.driver, self.allocated + self.kept)
+
+    mps = FragmentedMps()
+
+    def windows(count, grant_mb=100, grow_mb=0):
+        for _ in range(count):
+            mps.driver += grow_mb * MIB
+            packing.maybe_shrink(grant_mb)
+        return mps.empty_cache_calls
+
+    with mps_host(available_mb=40 * 1024, mps=mps):
+        mps.allocate(3000, driver_mb=5000)
+        mps.kept = 1000 * MIB
+        packing._last_growth = (8, 100.0)
+        assert windows(6) == 1, "the release left 1000 MiB of 2000"
+        assert packing._last_growth is None, "it returned 1000 MiB"
+        assert windows(6, grow_mb=1) == 1, "the slack grew 6 MiB"
+        mps.driver += 250 * MIB
+        assert windows(2) == 2, "the slack grew 256 MiB past what was left"
+        assert windows(4, grant_mb=0) == 2, "memory-blind windows wait as well"
+        assert windows(1, grow_mb=300) == 2
+        assert windows(1, grow_mb=-100) == 3, "growing past it once is enough"
+        mps.driver += 256 * MIB
+        assert windows(2, grant_mb=0) == 4, "a memory-blind release"
+        assert windows(1) == 4
+        mps.driver += 256 * MIB
+        assert windows(2, grant_mb=0) == 5, "a grant with memory re-armed it"
+        packing.note_trimmed()
+        mps.kept = 0
+        assert windows(2) == 6, "a trim forgets what a release left"
+        mps.driver += 200 * MIB
+        assert windows(2) == 7, (
+            "a release that returned all its slack left none"
+        )
+        mps.kept = 255 * MIB
+        mps.driver += 1000 * MIB
+        assert windows(2) == 8
+        assert windows(2) == 9, "a release that left 255 MiB is not waited on"
+        mps.kept = 256 * MIB
+        mps.driver += 1000 * MIB
+        assert windows(2) == 10
+        assert windows(2) == 10, "a release that left 256 MiB is waited on"
+        packing.release_pool()
+        assert windows(2) == 12, "another release forgets what was left"
+        packing.note_trimmed()
+        mps.driver = mps.allocated + 200 * MIB
+        mps.kept = 200 * MIB
+        packing._last_growth = (8, 100.0)
+        assert windows(2) == 13
+        before = packing.time.monotonic()
+        assert packing._last_growth == (8, 100.0), "it returned nothing"
+        assert windows(4) == 13, "a release that returned less than it left"
+        with mock.patch.object(packing.time, "monotonic") as now:
+            now.return_value = before + 29
+            assert windows(2) == 13
+            now.return_value = before + 30
+            windows(1)
+            assert packing.maybe_shrink(100) is False
+            assert mps.empty_cache_calls == 14, "the wait ends after 30 s"
+    packing.note_trimmed()
+    assert packing._last_growth == (8, 100.0), (
+        "a trim that returned nothing keeps it too"
+    )
+    assert not memory._release_state["armed"]
+
+
 def test_the_clamp_credits_a_split_pool_the_release_decision_refuses(fake_torch):
     """The two readings ask different questions and only one takes the split
     term. A batch can allocate into the hole inside a split segment, so the
@@ -2396,14 +2568,14 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
     assert halved["oom_class"]["exception"] == packing.OOM_HALVING_WITNESS
     assert "clamped" not in halved
 
-    # A window that dies after the impl hit the ceiling still reports it: the
-    # failure path is where the orchestrator most needs to know the size was
-    # not its choice.
+    # A window that dies of another error after the impl hit the ceiling
+    # still reports it: the failure path is where the orchestrator most needs
+    # to know the size was not its choice.
     class Failing:
         def predict(self, inputs):
             fake_oom_retry.record(1)
             fake_oom_retry.note_index_limit()
-            raise RuntimeError("integer out of range")
+            raise RuntimeError("unsupported input")
 
     with pytest.raises(packing.WindowFailure) as caught:
         packing.run_window(Failing(), items(4), grant(unit_budget=4))
@@ -2411,6 +2583,191 @@ def test_an_impl_that_caps_itself_is_reported_as_a_ceiling_not_an_oom(
     assert failed["clamped"]["reason"] == "index_limit"
     assert failed["clamped"]["to_units"] == 1
     assert "oom" not in failed, "`classify_oom` is right to refuse it"
+
+    # A ceiling the impl raises without cutting the batch itself (an MPS array
+    # over 2^32 bytes before macOS 15): the harness halves the batch and the
+    # window's other items run. The clamp is carried by the first batch that
+    # ran whole after a split, below the smallest batch that failed; a window
+    # that fails on the error reports none.
+    class Raising:
+        def __init__(self, fails):
+            self.fails = fails
+            self.batches = []
+
+        def predict(self, inputs):
+            self.batches.append(len(inputs))
+            if self.fails(inputs):
+                raise RuntimeError(
+                    "[MPSNDArray initWithDevice:descriptor:] Error: total "
+                    "bytes of NDArray > 2**32"
+                )
+            return [item.data for item in inputs]
+
+    def clamps(measurements):
+        return [
+            (index, (m["clamped"]["from_units"], m["clamped"]["to_units"]))
+            for index, m in enumerate(measurements)
+            if "clamped" in m
+        ]
+
+    impl = Raising(lambda inputs: len(inputs) > 2)
+    payload = packing.run_window(impl, items(5), grant(unit_budget=5))
+    assert payload["outputs"] == [0, 1, 2, 3, 4]
+    assert impl.batches == [5, 2, 2, 1]
+    failed, halved = payload["measurements"][:2]
+    assert not {"units", "oom", "clamped"} & failed.keys()
+    assert halved["clamped"] == {
+        "from_units": 5,
+        "to_units": 2,
+        "reason": "index_limit",
+        "free_mb": 8000,
+    }
+    assert clamps(payload["measurements"]) == [(1, (5, 2))]
+
+    impl = Raising(lambda inputs: len(inputs) > 1)
+    payload = packing.run_window(impl, items(5), grant(unit_budget=5))
+    assert impl.batches == [5, 2, 1, 1, 1, 1, 1]
+    assert clamps(payload["measurements"]) == [(2, (2, 1))]
+
+    # A batch the live memory clamp cut below the halved size is not the
+    # first to run at it.
+    def fails_and_frees(inputs):
+        fake_torch.free = (250 if len(inputs) > 4 else 8000) * MIB
+        return len(inputs) > 4
+
+    impl = Raising(fails_and_frees)
+    payload = packing.run_window(impl, items(8), grant(unit_budget=8))
+    assert impl.batches == [8, 2, 4, 2]
+    assert clamps(payload["measurements"]) == [(1, (8, 2)), (2, (8, 4))]
+    assert "reason" not in payload["measurements"][1]["clamped"]
+
+    # Items of different sizes: the one clamp runs from the smallest batch
+    # that failed to the largest that ran below it, here not the last.
+    def pixel_window(widths, fails, budget):
+        impl = Raising(fails)
+        mixed = [
+            PredictionInput(data=100 * width, file=png_bytes(width, 100))
+            for width in widths
+        ]
+        payload = packing.run_window(
+            impl,
+            mixed,
+            grant(unit_budget=budget, unit="pixel", aggregation="sum"),
+        )
+        return impl.batches, clamps(payload["measurements"])
+
+    def over(limit):
+        return lambda inputs: sum(item.data for item in inputs) > limit
+
+    assert pixel_window([120] * 4 + [1] * 4, over(30000), 48400) == (
+        [8, 4, 2, 2, 2, 2],
+        [(2, (48000, 24000))],
+    )
+    # A batch below the halved item count counts as well.
+    assert pixel_window([1] * 6 + [290], over(29000), 40000) == (
+        [7, 3, 3, 1],
+        [(1, (29600, 29000))],
+    )
+    # A padded batch fails on items times its largest item, so one that ran
+    # can price above one that failed; it does not count.
+    def padded(inputs):
+        return len(inputs) * max(item.data for item in inputs) > 30000
+
+    assert pixel_window([1, 1, 1, 120, 120, 120], padded, 24000) == (
+        [4, 2, 2, 2],
+        [(1, (12300, 12100))],
+    )
+    # A batch that ran whole before the first failure counts.
+    widths = [150, 150, 150, 100, 100, 50, 50]
+    assert pixel_window(widths, over(30000), 40000) == (
+        [2, 4, 2, 2, 1],
+        [(2, (40000, 30000))],
+    )
+
+    # A batch that ran whole below a later, smaller failure still counts.
+    def holds_150(inputs):
+        return len(inputs) > 4 or (
+            len(inputs) > 1 and any(item.data == 15000 for item in inputs)
+        )
+
+    widths = [100] * 3 + [300] * 3 + [150, 100, 100] + [100] * 3
+    assert pixel_window(widths, holds_150, 185000) == (
+        [12, 6, 3, 3, 3] + [1] * 6,
+        [(2, (35000, 30000))],
+    )
+
+    # A batch that ran at a size that later failed is not below it.
+    impl = Raising(
+        lambda inputs: len(inputs) > 4
+        or (len(inputs) > 2 and any(item.data >= 4 for item in inputs))
+    )
+    payload = packing.run_window(impl, items(8), grant(unit_budget=8))
+    assert impl.batches == [8, 4, 4, 2, 2]
+    assert clamps(payload["measurements"]) == [(1, (4, 2))]
+
+    # A batch the impl's own OOM halving touched did not run at the size.
+    def fails_then_halves(inputs):
+        if len(impl.batches) == 2:
+            fake_oom_retry.record(4, halvings=1)
+        return len(inputs) > 4
+
+    impl = Raising(fails_then_halves)
+    payload = packing.run_window(impl, items(8), grant(unit_budget=8))
+    halved = payload["measurements"][1]
+    assert halved["oom"] is True and "clamped" not in halved
+    assert clamps(payload["measurements"]) == [(2, (8, 4))]
+
+    def absorbs_200(inputs):
+        if [item.data for item in inputs] == [20000]:
+            fake_oom_retry.record(1, halvings=1)
+        return len(inputs) > 1
+
+    assert pixel_window([150, 200, 50], absorbs_200, 30000) == (
+        [1, 2, 1, 1],
+        [(3, (25000, 15000))],
+    )
+
+    # A batch the live memory clamp cut still ran whole at its size.
+    def fails_then_clamps(inputs):
+        low = len(inputs) < 4 and any(item.data == 20000 for item in inputs)
+        fake_torch.free = (250 if low else 8000) * MIB
+        return sum(item.data for item in inputs) > 20000
+
+    batches, found = pixel_window([1, 150, 200, 200], fails_then_clamps, 55100)
+    assert batches == [4, 2, 2, 1, 1]
+    assert found[0] == (1, (40000, 20000))
+    fake_torch.free = 8000 * MIB
+
+    def fails_on_item_5(inputs):
+        return any(item.data == 5 for item in inputs)
+
+    def frees_then_fails_on_item_5(inputs):
+        fake_torch.free = (250 if len(inputs) > 4 else 8000) * MIB
+        return fails_on_item_5(inputs)
+
+    impl = Raising(frees_then_fails_on_item_5)
+    with pytest.raises(packing.WindowFailure) as caught:
+        packing.run_window(impl, items(8), grant(unit_budget=8))
+    assert impl.batches == [8, 2, 4, 2, 2, 1, 1]
+    memory_clamp = caught.value.measurements[1]["clamped"]
+    assert clamps(caught.value.measurements) == [(1, (8, 2))]
+    assert "reason" not in memory_clamp
+
+    # The same item through an impl that halves on its own: the harness does
+    # not split again.
+    class Retrying(Raising):
+        def predict(self, inputs):
+            return impl_utils.run_with_oom_retry(
+                super().predict, inputs, oom_exceptions=MemoryError
+            )
+
+    impl = Retrying(fails_on_item_5)
+    with mock.patch.dict(sys.modules, {"inferio.impl.utils": impl_utils}):
+        with pytest.raises(packing.WindowFailure) as caught:
+            packing.run_window(impl, items(8), grant(unit_budget=8))
+    assert impl.batches == [8, 4, 4, 2, 1, 1]
+    assert len(caught.value.measurements) == 1
+    assert clamps(caught.value.measurements) == []
 
 
 def test_an_impl_that_executed_nothing_in_one_call_reports_zero_not_the_batch(
@@ -2581,7 +2938,9 @@ def nvml_card(cuda, monkeypatch, total_mb=8192, others_mb=1000):
         return (total_mb - others_mb - ours, total_mb)
 
     monkeypatch.setattr(memory, "_nvml_memory", reading)
+    monkeypatch.setitem(memory._release_state, "armed", False)
     monkeypatch.setitem(memory._release_state, "largest_units", None)
+    monkeypatch.setitem(memory._release_state, "grantless_size", None)
 
 
 @pytest.fixture
@@ -2598,6 +2957,7 @@ def test_only_cuda_under_the_windows_display_driver_can_spill(
     dxg = tmp_path / "dxg"
     monkeypatch.setattr(memory, "DXG_DEVICE", str(dxg))
     monkeypatch.setattr(memory.sys, "platform", "linux")
+    monkeypatch.delenv(memory.SPILL_VERDICT_ENV, raising=False)
     assert not memory.spill_capable(), "Linux"
     dxg.touch()
     assert memory.spill_capable(), "WSL2 or Docker Desktop"
@@ -2609,6 +2969,12 @@ def test_only_cuda_under_the_windows_display_driver_can_spill(
     dxg.unlink()
     monkeypatch.setattr(memory.sys, "platform", "win32")
     assert memory.spill_capable(), "native Windows"
+    # The orchestrator's per-GPU verdict wins over the platform.
+    monkeypatch.setenv(memory.SPILL_VERDICT_ENV, "0")
+    assert not memory.spill_capable(), "a TCC card on native Windows"
+    monkeypatch.setattr(memory.sys, "platform", "linux")
+    monkeypatch.setenv(memory.SPILL_VERDICT_ENV, "1")
+    assert memory.spill_capable()
 
 
 def run_growing_windows(cuda):
@@ -2642,12 +3008,14 @@ def test_no_release_or_spill_flag_off_a_spill_capable_host(
     larger than the card is not flagged."""
     monkeypatch.setattr(memory, "DXG_DEVICE", str(tmp_path / "dxg"))
     monkeypatch.setattr(memory.sys, "platform", "linux")
+    monkeypatch.setattr(memory, "_malloc_trim", lambda: None)
     nvml_card(fake_torch, monkeypatch)
     payloads = run_growing_windows(fake_torch)
     impl = caching_impl(fake_torch, [8192 + 1000])
     payloads.append(packing.run_window(impl, items(1), grant(unit_budget=1)))
+    payloads.append(packing.run_grantless_window(impl, items(2)))
     assert [m["items"] for m in payloads[2]["measurements"]] == [4, 1]
-    assert fake_torch.reserved == (8192 + 1000) * MIB
+    assert fake_torch.reserved == 2 * (8192 + 1000) * MIB
     assert fake_torch.empty_cache_calls == 0
     assert not any(m.get("spilled") for p in payloads for m in p["measurements"])
 
@@ -2661,6 +3029,70 @@ def test_the_backstop_needs_nvml(fake_torch, monkeypatch):
     assert payload["memory"]["free_source"] == "torch"
     assert "spilled" not in payload["measurements"][0]
     assert fake_torch.empty_cache_calls == 0
+
+
+def test_a_grantless_window_releases_the_pool_before_a_larger_input_only(
+    spill_host, caplog
+):
+    """An impl that runs one input at a time: the pool is released before a
+    window whose largest input has more pixels than any since the last
+    release. The third window's largest input is in the middle and has less
+    width than the first, the second and fourth have more pixels only in sum,
+    and a trim restarts the record; the three-item pools are 208 MiB above
+    NVML's used memory, within the tolerance."""
+    assert len(png_bytes(30, 45)) == len(png_bytes(40, 30)), "same PNG bytes"
+    impl = caching_impl(spill_host, [2800])
+    impl.enable_batching = False
+
+    def run(window):
+        inputs = [PredictionInput(data=0, file=png_bytes(w, h)) for w, h in window]
+        return packing.run_grantless_window(impl, inputs)
+
+    with caplog.at_level(logging.DEBUG, logger="inferio_worker.packing"):
+        payloads = [
+            run(window)
+            for window in (
+                [(40, 30)],
+                [(30, 40), (20, 20)],
+                [(40, 30), (30, 45), (20, 20)],
+                [(40, 30), (40, 30), (40, 30)],
+            )
+        ]
+        memory.empty_cache(memory.TRIM_RELEASE)
+        payloads.append(run([(50, 30)]))
+    assert spill_host.empty_cache_calls == 2, "the third window and the trim"
+    assert [p["measurements"][0].get("regrow_after") for p in payloads] == [
+        None, None, memory.GROWTH_RELEASE, None, memory.TRIM_RELEASE
+    ]
+    assert not any(p["measurements"][0].get("spilled") for p in payloads)
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_a_batching_grantless_window_is_sized_by_its_input_count(spill_host):
+    """One batch pads to its largest input, so three images outgrow one."""
+    impl = caching_impl(spill_host, [100])
+    image = PredictionInput(data=0, file=png_bytes(40, 30))
+    packing.run_grantless_window(impl, [image])
+    payload = packing.run_grantless_window(impl, [image] * 3)
+    assert payload["measurements"][0]["regrow_after"] == memory.GROWTH_RELEASE
+
+
+def test_a_grantless_window_that_spills_is_flagged_and_releases_the_pool(
+    spill_host, caplog
+):
+    mb_per_item = [8192 + 1000]
+    impl = caching_impl(spill_host, mb_per_item)
+    with caplog.at_level(logging.DEBUG, logger="inferio_worker.packing"):
+        spilled = packing.run_grantless_window(impl, items(1))
+        mb_per_item[0] = 100
+        after = packing.run_grantless_window(impl, items(1))
+    assert spilled["measurements"][0]["spilled"] is True
+    assert spilled["memory"]["reserved_mb"] == 0, "the released pool"
+    assert spill_host.empty_cache_calls == 1
+    assert after["measurements"][0].get("spilled") is None
+    assert after["measurements"][0]["regrow_after"] == memory.SPILL_RELEASE
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
 
 
 def test_any_release_restarts_the_largest_batch_record(spill_host):
@@ -2750,25 +3182,39 @@ def test_halving_after_a_spill_never_exceeds_the_grant(spill_host):
     assert all(m["units"] <= 100 for m in measurements[1:])
 
 
-def test_a_model_that_cannot_fit_warns_once_and_stops_halving_at_one_item(
+def test_a_spill_that_outlives_its_release_releases_nothing_until_one_fits(
     spill_host, caplog
 ):
-    """Live memory past the card: releasing gives nothing back, so after the
-    halving reaches one item every batch is flagged but none is released, and
-    the warning is given once."""
+    """Live memory past the card: the first release gives nothing back, so
+    later spills release nothing and log at debug, still halving, until a
+    batch that fits re-arms the release and the warning."""
+    live_mb = [8192 + 1000]
 
     def predict(inputs):
-        spill_host.reserved = spill_host.allocated = (8192 + 1000) * MIB
+        spill_host.reserved = spill_host.allocated = live_mb[0] * MIB
         spill_host.peak_reserved = spill_host.reserved
         return [None] * len(inputs)
 
     impl = SimpleNamespace(predict=predict)
     with caplog.at_level(logging.DEBUG, logger="inferio_worker.packing"):
-        first = packing.run_window(impl, items(7), grant(unit_budget=4, mb=0))
+        first = packing.run_window(impl, items(8), grant(unit_budget=4, mb=0))
+        assert memory._release_state["largest_units"] == 4, (
+            "a release that returned nothing keeps the largest batch"
+        )
         second = packing.run_window(impl, items(2), grant(unit_budget=1, mb=0))
+        packing.run_grantless_window(impl, items(1))
+        live_mb[0] = 100
+        packing.run_grantless_window(impl, items(1))
+        live_mb[0] = 8192 + 1000
+        packing.run_window(impl, items(1), grant(unit_budget=1, mb=0))
     measurements = first["measurements"] + second["measurements"]
-    assert [m["items"] for m in measurements] == [4, 2, 1, 1, 1]
+    assert [m["items"] for m in measurements] == [4, 2, 1, 1, 1, 1]
     assert all(m["spilled"] for m in measurements)
-    assert spill_host.empty_cache_calls == 2, "the 4 and the 2 only"
+    assert [m.get("regrow_after") for m in measurements] == [None] * 6, (
+        "a release that returned nothing arms no re-grow report"
+    )
+    assert spill_host.empty_cache_calls == 2, "the first spill, and the last"
     spills = [r for r in caplog.records if "system memory" in r.getMessage()]
-    assert [r.levelno for r in spills] == [logging.WARNING] + [logging.DEBUG] * 4
+    assert [r.levelno for r in spills] == (
+        [logging.WARNING] + [logging.DEBUG] * 6 + [logging.WARNING]
+    )

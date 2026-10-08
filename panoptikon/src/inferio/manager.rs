@@ -385,6 +385,9 @@ pub struct BatchHealth {
     pub age_ms: u64,
     /// Inputs in the batch, not cost-dimension units.
     pub items: Option<u64>,
+    /// Size in cost-dimension units; `None` without a grant or when the batch
+    /// was unpriced.
+    pub units: Option<u64>,
     pub reserved_before_mb: Option<u64>,
     pub peak_reserved_mb: Option<u64>,
     pub allocated_before_mb: Option<u64>,
@@ -392,6 +395,14 @@ pub struct BatchHealth {
     pub duration_ms: Option<f64>,
     /// Allocator retries this batch caused; `None` off CUDA.
     pub alloc_retries: Option<u64>,
+    /// The pool exceeded NVML's used memory on the GPU by more than 512 MiB
+    /// after this batch: part of it was in system RAM.
+    pub spilled: bool,
+    /// The pool release this batch re-grew from (`"trim"`, `"shrink"`,
+    /// `"growth"` or `"spill"`), on the first batch after it only.
+    pub regrow_after: Option<String>,
+    /// Free device memory read before the batch.
+    pub free_mb: Option<u64>,
 }
 
 impl ReplicaTelemetryHealth {
@@ -425,12 +436,16 @@ impl ReplicaTelemetryHealth {
                 seq: sample.seq,
                 age_ms: age_ms(sample.captured_at),
                 items: sample.measurement.items,
+                units: sample.measurement.units,
                 reserved_before_mb: sample.measurement.reserved_before_mb,
                 peak_reserved_mb: sample.measurement.peak_reserved_mb,
                 allocated_before_mb: sample.measurement.allocated_before_mb,
                 peak_allocated_mb: sample.measurement.peak_allocated_mb,
                 duration_ms: sample.measurement.duration_ms,
                 alloc_retries: sample.measurement.alloc_retries,
+                spilled: sample.measurement.spilled,
+                regrow_after: sample.measurement.regrow_after.clone(),
+                free_mb: sample.measurement.free_mb,
             })
             .collect();
         recent.reverse();
@@ -1623,12 +1638,6 @@ impl ModelManager {
         let _admission = self
             .acquire_load_admission(inference_id, &device_keys)
             .await;
-        // The address of a unified GPU whose worker counts GTT as its own.
-        let unified_devices: Vec<Option<String>> = spec
-            .device_pins
-            .iter()
-            .map(|pin| self.cfg.gpus.unified_pin_bdf(pin.as_deref()))
-            .collect();
         // A pooled worker needs the same pin and the same CPU placement.
         let pool_pin = self.cfg.gpus.default_pin();
         let pool_on_cpu =
@@ -1681,14 +1690,9 @@ impl ModelManager {
                 };
                 let spec = &spec;
                 let device = device.clone();
-                let unified = unified_devices[replica].clone();
-                let on_cpu = device_keys[replica].as_deref() == Some(super::cpu::DEVICE_KEY);
+                let spawn =
+                    (self.cfg.gpus).spawn_config(&self.cfg.spawn, device_keys[replica].as_deref());
                 async move {
-                    let spawn = if on_cpu {
-                        std::borrow::Cow::Owned(self.cfg.spawn.for_cpu_device())
-                    } else {
-                        self.cfg.spawn.for_unified_device(unified.as_deref())
-                    };
                     let mut worker = match claimed {
                         Some(worker) => {
                             match self
@@ -1909,7 +1913,7 @@ mod tests {
     use super::super::registry::RegistryConfig;
     use super::super::worker::WorkerDeadlines;
     use super::super::worker::testing::test_spawn_config;
-    use super::super::worker::{Timestamped, WorkerTelemetry};
+    use super::super::worker::{BatchMeasurement, Timestamped, WorkerTelemetry};
     use super::*;
     use crate::db::ledger::MAX_ERROR_BYTES;
     use serde_json::json;
@@ -3352,6 +3356,31 @@ metadata.cost.seed_units = 1000000
         );
 
         manager.shutdown().await;
+    }
+
+    /// A recent batch in `/health` carries its size in units, whether it
+    /// spilled, the release it re-grew from and the free reading before it.
+    #[test]
+    fn recent_batches_show_what_each_batch_measured() {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.record_measurements(vec![BatchMeasurement {
+            units: Some(64),
+            spilled: true,
+            regrow_after: Some("growth".to_owned()),
+            free_mb: Some(1_234),
+            ..BatchMeasurement::default()
+        }]);
+        let health = ReplicaTelemetryHealth::snapshot(&Arc::new(StdMutex::new(telemetry)));
+        let batch = &health.recent_batches[0];
+        assert_eq!(
+            (
+                batch.units,
+                batch.spilled,
+                batch.regrow_after.as_deref(),
+                batch.free_mb
+            ),
+            (Some(64), true, Some("growth"), Some(1_234))
+        );
     }
 
     /// Replicas run windows concurrently: 4 uncapped-merge predicts of 1.5 s on

@@ -374,6 +374,7 @@ impl VramLedger {
         // under memory pressure, which also feeds no throughput sample.
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
         let pressure = window.is_some_and(|charge| charge.pressure != mps::MemoryPressure::Normal);
+        let paging = window.is_some_and(|charge| charge.pressure.paging());
         let item_capped = window.is_some_and(|charge| charge.item_cap.is_some());
         // The largest units per item an item-capped batch ran, if one ran,
         // and whether a batch filled the cap.
@@ -408,6 +409,10 @@ impl VramLedger {
         // the largest batch that ran uncut.
         let mut index_limit_to: Option<u64> = None;
         let mut ran_wider_uncut = 0u64;
+        // Whether a batch grew the pool, and the largest pool a batch left;
+        // `None` while none had pool figures.
+        let mut window_grew_pool: Option<bool> = None;
+        let mut window_pool: Option<u64> = None;
         // Summed over the window, `None` while no batch reported the counter.
         let mut alloc_retries: Option<u64> = None;
         // `(MiB the pool grew back, that batch's wall time)` after a release
@@ -454,6 +459,7 @@ impl VramLedger {
                     model.as_deref(),
                     // The RAM domain the reading was clipped from, if stated.
                     RamBasis::of_batch(measurement),
+                    GttBasis::pair(measurement.gtt_free_mb, measurement.ram_available_mb),
                 );
             }
             // This replica's pool as the batch left it, never its peak: a peak
@@ -564,6 +570,32 @@ impl VramLedger {
                 saw_spill |= measurement.spilled;
                 continue;
             }
+            // Pool growth compares the post-batch pool (the peak only from an
+            // older worker) with the pool before; `None` when either is absent,
+            // which is not "warm". On every platform, CUDA included: a mid-batch
+            // peak would mark every MPS batch, and every CUDA batch that
+            // retried an allocation, as pool-growing. See
+            // docs/batch-calibration-design.md, "Batch size: what counts as
+            // a measurement".
+            let pool_after = measurement
+                .reserved_after_mb
+                .or(measurement.peak_reserved_mb);
+            let grew_pool = match (pool_after, measurement.reserved_before_mb) {
+                (Some(after), Some(before)) => Some(after > before),
+                _ => None,
+            };
+            let full = budget_floor.is_some_and(|floor| {
+                measurement.units.is_some_and(|units| units >= floor)
+                    || measurement.next_over_budget
+            });
+            // While paging, a batch whose collapse the pressure suppressed
+            // still ran: its pool growth and its size count for the
+            // [`PressureCap`].
+            if measurement.throughput_collapse && paging {
+                window_grew_pool = window_grew_pool.max(grew_pool);
+                window_pool = window_pool.max(pool_after);
+                ran_full |= full;
+            }
             if collapse_suppressed || uncorroborated {
                 continue;
             }
@@ -594,21 +626,9 @@ impl VramLedger {
             if !clipped {
                 ran_wider_uncut = ran_wider_uncut.max(units.unwrap_or(0));
             }
-            // Pool growth compares the post-batch pool (the peak only from an
-            // older worker) with the pool before; `None` when either is absent,
-            // which is not "warm". On every platform, CUDA included: a mid-batch
-            // peak would mark every MPS batch, and every CUDA batch that
-            // retried an allocation, as pool-growing. See
-            // docs/batch-calibration-design.md, "Batch size: what counts as
-            // a measurement".
-            let pool_after = measurement
-                .reserved_after_mb
-                .or(measurement.peak_reserved_mb);
-            let grew_pool = match (pool_after, measurement.reserved_before_mb) {
-                (Some(after), Some(before)) => Some(after > before),
-                _ => None,
-            };
             let high_water = grew_pool == Some(true);
+            window_grew_pool = window_grew_pool.max(grew_pool);
+            window_pool = window_pool.max(pool_after);
             // Every batch that ran counts toward the warm-up, except negatives
             // and dropped collapses (skipped above).
             ran_batches = ran_batches.saturating_add(1);
@@ -642,8 +662,6 @@ impl VramLedger {
                     delta_mb: peak.saturating_sub(at_load),
                 });
                 anchor = anchor.max(units);
-                let full = budget_floor
-                    .is_some_and(|floor| units >= floor || measurement.next_over_budget);
                 ran_full |= full;
             }
             // Pool-over-allocated ratio, only where the pool grew and the delta
@@ -701,6 +719,7 @@ impl VramLedger {
                     stamped.value.total_mb,
                     model.as_deref(),
                     RamBasis::of(&stamped.value),
+                    GttBasis::pair(stamped.value.gtt_free_mb, stamped.value.ram_available_mb),
                 );
             }
         }
@@ -895,6 +914,8 @@ impl VramLedger {
             fit_samples: fit_sample_count,
             at_budget: !queue_bound && !pressure && ran_full,
             filled: !queue_bound && !ram_bound && ran_full,
+            grew_pool: window_grew_pool,
+            pool_mb: window_pool,
             throughput_samples,
             oom: saw_oom,
             throughput_collapse: saw_collapse,

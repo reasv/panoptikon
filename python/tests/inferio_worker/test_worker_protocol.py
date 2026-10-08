@@ -778,13 +778,15 @@ def test_a_trim_that_released_nothing_leaves_the_shrink_state_alone() -> None:
             "nor reset the hysteresis that is counting towards a real release"
         )
     finally:
-        packing.note_trimmed()
+        packing.reset_comparator()
+        packing.reset_shrink_state()
 
 
 def test_the_worker_returns_freed_memory_after_each_predict_reply() -> None:
     """After every `predict` reply, ok or error, the worker trims the C heap
-    before it reads the next request. Driven in-process, noting which reply
-    frames were written when each trim ran."""
+    and stops counting paging from the window's last reading before it reads
+    the next request. Driven in-process, noting which reply frames were
+    written when each ran."""
     from unittest import mock
 
     from inferio_worker import __main__ as harness
@@ -814,19 +816,26 @@ def test_the_worker_returns_freed_memory_after_each_predict_reply() -> None:
         return frames
 
     trims: list[list[tuple[int, str]]] = []
+    clears: list[list[tuple[int, str]]] = []
     windows = mock.Mock(
         side_effect=[{"outputs": [{"echo": 1}]}, RuntimeError("the window failed")]
     )
     with (
         mock.patch.dict(sys.modules, {"torch": None}),
         mock.patch.object(memory, "return_freed_memory", lambda: trims.append(replies())),
+        mock.patch.object(
+            memory,
+            "count_paging_from_last_reading",
+            lambda counted: clears.append(replies()) if not counted else None,
+        ),
         mock.patch.object(packing, "run_grantless_window", windows),
     ):
         assert harness._serve(proto_in, proto_out) == 0
     # Trims also run at load end; those after a predict reply are the last
     # frame written being that reply.
-    after_predict = [frames[-1] for frames in trims if frames and frames[-1][0] >= 4]
-    assert after_predict == [(4, "ok"), (5, "error")], trims
+    for runs in (trims, clears):
+        last = [frames[-1] for frames in runs if frames and frames[-1][0] >= 4]
+        assert last == [(4, "ok"), (5, "error")], runs
 
 
 def test_the_worker_holds_no_request_input_while_it_waits() -> None:
@@ -869,6 +878,55 @@ def test_the_worker_holds_no_request_input_while_it_waits() -> None:
     assert alive_at_trim == [False], alive_at_trim
 
 
+def test_every_load_runs_the_attention_check_after_it_is_priced() -> None:
+    """The GQA check runs once per load, after `finish_load` and before the
+    reply: it looks at where the load put memory, its own allocation is no
+    part of the load's footprint, and a dtype it left undecided is tested
+    again at the next load."""
+    from unittest import mock
+
+    from inferio_worker import __main__ as harness
+    from inferio_worker import memory, sdpa
+
+    proto_in = io.BytesIO()
+    for message in (
+        handshake_msg(req_id=1),
+        configure_msg(req_id=2),
+        {"type": "load", "id": 3},
+        {"type": "load", "id": 4},
+        {"type": "unload", "id": 5},
+    ):
+        payload = msgpack.packb(message, use_bin_type=True)
+        proto_in.write(struct.pack("<I", len(payload)) + payload)
+    proto_in.seek(0)
+    calls: list[str] = []
+
+    def spy(name, function):
+        def record(*args, **kwargs):
+            calls.append(name)
+            return function(*args, **kwargs)
+
+        return record
+
+    with (
+        mock.patch.dict(sys.modules, {"torch": None}),
+        mock.patch.object(memory, "begin_load", spy("begin", memory.begin_load)),
+        mock.patch.object(
+            memory, "pinned_device_missing", spy("pin", memory.pinned_device_missing)
+        ),
+        mock.patch.object(memory, "finish_load", spy("finish", memory.finish_load)),
+        mock.patch.object(
+            sdpa,
+            "expand_kv_heads_without_fused_gqa",
+            spy("check", lambda: sdpa.NOT_APPLICABLE),
+        ),
+        mock.patch.object(harness, "_send_ok", spy("reply", harness._send_ok)),
+    ):
+        assert harness._serve(proto_in, io.BytesIO()) == 0
+    load = ["begin", "pin", "finish", "check", "reply"]
+    assert calls[calls.index("begin") :] == [*load, *load, "reply"]
+
+
 def test_the_batch_memory_frames_capability_is_read_off_the_handshake() -> None:
     """`batch_memory_frames` is announced, not agreed: present-and-true means
     the orchestrator reads mid-request `memory` frames, and every other answer
@@ -889,6 +947,53 @@ def test_the_batch_memory_frames_capability_is_read_off_the_handshake() -> None:
     assert negotiated(batch_memory_frames=True) == (True, True)
     for hostile in (None, False, 1, "true", {}):
         assert negotiated(batch_memory_frames=hostile) == (True, False), hostile
+
+
+def test_a_rocm_torch_before_2_6_fails_the_handshake_under_rocr(
+    monkeypatch,
+) -> None:
+    """Such a torch fails at its first GPU use while `ROCR_VISIBLE_DEVICES`
+    is set without `HIP_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES`, so the
+    handshake fails first and names the cause."""
+    import importlib.metadata
+
+    from inferio_worker import __main__ as worker_main
+    from inferio_worker import protocol
+
+    for version, rocr, hip, cuda, device, fails in (
+        ("2.5.1+rocm6.2", "0", None, None, None, True),
+        ("2.5.1+rocm6.2", "0", "0", None, None, False),
+        ("2.5.1+rocm6.2", "0", "", None, None, False),
+        ("2.5.1+rocm6.2", "0", None, "0", None, False),
+        ("2.5.1+rocm6.2", "0", None, "", None, False),
+        ("2.5.1+rocm6.2", "0", None, None, "cpu", False),
+        ("2.5.1+rocm6.2", None, None, None, None, False),
+        ("2.6.0+rocm6.2", "0", None, None, None, False),
+        ("2.10.0+rocm7.2", "0", None, None, None, False),
+        ("2.5.1+cu124", "0", None, None, None, False),
+    ):
+        monkeypatch.setattr(importlib.metadata, "version", lambda _: version)
+        for name, value in (
+            ("ROCR_VISIBLE_DEVICES", rocr),
+            ("HIP_VISIBLE_DEVICES", hip),
+            ("CUDA_VISIBLE_DEVICES", cuda),
+            ("INFERIO_DEVICE", device),
+        ):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        request, reply = io.BytesIO(), io.BytesIO()
+        protocol.write_frame(request, handshake_msg(req_id=1))
+        request.seek(0)
+        impl_cls, _ = worker_main._handshake(request, reply)
+        reply.seek(0)
+        frame = protocol.read_frame(reply)
+        assert (impl_cls is None) == fails, (version, rocr, hip, cuda, device)
+        if fails:
+            assert frame["type"] == "error"
+            assert version in frame["message"]
+            assert "ROCR_VISIBLE_DEVICES" in frame["message"]
 
 
 def test_a_worker_that_can_measure_nothing_answers_the_capability_in_silence(

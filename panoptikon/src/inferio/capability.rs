@@ -6,7 +6,8 @@
 //! anything. ROCm/MPS/CPU hosts are not queried and are unknown by
 //! design — the only capability floors shipped today are
 //! CUDA-specific (bf16 + FlashAttention 2 want sm_80+), and the Python
-//! impls carry their own load-time backstop guard.
+//! impls carry their own load-time backstop guard. A model that loads on
+//! some backends only lists them in its `accelerators` metadata.
 //! The query itself runs in `gpu.rs`, together with the GPU identity probe.
 
 use std::io::Read;
@@ -57,11 +58,13 @@ impl HostComputeCaps {
 }
 
 /// Inject `unavailable: true` + `unavailable_reason` into every inference
-/// id whose numeric `min_compute_capability` metadata this host provably
-/// fails. Unknown hosts and satisfied floors leave the body untouched.
-/// Floors are read from per-id metadata only (where the shipped registry
-/// sets them), not group metadata.
-pub fn overlay_metadata(root: &mut JsonValue, caps: &HostComputeCaps) {
+/// id whose `accelerators` metadata (backends it loads on: `cuda`, `rocm`,
+/// `mps`, `cpu`) leaves out `backend`, the one this host runs models on, or
+/// whose numeric `min_compute_capability` this host provably fails. Unknown
+/// hosts and satisfied floors leave the body untouched. Both are read from
+/// per-id metadata only (where the shipped registry sets them), not group
+/// metadata.
+pub fn overlay_metadata(root: &mut JsonValue, caps: &HostComputeCaps, backend: &str) {
     let Some(groups) = root.as_object_mut() else {
         return;
     };
@@ -76,6 +79,19 @@ pub fn overlay_metadata(root: &mut JsonValue, caps: &HostComputeCaps) {
             let Some(obj) = meta.as_object_mut() else {
                 continue;
             };
+            if let Some(accelerators) = obj.get("accelerators").and_then(JsonValue::as_array)
+                && !accelerators
+                    .iter()
+                    .any(|name| name.as_str() == Some(backend))
+            {
+                let names: Vec<&str> = accelerators.iter().filter_map(JsonValue::as_str).collect();
+                let reason = format!(
+                    "Runs only on {} (this host runs models on {backend})",
+                    names.join(", ")
+                );
+                mark_unavailable(obj, reason);
+                continue;
+            }
             let Some(floor) = obj
                 .get("min_compute_capability")
                 .and_then(JsonValue::as_f64)
@@ -84,20 +100,21 @@ pub fn overlay_metadata(root: &mut JsonValue, caps: &HostComputeCaps) {
             };
             if caps.meets_floor(floor) == Some(false) {
                 let tenths = (floor * 10.0).round() as i64;
-                obj.insert("unavailable".to_string(), JsonValue::Bool(true));
-                obj.insert(
-                    "unavailable_reason".to_string(),
-                    JsonValue::String(format!(
-                        "Requires an NVIDIA GPU with compute capability >= \
-                         {}.{} (detected: {})",
-                        tenths / 10,
-                        tenths % 10,
-                        caps.describe(),
-                    )),
+                let reason = format!(
+                    "Requires an NVIDIA GPU with compute capability >= {}.{} (detected: {})",
+                    tenths / 10,
+                    tenths % 10,
+                    caps.describe(),
                 );
+                mark_unavailable(obj, reason);
             }
         }
     }
+}
+
+fn mark_unavailable(obj: &mut serde_json::Map<String, JsonValue>, reason: String) {
+    obj.insert("unavailable".to_string(), JsonValue::Bool(true));
+    obj.insert("unavailable_reason".to_string(), JsonValue::String(reason));
 }
 
 /// One `major.minor` capability field as nvidia-smi prints it, else `None`.
@@ -328,7 +345,7 @@ mod tests {
             }
         });
         let caps = HostComputeCaps::from_caps(vec![(6, 1)]);
-        overlay_metadata(&mut body, &caps);
+        overlay_metadata(&mut body, &caps, "cuda");
         let gated = &body["doctr"]["inference_ids"]["dots_ocr"];
         assert_eq!(gated["unavailable"], json!(true));
         let reason = gated["unavailable_reason"].as_str().unwrap();
@@ -349,12 +366,46 @@ mod tests {
             }
         });
         let mut satisfied = template.clone();
-        overlay_metadata(&mut satisfied, &HostComputeCaps::from_caps(vec![(8, 9)]));
+        overlay_metadata(
+            &mut satisfied,
+            &HostComputeCaps::from_caps(vec![(8, 9)]),
+            "cuda",
+        );
         assert_eq!(satisfied, template);
 
         let mut unknown = template.clone();
-        overlay_metadata(&mut unknown, &HostComputeCaps::unknown());
+        overlay_metadata(&mut unknown, &HostComputeCaps::unknown(), "cuda");
         assert_eq!(unknown, template);
+    }
+
+    /// A model that lists the backends it loads on is unavailable on any
+    /// other, whatever the capability probe knows.
+    #[test]
+    fn overlay_marks_ids_whose_accelerators_leave_out_the_host_backend() {
+        let template = json!({
+            "doctr": {
+                "group_metadata": {},
+                "inference_ids": {
+                    "dots_ocr": {"accelerators": ["cuda"], "min_compute_capability": 8.0},
+                    "doctr|db_resnet50": {"description": "open"}
+                }
+            }
+        });
+        for backend in ["rocm", "mps", "cpu"] {
+            let mut body = template.clone();
+            overlay_metadata(&mut body, &HostComputeCaps::unknown(), backend);
+            let ids = &body["doctr"]["inference_ids"];
+            assert_eq!(ids["dots_ocr"]["unavailable"], json!(true), "{backend}");
+            assert!(ids["doctr|db_resnet50"].get("unavailable").is_none());
+        }
+        let mut cuda = template.clone();
+        overlay_metadata(&mut cuda, &HostComputeCaps::unknown(), "cuda");
+        assert_eq!(cuda, template);
+        overlay_metadata(&mut cuda, &HostComputeCaps::from_caps(vec![(7, 5)]), "cuda");
+        assert_eq!(
+            cuda["doctr"]["inference_ids"]["dots_ocr"]["unavailable"],
+            json!(true)
+        );
     }
 
     #[test]
@@ -368,7 +419,7 @@ mod tests {
             }
         });
         let mut body = template.clone();
-        overlay_metadata(&mut body, &HostComputeCaps::from_caps(vec![(6, 1)]));
+        overlay_metadata(&mut body, &HostComputeCaps::from_caps(vec![(6, 1)]), "cuda");
         assert_eq!(body, template);
     }
 }

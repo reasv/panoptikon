@@ -579,6 +579,47 @@ fn a_one_item_oom_with_room_to_spare_condemns_nothing() {
     }
 }
 
+/// Where a full GPU spills to system RAM, a model too big for it never runs
+/// out of memory: a one-item window whose batch spilled is a strike as a
+/// one-item out-of-memory window is, with less room than one item costs and
+/// not with room to spare.
+#[test]
+fn one_item_windows_that_spill_with_no_room_for_one_condemn_the_replica() {
+    for (total_mb, base_mb, free_mb, condemned) in
+        [(32_607, 31_150, 456, true), (100_000, 1_000, 90_000, false)]
+    {
+        let ledger = ledger(total_mb, no_margin());
+        let handle = loaded(Some(base_mb), Some(0));
+        let admission = ledger
+            .register_worker("g/too-big", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, free_mb, 0);
+        ledger.ingest_all_for_test();
+        let window = || {
+            let token = admission.request_grant(1, None, 1, 0).expect("granted");
+            assert_eq!(token.grant().unit_budget, 1);
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![BatchMeasurement {
+                    spilled: true,
+                    items: Some(1),
+                    ..warm_batch(1, 1.0)
+                }]);
+            token.finish(WindowOutcome::Responded { oom: None })
+        };
+        for _ in 1..OOM_WINDOWS_AT_FLOOR {
+            assert!(window().is_none());
+        }
+        let verdict = window();
+        assert_eq!(verdict.is_some(), condemned, "{total_mb} MiB card");
+        if let Some(verdict) = verdict {
+            assert_eq!(verdict.base_mb, base_mb);
+            assert!(verdict.needs_mb > verdict.room_mb, "{verdict}");
+        }
+    }
+}
+
 /// The Windows sysmem fallback, whose 304 MiB of growth had 297 MiB of card
 /// to grow into, against a heterogeneous-corpus drop whose growth all fitted
 /// (docs/batch-calibration-design.md, "The worker's verdict is a candidate").
@@ -1021,8 +1062,10 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
         requests: 1,
         unit_budget: 8,
         size_asked: 8,
+        units_asked: 8,
         granted_at: Instant::now(),
         squeezed: false,
+        memory_cut: false,
         room_bound: false,
         peak_occupants: 0,
         queue_bound: false,
@@ -1115,8 +1158,10 @@ fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
         requests: 1,
         unit_budget: 512,
         size_asked: 512,
+        units_asked: 512,
         granted_at: Instant::now(),
         squeezed: false,
+        memory_cut: false,
         room_bound: false,
         peak_occupants: 0,
         queue_bound: false,

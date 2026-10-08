@@ -250,7 +250,8 @@ fn is_hip_related_lib_dir(dir: &Path) -> bool {
 
 /// Prepend HIP dirs to `LD_LIBRARY_PATH`; default `ROCM_PATH`/`HIP_PATH` to
 /// `/opt/rocm` when unset. Also sets MIOpen find/cache defaults so conv/GEMM
-/// solver search does not stall (EasyOCR/CRAFT: IsEnoughWorkspace size 0).
+/// solver search does not stall (EasyOCR/CRAFT: IsEnoughWorkspace size 0),
+/// and its log level to errors.
 /// Empty on non-Linux.
 fn hip_worker_env() -> Vec<(String, String)> {
     #[cfg(not(target_os = "linux"))]
@@ -289,6 +290,9 @@ fn hip_worker_env() -> Vec<(String, String)> {
         // tens of seconds until the unload grace kills the worker.
         // See ROCm/TheRock#3077, rocm-libraries#4071.
         push_if_unset(&mut out, "MIOPEN_FIND_MODE", "FAST".to_owned());
+        // Errors only (3): MIOpen's per-call workspace warnings would flood
+        // the gateway log.
+        push_if_unset(&mut out, "MIOPEN_LOG_LEVEL", "3".to_owned());
         if let Some(cache) = miopen_cache_dir() {
             let path = |leaf: &str| cache.join(leaf).to_string_lossy().into_owned();
             push_if_unset(&mut out, "MIOPEN_USER_DB_PATH", path("db"));
@@ -433,12 +437,13 @@ mod tests {
         // Linux the whole HIP env is empty by design.
         let rocm = worker_env(Accelerator::Rocm, &bare_python());
         #[cfg(target_os = "linux")]
-        if env::var_os("MIOPEN_FIND_MODE").is_none() {
-            assert!(
-                rocm.iter()
-                    .any(|(k, v)| k == "MIOPEN_FIND_MODE" && v == "FAST"),
-                "expected MIOPEN_FIND_MODE=FAST in {rocm:?}"
-            );
+        for (key, value) in [("MIOPEN_FIND_MODE", "FAST"), ("MIOPEN_LOG_LEVEL", "3")] {
+            if env::var_os(key).is_none() {
+                assert!(
+                    rocm.iter().any(|(k, v)| k == key && v == value),
+                    "expected {key}={value} in {rocm:?}"
+                );
+            }
         }
         #[cfg(not(target_os = "linux"))]
         assert!(rocm.is_empty(), "non-Linux HIP env must be empty: {rocm:?}");

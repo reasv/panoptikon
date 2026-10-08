@@ -718,6 +718,7 @@ fn host_ram_free(ledger: &VramLedger, free_mb: u64) {
         uuid: cpu::DEVICE_KEY.to_owned(),
         total_mb: CPU_RAM_MB,
         free_mb,
+        gtt: None,
     }]));
 }
 

@@ -242,26 +242,40 @@ fn cpu_host(count: u64, headroom: u64, percent: u64) -> (Arc<VramLedger>, Vec<Co
     (ledger, replicas)
 }
 
-/// A 16 GB Mac (recommended max 12 288 MiB) with a cold MPS replica whose
-/// pool is `pool_ratio` times its tensors and a cold CPU replica, 2500 MiB
-/// of base each: 7288 MiB of headroom on both devices.
-fn mac(pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>) {
+/// A 16 GB Mac (recommended max 12 288 MiB), or a 16 GB APU host (512 MiB
+/// carve-out, 16 GiB of GTT), with a cold GPU replica whose pool is
+/// `pool_ratio` times its tensors and a cold CPU replica, 2500 MiB of base
+/// each, and the RAM room of the pair: the carve-out (APU only) and RAM, less
+/// the RAM floor and both bases.
+fn unified_pair(apu: bool, pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>, u64) {
     const RAM_MB: u64 = 16_384;
     const RECOMMENDED_MAX_MB: u64 = RAM_MB / 4 * 3;
     const BASE_MB: u64 = 2500;
-    // The CPU device capped at Metal's three quarters: the same room on both.
-    let budgets = VramBudgets::default().with_gpu(
-        cpu::DEVICE_KEY,
-        VramBudget {
-            cap_fraction: Some(0.75),
-            ..VramBudget::default()
-        },
-    );
-    let ledger = VramLedger::new(&GpuInventory::known_mps(RAM_MB), budgets, None);
+    const CARVEOUT_MB: u64 = 512;
+    let (inventory, gpu, gpu_handle) = if apu {
+        let total_mb = CARVEOUT_MB + RAM_MB;
+        let device = crate::inferio::gpu::GpuInfo {
+            total_mb,
+            unified_ram_mb: Some(total_mb),
+            vram_carveout_mb: Some(CARVEOUT_MB),
+            ..super::unified_memory::apu_device(0)
+        };
+        let inventory = GpuInventory::known_rocm(vec![device])
+            .with_cpu(RAM_MB, crate::inferio::cpu::MemRoots::default());
+        (
+            inventory,
+            AMD_A,
+            loaded_rocm(Some("0000:03:00.0"), Some(total_mb)),
+        )
+    } else {
+        let handle = loaded_mps(Some(RECOMMENDED_MAX_MB));
+        (GpuInventory::known_mps(RAM_MB), MPS_GPU, handle)
+    };
+    let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
     ledger.install_probe_stub(None);
     let mut replicas = Vec::new();
     for (model, device, handle) in [
-        ("g/mps", MPS_GPU, loaded_mps(Some(RECOMMENDED_MAX_MB))),
+        ("g/gpu", gpu, gpu_handle),
         ("g/cpu", cpu::DEVICE_KEY, loaded_on_cpu(Some(RAM_MB))),
     ] {
         handle
@@ -275,16 +289,16 @@ fn mac(pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>) {
         let admission = ledger
             .register_worker(model, item_cost(8), &handle, Some(device))
             .expect("admitted");
-        let on_mps = device == MPS_GPU;
+        let on_gpu = device == gpu;
         replicas.push(Cold {
             model: model.to_owned(),
             device: device.to_owned(),
             handle,
             admission,
             seed: 8,
-            allocated_mb: if on_mps { SEED_BUDGET_MB } else { 2560 },
-            pool_ratio: if on_mps { pool_ratio } else { 1.0 },
-            keeps_pool: on_mps,
+            allocated_mb: if on_gpu { SEED_BUDGET_MB } else { 2560 },
+            pool_ratio: if on_gpu { pool_ratio } else { 1.0 },
+            keeps_pool: on_gpu,
             kept_mb: 0,
             first_only_mb: 0,
             first_window: u64::MAX,
@@ -293,25 +307,45 @@ fn mac(pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>) {
             open: None,
         });
     }
-    // Nothing else holds RAM: both bases are ours. The MPS reading carries
-    // its RAM domain, as every Metal reading does.
-    VramLedger::record_free_locked(
-        &mut ledger.lock(),
-        MPS_GPU,
-        RECOMMENDED_MAX_MB - 2 * BASE_MB,
-        "mps".to_owned(),
-        std::time::Instant::now(),
-        None,
-        None,
-        Some(RamBasis {
+    // Nothing else holds RAM: both bases are ours, the APU's beyond its
+    // carve-out.
+    if apu {
+        let in_ram = BASE_MB - CARVEOUT_MB;
+        let available = RAM_MB - BASE_MB - in_ram;
+        super::unified_memory::push_apu(&replicas[0].handle, 0, RAM_MB - in_ram, available, 0);
+        ledger.ingest_all_for_test();
+        ledger.record_free_for_test(cpu::DEVICE_KEY, available);
+    } else {
+        // The MPS reading carries its RAM domain, as every Metal reading
+        // does, and the host's own read of RAM answers the same.
+        let available = RAM_MB - 2 * BASE_MB;
+        VramLedger::record_free_locked(
+            &mut ledger.lock(),
+            gpu,
+            RECOMMENDED_MAX_MB - 2 * BASE_MB,
+            "mps".to_owned(),
+            std::time::Instant::now(),
+            None,
+            None,
+            Some(RamBasis {
+                total_mb: RAM_MB,
+                available_mb: available,
+            }),
+            None,
+        );
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: gpu.to_owned(),
             total_mb: RAM_MB,
-            available_mb: RAM_MB - 2 * BASE_MB,
-        }),
-    );
-    ledger.record_free_for_test(cpu::DEVICE_KEY, RAM_MB - 2 * BASE_MB);
-    assert_eq!(ledger.headroom_mb(MPS_GPU), 7288);
-    assert_eq!(ledger.headroom_mb(cpu::DEVICE_KEY), 7288);
-    (ledger, replicas)
+            free_mb: available,
+            gtt: None,
+        }]));
+        ledger.record_free_for_test(cpu::DEVICE_KEY, available);
+    }
+    let headroom = (ledger.headroom_mb(gpu), ledger.headroom_mb(cpu::DEVICE_KEY));
+    assert_eq!(headroom, if apu { (9848, 9848) } else { (9336, 9336) });
+    let carveout = if apu { CARVEOUT_MB } else { 0 };
+    let room = carveout + RAM_MB - cpu::ram_reserve_mb(RAM_MB) - 2 * BASE_MB;
+    (ledger, replicas, room)
 }
 
 /// An 8 GiB card, 3817 MiB of headroom, at a tenth, a half and all of the
@@ -423,33 +457,27 @@ fn cold_cpu_replicas_on_a_16_gb_host_stay_inside_the_headroom() {
     assert_eq!(ran.over, [220, -420, -1700, -1060, -1060]);
 }
 
-/// A 16 GB Mac. The first MPS batch is priced at the default pool margin;
-/// from the second on at the margin it measured. A pool 2.9 times its
-/// tensors is 1212 MiB over in the first two windows and inside after.
+/// A 16 GB Mac, and a 16 GB APU host at a HIP-sized pool. The first GPU
+/// batch is priced at the default pool margin; from the second on at the
+/// margin it measured. The pair stays within its RAM room.
 #[test]
-fn a_cold_mps_and_cpu_replica_on_a_16_gb_mac_are_priced_at_the_measured_pool() {
-    let cases: [(f64, [[u64; 2]; 4], [i64; 4]); 3] = [
-        (
-            1.25,
-            [[8, 8], [14, 6], [13, 5], [14, 7]],
-            [-2168, -248, -888, -568],
-        ),
-        (
-            2.3,
-            [[8, 8], [7, 6], [6, 5], [8, 6]],
-            [-17, -17, -657, -657],
-        ),
-        (
-            2.9,
-            [[8, 8], [7, 2], [6, 3], [8, 3]],
-            [1212, 1212, -388, -388],
-        ),
+fn a_cold_gpu_and_cpu_replica_on_a_16_gb_unified_host_are_priced_at_the_measured_pool() {
+    let cases = [
+        (false, 1.25, [[8, 8], [16, 11], [15, 10], [16, 10]]),
+        (false, 2.3, [[8, 8], [11, 6], [10, 5], [11, 7]]),
+        (false, 2.9, [[8, 8], [9, 6], [7, 5], [9, 6]]),
+        (true, 1.25, [[8, 8], [16, 12], [15, 11], [16, 11]]),
     ];
-    for (pool_ratio, units, over) in cases {
-        let (ledger, mut replicas) = mac(pool_ratio);
-        let ran = run(&ledger, &mut replicas, 7288, 4);
-        assert_eq!(ran.units, units, "pool ratio {pool_ratio}");
-        assert_eq!(ran.over, over, "pool ratio {pool_ratio}");
+    for (apu, pool_ratio, units) in cases {
+        let (ledger, mut replicas, room) = unified_pair(apu, pool_ratio);
+        let ran = run(&ledger, &mut replicas, room, 4);
+        let label = format!("APU {apu}, pool ratio {pool_ratio}");
+        assert_eq!(ran.units, units, "{label}");
+        assert!(
+            ran.over.iter().all(|over| *over <= 0),
+            "{label}: {:?}",
+            ran.over
+        );
     }
 }
 

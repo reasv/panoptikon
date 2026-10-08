@@ -13,6 +13,9 @@ import inspect
 import logging
 import os
 import platform
+import re
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -21,6 +24,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+# psutil picks its platform module at import, so it must be imported before
+# any test fakes `sys.platform`.
+import psutil
 import pytest
 
 from inferio_worker import memory, packing, sdpa
@@ -94,6 +100,7 @@ class FakeCuda:
         # (feature suffixes and all, as amdgpu renders it) on ROCm.
         self.capability = (12, 0)
         self.gcn_arch = "gfx1100:sramecc+:xnack-"
+        self.integrated = 0
 
     def is_available(self):
         return True
@@ -121,7 +128,10 @@ class FakeCuda:
 
     def get_device_properties(self, index):
         assert index == 0, "a pinned worker only ever has device 0"
-        props = SimpleNamespace(uuid=self.uuid, name=self.name, total_memory=self.total)
+        props = SimpleNamespace(
+            uuid=self.uuid, name=self.name, total_memory=self.total,
+            is_integrated=self.integrated,
+        )
         if self.pci is not None:
             keys = ("pci_domain_id", "pci_bus_id", "pci_device_id")
             props.__dict__.update(dict(zip(keys, self.pci)))
@@ -207,7 +217,12 @@ def isolated(torch_module=None):
             mock.patch.dict(memory._bdf_state, {"bdf": None}, clear=False),
             mock.patch.dict(
                 memory._context_state,
-                {"measured_mb": None, "logged": False, "probe": None},
+                {
+                    "measured_mb": None,
+                    "logged": False,
+                    "probe": None,
+                    "unmeasured": None,
+                },
                 clear=False,
             ),
             mock.patch.dict(memory._logged, {}, clear=False),
@@ -568,20 +583,101 @@ def test_the_fixed_estimate_is_the_last_resort_and_names_itself(fake_torch) -> N
     report = memory.finish_load(before, object())
     assert report["base_method"] == "alloc_delta"
     assert report["base_mb"] == 800 + memory.CONTEXT_ESTIMATE_MB
+    with isolated(fake_torch_module(FakeCuda(), hip="7.2.0")):
+        assert memory.context_allowance_mb() == (
+            memory.HIP_CONTEXT_ESTIMATE_MB, "estimate"
+        )
+
+
+def test_an_unmeasured_context_is_logged_once_with_its_reason(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    # A base priced with the context estimate logs one INFO line per worker
+    # naming the estimate and why the context went unmeasured. A base from a
+    # per-process figure or a plausible free delta logs none.
+    band = "outside the band"
+    fixed = (
+        memory.CONTEXT_NO_DRIVER_READING,
+        memory.CONTEXT_INITIALISED_BEFORE,
+        memory.CONTEXT_INIT_UNSEEN,
+    )
+    cuda_estimate, hip_estimate = (
+        memory.CONTEXT_ESTIMATE_MB, memory.HIP_CONTEXT_ESTIMATE_MB
+    )
+    ours = [fdinfo("0000:03:00.0", 1, "1536 MiB")]
+    # The probe polls only when the test says, so whether it saw the GPU come
+    # up is not a race.
+    monkeypatch.setattr(memory._ContextProbe, "start", lambda self: None)
+    # `returned` is the MiB the allocation gives back to the free reading.
+    for (
+        hip, fdinfo_texts, initialized, polled, nvml, returned, method, expected
+    ) in (
+        (False, None, True, True, (8700, 24_576), 600, "alloc_delta",
+         (memory.CONTEXT_INITIALISED_BEFORE, cuda_estimate)),
+        (False, None, True, True, (None, None), 600, "alloc_delta",
+         (memory.CONTEXT_NO_DRIVER_READING, cuda_estimate)),
+        (False, None, False, False, (8700, 24_576), 600, "alloc_delta",
+         (memory.CONTEXT_INIT_UNSEEN, cuda_estimate)),
+        (False, None, False, True, (8700, 24_576), 600, "alloc_delta",
+         (band, cuda_estimate)),
+        (True, None, True, True, (None, None), 600, "alloc_delta",
+         (memory.CONTEXT_NO_DRIVER_READING, hip_estimate)),
+        (True, ours, True, True, (None, None), 600, "fdinfo", None),
+        (False, None, True, True, (None, None), 0, "free_delta", None),
+    ):
+        cuda = FakeCuda(initialized=initialized)
+        host = (
+            rocm_host(
+                tmp_path, monkeypatch, fdinfo_texts=fdinfo_texts, cuda=cuda
+            )
+            if hip
+            else isolated(fake_torch_module(cuda))
+        )
+        with (
+            host,
+            mock.patch.object(memory, "_nvml_memory", return_value=nvml),
+            caplog.at_level(logging.INFO, logger="inferio_worker.memory"),
+        ):
+            caplog.clear()
+            for _ in range(2):
+                before = memory.begin_load()
+                cuda.initialized = True
+                if polled and before["context_probe"] is not None:
+                    before["context_probe"].poll()
+                cuda.allocate(512, reserved_mb=600)
+                cuda.free += returned * MIB
+                report = memory.finish_load(before, object())
+                assert report["base_method"] == method
+        records = [(r.levelno, r.args) for r in caplog.records]
+        if expected is None:
+            assert records == [], method
+        elif expected[0] == band:
+            [(level, (reason, estimate))] = records
+            assert (level, estimate) == (logging.INFO, expected[1])
+            assert reason not in fixed, "the reading's own figure"
+        else:
+            assert records == [(logging.INFO, expected)], expected
 
 
 def test_a_measured_context_sharpens_the_plausibility_ceiling() -> None:
     # The ceiling is `reserved_delta + context + slack`, and it is not
-    # circular.
-    for measured, method in ((700, "free_delta"), (None, "alloc_delta")):
+    # circular. The free delta is 100 MiB over the estimate's ceiling.
+    estimate = memory.CONTEXT_ESTIMATE_MB
+    after = 8700 - (100 + estimate + memory.IMPLAUSIBLE_SLACK_MB + 100)
+    for measured, method in (
+        (estimate + 200, "free_delta"),
+        (None, "alloc_delta"),
+    ):
         cuda = FakeCuda(initialized=True)
         with isolated(fake_torch_module(cuda)):
             memory._context_state["measured_mb"] = measured
-            answers = [(8700, 24_576), (5900, 24_576)]
+            answers = [(8700, 24_576), (after, 24_576)]
             with mock.patch.object(
                 memory,
                 "_nvml_memory",
-                side_effect=lambda: answers.pop(0) if answers else (5900, 24_576),
+                side_effect=lambda: (
+                    answers.pop(0) if answers else (after, 24_576)
+                ),
             ):
                 before = memory.begin_load()
                 cuda.allocate(100, reserved_mb=100)
@@ -921,6 +1017,46 @@ def test_batch_measurement_is_per_call(fake_torch) -> None:
     measurement = memory.finish_batch(state, items=1)["measurements"][0]
     assert measurement["allocated_before_mb"] == 500
     assert measurement["peak_allocated_mb"] == 550
+    assert measurement["peak_reserved_mb"] == 800
+
+    # A pool emptied inside the batch and regrown smaller has no peak of its
+    # own: torch's is still the pool before the batch.
+    state = memory.begin_batch()
+    fake_torch.reserved = fake_torch.allocated
+    fake_torch.allocate(100)
+    emptied = memory.finish_batch(state, items=1)["measurements"][0]
+    assert (emptied["reserved_before_mb"], emptied["reserved_after_mb"]) == (
+        800, 650
+    )
+    assert emptied["peak_reserved_mb"] is None
+
+    # Emptied and regrown past the pool before the batch: that peak is its own.
+    fake_torch.reserved = 800 * MIB
+    state = memory.begin_batch()
+    fake_torch.reserved = fake_torch.allocated
+    fake_torch.allocate(250)
+    fake_torch.allocated -= 250 * MIB
+    fake_torch.reserved = fake_torch.allocated
+    regrown = memory.finish_batch(state, items=1)["measurements"][0]
+    assert (
+        regrown["reserved_before_mb"],
+        regrown["peak_reserved_mb"],
+        regrown["reserved_after_mb"],
+    ) == (800, 900, 650)
+
+    # A sampled MPS peak is this batch's own, even where the pool fell.
+    with mps_host(available_mb=110 * 1024) as mps:
+        mps.allocate(800)
+        state = memory.begin_batch()
+        state["mps_sampler"].observe()
+        mps.free(500)
+        mps.empty_cache()
+        sampled = memory.measure_batch(state, items=1)
+    assert (
+        sampled["reserved_before_mb"],
+        sampled["peak_reserved_mb"],
+        sampled["reserved_after_mb"],
+    ) == (800, 800, 300)
 
 
 def test_alloc_retries_is_a_per_batch_delta(fake_torch) -> None:
@@ -1079,13 +1215,19 @@ def test_hip_suppresses_the_uuid_but_keeps_the_address() -> None:
         before = memory.begin_load()
         cuda.allocate(1024)
         report = memory.finish_load(before, object())
+        cuda.integrated = 1
+        assert memory.gpu_integrated() is True
+        os.environ["INFERIO_DEVICE"] = "cpu"
+        assert memory.gpu_integrated() is None, "a CPU-device worker"
     assert "gpu_uuid" not in report, report
     assert (report["gpu_bdf"], report["gpu_total_mb"]) == ("0000:03:00.0", 8192)
     assert report["torch_version"] == "2.11.0+rocm7.2"
+    assert report["gpu_integrated"] is False, "HIP's integrated, for the host to check"
     # The same GPU on a CUDA build reports the UUID, and the address rides
     # along additively (registration keys on the UUID first there).
     with isolated(fake_torch_module(FakeCuda())):
         assert memory.device_identity()[0] == "GPU-1a2b3c4d-0000-0000-0000-000000000000"
+        assert memory.gpu_integrated() is None, "ROCm only"
 
 
 def test_a_raising_props_getter_degrades_one_field_not_the_whole_report() -> None:
@@ -1382,10 +1524,13 @@ def empty_dir(tmp_path, name: str) -> str:
 
 
 @contextmanager
-def rocm_host(tmp_path, monkeypatch, pci=None, fdinfo_texts=None, cuda=None):
-    """A ROCm worker whose two sysfs roots point at fixture trees. Both roots
-    are always redirected: the tiers read `/sys` and `/proc`, and what this
-    machine has there is not this suite's business."""
+def rocm_host(
+    tmp_path, monkeypatch, pci=None, fdinfo_texts=None, cuda=None, kfd=None,
+    proc=None,
+):
+    """A ROCm worker whose sysfs and procfs roots point at fixture trees. All
+    roots are always redirected: the tiers read `/sys` and `/proc`, and what
+    this machine has there is not this suite's business."""
     cuda = cuda if cuda is not None else FakeCuda()
     with isolated(fake_torch_module(cuda, hip="7.2.0")):
         monkeypatch.setattr(
@@ -1393,6 +1538,9 @@ def rocm_host(tmp_path, monkeypatch, pci=None, fdinfo_texts=None, cuda=None):
             "PCI_DEVICES_ROOT",
             pci if pci is not None else empty_dir(tmp_path, "no-pci"),
         )
+        for name, root in (("KFD_ROOT", kfd), ("PROC_ROOT", proc)):
+            root = root or empty_dir(tmp_path, name)
+            monkeypatch.setattr(memory, name, root)
         monkeypatch.setattr(
             memory,
             "FDINFO_ROOT",
@@ -1562,6 +1710,109 @@ def test_the_fdinfo_tier_works_off_the_dominant_client_identity(
     assert again["gpu_bdf"] == "0000:0c:00.0", "the wire field is the memoized identity"
 
 
+KFD_GPU_ID = 4242
+OTHER_GPU_ID = 4343
+OUR_PASID = 32770
+
+
+def kfd_tree(tmp_path, pci: tuple, procs: dict) -> str:
+    """A KFD tree with one GPU node at `pci`, another GPU and the CPU node as
+    a real host has them. `pci` is `(domain, bus, device)` as in
+    `FakeCuda.pci`, and `procs` is `{entry name: (pasid, vram MiB)}`."""
+    root = _fresh(tmp_path, "kfd")
+    domain, bus, device = pci
+    nodes = {
+        "0": (0, 0, 0),
+        "1": (domain, bus << 8 | device << 3, KFD_GPU_ID),
+        "2": (domain, (bus + 1) << 8 | device << 3, OTHER_GPU_ID),
+    }
+    for name, (d, loc, gpu_id) in nodes.items():
+        node = root / "topology/nodes" / name
+        node.mkdir(parents=True)
+        (node / "properties").write_text(f"domain {d}\nlocation_id {loc}\n")
+        (node / "gpu_id").write_text(f"{gpu_id}\n")
+    for name, (pasid, vram_mb) in procs.items():
+        entry = root / "proc" / str(name)
+        entry.mkdir(parents=True)
+        (entry / "pasid").write_text(f"{pasid}\n")
+        (entry / f"vram_{KFD_GPU_ID}").write_text(f"{vram_mb * MIB}\n")
+        (entry / f"vram_{OTHER_GPU_ID}").write_text(f"{4000 * MIB}\n")
+    return str(root)
+
+
+def proc_tree(tmp_path, initial_ns: bool, others: dict) -> str:
+    """A `/proc` whose PID namespace is the initial one or not, holding
+    `others` as `{pid: [fdinfo text]}`."""
+    root = _fresh(tmp_path, "proc")
+    (root / "self/ns").mkdir(parents=True)
+    try:
+        os.symlink(
+            memory.INIT_PID_NS if initial_ns else "pid:[4026532001]",
+            root / "self/ns/pid",
+        )
+    except OSError:
+        pytest.skip("this filesystem cannot hold a symlink")
+    for pid, texts in others.items():
+        (root / str(pid) / "fdinfo").mkdir(parents=True)
+        for fd, text in enumerate(texts):
+            (root / str(pid) / "fdinfo" / str(fd)).write_text(text)
+    return str(root)
+
+
+def test_kfd_is_the_discrete_base_where_it_exceeds_fdinfo(
+    tmp_path, monkeypatch
+) -> None:
+    # fdinfo can miss part of a process's compute memory that KFD's own
+    # per-process counter holds. The KFD entry is ours by PID only in the
+    # initial PID namespace; elsewhere by the PASID KFD gives our DRM
+    # clients, unless another process holds it too (a fork).
+    def ours(vram: str | None = "1536 MiB") -> str:
+        return fdinfo("0001:03:01.0", 1, vram) + f"pasid:\t{OUR_PASID}\n"
+
+    pid, host_pid = os.getpid(), 999_999
+    # Outside the initial namespace `/proc` also holds our own process, under
+    # its PID and as `self`.
+    me = {pid: [ours()], "self": [ours()]}
+    fork = {pid: [ours()], "self": [ours()], pid + 1: [ours()]}
+    under_pool = "free_delta", 1200
+    for initial_ns, procs, others, vram, expected, label in (
+        (True, {pid: (OUR_PASID, 1600)}, {}, "1536 MiB", ("kfd", 1600),
+         "by PID"),
+        (True, {pid: (OUR_PASID, 1536)}, {}, "1536 MiB", ("fdinfo", 1536),
+         "not above"),
+        (True, {host_pid: (OUR_PASID, 1600)}, {}, "1536 MiB", ("fdinfo", 1536),
+         "no entry by PID: a PASID join would find a forked parent"),
+        (True, {pid: (OUR_PASID, 1600)}, {}, None, ("kfd", 1600),
+         "no fdinfo VRAM reading"),
+        (True, {pid: (OUR_PASID, 8192)}, {}, "1536 MiB", ("fdinfo", 1536),
+         "KFD at the GPU's total"),
+        (True, {pid: (OUR_PASID, 900)}, {}, "800 MiB", under_pool,
+         "both below the pool"),
+        (True, {pid: (OUR_PASID, 1600)}, {}, "800 MiB", ("kfd", 1600),
+         "fdinfo under the pool"),
+        (False, {host_pid: (OUR_PASID, 1600)}, me, "1536 MiB", ("kfd", 1600),
+         "by PASID"),
+        (False, {pid: (1, 1600)}, me, "1536 MiB", ("fdinfo", 1536),
+         "a PID-named entry outside the initial namespace"),
+        (False, {host_pid: (OUR_PASID, 1600)}, fork, "1536 MiB",
+         ("fdinfo", 1536), "a PASID a fork holds too"),
+        (False, {host_pid: (OUR_PASID, 1600), host_pid + 1: (OUR_PASID, 1600)},
+         me, "1536 MiB", ("fdinfo", 1536), "two entries with our PASID"),
+        (False, {}, me, "1536 MiB", ("fdinfo", 1536), "no KFD entry"),
+    ):
+        cuda = FakeCuda()
+        cuda.pci = (1, 0x03, 0x01)
+        with rocm_host(
+            tmp_path, monkeypatch, fdinfo_texts=[ours(vram)], cuda=cuda,
+            kfd=kfd_tree(tmp_path, cuda.pci, procs),
+            proc=proc_tree(tmp_path, initial_ns, others),
+        ):
+            before = memory.begin_load()
+            cuda.allocate(1024, reserved_mb=1200)
+            report = memory.finish_load(before, object())
+        assert (report["base_method"], report["base_mb"]) == expected, label
+
+
 # --- Unified GPUs: AMD APUs (docs/unified-memory-admission.md, backend B). ---
 
 # A BC-250/Strix-Halo-shaped GPU.
@@ -1577,16 +1828,17 @@ def unified(ram_available_mb: int | None = 8 * 1024, bdf: str = "0000:03:00.0"):
     `FakeCuda`'s PCI fields render to. psutil is stubbed rather than read: a
     test whose expected numbers came from the machine it runs on asserts
     nothing."""
-    real = memory._ram_available_bytes
-    memory._ram_available_bytes = (
-        lambda: None if ram_available_mb is None else ram_available_mb * MIB
+    real = memory._ram_bounds_bytes
+    memory._ram_bounds_bytes = lambda root=None: (
+        real(root)[0],
+        None if ram_available_mb is None else ram_available_mb * MIB,
     )
     os.environ["PANOPTIKON_UNIFIED_GPU"] = bdf
     try:
         yield
     finally:
         del os.environ["PANOPTIKON_UNIFIED_GPU"]
-        memory._ram_available_bytes = real
+        memory._ram_bounds_bytes = real
 
 
 def test_the_amdgpu_tier_is_gtt_inclusive_on_a_unified_device(
@@ -1618,11 +1870,16 @@ def test_the_amdgpu_tier_is_gtt_inclusive_on_a_unified_device(
             sample = memory.device_memory_sample()
     assert sample["free_source"] == "amdgpu-sysfs", "the driver, not the formula"
     assert (sample["free_mb"], sample["total_mb"]) == (256 + 8 * 1024, total)
+    assert (sample["gtt_free_mb"], sample["ram_available_mb"]) == (
+        60 * 1024,
+        8 * 1024,
+    ), "and both terms of its GTT clamp"
 
 
 def test_the_fdinfo_tier_counts_gtt_on_a_unified_device(tmp_path, monkeypatch) -> None:
     # On an APU our own allocations are VRAM + GTT, and a VRAM-only figure
-    # would report a multi-gigabyte model as holding a few hundred MB.
+    # would report a multi-gigabyte model as holding a few hundred MB. KFD's
+    # counter is such a figure, so it is not read there.
     texts = [
         fdinfo("0000:03:00.0", 1, "256 MiB") + "drm-resident-gtt:\t2048 MiB\n",
         fdinfo("0000:03:00.0", 1, "256 MiB") + "drm-resident-gtt:\t2048 MiB\n",
@@ -1634,8 +1891,13 @@ def test_the_fdinfo_tier_counts_gtt_on_a_unified_device(tmp_path, monkeypatch) -
     gpu = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 256 * MIB)})
     write_gtt(gpu, "0000:03:00.0", APU_GTT_MIB * MIB, 4096 * MIB)
     carveout = FakeCuda(total_mb=APU_CARVEOUT_MIB)
-    with rocm_host(tmp_path, monkeypatch, pci=gpu, fdinfo_texts=texts, cuda=carveout):
+    kfd = kfd_tree(tmp_path, carveout.pci, {os.getpid(): (OUR_PASID, 4096)})
+    with rocm_host(
+        tmp_path, monkeypatch, pci=gpu, fdinfo_texts=texts, cuda=carveout,
+        kfd=kfd, proc=proc_tree(tmp_path, True, {}),
+    ):
         assert memory.fdinfo_own_vram_mb() == 384, "VRAM alone without the flag"
+        assert memory.kfd_own_vram_mb() == 4096
         with unified():
             assert memory.fdinfo_own_vram_mb() == 384 + 2560
             before = memory.begin_load()
@@ -1726,7 +1988,7 @@ def test_after_load_checks_the_pin_then_prices_then_checks_gqa(
     monkeypatch.setattr(
         sdpa,
         "expand_kv_heads_without_fused_gqa",
-        lambda: events.append("gqa") or sdpa.PATCHED,
+        lambda: events.append("gqa") or {"float32": sdpa.EXPANDED},
     )
 
     def price() -> dict:
@@ -1734,7 +1996,8 @@ def test_after_load_checks_the_pin_then_prices_then_checks_gqa(
         return {"base_mb": 512}
 
     if problem is None:
-        assert memory.after_load(price) == ({"base_mb": 512}, sdpa.PATCHED)
+        record = {"float32": sdpa.EXPANDED}
+        assert memory.after_load(price) == ({"base_mb": 512}, record)
         assert events == ["pin", "price", "gqa"]
     else:
         with pytest.raises(RuntimeError):
@@ -1761,16 +2024,16 @@ def test_the_unified_signal_is_an_address_the_worker_verifies(
             with mock.patch.dict(
                 os.environ, {"PANOPTIKON_UNIFIED_GPU": value}, clear=False
             ):
-                assert memory._unified_gpu() is expected, value
+                assert memory.unified_gpu() is expected, value
                 regions = ("vram", "gtt") if expected else ("vram",)
                 assert memory._memory_regions() == regions, value
-        assert memory._unified_gpu() is False, "absent is the default everywhere"
+        assert memory.unified_gpu() is False, "absent is the default everywhere"
     # With no identity yet — the pre-load reading — the answer is discrete.
     with isolated():
         with mock.patch.dict(
             os.environ, {"PANOPTIKON_UNIFIED_GPU": "0000:03:00.0"}, clear=False
         ):
-            assert memory._unified_gpu() is False
+            assert memory.unified_gpu() is False
     # And a worker that landed on another GPU keeps the discrete currency.
     root = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 256 * MIB)})
     write_gtt(root, "0000:03:00.0", APU_GTT_MIB * MIB, 4096 * MIB)
@@ -1809,7 +2072,7 @@ def test_nvml_is_refused_outright_on_a_rocm_worker(tmp_path, monkeypatch) -> Non
 
 
 def test_the_fdinfo_reading_is_bounded_below_and_above(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ) -> None:
     # fdinfo's KFD/compute figures are VM-walk-based and need a recent kernel,
     # so a reading materially below our own allocator pool is an under-report,
@@ -1835,10 +2098,17 @@ def test_the_fdinfo_reading_is_bounded_below_and_above(
         (total - 1, 1024, 1, "fdinfo", "one MiB under it is a real reading"),
         # The comparand is the ABSOLUTE post-load pool, not the window delta:
         # a windowed one would pass an under-report on every reload.
-        (900, 3000, 2, "free_delta", "an under-report against the pool by then"),
+        (4000, 3000, 2, "free_delta",
+         "an under-report against the pool by then"),
     ):
         assert base_method(vram, pool, loads) == expected, label
-    assert slack < memory.CONTEXT_ESTIMATE_MB, "a missed context is never jitter"
+    # Each rejection is an INFO line, once per worker, naming the source.
+    with caplog.at_level(logging.INFO, logger="inferio_worker.memory"):
+        base_method(900, 3000, 2)
+        base_method(total, 1024, 2)
+    rejections = (("fdinfo", 900), ("fdinfo", total))
+    rejected = [r for r in caplog.records if r.args[:2] in rejections]
+    assert [r.levelno for r in rejected] == [logging.INFO, logging.INFO]
 
 
 def test_the_amdgpu_tiers_never_initialize_cuda_and_never_raise(
@@ -1965,6 +2235,7 @@ def mps_host(
         max(0, ram_mb - available_mb) * MIB,
         pressure,
         0,
+        0,
     )
     memory_info = SimpleNamespace(total=ram_mb * MIB, available=7 * MIB)
     with isolated(fake_mps_torch_module(mps)), mac_counters(counters, paging):
@@ -2089,12 +2360,14 @@ def available_mb(
     anonymous_mb: int,
     pressure: int = 1,
     paging: bool = False,
+    file_backed_mb: int = 0,
 ) -> int:
     """`mac_available_bytes` over one set of counters, in MiB."""
     counters = (
         *(value * MIB for value in (ram_mb, wired_mb, compressed_mb, anonymous_mb)),
         pressure,
         0,
+        file_backed_mb * MIB,
     )
     with mac_counters(counters, paging):
         available = memory.mac_available_bytes()
@@ -2147,52 +2420,80 @@ def test_the_mac_reading_falls_with_this_processs_own_allocation() -> None:
 
 
 def test_nothing_is_available_while_the_mac_pages_under_pressure() -> None:
-    """At critical (4), or at warning (2) while it is paging, macOS keeps
-    several GiB of file cache that the formula counts as available: 9 963 MiB
-    here. Warning without paging only means memory is held compressed."""
+    """Nothing at critical (4), or at warning (2) while it is paging. Warning
+    without paging takes the ~9 GiB of file cache macOS kept out of the
+    formula's 9 963 MiB."""
     for level, paging, expected in [
         (1, False, 9_963),
         (1, True, 9_963),
-        (2, False, 9_963),
+        (2, False, 963),
         (2, True, 0),
+        (3, False, 963),
         (3, True, 0),
         (4, False, 0),
         (4, True, 0),
     ]:
-        available = available_mb(131_072, 5_189, 55_599, 60_321, level, paging)
+        available = available_mb(
+            131_072, 5_189, 55_599, 60_321, level, paging, file_backed_mb=9_000
+        )
         assert available == expected, (level, paging)
 
 
-NO_SWAPOUTS_SEEN = {"count": None, "read_at": None, "rose_at": None}
+NO_SWAPOUTS_SEEN = dict.fromkeys(("count", "read_at", "rose_after", "since"))
 
 
-def test_paging_is_a_swap_out_counter_that_rose_recently() -> None:
-    """Since the previous reading, or within `MAC_PAGING_SECONDS` before this
-    one. A first reading has nothing to compare with, nor has one whose
-    predecessor is older than `MAC_PAGING_STALE_SECONDS`."""
-    readings = [  # (seconds, swap-out counter, paging)
-        (0, 500, False),
-        (1, 500, False),
-        (2, 501, True),
-        (12, 501, True),
-        (13, 501, False),
-        (73, 600, True),  # 60 s after the last reading
-        (134, 900, False),  # 61 s: too old to compare with
-        (135, 901, True),
-        (150, 100, False),  # a counter that fell is not a rise
-        (151, 100, False),
-    ]
+def paging_at(seconds: float, swapouts: int) -> bool:
+    """`_mac_paging` read `seconds` into a fake clock."""
+    return memory._mac_paging(swapouts, 1000.0 + seconds)
+
+
+def test_paging_is_a_rise_within_the_window_or_after_a_batch_started() -> None:
+    """A rise is dated by the earlier reading of the pair that saw it. Paging
+    is a rise within `MAC_PAGING_SECONDS` before now, or one after the
+    reading the window's previous batch started from, however long that
+    batch ran. Mirrors `mps.rs`."""
     with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
-        for seconds, swapouts, paging in readings:
-            with mock.patch("time.monotonic", return_value=1000.0 + seconds):
-                assert memory._mac_paging(swapouts) is paging, seconds
+        # Two 90 s batches while the counter rises through both.
+        assert not paging_at(0, 500), "one reading cannot tell"
+        memory.count_paging_from_last_reading(True)
+        assert paging_at(90, 900), "rose after batch 1 started"
+        memory.count_paging_from_last_reading(False)
+        assert not paging_at(90, 900), "without it the rise is dated 90 s ago"
+        memory.count_paging_from_last_reading(True)
+        assert paging_at(180, 1300), "rose after batch 2 started"
+        memory.count_paging_from_last_reading(True)
+        paging_at(181, 100)
+        assert not paging_at(200, 100), "a counter that fell did not rise"
+    with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
+        # A burst 20-24 s into a 45 s batch.
+        paging_at(0, 500)
+        memory.count_paging_from_last_reading(True)
+        assert paging_at(45, 504), "rose after the batch started"
+        memory.count_paging_from_last_reading(False)
+        assert not paging_at(45, 504), "without it the rise is dated 45 s ago"
+        assert paging_at(55, 505), "a rise dated exactly 10 s ago is paging"
+
+
+def test_a_windows_first_reading_counts_only_a_recent_rise() -> None:
+    """No batch of the window comes before its first reading, so a rise
+    counts there only within `MAC_PAGING_SECONDS`. One at the end of a 120 s
+    idle wait is dated at the reading before the wait. A rise 50 s before a
+    job is never paging for it."""
+    with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
+        paging_at(0, 500)
+        assert not paging_at(120, 600), "dated at the reading 120 s before"
+    with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
+        paging_at(0, 500)
+        assert not paging_at(55, 600), "dated 55 s before, outside the window"
+        memory.count_paging_from_last_reading(True)
+        assert not paging_at(65, 600), "the rise came before batch 1 started"
 
 
 def test_the_swap_out_counter_is_followed_at_every_pressure_level() -> None:
     """A reading at normal is the one the next is compared with, so paging
     that starts as the level turns to warning is seen at once."""
     def available(seconds: int, level: int, swapouts: int) -> int | None:
-        counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, level, swapouts)
+        counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, level, swapouts, 0)
         with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
             with mock.patch("time.monotonic", return_value=1000.0 + seconds):
                 return memory.mac_available_bytes()
@@ -2200,6 +2501,51 @@ def test_the_swap_out_counter_is_followed_at_every_pressure_level() -> None:
     with mock.patch.dict(memory._swapouts, NO_SWAPOUTS_SEEN):
         assert available(0, 1, 500) == 40 * 1024 * MIB
         assert available(5, 2, 700) == 0
+
+
+def test_the_vm_statistics_fields_are_read_at_their_positions() -> None:
+    # wire_count, compressor_page_count, internal_page_count, swapouts and
+    # external_page_count: each value is its own 1-based position in
+    # `vm_statistics64_data_t` (<mach/vm_statistics.h>).
+    raw = struct.pack("@4I9Q2I4Q4IQ", *range(1, 25))
+    assert memory._vm_statistics(raw) == (4, 20, 23, 19, 22)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="vm_stat is macOS's")
+def test_the_mac_counters_match_vm_stat() -> None:
+    def vm_stat() -> tuple[int, int, int, int, int]:
+        """Swap-outs since boot, then the wired, compressed and anonymous
+        memory and the file cache in bytes."""
+        out = subprocess.run(
+            ["vm_stat"], capture_output=True, text=True, check=True
+        ).stdout
+
+        def count(label: str) -> int:
+            return int(re.search(label + r"\s+(\d+)", out).group(1))
+
+        page = count("page size of")
+        return (
+            count("Swapouts:"),
+            count("Pages wired down:") * page,
+            count("Pages occupied by compressor:") * page,
+            count("Anonymous pages:") * page,
+            count("File-backed pages:") * page,
+        )
+
+    before, wired, compressed, anonymous, file_cache = vm_stat()
+    counters = memory._mac_memory_counters()
+    after, *_ = vm_stat()
+    assert counters is not None
+    # Each figure moves between the two reads; the compressor may hold
+    # little or nothing.
+    assert wired / 2 <= counters[1] <= wired * 2
+    assert compressed / 2 - 64 * MIB <= counters[2]
+    assert counters[2] <= compressed * 2 + 64 * MIB
+    assert anonymous / 2 <= counters[3] <= anonymous * 2
+    assert file_cache / 2 <= counters[6] <= file_cache * 2
+    if before == 0:
+        pytest.skip("no swap-outs since boot to compare")
+    assert before <= counters[5] <= after
 
 
 def test_an_unreadable_pressure_level_counts_as_normal() -> None:
@@ -2211,7 +2557,8 @@ def test_an_unreadable_pressure_level_counts_as_normal() -> None:
 def test_while_the_mac_pages_an_mps_batch_fits_the_pool_it_holds() -> None:
     """Nothing is free beyond this process's own pool, so the live clamp cuts
     a batch to what that pool can hold. At warning without paging the reading
-    stands and the batch keeps its size."""
+    stands, as the fake host has no file cache, and the batch keeps its
+    size."""
     with mps_host(available_mb=40 * 1024, pressure=2, paging=True) as mps:
         mps.allocate(1000, driver_mb=3000)
         reading = memory.free_total_reading()
@@ -2226,7 +2573,7 @@ def test_while_the_mac_pages_an_mps_batch_fits_the_pool_it_holds() -> None:
 
 def test_while_the_mac_pages_a_cpu_worker_on_it_has_nothing_free() -> None:
     """A CPU replica draws from the same RAM as Metal, so the same reading."""
-    counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 4, 0)
+    counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 4, 0, 0)
     memory_info = SimpleNamespace(total=128 * 1024 * MIB, available=40 * 1024 * MIB)
     with mac_counters(counters):
         with mock.patch("psutil.virtual_memory", return_value=memory_info):
@@ -2397,7 +2744,8 @@ def cpu_host(
     `INFERIO_DEVICE=cpu`, which is the whole of the signal. `cgroup` points at
     a fake cgroup root and `meminfo` at a fake `/proc/meminfo`; absent, at
     nothing, so the host running the suite cannot lend its own limit or slab
-    to a test that says nothing about one."""
+    to a test that says nothing about one. The macOS and Windows readings are
+    stubbed out for the same reason: psutil is the RAM on every host."""
     ram = ram if ram is not None else FakeRam()
     with isolated(torch_module):
         os.environ.pop("PANOPTIKON_DEVICE_PIN", None)
@@ -2418,6 +2766,10 @@ def cpu_host(
             ),
             mock.patch.object(
                 memory, "PROC_MEMINFO", meminfo or "/nonexistent/meminfo"
+            ),
+            mock.patch.object(memory, "_mac_memory_counters", return_value=None),
+            mock.patch.object(
+                memory, "_windows_memory_status", return_value=None
             ),
         ):
             yield ram
@@ -2551,9 +2903,12 @@ def test_a_cpu_worker_reports_the_resident_set_a_batch_left() -> None:
     assert measurement["rss_after_mb"] == 600, "what it still holds"
 
 
-def test_linux_free_ram_leaves_out_reclaimable_slab(tmp_path) -> None:
+def test_linux_free_ram_leaves_out_reclaimable_slab(
+    tmp_path, monkeypatch
+) -> None:
     # `MemAvailable` (psutil's `available`) counts slab the kernel may not
     # free in time; `cpu.rs` subtracts the same row.
+    monkeypatch.setattr(sys, "platform", "linux")
     meminfo = tmp_path / "meminfo"
     meminfo.write_text(
         "MemTotal:       131737460 kB\nMemAvailable:   31339520 kB\n"
@@ -2566,7 +2921,7 @@ def test_linux_free_ram_leaves_out_reclaimable_slab(tmp_path) -> None:
         with mock.patch.object(sys, "platform", "win32"):
             assert memory._reclaimable_slab_bytes() == 0
         # A unified ROCm GPU clamps its GTT by the same figure.
-        assert memory._ram_available_bytes() == 24_605 * MIB
+        assert memory._ram_bounds_bytes()[1] == 24_605 * MIB
     # More slab than is available, a row in another unit, no row, no file.
     for text, free_mb in (
         ("SReclaimable:   99999999 kB\n", 0),
@@ -2588,6 +2943,30 @@ def test_linux_free_ram_leaves_out_reclaimable_slab(tmp_path) -> None:
     meminfo.write_text("SReclaimable:    6144000 kB\n")
     with cpu_host(FakeRam(128 * 1024, 30_605), cgroup=str(group), meminfo=str(meminfo)):
         assert memory.ram_free_total_mb() == (10 * 1024, 16 * 1024)
+
+
+def test_windows_free_ram_is_bounded_by_available_commit() -> None:
+    with cpu_host(FakeRam(total_mb=64 * 1024, available_mb=8 * 1024)):
+        for phys_mb, commit_mb, free_mb in (
+            (12_288, 3_072, 3_072),
+            (12_288, 40_960, 12_288),
+        ):
+            status = memory._MemoryStatusEx(
+                ullAvailPhys=phys_mb * MIB, ullAvailPageFile=commit_mb * MIB
+            )
+            with mock.patch.object(
+                memory, "_windows_memory_status", return_value=status
+            ):
+                assert memory.ram_free_total_mb() == (free_mb, 64 * 1024)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a Windows API")
+def test_the_windows_memory_status_is_read() -> None:
+    status = memory._windows_memory_status()
+    assert status is not None
+    assert 0 < status.ullAvailPhys <= status.ullTotalPhys
+    assert 0 < status.ullAvailPageFile <= status.ullTotalPageFile
+    assert status.ullTotalPhys == psutil.virtual_memory().total
 
 
 def test_freed_host_memory_is_returned_before_the_resident_readings(
@@ -2749,6 +3128,17 @@ def test_the_cpu_device_is_bounded_by_the_cgroup_limit(tmp_path) -> None:
         )
         assert memory.ram_free_total_mb() == (10 * 1024, 16 * 1024)
         assert memory.ram_gpu_name() == "CPU (16 GB)", "what /health must show"
+
+    # An APU clamps its unclaimed GTT (60 GiB) by the same bounded RAM.
+    pci = pci_root(tmp_path, {"0000:03:00.0": (APU_CARVEOUT_MIB * MIB, 256 * MIB)})
+    write_gtt(pci, "0000:03:00.0", APU_GTT_MIB * MIB, 4096 * MIB)
+    hip = fake_torch_module(FakeCuda(), hip="7.2.0")
+    with cpu_host(machine(), hip, pinned=False, cgroup=str(v2)):
+        os.environ["PANOPTIKON_UNIFIED_GPU"] = "0000:03:00.0"
+        assert memory.amdgpu_free_total_mb(pci) == (
+            256 + 10 * 1024,
+            APU_CARVEOUT_MIB + APU_GTT_MIB,
+        )
 
     # cgroup v1, the same facts under the controller's own names.
     v1 = tmp_path / "v1" / "memory"
@@ -3261,8 +3651,8 @@ def test_the_mps_release_decision_has_no_split_term_to_net(fake_torch) -> None:
     """The MPS half, as a known limit rather than a fix. The CUDA
     release decision nets `inactive_split_bytes.all.current`; torch.mps
     publishes no fragmentation counter at all, so `unreturnable_split_mb()` is
-    `None` there and the MPS reading keeps the over-read: most releases can
-    claim slack that returns nothing.
+    `None` there and the MPS reading keeps the over-read: a release can claim
+    slack that returns nothing (`maybe_shrink` then waits for it to grow).
     """
     mps = FakeMpsAllocator()
     with mps_host(available_mb=40 * 1024, mps=mps):
@@ -3365,7 +3755,7 @@ def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:
     with mps_host(available_mb=40 * 1024):
         with mock.patch.object(
             memory, "_mac_memory_counters",
-            side_effect=[(128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 1, 0)],
+            side_effect=[(128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 1, 0, 0)],
         ) as counters:
             reading = memory.free_total_reading()
         assert counters.call_count == 1, "one read, not one per term"

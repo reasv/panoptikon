@@ -5,7 +5,7 @@
 //! its `/dev/dri/renderD<minor>` opens read-write. amd-smi/rocm-smi are not
 //! used because they enumerate in PCI order, which is not HIP's. Live memory
 //! comes from amdgpu's `mem_info_vram_{total,used}` (plus `gtt` on an APU)
-//! and `/proc/meminfo`.
+//! and `/proc/meminfo`, bounded by the cgroup limit as for the CPU device.
 //!
 //! Identity is all-or-nothing per host: a row's index is the
 //! `HIP_VISIBLE_DEVICES` value a pin selects with, so it only means anything
@@ -19,7 +19,8 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::gpu::{GpuInfo, GpuMemory};
+use super::cpu;
+use super::gpu::{GpuInfo, GpuMemory, GttBasis};
 
 /// Every env var that can restrict which GPUs a HIP process sees.
 /// `ROCR_VISIBLE_DEVICES` filters at the ROCr/KFD layer; the other three at
@@ -39,7 +40,8 @@ const HIP_LAYER_VISIBILITY_VARS: [&str; 3] = [
     "GPU_DEVICE_ORDINAL",
 ];
 
-/// The four filesystem roots the probe reads, injectable for fixture trees.
+/// The filesystem paths the probe reads, and how it asks amdgpu whether a
+/// GPU is an APU, injectable for fixture trees.
 #[derive(Debug, Clone)]
 pub(super) struct SysfsRoots {
     /// KFD topology nodes, one numeric subdirectory per node.
@@ -48,9 +50,13 @@ pub(super) struct SysfsRoots {
     pub pci_devices: PathBuf,
     /// DRM nodes; `renderD<minor>` is the per-GPU render node.
     pub dev_dri: PathBuf,
-    /// `MemTotal` for an APU's identity; `MemAvailable` and `SReclaimable`
-    /// for its GTT clamp.
-    pub meminfo: PathBuf,
+    /// The KFD device ROCr opens read-write; without it no GPU is usable.
+    pub kfd: PathBuf,
+    /// Host RAM statistics: `MemTotal` for an APU's identity, and
+    /// deliverable RAM for its GTT clamp.
+    pub ram: cpu::MemRoots,
+    /// [`amdgpu_fusion`], read on each openable render node.
+    pub fusion: fn(&fs::File) -> Option<bool>,
 }
 
 impl Default for SysfsRoots {
@@ -59,7 +65,9 @@ impl Default for SysfsRoots {
             kfd_nodes: PathBuf::from("/sys/class/kfd/kfd/topology/nodes"),
             pci_devices: PathBuf::from("/sys/bus/pci/devices"),
             dev_dri: PathBuf::from("/dev/dri"),
-            meminfo: PathBuf::from("/proc/meminfo"),
+            kfd: PathBuf::from("/dev/kfd"),
+            ram: cpu::MemRoots::default(),
+            fusion: amdgpu_fusion,
         }
     }
 }
@@ -124,13 +132,40 @@ impl ProbeFailure {
 }
 
 /// Build the GPU inventory, or a [`ProbeFailure`] for an unknown host.
-/// `ambient` holds each [`VISIBILITY_VARS`] value, by position. Any ambient
-/// restriction leaves the inventory unknown, since HIP indices count the
-/// filtered set and cannot be mapped to KFD nodes.
+/// `ambient` holds each [`VISIBILITY_VARS`] value, by position. Empty when
+/// this process can use no GPU, so ROCr enumerates none whatever the filter
+/// says and workers run on the CPU. Otherwise any ambient restriction leaves
+/// the inventory unknown, since HIP indices count the filtered set and cannot
+/// be mapped to KFD nodes.
 pub(super) fn build(
     roots: &SysfsRoots,
     ambient: [Option<&str>; VISIBILITY_VARS.len()],
 ) -> Result<Vec<GpuInfo>, ProbeFailure> {
+    let openable = openable_gpu_nodes(roots)?;
+    let gpu_nodes = openable.gpu_nodes;
+    let count = openable.nodes.len();
+    if count == 0 {
+        if gpu_nodes + openable.hidden == 0 {
+            tracing::warn!(
+                "this host is configured for ROCm but its KFD topology lists no \
+                 GPU; models run on the CPU device, priced against RAM, until \
+                 panoptikon restarts after the GPU appears"
+            );
+        } else {
+            tracing::warn!(
+                gpu_nodes,
+                hidden_nodes = openable.hidden,
+                kfd_openable = openable.kfd_openable,
+                "this process can open none of this host's AMD GPUs, so ROCm \
+                 enumerates none and models run on the CPU device, priced \
+                 against RAM; to use them, add the user running panoptikon to \
+                 the group that owns /dev/kfd and /dev/dri/renderD*, usually \
+                 render (in Docker, pass /dev/kfd and /dev/dri, and set \
+                 RENDER_GID in deploy/docker-compose.rocm.yml)"
+            );
+        }
+        return Ok(Vec::new());
+    }
     if let Some(var) = ambient_restriction(ambient) {
         tracing::info!(
             variable = var,
@@ -146,26 +181,14 @@ pub(super) fn build(
              card than devices = [N] names\": with a ROCR filter in force, \
              index N counts the GPUs the operator left visible"
         );
-        return Err(ProbeFailure::logged("ambient visibility restriction", 0, 0));
-    }
-    let openable = openable_gpu_nodes(roots)?;
-    let gpu_nodes = openable.gpu_nodes;
-    let count = openable.nodes.len();
-    if count == 0 {
-        return Err(ProbeFailure::undiagnosed(
-            if gpu_nodes == 0 && openable.hidden > 0 {
-                "every KFD GPU node is hidden by a device cgroup (/dev/dri not granted)"
-            } else if gpu_nodes == 0 {
-                "no KFD GPU nodes (this host has no amdgpu topology)"
-            } else {
-                "no openable render node"
-            },
+        return Err(ProbeFailure::logged(
+            "ambient visibility restriction",
             gpu_nodes,
             count,
         ));
     }
     let mut rows = Vec::with_capacity(count);
-    for (index, (node, props)) in openable.nodes.iter().enumerate() {
+    for (index, (node, props, fusion)) in openable.nodes.iter().enumerate() {
         let Ok(index) = u32::try_from(index) else {
             return Err(ProbeFailure::undiagnosed(
                 "more openable GPUs than a device index can name",
@@ -173,7 +196,7 @@ pub(super) fn build(
                 count,
             ));
         };
-        let Some(row) = identify(roots, *node, props, index) else {
+        let Some(row) = identify(roots, *node, props, *fusion, index) else {
             return Err(ProbeFailure::logged(
                 "identity read failed",
                 gpu_nodes,
@@ -194,12 +217,13 @@ pub(super) fn build(
 /// high; the ledger's margin covers that.
 ///
 /// A unified GPU's total is carve-out plus GTT, and its free is
-/// `(vram_total − vram_used) + min(gtt_total − gtt_used, deliverable RAM)`
-/// ([`ram_deliverable_mb`]), because unclaimed GTT is backed by RAM that may
-/// not be free.
+/// `(vram_total − vram_used) + min(gtt_total − gtt_used, deliverable RAM)`,
+/// because unclaimed GTT is backed by RAM that may not be free. Deliverable
+/// RAM is the CPU device's free reading ([`cpu::ram_available_mb`]): within
+/// the cgroup limit too.
 pub(super) fn query_memory(
     pci_devices: &Path,
-    meminfo: &Path,
+    ram: &cpu::MemRoots,
     gpus: &[GpuRef],
 ) -> Option<Vec<GpuMemory>> {
     if gpus.is_empty() {
@@ -217,6 +241,7 @@ pub(super) fn query_memory(
                 uuid: gpu.key.clone(),
                 total_mb: vram_total_mb,
                 free_mb: vram_free_mb,
+                gtt: None,
             });
             continue;
         }
@@ -224,12 +249,16 @@ pub(super) fn query_memory(
         let gtt_free_mb = gtt_total_mb.saturating_sub(read_mb(&dir.join("mem_info_gtt_used"))?);
         let available_mb = match ram_available_mb {
             Some(mb) => mb,
-            None => *ram_available_mb.insert(ram_deliverable_mb(meminfo)?),
+            None => *ram_available_mb.insert(cpu::ram_available_mb(ram)?),
         };
         out.push(GpuMemory {
             uuid: gpu.key.clone(),
             total_mb: vram_total_mb + gtt_total_mb,
             free_mb: vram_free_mb + gtt_free_mb.min(available_mb),
+            gtt: Some(GttBasis {
+                gtt_free_mb,
+                ram_available_mb: available_mb,
+            }),
         });
     }
     Some(out)
@@ -281,8 +310,10 @@ struct OpenableNodes {
     gpu_nodes: usize,
     /// Nodes skipped because a device cgroup hides them; not in `gpu_nodes`.
     hidden: usize,
-    /// The survivors, in ascending KFD node order.
-    nodes: Vec<(u32, HashMap<String, u64>)>,
+    /// Whether `/dev/kfd` opens read-write; if not, no node survives.
+    kfd_openable: bool,
+    /// The survivors, in ascending KFD node order, with [`amdgpu_fusion`].
+    nodes: Vec<(u32, HashMap<String, u64>, Option<bool>)>,
 }
 
 /// GPU nodes this process can open, in ascending KFD node order (assumed to
@@ -296,6 +327,8 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
     let mut nodes = node_dirs(&roots.kfd_nodes);
     // Numeric order: a string sort would put node 10 before node 2.
     nodes.sort_by_key(|(node, _)| *node);
+    let kfd = opens_read_write(&roots.kfd);
+    let kfd_openable = kfd.is_ok();
     let mut gpu_nodes = 0usize;
     let mut hidden = 0usize;
     let mut out = Vec::new();
@@ -349,6 +382,9 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
             continue;
         }
         gpu_nodes += 1;
+        if !kfd_openable {
+            continue;
+        }
         let Some(minor) = props.get("drm_render_minor").copied().filter(|m| *m > 0) else {
             tracing::info!(
                 node,
@@ -357,26 +393,110 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
             );
             continue;
         };
-        // Read-write, as KFD's device-cgroup check requires: a cgroup can
-        // grant `r` without `w`, and ROCr then refuses the GPU.
-        let render = roots.dev_dri.join(format!("renderD{minor}"));
-        if let Err(err) = OpenOptions::new().read(true).write(true).open(&render) {
-            tracing::info!(
-                node,
-                render_minor = minor,
+        let render = match open_render_node(&roots.dev_dri, minor) {
+            Ok(render) => render,
+            Err(err) => {
+                tracing::info!(
+                    node,
+                    render_minor = minor,
+                    error = %err,
+                    "KFD GPU node's render node cannot be opened read-write; \
+                     excluding it from the ROCm inventory"
+                );
+                continue;
+            }
+        };
+        let fusion = (roots.fusion)(&render);
+        out.push((node, props, fusion));
+    }
+    if let Err(err) = kfd
+        && gpu_nodes > 0
+    {
+        // A missing device or group lasts until a restart or a new login;
+        // any other error may pass while the GPU exists.
+        if !matches!(
+            err.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        ) {
+            tracing::warn!(
                 error = %err,
-                "KFD GPU node's render node cannot be opened read-write; \
-                 excluding it from the ROCm inventory"
+                "/dev/kfd cannot be opened read-write; leaving the ROCm GPU \
+                 inventory unknown"
             );
-            continue;
+            return Err(ProbeFailure::logged("/dev/kfd open failed", gpu_nodes, 0));
         }
-        out.push((node, props));
+        tracing::info!(
+            error = %err,
+            "/dev/kfd cannot be opened read-write; no GPU node is usable"
+        );
     }
     Ok(OpenableNodes {
         gpu_nodes,
         hidden,
+        kfd_openable,
         nodes: out,
     })
+}
+
+/// Open a GPU's render node read-write, as KFD's device-cgroup check
+/// requires: a cgroup can grant `r` without `w`, and ROCr then refuses the GPU.
+fn open_render_node(dev_dri: &Path, minor: u64) -> io::Result<fs::File> {
+    let render = dev_dri.join(format!("renderD{minor}"));
+    OpenOptions::new().read(true).write(true).open(render)
+}
+
+/// Open `path` read-write, as ROCr opens `/dev/kfd`.
+fn opens_read_write(path: &Path) -> io::Result<()> {
+    OpenOptions::new().read(true).write(true).open(path)?;
+    Ok(())
+}
+
+/// Whether amdgpu flags this GPU as an APU: `AMDGPU_IDS_FLAGS_FUSION` in the
+/// `AMDGPU_INFO_DEV_INFO` answer on its render node, the flag ROCr reports as
+/// integrated. `None` if the query fails.
+#[cfg(target_os = "linux")]
+fn amdgpu_fusion(render: &fs::File) -> Option<bool> {
+    use std::os::fd::AsRawFd;
+    /// `DRM_IOW(DRM_COMMAND_BASE + DRM_AMDGPU_INFO, struct drm_amdgpu_info)`
+    /// in the generic ioctl encoding (x86_64, aarch64).
+    const DRM_IOCTL_AMDGPU_INFO: u32 = 0x4020_6445;
+    const AMDGPU_INFO_DEV_INFO: u32 = 0x16;
+    const AMDGPU_IDS_FLAGS_FUSION: u64 = 0x1;
+    /// `ids_flags` is at byte 136 of `struct drm_amdgpu_info_device`; the
+    /// kernel copies at most the size asked for.
+    const IDS_FLAGS_WORD: usize = 17;
+    /// `struct drm_amdgpu_info`: 32 bytes, the query arguments unused here.
+    #[repr(C)]
+    struct DrmAmdgpuInfo {
+        return_pointer: u64,
+        return_size: u32,
+        query: u32,
+        arguments: [u32; 4],
+    }
+    const _: () = assert!(size_of::<DrmAmdgpuInfo>() == 32);
+    let mut device = [0u64; IDS_FLAGS_WORD + 1];
+    let mut request = DrmAmdgpuInfo {
+        return_pointer: device.as_mut_ptr() as u64,
+        return_size: std::mem::size_of_val(&device) as u32,
+        query: AMDGPU_INFO_DEV_INFO,
+        arguments: [0; 4],
+    };
+    // SAFETY: the kernel writes at most `return_size` bytes to
+    // `return_pointer`, which `device` provides for the whole call.
+    let rc = unsafe {
+        libc::ioctl(
+            render.as_raw_fd(),
+            DRM_IOCTL_AMDGPU_INFO as libc::Ioctl,
+            &mut request,
+        )
+    };
+    (rc == 0).then(|| device[IDS_FLAGS_WORD] & AMDGPU_IDS_FLAGS_FUSION != 0)
+}
+
+/// No amdgpu off Linux.
+#[cfg(not(target_os = "linux"))]
+fn amdgpu_fusion(_render: &fs::File) -> Option<bool> {
+    None
 }
 
 /// Whether a `properties` read error means the node is hidden from this
@@ -400,12 +520,14 @@ fn node_dirs(root: &Path) -> Vec<(u32, PathBuf)> {
         .collect()
 }
 
-/// The ISA name (`gfx1100`) of every GPU node in the KFD topology, in node
-/// order, for the startup accelerator report. Quiet and best-effort: it names
-/// what the kernel lists, whether or not this process can open it.
-pub(super) fn topology_gfx_names(kfd_nodes: &Path) -> Vec<String> {
-    let mut nodes = node_dirs(kfd_nodes);
+/// Every GPU node in the KFD topology that this process can see, in node
+/// order: its ISA name (`gfx1100`) and whether `/dev/kfd` and its render node
+/// open read-write, which is what [`build`] admits it by. Quiet and best-effort.
+/// Without `check_access` nothing is opened and every GPU reports `false`.
+pub(super) fn topology_gpus(roots: &SysfsRoots, check_access: bool) -> Vec<(String, bool)> {
+    let mut nodes = node_dirs(&roots.kfd_nodes);
     nodes.sort_by_key(|(node, _)| *node);
+    let kfd_openable = check_access && opens_read_write(&roots.kfd).is_ok();
     nodes
         .into_iter()
         .filter_map(|(_, dir)| {
@@ -413,18 +535,24 @@ pub(super) fn topology_gfx_names(kfd_nodes: &Path) -> Vec<String> {
             if props.get("simd_count").copied().unwrap_or(0) == 0 {
                 return None;
             }
-            gfx_name(u32::try_from(*props.get("gfx_target_version")?).ok()?)
+            let gfx = gfx_name(u32::try_from(*props.get("gfx_target_version")?).ok()?)?;
+            let openable = kfd_openable
+                && props.get("drm_render_minor").is_some_and(|minor| {
+                    *minor > 0 && open_render_node(&roots.dev_dri, *minor).is_ok()
+                });
+            Some((gfx, openable))
         })
         .collect()
 }
 
 /// Turn one openable GPU node into a GPU row, or `None` to make the whole
-/// probe unknown. An APU (one node with both SIMDs and CPU cores) is a
-/// unified GPU: total is carve-out plus GTT, and it is named by host RAM.
+/// probe unknown. An APU is a unified GPU: total is carve-out plus GTT, and it
+/// is named by host RAM. `fusion` is [`amdgpu_fusion`] for its render node.
 fn identify(
     roots: &SysfsRoots,
     node: u32,
     props: &HashMap<String, u64>,
+    fusion: Option<bool>,
     index: u32,
 ) -> Option<GpuInfo> {
     let bdf = props
@@ -471,9 +599,21 @@ fn identify(
         );
         return None;
     };
-    // APU: one node with both SIMDs and CPU cores. Discrete GPUs report 0
-    // or omit the key.
-    let unified = props.get("cpu_cores_count").copied().unwrap_or(0) > 0;
+    let Some(fusion) = fusion else {
+        tracing::warn!(
+            node,
+            bdf = %bdf,
+            "amdgpu did not answer whether this GPU is an APU; leaving the \
+             ROCm GPU inventory unknown (an APU priced as a discrete GPU \
+             would be budgeted against its BIOS carve-out alone)"
+        );
+        return None;
+    };
+    // HIP's `integrated`: amdgpu's APU flag, or CPU cores on the GPU's own
+    // KFD node (an ACPI CRAT APU). Kernels that build the topology from a
+    // virtual CRAT, every GPU since 6.7, put an APU's CPU cores on a node of
+    // their own.
+    let unified = fusion || props.get("cpu_cores_count").copied().unwrap_or(0) > 0;
     let unified = match unified {
         false => None,
         true => Some(unified_facts(roots, node, &bdf, &device, vram_total_mb)?),
@@ -520,19 +660,19 @@ fn unified_facts(
             node,
             bdf = %bdf,
             vram_total_mb,
-            "this KFD node reports both SIMDs and CPU cores, i.e. an APU, but \
-             its mem_info_gtt_total is missing or zero; amdgpu publishes only \
-             the BIOS UMA carve-out as such a GPU's VRAM total, so pricing \
-             it on that alone would budget every grant against a few hundred \
-             MB — leaving the ROCm GPU inventory unknown instead"
+            "this GPU is an APU, but its mem_info_gtt_total is missing or \
+             zero; amdgpu publishes only the BIOS UMA carve-out as such a \
+             GPU's VRAM total, so pricing it on that alone would budget every \
+             grant against a few hundred MB — leaving the ROCm GPU inventory \
+             unknown instead"
         );
         return None;
     };
-    let Some(mem_total_mb) = meminfo_mb(&roots.meminfo, "MemTotal") else {
+    let Some(mem_total_mb) = meminfo_mb(&roots.ram.meminfo, "MemTotal") else {
         tracing::warn!(
             node,
             bdf = %bdf,
-            meminfo = %roots.meminfo.display(),
+            meminfo = %roots.ram.meminfo.display(),
             "this KFD node is an APU but MemTotal could not be read; the \
              machine's RAM is that GPU's capacity and its calibration name, \
              so there is nothing to name it with — leaving the ROCm GPU \
@@ -551,6 +691,7 @@ fn unified_facts(
 /// RAM the kernel could deliver now, in MiB: `MemAvailable` less
 /// `SReclaimable`, slab it counts as available but may not free before it
 /// kills a process. `None` without a `MemAvailable` row.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn ram_deliverable_mb(meminfo: &Path) -> Option<u64> {
     let available = meminfo_mb(meminfo, "MemAvailable")?;
     Some(available.saturating_sub(meminfo_mb(meminfo, "SReclaimable").unwrap_or(0)))
@@ -740,11 +881,17 @@ mod tests {
                 kfd_nodes: dir.path().join("kfd/nodes"),
                 pci_devices: dir.path().join("pci"),
                 dev_dri: dir.path().join("dri"),
-                meminfo: dir.path().join("meminfo"),
+                kfd: dir.path().join("kfd/device"),
+                ram: cpu::MemRoots {
+                    meminfo: dir.path().join("meminfo"),
+                    cgroup: dir.path().join("cgroup"),
+                },
+                fusion: fixture_fusion,
             };
             for root in [&roots.kfd_nodes, &roots.pci_devices, &roots.dev_dri] {
                 fs::create_dir_all(root).unwrap();
             }
+            fs::write(&roots.kfd, "").unwrap();
             // A 128 GiB machine whose 512 MiB carve-out firmware already took
             // out of MemTotal, which the cases that care overwrite.
             Self { _dir: dir, roots }.meminfo(MEM_TOTAL_KB, MEM_TOTAL_KB / 2)
@@ -758,7 +905,7 @@ mod tests {
                 "MemTotal:       {total_kb} kB\nMemFree:         1234567 kB\n\
                  MemAvailable:   {available_kb} kB\nBuffers:           98765 kB\n"
             );
-            fs::write(&self.roots.meminfo, body).unwrap();
+            fs::write(&self.roots.ram.meminfo, body).unwrap();
             self
         }
 
@@ -786,7 +933,12 @@ mod tests {
         }
 
         fn render(&self, minor: u64) -> &Self {
-            fs::write(self.roots.dev_dri.join(format!("renderD{minor}")), b"").unwrap();
+            self.render_answering(minor, "")
+        }
+
+        /// A render node whose amdgpu query answers per [`fixture_fusion`].
+        fn render_answering(&self, minor: u64, answer: &str) -> &Self {
+            fs::write(self.roots.dev_dri.join(format!("renderD{minor}")), answer).unwrap();
             self
         }
 
@@ -816,11 +968,13 @@ mod tests {
                 .pci(&bdf, total_bytes, 0)
         }
 
-        /// An APU in one call: the same, plus its GTT window.
+        /// An APU in one call, as a virtual-CRAT kernel lists it: a GPU node
+        /// with no CPU cores whose amdgpu query reports the APU flag, plus its
+        /// GTT window.
         fn apu(&self, node: u32, location_id: u64, minor: u64, carve: u64, gtt: u64) -> &Self {
             let bdf = format_bdf(0, location_id).expect("a fixture address");
-            self.node(node, &apu_props(location_id, minor, 110_501))
-                .render(minor)
+            self.node(node, &gpu_props(location_id, minor, 0, 110_501))
+                .render_answering(minor, "fusion")
                 .pci(&bdf, carve, 0)
                 .gtt(&bdf, gtt, 0)
         }
@@ -836,6 +990,20 @@ mod tests {
                 .err()
                 .map(|failure| failure.bucket)
         }
+    }
+
+    /// The amdgpu APU query on a fixture render node: its content is
+    /// `fusion` for an APU, `unanswered` for a failed query.
+    fn fixture_fusion(render: &fs::File) -> Option<bool> {
+        let mut answer = String::new();
+        io::Read::read_to_string(&mut &*render, &mut answer).unwrap();
+        (answer != "unanswered").then_some(answer == "fusion")
+    }
+
+    fn set_readonly(path: &Path, value: bool) {
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(value);
+        fs::set_permissions(path, perms).unwrap();
     }
 
     const GB24: u64 = 24 * 1024 * 1024 * 1024;
@@ -877,8 +1045,8 @@ mod tests {
         props
     }
 
-    /// The APU shape: the same node, but KFD reports the host's CPU cores on
-    /// it, which is the only signal an integrated part has.
+    /// The ACPI CRAT APU shape: the same node, but KFD reports the host's CPU
+    /// cores on it.
     fn apu_props(location_id: u64, minor: u64, target: u64) -> Vec<(&'static str, u64)> {
         let mut props = gpu_props(location_id, minor, 0, target);
         props[0] = ("cpu_cores_count", 16);
@@ -1019,16 +1187,20 @@ mod tests {
         }
     }
 
-    /// An APU node — KFD's only positive signal being SIMDs *and* CPU cores
-    /// on one node — is a **priced unified device**: total is carve-out +
-    /// GTT, named from the machine's RAM. amdgpu publishes the carve-out as
+    /// An APU is a **priced unified device**: total is carve-out + GTT,
+    /// named from the machine's RAM. amdgpu publishes the carve-out as
     /// `mem_info_vram_total`, so the discrete rules would budget it against
     /// 512 MB and collapse every grant to batch-1
-    /// (docs/unified-memory-admission.md, backend B).
+    /// (docs/unified-memory-admission.md, backend B). An APU is what HIP
+    /// calls integrated: amdgpu's APU flag on a GPU node beside a separate
+    /// CPU node (virtual CRAT, every kernel since 6.7), or one node with both
+    /// SIMDs and CPU cores (ACPI CRAT).
     #[test]
     fn an_apu_node_is_a_priced_unified_device() {
         let fixture = Fixture::new();
-        fixture.apu(1, LOC_03_00, 128, CARVE_512M, GTT_64G);
+        fixture
+            .node(0, &[("cpu_cores_count", 16), ("simd_count", 0)])
+            .apu(1, LOC_03_00, 128, CARVE_512M, GTT_64G);
         let rows = fixture.build().expect("an APU host is priced now");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].uuid, KEY_03);
@@ -1057,8 +1229,18 @@ mod tests {
             (Some(96 * 1024), 112 * 1024)
         );
 
+        // The ACPI CRAT shape, with no APU flag, is the same device.
+        let single_node = Fixture::new();
+        single_node
+            .node(1, &apu_props(LOC_03_00, 128, 110_501))
+            .render(128)
+            .pci(BDF_03, CARVE_512M, 0)
+            .gtt(BDF_03, GTT_64G, 0);
+        assert_eq!(single_node.build(), Some(rows));
+
         // Neither extra fact is optional: without GTT the GPU is priced at
-        // its carve-out, and without MemTotal it cannot be named.
+        // its carve-out, and without MemTotal it cannot be named. Nor is the
+        // APU flag: unanswered, an APU and a discrete GPU look alike.
         #[rustfmt::skip]
         let missing = [
             (None, false, "no GTT total"), (Some(0), false, "a zero GTT total"),
@@ -1073,10 +1255,15 @@ mod tests {
                 fs::remove_file(gtt_total).unwrap();
             }
             if drop_meminfo {
-                fs::remove_file(&fixture.roots.meminfo).unwrap();
+                fs::remove_file(&fixture.roots.ram.meminfo).unwrap();
             }
             assert!(fixture.build().is_none(), "{label}");
         }
+        let unanswered = Fixture::new();
+        unanswered
+            .apu(1, LOC_03_00, 128, CARVE_512M, GTT_64G)
+            .render_answering(128, "unanswered");
+        assert!(unanswered.build().is_none(), "no APU flag");
 
         // A dGPU **and** an APU on one host. KFD lists the APU's node first
         // on such a machine, so the old decline could not simply skip it;
@@ -1188,49 +1375,65 @@ mod tests {
             .dgpu(1, LOC_03_00, 128, GB24)
             .dgpu(2, LOC_0C_00, 129, GB24);
         let read_only = fixture.roots.dev_dri.join("renderD128");
-        let set_readonly = |value| {
-            let mut perms = fs::metadata(&read_only).unwrap().permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(value);
-            fs::set_permissions(&read_only, perms).unwrap();
-        };
-        set_readonly(true);
+        set_readonly(&read_only, true);
         // Privileges that ignore the mode bits (root in a container) defeat
         // the fixture: the premise fails, not the behaviour.
         let writable = OpenOptions::new().read(true).write(true).open(&read_only);
         if writable.is_ok() {
-            set_readonly(false);
+            set_readonly(&read_only, false);
             return;
         }
         let rows = fixture.build().expect("the writable sibling survives");
         // Restored before the assertions so a failure still leaves a
         // deletable tree: `TempDir`'s drop leaks a read-only file.
-        set_readonly(false);
+        set_readonly(&read_only, false);
         assert_eq!(indexed(rows), vec![at(0, BDF_0C)], "one openable GPU");
     }
 
+    /// GPU nodes this process cannot open (no render node, or no read-write
+    /// `/dev/kfd`), no GPU nodes, no topology, and every GPU node hidden by a
+    /// device cgroup: ROCr enumerates nothing, so the inventory is known empty.
     #[test]
-    fn no_openable_gpu_node_is_unknown() {
+    fn no_usable_gpu_node_is_an_empty_inventory() {
         let fixture = Fixture::new();
         fixture
             .node(0, &[("cpu_cores_count", 32), ("simd_count", 0)])
             .node(1, &gpu_props(LOC_03_00, 128, 0, 110000))
             .pci(BDF_03, GB24, 0);
-        assert_eq!(fixture.bucket(), Some("no openable render node"));
-        // No GPU nodes at all — and, on a non-ROCm host, no topology root —
-        // is the same answer under a bucket that says so.
-        let empty = Fixture::new();
+        assert_eq!(fixture.build(), Some(Vec::new()));
+        let no_kfd = Fixture::new();
+        no_kfd.dgpu(1, LOC_03_00, 128, GB24);
+        fs::remove_file(&no_kfd.roots.kfd).unwrap();
+        assert_eq!(no_kfd.build(), Some(Vec::new()));
         assert_eq!(
-            empty.bucket(),
-            Some("no KFD GPU nodes (this host has no amdgpu topology)")
+            topology_gpus(&no_kfd.roots, true),
+            [("gfx1100".to_owned(), false)]
         );
+        let read_only_kfd = Fixture::new();
+        read_only_kfd.dgpu(1, LOC_03_00, 128, GB24);
+        let kfd = &read_only_kfd.roots.kfd;
+        set_readonly(kfd, true);
+        // Skipped where privileges ignore the mode bits (root).
+        if OpenOptions::new().read(true).write(true).open(kfd).is_err() {
+            let rows = read_only_kfd.build();
+            let topology = topology_gpus(&read_only_kfd.roots, true);
+            set_readonly(kfd, false);
+            assert_eq!(rows, Some(Vec::new()));
+            assert_eq!(topology, [("gfx1100".to_owned(), false)]);
+        } else {
+            set_readonly(kfd, false);
+        }
+        let empty = Fixture::new();
+        assert_eq!(empty.build(), Some(Vec::new()));
         let rootless = SysfsRoots {
             kfd_nodes: empty.roots.kfd_nodes.join("absent"),
             ..empty.roots.clone()
         };
-        assert!(build(&rootless, [None; VISIBILITY_VARS.len()]).is_err());
-        // Every GPU node denied by KFD (a container without `/dev/dri`) says
-        // so. Mode bits produce the denial unless privileges ignore them.
+        assert_eq!(
+            build(&rootless, [None; VISIBILITY_VARS.len()]).ok(),
+            Some(Vec::new())
+        );
+        // Mode bits produce the denial unless privileges ignore them.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1241,16 +1444,23 @@ mod tests {
             let props = hidden.roots.kfd_nodes.join("1/properties");
             fs::set_permissions(&props, fs::Permissions::from_mode(0o000)).unwrap();
             if fs::read_to_string(&props).is_err() {
-                assert_eq!(
-                    hidden.bucket(),
-                    Some("every KFD GPU node is hidden by a device cgroup (/dev/dri not granted)")
-                );
-                // A visible GPU node whose render node cannot be opened is
-                // a permissions problem, not a hidden one.
-                hidden.node(2, &gpu_props(LOC_0C_00, 129, 0, 110000));
-                assert_eq!(hidden.bucket(), Some("no openable render node"));
+                assert_eq!(hidden.build(), Some(Vec::new()));
             }
         }
+    }
+
+    /// A `/dev/kfd` that fails to open for a reason other than a missing
+    /// device or group (here EISDIR) leaves the inventory unknown while the
+    /// topology lists a GPU.
+    #[cfg(unix)]
+    #[test]
+    fn other_kfd_open_errors_leave_the_inventory_unknown() {
+        let fixture = Fixture::new();
+        fs::remove_file(&fixture.roots.kfd).unwrap();
+        fs::create_dir(&fixture.roots.kfd).unwrap();
+        assert_eq!(fixture.build(), Some(Vec::new()), "no GPU node");
+        fixture.dgpu(1, LOC_03_00, 128, GB24);
+        assert_eq!(fixture.bucket(), Some("/dev/kfd open failed"));
     }
 
     /// Any of the four visibility vars blanks the inventory; empty and
@@ -1288,18 +1498,30 @@ mod tests {
         assert_eq!(format_bdf(0x1_0000, 0x0300), None);
     }
 
-    /// The report's names: GPU nodes only, in numeric node order, with no
-    /// render node or VRAM counter needed; no topology names nothing.
+    /// GPU nodes only, in numeric node order, each marked by whether its
+    /// render node opens, with no VRAM counter needed; no topology lists
+    /// nothing.
     #[test]
-    fn topology_names_every_gpu_node_in_node_order() {
+    fn topology_lists_every_gpu_node_in_node_order() {
         let fixture = Fixture::new();
         fixture
             .node(0, &[("cpu_cores_count", 32), ("simd_count", 0)])
             .node(10, &gpu_props(LOC_0C_00, 129, 0, 120001))
-            .node(2, &gpu_props(LOC_03_00, 128, 0, 110000));
-        let names = topology_gfx_names(&fixture.roots.kfd_nodes);
-        assert_eq!(names, ["gfx1100", "gfx1201"]);
-        assert!(topology_gfx_names(&fixture.roots.kfd_nodes.join("absent")).is_empty());
+            .node(2, &gpu_props(LOC_03_00, 128, 0, 110000))
+            .render(129);
+        assert_eq!(
+            topology_gpus(&fixture.roots, true),
+            [("gfx1100".to_owned(), false), ("gfx1201".to_owned(), true)]
+        );
+        assert_eq!(
+            topology_gpus(&fixture.roots, false),
+            [("gfx1100".to_owned(), false), ("gfx1201".to_owned(), false)]
+        );
+        let rootless = SysfsRoots {
+            kfd_nodes: fixture.roots.kfd_nodes.join("absent"),
+            ..fixture.roots.clone()
+        };
+        assert!(topology_gpus(&rootless, true).is_empty());
     }
 
     /// major*10000 + minor*100 + stepping, rendered major-decimal then
@@ -1346,15 +1568,15 @@ mod tests {
     /// The staleness refresh reads the same files the worker's free/total
     /// tier does, keyed by the inventory's device key, and is all-or-nothing.
     /// On a **unified** GPU total is carve-out + GTT and free adds as much
-    /// GTT as RAM can deliver right now — that clamp is the whole reason
-    /// `/proc/meminfo` is read, and why a discrete host must not depend on
-    /// it.
+    /// GTT as RAM can deliver right now, within the cgroup limit — that
+    /// clamp is the whole reason `/proc/meminfo` is read, and why a discrete
+    /// host must not depend on it.
     #[test]
     fn the_refresh_reads_every_gpu_or_none_of_them() {
         let fixture = Fixture::new();
         fixture.pci(BDF_03, GB24, 4 * GIB).pci(BDF_0C, GB16, 0);
         let roots = &fixture.roots;
-        let read = |gpus: &[GpuRef]| query_memory(&roots.pci_devices, &roots.meminfo, gpus);
+        let read = |gpus: &[GpuRef]| query_memory(&roots.pci_devices, &roots.ram, gpus);
         let tuple = |r: GpuMemory| (r.uuid, r.total_mb, r.free_mb);
         let seen = |gpus: &[GpuRef]| {
             read(gpus).map(|rows| rows.into_iter().map(tuple).collect::<Vec<_>>())
@@ -1380,7 +1602,7 @@ mod tests {
             unified,
         };
         let read_from = |f: &Fixture, gpu: GpuRef| {
-            query_memory(&f.roots.pci_devices, &f.roots.meminfo, &[gpu])
+            query_memory(&f.roots.pci_devices, &f.roots.ram, &[gpu])
                 .map(|mut r| r.remove(0))
                 .map(|r| (r.total_mb, r.free_mb))
         };
@@ -1395,6 +1617,15 @@ mod tests {
         let tight = host(8 * 1024 * 1024);
         let budget = 512 + 64 * 1024;
         assert_eq!(read_from(&tight, apu(true)), Some((budget, 256 + 8 * 1024)));
+        let terms = query_memory(&tight.roots.pci_devices, &tight.roots.ram, &[apu(true)]);
+        assert_eq!(
+            terms.map(|rows| rows[0].gtt),
+            Some(Some(GttBasis {
+                gtt_free_mb: 60 * 1024,
+                ram_available_mb: 8 * 1024,
+            })),
+            "and carries both terms"
+        );
         assert_eq!(
             read_from(&tight, apu(false)),
             Some((512, 256)),
@@ -1402,15 +1633,28 @@ mod tests {
         );
         // 2 GiB of that RAM is reclaimable slab, which is not deliverable.
         let slab = host(8 * 1024 * 1024);
-        let mut rows = fs::read_to_string(&slab.roots.meminfo).unwrap();
+        let mut rows = fs::read_to_string(&slab.roots.ram.meminfo).unwrap();
         rows.push_str("SReclaimable:    2097152 kB\n");
-        fs::write(&slab.roots.meminfo, rows).unwrap();
+        fs::write(&slab.roots.ram.meminfo, rows).unwrap();
         assert_eq!(read_from(&slab, apu(true)), Some((budget, 256 + 6 * 1024)));
-        assert_eq!(ram_deliverable_mb(&slab.roots.meminfo), Some(6 * 1024));
+        assert_eq!(ram_deliverable_mb(&slab.roots.ram.meminfo), Some(6 * 1024));
         // Plenty of RAM: the GTT term is the driver's own figure again.
         let roomy = host(100 * 1024 * 1024);
         let seen = read_from(&roomy, apu(true));
         assert_eq!(seen, Some((budget, 256 + 60 * 1024)));
+        // In a container limited to 16 GiB with 10 GiB used, 6 GiB is left.
+        fs::create_dir_all(&roomy.roots.ram.cgroup).unwrap();
+        fs::write(
+            roomy.roots.ram.cgroup.join("memory.max"),
+            format!("{}\n", 16 * GIB),
+        )
+        .unwrap();
+        fs::write(
+            roomy.roots.ram.cgroup.join("memory.current"),
+            format!("{}\n", 10 * GIB),
+        )
+        .unwrap();
+        assert_eq!(read_from(&roomy, apu(true)), Some((budget, 256 + 6 * 1024)));
 
         // All-or-nothing extends to the new files, and only to unified rows.
         let no_gtt = Fixture::new();
@@ -1420,7 +1664,7 @@ mod tests {
         no_meminfo
             .pci(BDF_03, CARVE_512M, 0)
             .gtt(BDF_03, GTT_64G, 0);
-        fs::remove_file(&no_meminfo.roots.meminfo).unwrap();
+        fs::remove_file(&no_meminfo.roots.ram.meminfo).unwrap();
         assert!(
             read_from(&no_meminfo, apu(true)).is_none(),
             "no MemAvailable"
@@ -1436,7 +1680,7 @@ mod tests {
     #[test]
     fn parses_the_two_meminfo_rows() {
         let fixture = Fixture::new().meminfo(MEM_TOTAL_KB, 8 * 1024 * 1024);
-        let path = &fixture.roots.meminfo;
+        let path = &fixture.roots.ram.meminfo;
         assert_eq!(meminfo_mb(path, "MemTotal"), Some(128 * 1024 - 512));
         assert_eq!(meminfo_mb(path, "MemAvailable"), Some(8 * 1024));
         assert_eq!(meminfo_mb(path, "MemShrubbery"), None);
@@ -1499,7 +1743,7 @@ mod tests {
         fixture
             .dgpu(1, LOC_03_00, 128, GB24)
             .dgpu(2, LOC_0C_00, 129, GB16);
-        fs::remove_file(&fixture.roots.meminfo).unwrap();
+        fs::remove_file(&fixture.roots.ram.meminfo).unwrap();
         let rows = fixture.build().expect("no meminfo, no problem");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "AMD gfx1100 (24 GB)");

@@ -114,7 +114,7 @@ class TestEasyOcrDevice:
 
 
 class TestWhisperDevice:
-    def _load(self, devices):
+    def _load(self, devices, ct2_gpus):
         from inferio.impl.whisper import FasterWhisperModel
 
         captured = {}
@@ -129,7 +129,10 @@ class TestWhisperDevice:
             return "float32"
 
         model = FasterWhisperModel(model_name="fake/whisper")
-        with _mocked_module("faster_whisper", WhisperModel=WhisperModel):
+        ct2 = _mocked_module(
+            "ctranslate2", get_cuda_device_count=lambda: ct2_gpus
+        )
+        with _mocked_module("faster_whisper", WhisperModel=WhisperModel), ct2:
             with mock.patch(
                 "inferio.impl.whisper.get_device", return_value=devices
             ):
@@ -140,18 +143,20 @@ class TestWhisperDevice:
                     model.load()
         return captured, compute_type_args
 
-    def test_a_non_cuda_device_is_named_outright(self):
+    def test_a_device_ct2_cannot_use_is_named_as_the_cpu(self):
         # The half that has to be authoritative: a CPU-priced host must not
-        # let CTranslate2's own probe find the machine's GPU.
-        for kind in ("cpu", "mps"):
-            captured, compute_args = self._load([torch.device(kind)])
-            assert captured["device"] == "cpu"
-            assert compute_args["device_kind"] == "cpu"
+        # let CTranslate2's own probe find the machine's GPU. A `cuda` device
+        # this CT2 build sees no GPU for (a ROCm torch with the PyPI wheel)
+        # runs on the CPU too.
+        for kind, gpus in (("cpu", 1), ("mps", 1), ("cuda", 0)):
+            captured, compute_args = self._load([torch.device(kind)], gpus)
+            assert captured["device"] == "cpu", kind
+            assert compute_args["device_kind"] == "cpu", kind
 
     def test_a_cuda_device_keeps_auto(self):
-        # Deliberately `auto` rather than `"cuda"`: torch calls a ROCm board
-        # `cuda` too, and a CT2 build with no GPU support raises on an
-        # explicit `device="cuda"` where `auto` degrades to the CPU itself.
-        captured, compute_args = self._load([torch.device("cuda")])
+        # Deliberately `auto` rather than `"cuda"`: a CT2 build with no GPU
+        # support raises on an explicit `device="cuda"` where `auto` degrades
+        # to the CPU itself.
+        captured, compute_args = self._load([torch.device("cuda")], 1)
         assert captured["device"] == "auto"
         assert compute_args["device_kind"] == "cuda"

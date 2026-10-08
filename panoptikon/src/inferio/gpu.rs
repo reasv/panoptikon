@@ -11,7 +11,9 @@
 //! unparseable identity makes the whole result unknown, and unknown leaves
 //! pins untouched.
 
-use std::path::PathBuf;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,6 +24,7 @@ use super::capability::{HostComputeCaps, find_nvidia_smi, output_with_timeout, p
 use super::cpu;
 use super::mps;
 use super::rocm;
+use super::worker::WorkerSpawnConfig;
 use crate::config::Accelerator;
 
 /// CUDA's device filter (and HIP's alias for its own). Takes a `GPU-…` UUID.
@@ -37,6 +40,10 @@ pub const HIP_PIN_ENV_VAR: &str = "HIP_VISIBLE_DEVICES";
 /// mismatch.
 pub const UNIFIED_GPU_ENV_VAR: &str = "PANOPTIKON_UNIFIED_GPU";
 
+/// Set on a worker on an NVIDIA GPU: `1` when a full allocation there spills
+/// to system RAM ([`GpuInventory::spill_verdict`]), `0` when it fails.
+pub const SPILLS_TO_RAM_ENV_VAR: &str = "PANOPTIKON_SPILLS_TO_RAM";
+
 /// Written next to the visibility variable with the same pin, so the worker
 /// can tell our pin from an operator's ambient one
 /// (`memory.py::pinned_device_missing`).
@@ -51,6 +58,27 @@ pub fn pin_env_var(accelerator: Accelerator) -> &'static str {
         Accelerator::Cuda | Accelerator::Cpu | Accelerator::Mps | Accelerator::Auto => {
             CUDA_PIN_ENV_VAR
         }
+    }
+}
+
+/// The `backend` component of a calibration profile key. `Auto` (resolution
+/// failed) keys as `cpu`; Apple Silicon keys as `mps`.
+pub fn accelerator_backend(accelerator: Accelerator) -> &'static str {
+    match accelerator {
+        Accelerator::Cuda => "cuda",
+        Accelerator::Rocm => "rocm",
+        Accelerator::Mps => "mps",
+        Accelerator::Cpu | Accelerator::Auto => "cpu",
+    }
+}
+
+/// The backend workers run on: the CPU on a host whose models are placed on
+/// the CPU device, the accelerator's otherwise.
+pub fn worker_backend(inventory: &GpuInventory, accelerator: Accelerator) -> &'static str {
+    if inventory.resolve_device_key(None).as_deref() == Some(cpu::DEVICE_KEY) {
+        "cpu"
+    } else {
+        accelerator_backend(accelerator)
     }
 }
 
@@ -86,14 +114,11 @@ impl GpuInfo {
         self.unified_ram_mb.is_some()
     }
 
-    /// Capacity used to rank GPUs for default placement: `max(carve-out,
-    /// total / 8)` on a unified ROCm GPU, `total_mb` otherwise. Not used for
-    /// pricing. See docs/unified-memory-admission.md "Backend B".
+    /// Capacity used to rank GPUs for default placement: the carve-out on a
+    /// unified ROCm GPU, whose GTT is host RAM, `total_mb` otherwise. Not used
+    /// for pricing. See docs/unified-memory-admission.md "Backend B".
     pub fn placement_total_mb(&self) -> u64 {
-        match self.vram_carveout_mb {
-            Some(carveout) => carveout.max(self.total_mb / 8),
-            None => self.total_mb,
-        }
+        self.vram_carveout_mb.unwrap_or(self.total_mb)
     }
 
     /// `major * 10 + minor`, or `None` when unknown (never 0, so unknown is
@@ -131,23 +156,26 @@ pub struct GpuInventory {
     backend: MemoryBackend,
     /// CPU device RAM statistics roots; `Some` iff there is a CPU device.
     cpu_roots: Option<cpu::MemRoots>,
-    /// The visibility variable is set and empty (`CUDA_VISIBLE_DEVICES=`): no
-    /// GPU is visible, no pin may be written, everything runs on the CPU.
-    blank_mask: bool,
+    /// No GPU is visible to a worker: the visibility variable is set and empty
+    /// (`CUDA_VISIBLE_DEVICES=`), or this process can open no ROCm GPU. No pin
+    /// may be written; everything runs on the CPU.
+    no_visible_gpu: bool,
 }
 
 /// Which interface answers live-memory queries and which pin vocabulary
 /// applies, set from the resolved accelerator.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 enum MemoryBackend {
-    #[default]
-    NvidiaSmi,
+    NvidiaSmi {
+        /// The GPUs (by UUID) that move memory to system RAM when full.
+        spilling: Arc<[String]>,
+    },
     RocmSysfs {
         /// The PCI device root the probe read, reused by the refresh.
         pci_devices: PathBuf,
-        /// `/proc/meminfo`; read only for unified GPUs, which clamp unclaimed
-        /// GTT to `MemAvailable`.
-        meminfo: PathBuf,
+        /// Host RAM statistics; read only for unified GPUs, which clamp
+        /// unclaimed GTT to the RAM the OS could deliver.
+        ram: cpu::MemRoots,
         /// A HIP-layer visibility variable (`HIP_VISIBLE_DEVICES`,
         /// `CUDA_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL`) was set at probe
         /// time, so no pin of ours is written. `ROCR_VISIBLE_DEVICES` is not.
@@ -159,6 +187,14 @@ enum MemoryBackend {
     Cpu,
 }
 
+impl Default for MemoryBackend {
+    fn default() -> Self {
+        Self::NvidiaSmi {
+            spilling: Arc::default(),
+        }
+    }
+}
+
 /// Everything one `nvidia-smi` call tells us about this host's GPUs.
 pub struct HostGpus {
     /// Compute-capability floors for `/metadata` availability filtering.
@@ -167,10 +203,28 @@ pub struct HostGpus {
     pub inventory: GpuInventory,
 }
 
-/// ISA names of the GPUs in the KFD topology (`gfx1100`), for the startup
-/// accelerator report; empty without amdgpu.
-pub fn rocm_topology_gfx_names() -> Vec<String> {
-    rocm::topology_gfx_names(&rocm::SysfsRoots::default().kfd_nodes)
+/// The gfx targets the `rocm` extra's torch wheel is built for:
+/// `PYTORCH_ROCM_ARCH` of PyTorch 2.11's ROCm builds. Update with that pin.
+pub const ROCM_WHEEL_GFX: [&str; 14] = [
+    "gfx900", "gfx906", "gfx908", "gfx90a", "gfx942", "gfx950", "gfx1030", "gfx1100", "gfx1101",
+    "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+];
+
+/// Makes HIP run kernels built for another gfx target, so a GPU outside
+/// [`ROCM_WHEEL_GFX`] can still run the wheel's kernels.
+const GFX_OVERRIDE_ENV_VAR: &str = "HSA_OVERRIDE_GFX_VERSION";
+
+/// `HSA_OVERRIDE_GFX_VERSION` is set and non-empty in this process's
+/// environment, which workers inherit.
+pub fn gfx_override() -> bool {
+    std::env::var_os(GFX_OVERRIDE_ENV_VAR).is_some_and(|v| !v.is_empty())
+}
+
+/// The GPUs in the KFD topology: ISA name (`gfx1100`) and whether this
+/// process can open it; empty without amdgpu. Without `check_access` nothing
+/// is opened and every GPU reports `false`.
+pub fn rocm_topology_gpus(check_access: bool) -> Vec<(String, bool)> {
+    rocm::topology_gpus(&rocm::SysfsRoots::default(), check_access)
 }
 
 /// Probe once at startup; never fails. `accelerator` must be the resolved
@@ -183,11 +237,14 @@ pub fn probe(accelerator: Accelerator) -> HostGpus {
         Accelerator::Cuda | Accelerator::Auto => {
             // nvidia-smi ignores CUDA_VISIBLE_DEVICES, so it is applied here.
             let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
-            let host = build(query(accelerator).as_deref(), visible.as_deref());
-            if host.inventory.gpus().is_some_and(|gpus| !gpus.is_empty())
-                && host.inventory.spills_to_ram()
-            {
+            let mut host = build(query(accelerator).as_deref(), visible.as_deref());
+            host.inventory.set_spilling(
+                DriverPlatform::current(Path::new(WSL_GPU_DEVICE)),
+                query_driver_models,
+            );
+            if !host.inventory.spilling_gpus().is_empty() {
                 tracing::warn!(
+                    gpus = ?host.inventory.spilling_gpus(),
                     "with the NVIDIA driver's default \"CUDA - Sysmem Fallback Policy\", a GPU \
                      that runs out of memory silently uses system RAM instead of failing, and \
                      batch-size calibration can briefly exceed GPU memory, so inference can run \
@@ -201,10 +258,70 @@ pub fn probe(accelerator: Accelerator) -> HostGpus {
     with_cpu_device(host)
 }
 
-/// The GPU is driven by the Windows display driver: native Windows, or Linux
-/// under WSL2 or Docker Desktop, which expose it as `/dev/dxg`.
-fn windows_gpu_driver() -> bool {
-    cfg!(windows) || (cfg!(target_os = "linux") && std::path::Path::new("/dev/dxg").exists())
+/// The GPU device WSL2 and Docker Desktop expose: the Windows display driver.
+const WSL_GPU_DEVICE: &str = "/dev/dxg";
+
+/// Where the NVIDIA driver runs, for [`spills`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverPlatform {
+    /// Native Windows: each GPU has its own driver model.
+    Windows,
+    /// Linux under WSL2 or Docker Desktop: every GPU goes through the Windows
+    /// display driver.
+    Wsl,
+    /// Any other host.
+    Other,
+}
+
+impl DriverPlatform {
+    /// This host's platform; on Linux `dxg` is the WSL GPU device to look for.
+    fn current(dxg: &Path) -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "linux") && dxg.exists() {
+            Self::Wsl
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Whether a full NVIDIA GPU moves memory to system RAM instead of failing
+/// the allocation. The Windows display driver model (WDDM) does; TCC fails
+/// a full allocation. Any other model (MCDM, unmeasured) or none reported
+/// counts as WDDM, so a GPU that might spill keeps the spill handling.
+fn spills(platform: DriverPlatform, driver_model: Option<&str>) -> bool {
+    match platform {
+        DriverPlatform::Other => false,
+        DriverPlatform::Wsl => true,
+        DriverPlatform::Windows => {
+            !driver_model.is_some_and(|model| model.eq_ignore_ascii_case("TCC"))
+        }
+    }
+}
+
+/// Each GPU's current driver model (native Windows only). `None` on any
+/// failure, which [`spills`] reads as WDDM.
+fn query_driver_models() -> Option<String> {
+    let mut cmd = Command::new(find_nvidia_smi()?);
+    cmd.args([
+        "--query-gpu=uuid,driver_model.current",
+        "--format=csv,noheader",
+    ]);
+    let output = output_with_timeout(cmd, Duration::from_secs(5))?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `uuid, driver model` rows; unparseable rows are skipped.
+fn parse_driver_models(stdout: &str) -> HashMap<&str, &str> {
+    stdout
+        .lines()
+        .filter_map(|line| line.split_once(','))
+        .map(|(uuid, model)| (uuid.trim(), model.trim()))
+        .collect()
 }
 
 /// Append the CPU device after the accelerators, so a CPU worker on any host
@@ -239,13 +356,40 @@ fn with_cpu_device(mut host: HostGpus) -> HostGpus {
 /// off Linux there are no GPUs. The backend is `RocmSysfs` on every path.
 fn probe_rocm() -> HostGpus {
     let roots = rocm::SysfsRoots::default();
-    let blank = if cfg!(target_os = "linux") {
-        let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
-        rocm::blank_visibility_var(ambient.each_ref().map(Option::as_deref))
-    } else {
-        None
-    };
-    if let Some(var) = blank {
+    if !cfg!(target_os = "linux") {
+        return rocm_host(&roots, None, false, false);
+    }
+    let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
+    probe_rocm_at(
+        &roots,
+        ambient.each_ref().map(Option::as_deref),
+        under_wsl(),
+    )
+}
+
+/// What ROCm lacks under WSL2, logged at startup and printed by
+/// `panoptikon accelerator`.
+pub const ROCM_UNDER_WSL: &str = "ROCm under WSL2 runs through the Windows \
+    display driver, which exposes no GPU name and none of the amdgpu memory \
+    counters this host reads: models on the GPU run without a memory ledger or \
+    batch-size calibration, and a GPU that runs out of memory may move it to \
+    system RAM and slow down instead of failing";
+
+/// This process runs under WSL2, where GPUs are reached through the Windows
+/// display driver.
+pub fn under_wsl() -> bool {
+    DriverPlatform::current(Path::new(WSL_GPU_DEVICE)) == DriverPlatform::Wsl
+}
+
+/// [`probe_rocm`] over injected roots and visibility variables. A blank
+/// visibility variable, or no GPU this process can use, leaves no visible GPU:
+/// models run on the CPU device. Under WSL the inventory is unknown.
+fn probe_rocm_at(
+    roots: &rocm::SysfsRoots,
+    ambient: [Option<&str>; rocm::VISIBILITY_VARS.len()],
+    wsl: bool,
+) -> HostGpus {
+    if let Some(var) = rocm::blank_visibility_var(ambient) {
         tracing::info!(
             variable = var,
             "{var} is set and names no device, which is how the runtime is \
@@ -253,55 +397,23 @@ fn probe_rocm() -> HostGpus {
              it, so this host has no GPU devices and its models run on the CPU \
              device and are priced against RAM"
         );
-        return HostGpus {
-            caps: HostComputeCaps::unknown(),
-            inventory: GpuInventory {
-                gpus: Some(Vec::new().into()),
-                adoptable: None,
-                adopted: Arc::default(),
-                backend: MemoryBackend::RocmSysfs {
-                    pci_devices: roots.pci_devices.clone(),
-                    meminfo: roots.meminfo.clone(),
-                    ambient_hip_restriction: true,
-                },
-                cpu_roots: None,
-                blank_mask: true,
-            },
-        };
+        return rocm_host(roots, Some(Vec::new().into()), true, true);
     }
-    let (inventory, ambient_hip_restriction) = if cfg!(target_os = "linux") {
-        let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
-        let ambient = ambient.each_ref().map(Option::as_deref);
-        (
-            Some(rocm::build(&roots, ambient)),
-            rocm::ambient_hip_restriction(ambient),
-        )
-    } else {
-        (None, false)
-    };
-    let backend = MemoryBackend::RocmSysfs {
-        pci_devices: roots.pci_devices.clone(),
-        meminfo: roots.meminfo.clone(),
-        ambient_hip_restriction,
-    };
-    let host = |gpus: Option<Arc<[GpuInfo]>>| HostGpus {
-        caps: HostComputeCaps::unknown(),
-        inventory: GpuInventory {
-            gpus,
-            adoptable: None,
-            adopted: Arc::default(),
-            backend: backend.clone(),
-            cpu_roots: None,
-            blank_mask: false,
-        },
-    };
-    let gpus = match inventory {
-        Some(Ok(gpus)) => gpus,
-        Some(Err(failure)) => {
-            failure.log();
-            return host(None);
+    let ambient_hip_restriction = rocm::ambient_hip_restriction(ambient);
+    // WSL has no amdkfd: ROCm reaches the GPU through /dev/dxg.
+    if wsl {
+        tracing::warn!("{ROCM_UNDER_WSL}");
+        return rocm_host(roots, None, ambient_hip_restriction, false);
+    }
+    let gpus = match rocm::build(roots, ambient) {
+        Ok(gpus) if gpus.is_empty() => {
+            return rocm_host(roots, Some(gpus.into()), ambient_hip_restriction, true);
         }
-        None => return host(None),
+        Ok(gpus) => gpus,
+        Err(failure) => {
+            failure.log();
+            return rocm_host(roots, None, ambient_hip_restriction, false);
+        }
     };
     for gpu in &gpus {
         tracing::info!(
@@ -315,7 +427,43 @@ fn probe_rocm() -> HostGpus {
             "detected GPU"
         );
     }
-    host(Some(gpus.into()))
+    if let Some(gpu) = default_gpu(&gpus)
+        && lacks_wheel_kernels(gpu, gfx_override())
+    {
+        tracing::warn!(
+            gfx = gpu.arch().as_deref().unwrap_or("unknown"),
+            index = gpu.index,
+            "the default GPU has no kernels in the ROCm build of torch: models \
+             placed on it fail unless {GFX_OVERRIDE_ENV_VAR} names a supported \
+             target of the same generation (in Docker: \
+             deploy/docker-compose.rocm.yml) or they are pinned to another device"
+        );
+    }
+    rocm_host(roots, Some(gpus.into()), ambient_hip_restriction, false)
+}
+
+/// A ROCm host over `roots`: unknown capabilities, nothing adoptable.
+fn rocm_host(
+    roots: &rocm::SysfsRoots,
+    gpus: Option<Arc<[GpuInfo]>>,
+    ambient_hip_restriction: bool,
+    no_visible_gpu: bool,
+) -> HostGpus {
+    HostGpus {
+        caps: HostComputeCaps::unknown(),
+        inventory: GpuInventory {
+            gpus,
+            adoptable: None,
+            adopted: Arc::default(),
+            backend: MemoryBackend::RocmSysfs {
+                pci_devices: roots.pci_devices.clone(),
+                ram: roots.ram.clone(),
+                ambient_hip_restriction,
+            },
+            cpu_roots: None,
+            no_visible_gpu,
+        },
+    }
 }
 
 /// One synthetic unified-memory device from macOS sysctls (`mps.rs`). With
@@ -329,7 +477,7 @@ fn probe_mps() -> HostGpus {
             adopted: Arc::default(),
             backend: MemoryBackend::Mps,
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         },
     };
     let Some(facts) = mps::probe() else {
@@ -367,7 +515,7 @@ fn probe_cpu() -> HostGpus {
             adopted: Arc::default(),
             backend: MemoryBackend::Cpu,
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         },
     }
 }
@@ -419,6 +567,26 @@ pub struct GpuMemory {
     pub uuid: String,
     pub total_mb: u64,
     pub free_mb: u64,
+    /// The terms of an APU's free reading; `None` on any other device.
+    pub gtt: Option<GttBasis>,
+}
+
+/// The two terms an APU's free reading takes the smaller of, on top of its
+/// free VRAM: unclaimed GTT, and the host RAM the OS could deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GttBasis {
+    pub gtt_free_mb: u64,
+    pub ram_available_mb: u64,
+}
+
+impl GttBasis {
+    /// Both terms, or `None`.
+    pub fn pair(gtt_free_mb: Option<u64>, ram_available_mb: Option<u64>) -> Option<Self> {
+        Some(Self {
+            gtt_free_mb: gtt_free_mb?,
+            ram_available_mb: ram_available_mb?,
+        })
+    }
 }
 
 /// How this host's live free/total memory is read. Cheap to clone.
@@ -427,10 +595,10 @@ pub(super) enum MemoryQuery {
     /// One `nvidia-smi --query-gpu` call covering every visible GPU.
     NvidiaSmi,
     /// amdgpu's `mem_info_vram_{total,used}` per GPU, plus
-    /// `mem_info_gtt_{total,used}` and `MemAvailable` for a unified GPU.
+    /// `mem_info_gtt_{total,used}` and deliverable RAM for a unified GPU.
     RocmSysfs {
         pci_devices: PathBuf,
-        meminfo: PathBuf,
+        ram: cpu::MemRoots,
         /// Every GPU's key, address and unified flag, in inventory order.
         gpus: Arc<[rocm::GpuRef]>,
     },
@@ -460,9 +628,9 @@ impl MemoryQuery {
             Self::NvidiaSmi => query_memory_nvidia_smi(),
             Self::RocmSysfs {
                 pci_devices,
-                meminfo,
+                ram,
                 gpus,
-            } => rocm::query_memory(pci_devices, meminfo, gpus),
+            } => rocm::query_memory(pci_devices, ram, gpus),
             Self::Mps { key, ram_mb } => mps::query_memory(key, *ram_mb),
             Self::Cpu { key, ram_mb, roots } => cpu::query_memory(key, *ram_mb, roots),
             Self::Unavailable => None,
@@ -516,6 +684,7 @@ fn parse_memory(stdout: &str) -> Option<Vec<GpuMemory>> {
             uuid,
             total_mb,
             free_mb,
+            gtt: None,
         });
     }
     if gpus.is_empty() { None } else { Some(gpus) }
@@ -543,9 +712,9 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
                     gpus: Some(Vec::new().into()),
                     adoptable: None,
                     adopted: Arc::default(),
-                    backend: MemoryBackend::NvidiaSmi,
+                    backend: MemoryBackend::default(),
                     cpu_roots: None,
-                    blank_mask: true,
+                    no_visible_gpu: true,
                 },
             };
         }
@@ -556,9 +725,9 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
                     gpus: None,
                     adoptable: Some(reported.into()),
                     adopted: Arc::default(),
-                    backend: MemoryBackend::NvidiaSmi,
+                    backend: MemoryBackend::default(),
                     cpu_roots: None,
-                    blank_mask: false,
+                    no_visible_gpu: false,
                 },
             };
         }
@@ -579,9 +748,9 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
             gpus: Some(gpus.into()),
             adoptable: None,
             adopted: Arc::default(),
-            backend: MemoryBackend::NvidiaSmi,
+            backend: MemoryBackend::default(),
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         },
     }
 }
@@ -677,11 +846,29 @@ fn accelerators_of(gpus: &[GpuInfo]) -> &[GpuInfo] {
     &gpus[..end]
 }
 
-/// Where an unpinned replica lands: the highest compute capability, ties
-/// broken by [`GpuInfo::placement_total_mb`] and then the lowest index.
+/// Where an unpinned replica lands: [`default_gpu_with`], with the gfx
+/// override read from this process's environment, which workers inherit.
 fn default_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
+    default_gpu_with(gpus, gfx_override())
+}
+
+/// A ROCm GPU whose gfx target is outside [`ROCM_WHEEL_GFX`], unless
+/// `gfx_override` is set.
+fn lacks_wheel_kernels(gpu: &GpuInfo, gfx_override: bool) -> bool {
+    !gfx_override
+        && gpu.gfx_target_version.is_some()
+        && !gpu
+            .arch()
+            .is_some_and(|arch| ROCM_WHEEL_GFX.contains(&arch.as_str()))
+}
+
+/// A ROCm GPU outside [`ROCM_WHEEL_GFX`] last (unless `gfx_override`), then
+/// the highest compute capability, ties broken by
+/// [`GpuInfo::placement_total_mb`] and then the lowest index.
+fn default_gpu_with(gpus: &[GpuInfo], gfx_override: bool) -> Option<&GpuInfo> {
     gpus.iter().min_by_key(|gpu| {
         (
+            lacks_wheel_kernels(gpu, gfx_override),
             std::cmp::Reverse(gpu.cap_tenths()),
             std::cmp::Reverse(gpu.placement_total_mb()),
             gpu.index,
@@ -703,9 +890,9 @@ impl GpuInventory {
             gpus: (!gpus.is_empty()).then(|| gpus.into()),
             adoptable: None,
             adopted: Arc::default(),
-            backend: MemoryBackend::NvidiaSmi,
+            backend: MemoryBackend::default(),
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -718,7 +905,7 @@ impl GpuInventory {
             adopted: Arc::default(),
             backend: MemoryBackend::Cpu,
             cpu_roots: Some(cpu::MemRoots::default()),
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -735,7 +922,7 @@ impl GpuInventory {
             adopted: Arc::default(),
             backend: MemoryBackend::Mps,
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
         .with_cpu(ram_mb, cpu::MemRoots::default())
     }
@@ -749,11 +936,11 @@ impl GpuInventory {
             adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: rocm::SysfsRoots::default().pci_devices,
-                meminfo: rocm::SysfsRoots::default().meminfo,
+                ram: cpu::MemRoots::default(),
                 ambient_hip_restriction: false,
             },
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -781,7 +968,7 @@ impl GpuInventory {
     /// device on a host known to have none. Never both.
     fn rankable<'a>(&self, gpus: &'a [GpuInfo]) -> &'a [GpuInfo] {
         match accelerators_of(gpus) {
-            [] if self.blank_mask || matches!(self.backend, MemoryBackend::Cpu) => gpus,
+            [] if self.no_visible_gpu || matches!(self.backend, MemoryBackend::Cpu) => gpus,
             accelerators => accelerators,
         }
     }
@@ -792,17 +979,59 @@ impl GpuInventory {
             return "cpu";
         }
         match self.backend {
-            MemoryBackend::NvidiaSmi => "cuda",
+            MemoryBackend::NvidiaSmi { .. } => "cuda",
             MemoryBackend::RocmSysfs { .. } => "rocm",
             MemoryBackend::Mps => "mps",
             MemoryBackend::Cpu => "cpu",
         }
     }
 
-    /// A full CUDA GPU on this host moves memory to system RAM instead of
-    /// failing the allocation: the driver is the Windows display driver.
-    pub(super) fn spills_to_ram(&self) -> bool {
-        matches!(self.backend, MemoryBackend::NvidiaSmi) && windows_gpu_driver()
+    /// The NVIDIA GPUs, visible or adoptable, that move memory to system RAM
+    /// instead of failing a full allocation ([`spills`]). `query` reads the
+    /// driver models, and runs only on native Windows.
+    fn set_spilling(&mut self, platform: DriverPlatform, query: impl FnOnce() -> Option<String>) {
+        let driver_models = (platform == DriverPlatform::Windows).then(query).flatten();
+        let models = driver_models
+            .as_deref()
+            .map(parse_driver_models)
+            .unwrap_or_default();
+        let gpus = self.gpus().unwrap_or(&[]).iter().chain(self.adoptable());
+        let verdicts: Arc<[String]> = gpus
+            .filter(|gpu| spills(platform, models.get(gpu.uuid.as_str()).copied()))
+            .map(|gpu| gpu.uuid.clone())
+            .collect();
+        if let MemoryBackend::NvidiaSmi { spilling } = &mut self.backend {
+            *spilling = verdicts;
+        }
+    }
+
+    /// The GPUs (by UUID) a full allocation spills to system RAM on.
+    pub(super) fn spilling_gpus(&self) -> &[String] {
+        match &self.backend {
+            MemoryBackend::NvidiaSmi { spilling } => spilling,
+            _ => &[],
+        }
+    }
+
+    /// What a worker on this device is told about spilling
+    /// ([`SPILLS_TO_RAM_ENV_VAR`]): `None` off NVIDIA or for an unknown device.
+    pub(super) fn spill_verdict(&self, key: Option<&str>) -> Option<bool> {
+        let key = key.filter(|_| matches!(self.backend, MemoryBackend::NvidiaSmi { .. }))?;
+        Some(self.spilling_gpus().iter().any(|uuid| uuid == key))
+    }
+
+    /// The spawn config of a replica on device `key`: the CPU device's, or
+    /// `spawn` with a unified GPU's address and an NVIDIA GPU's spill verdict.
+    pub(super) fn spawn_config<'a>(
+        &self,
+        spawn: &'a WorkerSpawnConfig,
+        key: Option<&str>,
+    ) -> Cow<'a, WorkerSpawnConfig> {
+        if key == Some(cpu::DEVICE_KEY) {
+            return Cow::Owned(spawn.for_cpu_device());
+        }
+        let bdf = key.and_then(|key| self.unified_pin_bdf(Some(key)));
+        spawn.for_gpu(bdf.as_deref(), self.spill_verdict(key))
     }
 
     /// The GPUs an unmappable ambient mask hid, candidates for adoption.
@@ -852,9 +1081,9 @@ impl GpuInventory {
             gpus: None,
             adoptable: (!gpus.is_empty()).then(|| gpus.into()),
             adopted: Arc::default(),
-            backend: MemoryBackend::NvidiaSmi,
+            backend: MemoryBackend::default(),
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -878,9 +1107,7 @@ impl GpuInventory {
             };
         }
         let MemoryBackend::RocmSysfs {
-            pci_devices,
-            meminfo,
-            ..
+            pci_devices, ram, ..
         } = &self.backend
         else {
             return MemoryQuery::NvidiaSmi;
@@ -909,7 +1136,7 @@ impl GpuInventory {
         }
         MemoryQuery::RocmSysfs {
             pci_devices: pci_devices.clone(),
-            meminfo: meminfo.clone(),
+            ram: ram.clone(),
             gpus: keyed.into(),
         }
     }
@@ -1027,15 +1254,15 @@ impl GpuInventory {
             }
             return None;
         }
-        // A pin could only re-expose a GPU the operator hid.
-        if self.blank_mask {
+        // A pin could only re-expose a GPU the operator hid, or name one the
+        // worker cannot open.
+        if self.no_visible_gpu {
             if let Some(requested) = requested.map(str::trim).filter(|pin| !pin.is_empty()) {
                 tracing::warn!(
                     pin = %requested,
-                    "ignoring this device pin: this host's ambient visibility \
-                     variable is set to a value that names no device, so no \
-                     GPU is visible to a worker at all and this model runs on \
-                     the CPU device, priced against RAM"
+                    "ignoring this device pin: no GPU is visible to a worker \
+                     on this host (see the startup warning for why), so this \
+                     model runs on the CPU device, priced against RAM"
                 );
             }
             return None;
@@ -1108,10 +1335,11 @@ impl GpuInventory {
     ///
     /// No request gives the default GPU; a full key or an index gives that
     /// row; on CUDA an unambiguous UUID prefix also resolves. Anything else is
-    /// `None` without a warning (`resolve_pin` already warned).
+    /// `None` without a warning (`resolve_pin` already warned). With no
+    /// visible GPU every request gives the default device, as in `resolve_pin`.
     pub fn resolve_device_key(&self, requested: Option<&str>) -> Option<String> {
         let gpus = &self.priced_gpus()?;
-        let Some(requested) = requested else {
+        let Some(requested) = requested.filter(|_| !self.no_visible_gpu) else {
             return Some(default_gpu(self.rankable(gpus))?.uuid.clone());
         };
         let trimmed = requested.trim();
@@ -1332,6 +1560,69 @@ mod tests {
         GpuInventory::known(vec![gpu(0, "GPU-1111", "12.0"), gpu(3, "GPU-3333", "12.0")])
     }
 
+    /// Only the Windows display driver spills a full GPU to system RAM: on
+    /// native Windows per GPU by its driver model, under WSL every GPU.
+    #[test]
+    fn a_gpu_spills_under_the_windows_display_driver_only() {
+        use DriverPlatform::{Other, Windows, Wsl};
+        for (platform, model, spilled) in [
+            (Other, None, false),
+            (Wsl, None, true),
+            (Windows, Some("WDDM"), true),
+            (Windows, Some("tcc"), false),
+            (Windows, Some("MCDM"), true),
+            (Windows, Some("[N/A]"), true),
+            (Windows, None, true),
+        ] {
+            assert_eq!(spills(platform, model), spilled, "{platform:?} {model:?}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let dxg = dir.path().join("dxg");
+            assert_eq!(DriverPlatform::current(&dxg), Other);
+            std::fs::write(&dxg, "").expect("writes");
+            assert_eq!(DriverPlatform::current(&dxg), Wsl);
+        }
+        // The verdict is per GPU, adoptable rows included, joined by UUID.
+        let rows = "0, GPU-1111, A, 24576, 8.9\n1, GPU-2222, B, 97887, 12.0\n";
+        let models = "GPU-1111, WDDM\nGPU-2222, TCC\nunparseable\n";
+        for visible in [None, Some("1")] {
+            let mut inventory = build(Some(rows), visible).inventory;
+            inventory.set_spilling(Windows, || Some(models.to_owned()));
+            assert_eq!(inventory.spilling_gpus(), ["GPU-1111"], "{visible:?}");
+            assert_eq!(inventory.spill_verdict(Some("GPU-1111")), Some(true));
+            assert_eq!(inventory.spill_verdict(Some("GPU-2222")), Some(false));
+            assert_eq!(inventory.spill_verdict(None), None, "an unknown device");
+            inventory.set_spilling(Windows, || None);
+            assert_eq!(inventory.spilling_gpus().len(), 2, "no models read: WDDM");
+            inventory.set_spilling(Other, || panic!("queried off native Windows"));
+            assert!(inventory.spilling_gpus().is_empty());
+            inventory.set_spilling(Wsl, || panic!("queried off native Windows"));
+            assert_eq!(inventory.spilling_gpus().len(), 2, "WSL: every GPU");
+        }
+        // Each replica's spawn config carries its own GPU's verdict.
+        let mut inventory = build(Some(rows), None).inventory;
+        inventory.set_spilling(Windows, || Some(models.to_owned()));
+        let spawn = super::super::worker::testing::test_spawn_config();
+        let told = |key| {
+            let config = inventory.spawn_config(&spawn, Some(key));
+            config
+                .env
+                .iter()
+                .find(|(name, _)| name == SPILLS_TO_RAM_ENV_VAR)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(told("GPU-1111").as_deref(), Some("1"));
+        assert_eq!(told("GPU-2222").as_deref(), Some("0"));
+        let rocm = GpuInventory::known_rocm(vec![gpu(0, "GPU-1111", "")]);
+        assert_eq!(
+            rocm.spill_verdict(Some("GPU-1111")),
+            None,
+            "not an NVIDIA GPU"
+        );
+    }
+
     /// The calibration keyspace the host derives for itself: the compute
     /// capability on CUDA, KFD's ISA target on ROCm, nothing where only a
     /// loaded worker can answer.
@@ -1391,13 +1682,13 @@ mod tests {
     }
 
     fn rocm_inventory(pci_devices: PathBuf, gpus: Vec<GpuInfo>) -> GpuInventory {
-        rocm_inventory_with(pci_devices, rocm::SysfsRoots::default().meminfo, gpus)
+        rocm_inventory_with(pci_devices, cpu::MemRoots::default(), gpus)
     }
 
-    /// The same, with `/proc/meminfo` — only the unified refresh reads it.
+    /// The same, with host RAM statistics — only the unified refresh reads them.
     fn rocm_inventory_with(
         pci_devices: PathBuf,
-        meminfo: PathBuf,
+        ram: cpu::MemRoots,
         gpus: Vec<GpuInfo>,
     ) -> GpuInventory {
         GpuInventory {
@@ -1406,13 +1697,13 @@ mod tests {
             adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices,
-                meminfo,
+                ram,
                 // A knowable inventory is proof of no ambient restriction:
                 // the probe blanks it otherwise.
                 ambient_hip_restriction: false,
             },
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -1427,7 +1718,7 @@ mod tests {
             adopted: Arc::default(),
             backend: MemoryBackend::Mps,
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -1452,11 +1743,11 @@ mod tests {
             adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: PathBuf::from("/sys/bus/pci/devices"),
-                meminfo: PathBuf::from("/proc/meminfo"),
+                ram: cpu::MemRoots::default(),
                 ambient_hip_restriction,
             },
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         }
     }
 
@@ -1717,7 +2008,7 @@ mod tests {
             );
             // The capability view never blanks, whichever answer it was.
             assert_eq!(host.caps.meets_floor(8.6), Some(true), "{mask:?}");
-            assert!(!host.inventory.blank_mask, "{mask:?}");
+            assert!(!host.inventory.no_visible_gpu, "{mask:?}");
         }
 
         // Set and naming no device — `CUDA_VISIBLE_DEVICES=`, or a value of
@@ -1730,7 +2021,7 @@ mod tests {
             let host = build(Some(TWO_GPUS), mask);
             assert_eq!(uuids(&host, visible), Vec::<String>::new(), "{mask:?}");
             assert!(uuids(&host, adoptable).is_empty(), "{mask:?}");
-            assert!(host.inventory.blank_mask, "{mask:?}");
+            assert!(host.inventory.no_visible_gpu, "{mask:?}");
             assert_eq!(host.caps.meets_floor(8.6), None, "{mask:?}");
             assert_eq!(host.inventory.accelerators(), None, "{mask:?}");
             // No pin in any form, so no worker is handed a GPU back.
@@ -1750,7 +2041,7 @@ mod tests {
             // also the calibration keyspace `/metadata` reports.
             let host = host.inventory.with_cpu(64 * 1024, cpu::MemRoots::default());
             assert_eq!(host.resolve_device_key(None).as_deref(), Some("CPU"));
-            assert_eq!(host.resolve_device_key(Some("0")), None);
+            assert_eq!(host.resolve_device_key(Some("0")).as_deref(), Some("CPU"));
             assert_eq!(host.default_gpu_name().as_deref(), Some("CPU (64 GB)"));
         }
 
@@ -1811,9 +2102,9 @@ mod tests {
         }
     }
 
-    /// Default placement on a dGPU+APU host compares carve-outs, not
-    /// budgets, with an eighth-of-budget floor.
-    /// See docs/unified-memory-admission.md "Backend B: AMD APUs (ROCm)".
+    /// Default placement on a dGPU+APU host compares the APU's carve-out, not
+    /// its budget. See docs/unified-memory-admission.md "Backend B: AMD APUs
+    /// (ROCm)".
     #[test]
     fn default_placement_compares_an_apus_carve_out_not_its_budget() {
         const DGPU: &str = "AMD gfx1100 (24 GB)";
@@ -1825,7 +2116,7 @@ mod tests {
         let cases = [
             (512, GTT, 24_576, DGPU, "1", "a 64.5 GB budget loses to 24 GB VRAM"),
             (96 * 1024, 16 * 1024, 24_576, APU, "0", "a real carve-out wins"),
-            (512, GTT, 2048, APU, "0", "an eighth still beats a token card"),
+            (512, GTT, 2048, DGPU, "1", "GTT never outranks a card's VRAM"),
         ];
         for (carveout, gtt, dgpu_mb, name, pin, label) in cases {
             let host = GpuInventory::known_rocm(vec![
@@ -1834,6 +2125,29 @@ mod tests {
             ]);
             assert_eq!(host.default_gpu_name().as_deref(), Some(name), "{label}");
             assert_eq!(host.default_pin().as_deref(), Some(pin), "{label}");
+        }
+    }
+
+    /// A GPU the ROCm wheel has no kernels for ranks last, however large,
+    /// unless the gfx override makes HIP run another target's kernels. An
+    /// iGPU ranks by its carve-out either way.
+    #[test]
+    fn default_placement_ranks_a_gpu_the_wheel_lacks_last() {
+        let mut igpu = amd_apu(0, "0000:0e:00.0", 512, 65_536, 128 * 1024);
+        igpu.gfx_target_version = Some(100_306);
+        let mut card = amd_gpu(0, "0000:0e:00.0", 12_272);
+        card.gfx_target_version = Some(100_301);
+        // (the GPU at index 0, gfx override set) -> the index placement picks.
+        let cases = [
+            (&igpu, false, 1),
+            (&igpu, true, 1),
+            (&card, false, 1),
+            (&card, true, 0),
+        ];
+        for (first, gfx_override, expected) in cases {
+            let gpus = [first.clone(), amd_gpu(1, "0000:03:00.0", 8176)];
+            let picked = default_gpu_with(&gpus, gfx_override).map(|gpu| gpu.index);
+            assert_eq!(picked, Some(expected), "{} {gfx_override}", first.total_mb);
         }
     }
 
@@ -1848,7 +2162,7 @@ mod tests {
         assert_eq!(unknown.free_source(), "nvidia-smi", "nothing to refresh");
         let host = rocm_inventory_with(
             PathBuf::from("/sys/bus/pci/devices"),
-            PathBuf::from("/proc/meminfo"),
+            cpu::MemRoots::default(),
             vec![
                 amd_apu(0, "0000:03:00.0", 512, 64 * 1024, 128 * 1024),
                 amd_gpu(1, "0000:0c:00.0", 24_576),
@@ -1862,7 +2176,7 @@ mod tests {
              reporter must not inherit authority by string collision"
         );
         match query {
-            MemoryQuery::RocmSysfs { gpus, meminfo, .. } => {
+            MemoryQuery::RocmSysfs { gpus, ram, .. } => {
                 let rows: Vec<_> = gpus
                     .iter()
                     .map(|g| (g.key.as_str(), g.bdf.as_str(), g.unified))
@@ -1874,7 +2188,7 @@ mod tests {
                         ("GPU-BDF-0000:0c:00.0", "0000:0c:00.0", false),
                     ]
                 );
-                assert_eq!(meminfo, PathBuf::from("/proc/meminfo"));
+                assert_eq!(ram, cpu::MemRoots::default());
             }
             other => panic!("expected the sysfs query, got {other:?}"),
         }
@@ -1928,6 +2242,10 @@ mod tests {
         assert_eq!(inventory().unified_pin_bdf(None), None);
         assert_eq!(mps_inventory(128).unified_pin_bdf(None), None);
         assert_eq!(uninventoried_rocm(false).unified_pin_bdf(Some("0")), None);
+        let spawn = super::super::worker::testing::test_spawn_config();
+        let config = host.spawn_config(&spawn, Some("GPU-BDF-0000:03:00.0"));
+        let unified = (UNIFIED_GPU_ENV_VAR.to_owned(), APU_BDF.to_owned());
+        assert!(config.env.contains(&unified));
     }
 
     /// The whole refresh end to end against a fixture PCI tree, which the
@@ -1976,6 +2294,92 @@ mod tests {
             ],
         );
         assert!(partial.memory_query().run().is_none());
+    }
+
+    /// A ROCm host whose GPU this process cannot open (no render node, as
+    /// without the render group) has no visible GPU: models are placed on the
+    /// CPU device and no pin is written, as under a blank visibility variable,
+    /// whatever a visibility variable names.
+    #[test]
+    fn a_rocm_gpu_this_process_cannot_open_puts_models_on_the_cpu_device() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = rocm::SysfsRoots {
+            kfd_nodes: dir.path().join("nodes"),
+            pci_devices: dir.path().join("pci"),
+            dev_dri: dir.path().join("dri"),
+            kfd: dir.path().join("kfd"),
+            ram: cpu::MemRoots {
+                meminfo: dir.path().join("meminfo"),
+                ..cpu::MemRoots::default()
+            },
+            ..rocm::SysfsRoots::default()
+        };
+        let node = roots.kfd_nodes.join("1");
+        std::fs::create_dir_all(&node).unwrap();
+        std::fs::create_dir_all(&roots.dev_dri).unwrap();
+        std::fs::write(&roots.kfd, "").unwrap();
+        std::fs::write(
+            node.join("properties"),
+            "simd_count 96\ndrm_render_minor 128\ngfx_target_version 110000\n",
+        )
+        .unwrap();
+        for ambient in [
+            [None; rocm::VISIBILITY_VARS.len()],
+            [Some(""), None, None, None],
+            [Some("0"), None, None, None],
+        ] {
+            let host = probe_rocm_at(&roots, ambient, false).inventory;
+            assert!(host.no_visible_gpu, "{ambient:?}");
+            assert_eq!(host.accelerators(), None, "{ambient:?}");
+            assert_eq!(host.resolve_pin(Some("0")), None, "{ambient:?}");
+            let host = host.with_cpu(64 * 1024, cpu::MemRoots::default());
+            assert_eq!(host.resolve_device_key(None).as_deref(), Some("CPU"));
+            assert_eq!(host.resolve_device_key(Some("0")).as_deref(), Some("CPU"));
+        }
+    }
+
+    /// Under WSL, ROCm reaches the GPU through the Windows driver and KFD
+    /// lists nothing, so the inventory is unknown, not empty.
+    #[test]
+    fn rocm_under_wsl_leaves_the_inventory_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = rocm::SysfsRoots {
+            kfd_nodes: dir.path().join("absent"),
+            ..rocm::SysfsRoots::default()
+        };
+        // (ambient, no visible GPU, the pin written for a `1` request)
+        let cases = [
+            ([None; rocm::VISIBILITY_VARS.len()], false, Some("1")),
+            ([None, Some(""), None, None], true, None),
+            ([None, Some("0"), None, None], false, None),
+        ];
+        for (ambient, no_visible_gpu, pin) in cases {
+            let host = probe_rocm_at(&roots, ambient, true).inventory;
+            assert_eq!(host.no_visible_gpu, no_visible_gpu, "{ambient:?}");
+            if !no_visible_gpu {
+                assert_eq!(host.gpus(), None, "{ambient:?}");
+            }
+            assert_eq!(host.resolve_pin(Some("1")).as_deref(), pin, "{ambient:?}");
+        }
+    }
+
+    /// Workers run on the CPU where models are placed on the CPU device, and
+    /// on the accelerator where a GPU is visible.
+    #[test]
+    fn the_worker_backend_follows_where_models_are_placed() {
+        let ram_mb = 64 * 1024;
+        let with_cpu = |host: GpuInventory| host.with_cpu(ram_mb, cpu::MemRoots::default());
+        let hidden_cuda = with_cpu(build(Some(TWO_GPUS), Some("")).inventory);
+        let roots = rocm::SysfsRoots::default();
+        let hidden_rocm =
+            with_cpu(rocm_host(&roots, Some(Vec::new().into()), false, true).inventory);
+        assert_eq!(worker_backend(&hidden_cuda, Accelerator::Cuda), "cpu");
+        assert_eq!(worker_backend(&hidden_rocm, Accelerator::Rocm), "cpu");
+        let cuda = with_cpu(GpuInventory::known(vec![gpu(0, "GPU-a", "8.6")]));
+        let amd = amd_gpu(0, "0000:03:00.0", 24_576);
+        let rocm = with_cpu(GpuInventory::known_rocm(vec![amd]));
+        assert_eq!(worker_backend(&cuda, Accelerator::Cuda), "cuda");
+        assert_eq!(worker_backend(&rocm, Accelerator::Rocm), "rocm");
     }
 
     /// The dispatch itself: each accelerator gets its own backend, whatever
@@ -2176,7 +2580,7 @@ mod tests {
             adopted: Arc::default(),
             backend: MemoryBackend::Cpu,
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         };
         assert!(
             matches!(unprobed_cpu.cpu_memory_query(), MemoryQuery::Unavailable),
@@ -2189,7 +2593,7 @@ mod tests {
                 adopted: Arc::default(),
                 backend: MemoryBackend::Mps,
                 cpu_roots: None,
-                blank_mask: false,
+                no_visible_gpu: false,
             },
             unprobed_cpu,
         ] {
@@ -2375,11 +2779,11 @@ mod tests {
             adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: PathBuf::from("/sys/bus/pci/devices"),
-                meminfo: PathBuf::from("/proc/meminfo"),
+                ram: cpu::MemRoots::default(),
                 ambient_hip_restriction: true,
             },
             cpu_roots: None,
-            blank_mask: false,
+            no_visible_gpu: false,
         };
         for host in [uninventoried_rocm(true), with_gpus] {
             for requested in [

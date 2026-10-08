@@ -49,6 +49,7 @@ cu128 = [
     "nvidia-cudnn-cu12>=9.1.0.70; sys_platform == 'linux' or sys_platform == 'win32'",
 ]
 # ROCm 7.2 multi-arch (pytorch.org; not AMD .lw). Torch 2.11; cpu/cu128 stay 2.7.1.
+# Its gfx targets are listed in panoptikon/src/inferio/gpu.rs (ROCM_WHEEL_GFX).
 rocm = [
     "torch==2.11.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchvision==0.26.0; sys_platform == 'linux' and platform_machine == 'x86_64'",

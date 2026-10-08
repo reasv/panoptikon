@@ -5,6 +5,7 @@ use super::*;
 impl VramLedger {
     /// Read-only ledger snapshot for `GET /health`.
     pub fn health(&self) -> Vec<GpuBudgetHealth> {
+        let pressure = self.memory_pressure();
         let mut state = self.lock();
         // Refresh pools first, so `external_mb` is not computed from pool
         // readings older than the free reading.
@@ -19,13 +20,8 @@ impl VramLedger {
             .gpus
             .iter()
             .map(|(uuid, gpu)| {
-                let external = Self::external_locked(state, uuid);
-                let (reserve, reserve_rule) = self.reserve_locked(
-                    state,
-                    uuid,
-                    external.unwrap_or(0),
-                    self.budgets.for_gpu(uuid).margin_in_force(),
-                );
+                let side =
+                    self.side_locked(state, uuid, self.budgets.for_gpu(uuid).margin_in_force());
                 let mut workers: Vec<LedgerWorkerHealth> = state
                     .workers
                     .values()
@@ -35,6 +31,7 @@ impl VramLedger {
                         let anchor = cal.map(|cal| cal.max_units_measured).unwrap_or(0);
                         let knee = cal.and_then(|cal| cal.knee_units).filter(|knee| *knee > 0);
                         let shape_ceiling = shape_ceiling_for(cal, entry);
+                        let pressure_cap = cal.and_then(|cal| cal.pressure_cap);
                         LedgerWorkerHealth {
                             inference_id: entry.inference_id.clone(),
                             footprint_mb: entry.footprint_mb(),
@@ -55,11 +52,13 @@ impl VramLedger {
                             seed_units: entry.seed_units,
                             deflation: entry.deflation,
                             clean_windows: entry.clean_windows,
-                            unit_budget: Self::budget_locked(state, entry),
+                            unit_budget: Self::budget_locked(state, entry, pressure),
                             max_units_measured: anchor,
                             knee_units: knee,
                             shape_ceiling_units: shape_ceiling,
                             death_cap_units: cal.and_then(|cal| cal.death_cap_units),
+                            pressure_cap_units: pressure_cap.map(|cap| cap.units),
+                            pressure_regrow_to_units: pressure_cap.map(|cap| cap.regrow_to),
                             knee_is_local: cal.is_some_and(|cal| cal.knee_is_local),
                             trial_units: cal.and_then(|cal| cal.trial).map(|trial| trial.run),
                             retest_after_windows: cal.map_or(0, |cal| cal.retest_after),
@@ -89,17 +88,17 @@ impl VramLedger {
                     device_kind: state.inventory.device_kind(uuid).to_owned(),
                     gpu_arch: gpu.arch.clone(),
                     total_mb: gpu.total_mb,
-                    external_mb: external.unwrap_or(0),
-                    external_known: external.is_some(),
+                    external_mb: side.external.unwrap_or(0),
+                    external_known: side.external.is_some(),
                     external_source: gpu.free.as_ref().map(|sample| sample.source.clone()),
                     external_sample_age_ms: gpu
                         .free
                         .as_ref()
                         .map(|sample| sample.at.elapsed().as_millis() as u64),
-                    limit_mb: self.limit_locked(state, uuid),
-                    reserve_mb: reserve,
-                    reserve_rule: reserve_rule.to_owned(),
-                    headroom_mb: self.headroom_locked(state, uuid),
+                    limit_mb: side.limit,
+                    reserve_mb: side.reserve,
+                    reserve_rule: side.rule.to_owned(),
+                    headroom_mb: side.overdraft().max(0) as u64,
                     charges_mb: Self::charges_locked(state, uuid),
                     footprints_mb: Self::footprints_locked(state, uuid),
                     load_reservations_mb: gpu.load_reservations.values().copied().sum(),
@@ -131,7 +130,13 @@ pub struct GpuBudgetHealth {
     pub gpu_arch: Option<String>,
     pub total_mb: u64,
     /// `max(0, total − free − Σ our footprints)`: what other processes hold.
-    /// On unified memory the footprints of both devices sharing the RAM count.
+    /// On unified memory the footprints of every device sharing the RAM
+    /// count, an APU's only beyond the carve-out it can still use. On a GPU
+    /// that spills to system RAM, while it reads full or our own memory on it
+    /// changed since its last reading, at least its value at the last reading
+    /// that was neither. An APU reports this, the reserve, the limit and the
+    /// headroom from the side that binds: its VRAM and GTT (its own memory
+    /// only) or the RAM behind it.
     pub external_mb: u64,
     /// False when no free reading exists yet and `external_mb` is assumed 0.
     pub external_known: bool,
@@ -139,8 +144,11 @@ pub struct GpuBudgetHealth {
     /// `"nvidia-smi"` or `"amdgpu-sysfs"`.
     pub external_source: Option<String>,
     pub external_sample_age_ms: Option<u64>,
-    /// The admission budget: `min(total × cap_fraction,
-    /// total − external − reserve_mb)`.
+    /// The admission budget: `min(total × cap_fraction, room − external −
+    /// reserve_mb − the charges and load reservations of the other devices
+    /// sharing the RAM)`, an APU's only beyond the carve-out it can still
+    /// use. The room is `total`; on an APU's RAM side carve-out plus host
+    /// RAM, of which the reserve withholds at most the deliverable RAM.
     pub limit_mb: u64,
     /// The reserve applied to this GPU on top of `external_mb`.
     pub reserve_mb: u64,
@@ -148,12 +156,11 @@ pub struct GpuBudgetHealth {
     /// fraction, clamped), `"gpu_floor"` (3 % of the card, at most 1 GiB,
     /// where the default fraction gives less; not on Apple Silicon),
     /// `"flat_default"` (the cap itself, on a CUDA GPU that spills to system
-    /// RAM) or `"ram_floor"` (the minimum on the CPU device and on Apple
+    /// RAM) or `"ram_floor"` (the minimum on the CPU device, an APU and Apple
     /// Silicon: a tenth of RAM, at most 16 GiB, at least 2 GiB or a quarter
     /// of RAM).
     pub reserve_rule: String,
-    /// `limit − Σ charges − Σ load reservations`; on unified memory the
-    /// charges of both devices sharing the RAM.
+    /// `limit_mb − charges_mb − load_reservations_mb`.
     pub headroom_mb: u64,
     /// `Σ` per-worker `footprint + max(0, grants − pool growth)`; what
     /// `headroom_mb` subtracts. On the CPU device it includes GPU replicas'
@@ -214,7 +221,8 @@ pub struct LedgerWorkerHealth {
     pub deflation: u32,
     /// Consecutive clean windows since the last negative sample.
     pub clean_windows: u32,
-    /// The unit budget as of this snapshot: the batch size under the ratchet.
+    /// The unit budget as of this snapshot: the batch size under the ratchet,
+    /// at most the working size while macOS reports memory pressure.
     pub unit_budget: u64,
     /// Ratchet anchor: largest locally measured clean priced batch.
     pub max_units_measured: u64,
@@ -236,6 +244,14 @@ pub struct LedgerWorkerHealth {
     /// Half the batch a replica of this model was running here when its
     /// process died mid-window: caps `unit_budget` until the server restarts.
     pub death_cap_units: Option<u64>,
+    /// The batch a macOS paging episode left: caps `unit_budget` until clean
+    /// full windows double it back to the batch size admitted at normal
+    /// pressure; runtime-only.
+    pub pressure_cap_units: Option<u64>,
+    /// How far `pressure_cap_units` may grow back while macOS reports
+    /// memory pressure without paging; caps `unit_budget` while the level is
+    /// above normal.
+    pub pressure_regrow_to_units: Option<u64>,
     /// Throughput observations held (all occupancies); runtime-only.
     pub throughput_samples: usize,
     /// Local fit samples, including restored ones; the margin widens below

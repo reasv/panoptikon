@@ -22,8 +22,8 @@
 //!
 //! On the CPU device `reserved` is the live resident set and no growth is
 //! reusable: `charge(w) = footprint(w) + Σ grants(w)` and `room(w) = headroom`.
-//! Its reserve, and on a Mac the MPS device's, is never below
-//! [`cpu::ram_reserve_mb`]. A replica whose process dies mid-window there, or
+//! Its reserve is never below [`cpu::ram_reserve_mb`], nor is an APU's or, on
+//! a Mac, the MPS device's. A replica whose process dies mid-window there, or
 //! with host RAM booked, caps later batches of its (model, device) at half
 //! that batch ([`VramLedger::note_death_locked`]).
 //!
@@ -58,7 +58,7 @@ use super::calibration::{
     CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate, TrialCadence,
 };
 use super::cost::{CostAggregation, CostDimension, CostUnit, SEED_BUDGET_MB};
-use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
+use super::gpu::{GpuInventory, GpuMemory, GttBasis, MemoryQuery as GpuMemoryQuery};
 use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle, TrimReply};
 use super::{cpu, gpu, mps, worker};
 
@@ -90,7 +90,7 @@ use oom::{
     pool_grew_past_free,
 };
 pub use oom::{ErrorFrameOom, UnrunnableReplica, message_oom_tier};
-use ramp::{deflation_cap, median};
+use ramp::{admitted_units, deflation_cap, median};
 pub use registration::Admission;
 use registration::GpuLog;
 pub use trims::TrimRequest;
@@ -146,8 +146,9 @@ pub const EXTERNAL_SAMPLE_MAX_AGE: Duration = Duration::from_secs(10);
 /// Consecutive clean windows that repay one level of deflation.
 pub const CLEAN_WINDOWS_TO_RESTORE: u32 = 3;
 
-/// Consecutive one-item out-of-memory windows, with less room than one item,
-/// after which a replica is declared unable to run on this GPU.
+/// Consecutive one-item windows that ran out of memory or spilled to system
+/// RAM, with less room than one item, after which a replica is declared
+/// unable to run on this GPU.
 pub const OOM_WINDOWS_AT_FLOOR: u32 = CLEAN_WINDOWS_TO_RESTORE;
 
 /// How long a verdict reached by worker deaths refuses the model's loads; the
@@ -155,8 +156,8 @@ pub const OOM_WINDOWS_AT_FLOOR: u32 = CLEAN_WINDOWS_TO_RESTORE;
 /// The default ceiling of the load-failure cooldown.
 pub const DEATH_VERDICT_LAPSE: Duration = Duration::from_secs(300);
 
-/// Wall time that repays one level of deflation, for a replica too idle to
-/// earn clean windows.
+/// Wall time with no window granted that repays one level of deflation, for
+/// a replica too idle to earn clean windows.
 pub const DEFLATION_REPAY_SECS: Duration = TRIM_DEBOUNCE;
 
 /// Extrapolation ratchet: a unit budget never exceeds this times the anchor
@@ -379,9 +380,10 @@ pub const RESERVE_RULE_RAM_FLOOR: &str = "ram_floor";
 pub struct VramBudgets {
     pub default: VramBudget,
     per_gpu: HashMap<String, VramBudget>,
-    /// A full CUDA GPU here spills to system RAM instead of failing, so an
-    /// unset margin reserves [`DEFAULT_RESERVE_CAP_MB`] flat on each one.
-    pub spills_to_ram: bool,
+    /// The GPUs (by UUID) that spill to system RAM instead of failing a full
+    /// allocation: an unset margin reserves [`DEFAULT_RESERVE_CAP_MB`] flat
+    /// on each.
+    pub spilling: HashSet<String>,
 }
 
 impl VramBudgets {
@@ -390,7 +392,7 @@ impl VramBudgets {
         Self {
             default: budget,
             per_gpu: HashMap::new(),
-            spills_to_ram: false,
+            spilling: HashSet::new(),
         }
     }
 
@@ -398,6 +400,11 @@ impl VramBudgets {
     pub fn with_gpu(mut self, uuid: impl Into<String>, budget: VramBudget) -> Self {
         self.per_gpu.insert(uuid.into(), budget);
         self
+    }
+
+    /// Whether a full allocation on this GPU spills to system RAM.
+    pub fn spills_to_ram(&self, uuid: &str) -> bool {
+        self.spilling.contains(uuid)
     }
 
     /// The budget in force for one GPU.
@@ -573,11 +580,18 @@ struct GrantCharge {
     /// The batch size the gain rule asked for this window
     /// ([`VramLedger::size_locked`]), before anything cut it.
     size_asked: u64,
-    /// When the grant was issued: a throughput sample is charged its share
-    /// of the time from here to the settle.
+    /// `size_asked` in units under the ratchet, batch ceiling and deflation
+    /// at grant ([`admitted_units`]), before the [`PressureCap`].
+    units_asked: u64,
+    /// When the grant began, before its pressure reading: a throughput
+    /// sample is charged its share of the time from here to the settle, and
+    /// settle counts paging from here on.
     granted_at: Instant,
     /// Memory held this window back ([`Grant::squeezed`]).
     squeezed: bool,
+    /// Memory or host RAM cut the unit budget below the batch size and the
+    /// window's content: the size is memory's, not the queue's.
+    memory_cut: bool,
     /// The fitted price cut this window's batch to the device's room: not
     /// pre-fit, not a share beside another replica that is asking, and not
     /// cut further by host RAM or an item cap.
@@ -1087,6 +1101,10 @@ struct Ingested {
     /// The same whatever the memory pressure, unless host RAM set the
     /// budget: the [`PressureCap`] grows on these.
     filled: bool,
+    /// A batch grew the allocator pool; `None` without pool figures.
+    grew_pool: Option<bool>,
+    /// The largest pool a batch left; `None` without pool figures.
+    pool_mb: Option<u64>,
     /// Samples that entered the throughput ring.
     throughput_samples: usize,
     /// Which kind of negative, for the log; all fold into `negative`.
@@ -1110,15 +1128,20 @@ struct Ingested {
 /// windows during which macOS was swapping pages out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PressureCap {
-    /// Caps the unit budget: the size the last paging window ran at, doubled
-    /// by each clean full window since.
+    /// Caps the unit budget: the smallest size the paging windows ran at,
+    /// doubled by each clean full window since; at most `regrow_to` while
+    /// the level is above normal.
     units: u64,
-    /// How far `units` may grow back while the level is warning: half the
-    /// unit budget in force when the first episode began, halved again by
-    /// each later episode. Kept until the cap lifts.
+    /// How far `units` may grow back while the level is above normal: the
+    /// largest size a paging window's grant asked, at most half the unit
+    /// budget of each paging window our batch began. Kept until the cap
+    /// lifts.
     regrow_to: u64,
-    /// The last window was a paging one: the episode is still on.
-    paging: bool,
+    /// When the window that last halved `regrow_to` settled.
+    halved_at: Option<Instant>,
+    /// The largest pool a paging window of the episode left: growth up to it
+    /// refills memory we held, and is not new memory.
+    pool_mb: Option<u64>,
 }
 
 /// What the local store holds of a (model, GPU), as far as the write policy
@@ -1339,6 +1362,31 @@ struct FreeSample {
     at: Instant,
     /// The reading's [`RamBasis`], on unified devices.
     ram: Option<RamBasis>,
+    /// The reading's [`GttBasis`], on an APU.
+    gtt: Option<GttBasis>,
+}
+
+impl FreeSample {
+    /// An APU's free VRAM: what `free_mb` holds beyond the smaller GTT term,
+    /// so a shift of `free_mb` moves it. `None` without a [`GttBasis`].
+    fn vram_free_mb(&self) -> Option<u64> {
+        let gtt = self.gtt?;
+        Some(
+            self.free_mb
+                .saturating_sub(gtt.gtt_free_mb.min(gtt.ram_available_mb)),
+        )
+    }
+
+    /// An APU's free memory on its GTT side and in the RAM behind it:
+    /// `(VRAM + GTT free, VRAM free + deliverable RAM)`. `None` without a
+    /// [`GttBasis`].
+    fn apu_free_mb(&self) -> Option<(u64, u64)> {
+        let (vram_free, gtt) = (self.vram_free_mb()?, self.gtt?);
+        Some((
+            vram_free.saturating_add(gtt.gtt_free_mb),
+            vram_free.saturating_add(gtt.ram_available_mb),
+        ))
+    }
 }
 
 /// The architecture every synthetic GPU is seeded with, as [`VramLedger::new`]
@@ -1376,6 +1424,11 @@ struct GpuLedger {
     /// When `free` was credited for a departed resident. Forces a refresh;
     /// readings captured before it are refused.
     free_adjusted_at: Option<Instant>,
+    /// `external` at the last pool refresh that read at least
+    /// [`DEFAULT_RESERVE_CAP_MB`] free and was not credited for a departure;
+    /// held on a spilling GPU while it reads full or is credited for a
+    /// departure.
+    external_before_full_mb: Option<u64>,
 }
 
 #[derive(Default)]
@@ -1412,8 +1465,16 @@ struct LedgerState {
     free_total_mismatch_logged: HashSet<(String, String)>,
     /// Once-per-card guard on the architecture mismatch WARN.
     arch_mismatch_logged: HashSet<String>,
+    /// Once-per-card guard on the integrated-GPU mismatch WARN.
+    integrated_mismatch_logged: HashSet<String>,
     /// Once-per-card guard on the unpriced-dispatch WARN.
     unpriced_warned: HashSet<String>,
+    /// (model, device) pairs whose load logged the memory pressure WARN in
+    /// this pressure episode; a reading at normal ends the episode.
+    pressure_warned: HashSet<(String, String)>,
+    /// (model, device) pairs whose grant logged the paging cut WARN in this
+    /// pressure episode.
+    paging_cut_warned: HashSet<(String, String)>,
     /// Once-per-reason guard on the calibration-store skip DEBUG lines.
     profile_skip_logged: HashSet<(String, String, &'static str)>,
     next_id: u64,
@@ -1426,6 +1487,12 @@ struct LedgerState {
     /// Test seam for [`VramLedger::memory_pressure`].
     #[cfg(test)]
     pressure_stub: mps::MemoryPressure,
+    /// When [`VramLedger::memory_pressure`] was last called.
+    #[cfg(test)]
+    pressure_read_at: Option<Instant>,
+    /// The swap-out rise [`VramLedger::memory_pressure_since`] answers from.
+    #[cfg(test)]
+    paging_rose_at: Option<Instant>,
 }
 
 /// The fake host probe a test installs (see [`LedgerState::probe_stub`]).

@@ -221,7 +221,7 @@ def test_the_probe_records_the_workers_dtype_and_the_transformers_version(
     monkeypatch.setattr(
         sdpa,
         "expand_kv_heads_without_fused_gqa",
-        lambda: events.append("gqa") or sdpa.PATCHED,
+        lambda: events.append("gqa") or {"float32": sdpa.EXPANDED},
     )
     monkeypatch.setitem(
         sys.modules, "transformers", SimpleNamespace(__version__="4.99.0")
@@ -235,6 +235,6 @@ def test_the_probe_records_the_workers_dtype_and_the_transformers_version(
     assert facts == {
         "dtype": "fp16",
         "dtype_method": "inferred",
-        "gqa_check": "patched",
+        "gqa_check": {"float32": "expanded"},
         "transformers": "4.99.0",
     }

@@ -120,6 +120,18 @@ impl VramLedger {
         self.lock().pressure_stub = pressure;
     }
 
+    /// When [`Self::memory_pressure`] was last called.
+    #[cfg(test)]
+    pub(super) fn pressure_read_at_for_test(&self) -> Instant {
+        self.lock().pressure_read_at.expect("the pressure was read")
+    }
+
+    /// Date a swap-out rise for [`Self::memory_pressure_since`].
+    #[cfg(test)]
+    pub(super) fn set_paging_rise_for_test(&self, at: Instant) {
+        self.lock().paging_rose_at = Some(at);
+    }
+
     /// How many times the probe stub was asked.
     #[cfg(test)]
     pub(super) fn probe_calls(&self) -> u32 {
@@ -136,6 +148,7 @@ impl VramLedger {
             free_mb,
             "ram".to_owned(),
             Instant::now(),
+            None,
             None,
             None,
             None,

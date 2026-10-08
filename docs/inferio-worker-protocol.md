@@ -98,6 +98,7 @@ too old to send one leaves the reader on its previous fallback.
 |---|---|---|
 | `reserved_after_mb` | a measurement map | **every backend**, CUDA and ROCm included. It is not a Metal-only field and it is not inert off MPS: on CUDA it differs from `peak_reserved_mb` whenever the allocator released cached blocks mid-batch to retry an allocation, and such a batch changes from pool-growing to **warm**, so it now enters the orchestrator's knee ring. Measured on an idle 5090: a wd-vit cold ramp's largest granted budget fell 718 → 48 and its published one 1 024 → 64, at 1.119× the items/s; a GPU-bound MiniLM job moved 1.011× with its ring already full |
 | `ram_total_mb` / `ram_available_mb` | a measurement map | **`free_source: "mps"` only** — double-gated on the source and on the orchestrator's Metal-allocator flag, so a CUDA frame carries neither and prices exactly as it did before |
+| `gtt_free_mb` / `ram_available_mb` | a measurement map | a GTT-inclusive `"amdgpu-sysfs"` reading only (an APU) |
 
 Contract between the Rust orchestrator (parent) and a Python inference worker
 (child process). Companion to `inferio-rust-orchestrator-design.md` §4.
@@ -192,7 +193,7 @@ ignores them per the unknown-key rule and behaves exactly as before.
 | `aggregation` | `"count"` \| `"sum"` \| `"max-times-count"` — how per-item units combine into batch units |
 | `user_cap_items` | optional per-request cap on **item count** per batch (the user-facing "max batch size"). Never converted to units; enforced as an additional bound at pack time |
 | `fixed_mb` | the part of `mb` a batch costs whatever its size (the fitted cost's intercept); 0 before the cost is fitted, and absent from an older orchestrator, which means 0. The clamp scales only the rest: `unit_budget × (spendable − fixed_mb) / (mb − fixed_mb)`. What the worker still holds allocated since its load, up to `fixed_mb`, counts as spendable, because the batch does not allocate it again |
-| `ram_reserve_mb` | free host RAM the orchestrator keeps for the rest of the machine: the reserve of the grant's device when that device is host RAM (the CPU device, or the Mac GPU against `hw.memsize`), otherwise the CPU device's reserve for a RAM booking. The clamp counts free RAM only above it. 0 on a grant neither priced nor booked in host RAM |
+| `ram_reserve_mb` | free host RAM the orchestrator keeps for the rest of the machine: the reserve of the grant's device when that device is host RAM (the CPU device, an APU, or the Mac GPU against `hw.memsize`), otherwise the CPU device's reserve for a RAM booking. The clamp counts free RAM only above it. 0 on a grant neither priced nor booked in host RAM |
 | `ram_mb` | host RAM a CUDA or ROCm worker's window may add to its resident set: its booking on the CPU device less the growth it already holds. 0 when nothing is booked. The clamp scales the batch by `(free RAM − ram_reserve_mb) / ram_mb` as well, and the batch runs at the smaller of the two budgets |
 | `max_tokens` | **new (2026-09-06)**: the model's *sequence window* — the most tokens of one input that ever occupy the GPU at once, whatever the input's length. Integer tokens; nil when there is none; meaningful only for a `token`-priced model. When present the worker prices every input at `min(raw_tokens, max_tokens)` before packing. Resolved and denominated exactly as `canvas_pixels` is, and on the same both-sides rule |
 | `canvas_pixels` | **new (2026-09-04)**: the model's *canvas* — the largest number of decoded pixels one input can actually cost it, whatever resolution the input was submitted at. Integer pixels; nil when there is none; meaningful only for a `pixel`-priced model. When present the worker prices every input at `min(raw_pixels, canvas_pixels)` before packing. It is the figure the orchestrator resolved for this model — `metadata.cost.canvas_pixels` from the registry, else the canvas the worker itself reported on its `load` response — and it is what the orchestrator's *own* window pricing used, so both sides denominate one quantity |
@@ -390,6 +391,17 @@ a slower success, the ledger saw no negative and no clamp, and `unit_budget`
 widened past a batch the impl cannot execute, for a measured 3.2× throughput
 loss with no other symptom.
 
+A batch of several items whose `predict` raises such a failure without the
+impl having cut it (`looks_like_index_limit`, which also matches an MPS array
+over 2^32 bytes before macOS 15) does not fail the window: the harness
+reports it unpriced and without `oom`, and runs the rest of the window at
+half its items. The first batch that ran whole after a split, below the
+smallest batch that failed, with no absorbed OOM and no other clamp, carries
+one `clamped` map for the window: its `to_units` is the largest batch in this
+window that ran whole below the smallest batch that failed, 0 when none did;
+its `from_units` is that smallest failed batch. A window that fails on such
+an error reports no clamp.
+
 **The easyOCR ceiling in full**, since it is the worked example a second impl
 would copy. The canvas comes first: `easyocr.imgproc.resize_aspect_ratio`
 bounds an input's longer side at `canvas_size` (2560 by default, never
@@ -487,7 +499,9 @@ reading counts only above `grant.ram_reserve_mb`
 ledger left free. On a Mac the `"mps"` reading likewise counts RAM only above
 the reserve, and RAM below it comes off the pool
 (`spendable = max(min(free, RAM available − reserve) + pool + held, 0)`), as
-the ledger's grant does. Any other GPU worker's own
+the ledger's grant does. On an APU the reserve comes off the RAM term of its
+reading only (`spendable = VRAM free + min(GTT free, max(RAM − reserve, 0)) +
+pool`), so where GTT is short it withholds nothing. A discrete GPU worker's own
 free reading is the device's and has no reserve taken from it; its host RAM is
 checked separately against `grant.ram_mb`, and a batch that check shrank
 reports `clamped.reason = "host_ram"`. Uncredited, the
@@ -802,7 +816,8 @@ state at one instant, each key present but possibly nil:
 | `reserved_mb` | torch caching-allocator pool size (`memory_reserved`); on a `"ram"` host, this process's OS high-water resident set |
 | `allocated_mb` | live tensor bytes (`memory_allocated`); on a `"ram"` host, the live RSS |
 | `ram_total_mb` | **new**: `hw.memsize`, the host RAM an `"mps"` free reading is really measured out of. Present exactly when `free_source` is `"mps"`, absent from every other source and from a worker too old to report it |
-| `ram_available_mb` | **new**: the same instant's `available`, **before** `free_mb` clips it to `total_mb`. Paired with `ram_total_mb` — one counter read, so the pair is coherent |
+| `ram_available_mb` | **new**: the same instant's `available`, **before** `free_mb` clips it to `total_mb`. Paired with `ram_total_mb` — one counter read, so the pair is coherent. On a GTT-inclusive `"amdgpu-sysfs"` reading (an APU) it is the deliverable RAM of the GTT clamp, beside `gtt_free_mb` |
+| `gtt_free_mb` | an APU's unclaimed GTT (`mem_info_gtt_total − mem_info_gtt_used`): its `free_mb` is free VRAM plus the smaller of this and `ram_available_mb`. Present exactly when an `"amdgpu-sysfs"` reading is GTT-inclusive |
 
 `free_mb`/`total_mb` always come from **one** source, named by `free_source`.
 The two do not agree — NVML sees the whole GPU, `mem_get_info` the calling
@@ -831,8 +846,9 @@ files are the same, but the arithmetic covers the whole GPU an APU actually
 has: `total = mem_info_vram_total + mem_info_gtt_total` (the BIOS UMA
 carve-out plus the GTT window its allocations spill into as soon as the
 carve-out fills), and `free = (vram_total - vram_used) + min(gtt_total -
-gtt_used, ram_available)`, with `ram_available` from
-`psutil.virtual_memory().available`. The clamp is the load-bearing part:
+gtt_used, ram_available)`, with `ram_available` the RAM the CPU device reads
+as deliverable (within the cgroup limit), and both terms of the `min` sent
+beside it. The clamp is the load-bearing part:
 unclaimed GTT is address space, and the pages behind it come out of the same
 RAM every other process is using, so without it a machine under real memory
 pressure would read as idle. Every term is required — a GPU whose GTT
@@ -855,9 +871,11 @@ exists minus the RAM the kernel says is held: `hw.memsize − wired −
 compressor − anonymous pageable`, from `host_statistics64`'s `wire_count`,
 `compressor_page_count` and `internal_page_count` (the last being
 `vm.page_pageable_internal_count`, which excludes wired pages). That is what
-Activity Monitor calls used. The file-backed cache is left counted as
-available — the kernel drops clean file pages on demand — and purgeable pages
-counted as taken, the conservative side. The RAM term is the load-bearing
+Activity Monitor calls used. The file-backed cache (`external_page_count`) is
+left counted as available at normal pressure — the kernel drops clean file
+pages on demand — but taken at warning, where macOS makes room by compressing
+and swapping other memory; purgeable pages are counted as taken, the
+conservative side. The RAM term is the load-bearing
 part: the memory is the whole machine's, so external pressure has to be read
 from the OS — there is no accelerator-level free counter on that GPU at all —
 and a browser eating 40 GB then shows up exactly the way a game eating VRAM
@@ -888,14 +906,15 @@ falls with the process's own allocation.
 **`"ram"` is the CPU-priced host's reading** (docs/unified-memory-admission.md,
 backend C), and it is the degenerate case of the unified model: there is no
 accelerator pool to intersect with, so `total_mb` is physical RAM and
-`free_mb` is `psutil.virtual_memory().available` bounded by it, on Linux less
-`SReclaimable` (`/proc/meminfo`): `MemAvailable` counts reclaimable slab, but
-the kernel may not free it before it kills a process. It is
-authoritative — whole-machine by construction, and the only reading such a
-host has — and the orchestrator's own refresh reads the same sources under the
-same label (`MemTotal` and `MemAvailable − SReclaimable` on Linux,
-`GlobalMemoryStatusEx` on Windows, and on macOS the kernel-counter formula above, psutil's `available`
-being disqualified there for the reasons just given).
+`free_mb` is the per-platform available RAM, bounded by it: on Linux
+`MemAvailable` less `SReclaimable` (`/proc/meminfo`), because `MemAvailable`
+counts reclaimable slab that the kernel may not free before it kills a
+process; on Windows the smaller of `ullAvailPhys` and `ullAvailPageFile`
+(`GlobalMemoryStatusEx`); on macOS the kernel-counter formula above, since
+psutil's `available` is disqualified there for the reasons just given. It is
+authoritative (whole-machine by construction, and the only reading such a
+host has), and the orchestrator's own refresh reads the same figures under
+the same label.
 
 **The tier is gated on the spawner's `INFERIO_DEVICE=cpu`, not on the absence
 of an accelerator**, and is checked *before* every other tier rather than
@@ -914,7 +933,7 @@ running on.
 | field | meaning |
 |---|---|
 | `base_mb` | the worker's whole-**process** device footprint after load (CUDA context + workspaces + weights), not just its allocator footprint; on a `"ram"` host, the growth of the process's resident set across the load window. Absent — never zero — when the process demonstrably put nothing on the device it is priced against (no torch, a remote API, or a torch-importing engine like CTranslate2 whose VRAM the allocator never sees) |
-| `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"fdinfo"` (this process's own VRAM on its own GPU per DRM fdinfo — NVML's ROCm twin, same rank, HIP-only), `"mps"` (`torch.mps.driver_allocated_memory()` at load end — per-process *by construction*, since each process owns its Metal heap, so it is the same rank as the other two and needs neither a PID lookup nor a plausibility floor), `"rss"` (the growth of this process's resident set across the load window, on a `"ram"` host — see below), `"free_delta"` (driver free-memory delta across the load), `"alloc_delta_measured"` (**new 2026-09-04**: allocator peak delta plus the accelerator context this process *measured* itself, as the GPU free-memory delta across the first CUDA initialisation, taken before the impl allocated anything) or `"alloc_delta"` (allocator peak delta plus the fixed context allowance — the same formula with an assumed context instead of a measured one, and the last resort when no free reading was available to measure with). Always names the term that actually produced the reported number, and the two `alloc_delta*` spellings are two different formulas precisely so a stored profile cannot claim a measured context it never had |
+| `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"fdinfo"` (this process's own VRAM on its own GPU per DRM fdinfo — NVML's ROCm twin, same rank, HIP-only), `"kfd"` (the same quantity from KFD's per-process counter `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>`, used on a discrete GPU where it exceeds fdinfo, which misses part of a process's compute memory on some kernels; the entry is found by PID in the initial PID namespace and by the DRM clients' PASID elsewhere, and is not used when another process holds that PASID too, as a fork does), `"mps"` (`torch.mps.driver_allocated_memory()` at load end — per-process *by construction*, since each process owns its Metal heap, so it is the same rank as the other two and needs neither a PID lookup nor a plausibility floor), `"rss"` (the growth of this process's resident set across the load window, on a `"ram"` host — see below), `"free_delta"` (driver free-memory delta across the load), `"alloc_delta_measured"` (**new 2026-09-04**: allocator peak delta plus the accelerator context this process *measured* itself, as the GPU free-memory delta across the first CUDA initialisation, taken before the impl allocated anything) or `"alloc_delta"` (allocator peak delta plus the fixed context allowance — the same formula with an assumed context instead of a measured one, and the last resort when no free reading was available to measure with). Always names the term that actually produced the reported number, and the two `alloc_delta*` spellings are two different formulas precisely so a stored profile cannot claim a measured context it never had |
 | `reserved_at_load_mb` | allocator pool size right after load; the orchestrator's footprint and occupancy accounting prices later pool growth against this |
 | `allocated_at_load_mb` | live-tensor bytes right after load; the baseline the **cost fit** prices batches over (`peak_allocated − allocated_at_load`). On the `"mps"` and `"ram"` currencies it is that currency's live figure at load end — `current_allocated_memory()` and the resident set — since neither platform records an allocated peak of its own; see below. A worker too old to send it yields no fit samples at all, exactly as a missing `reserved_at_load_mb` does |
 | `rss_at_load_mb` | a CUDA or ROCm worker's resident set at load end, the baseline its host RAM per unit is measured over (design doc, "RAM ceiling for GPU models"). Absent on the `"ram"` and `"mps"` currencies, whose device memory is RAM already, and without torch |
@@ -924,7 +943,8 @@ running on.
 | `gpu_name` | that GPU's marketing name as torch reports it (e.g. `"NVIDIA GeForce RTX 5090"`), informational. The calibration profile records the orchestrator's own inventory name for the GPU, not this, and as provenance rather than as key — the key is `gpu_arch` below. On MPS torch has no GPU struct to ask, so the worker derives `"Apple M3 Max (128 GB)"` from the same two sysctls (`machdep.cpu.brand_string`, `hw.memsize`) and the same rounding the orchestrator's probe uses. On a `"ram"` host it is `"CPU (64 GB)"`, derived the same way from physical RAM and the same round-up-to-4-GiB rule |
 | `gpu_arch` | that GPU's **architecture**, and the GPU half of the calibration profile key: `"sm_<major><minor>"` from `torch.cuda.get_device_capability()` on CUDA (`"sm_120"`), the `gcnArchName` of `get_device_properties(0)` on ROCm with the per-host feature suffixes after `:` stripped (`"gfx1100:sramecc+:xnack-"` → `"gfx1100"` — xnack and sramecc are settings, not architectures), the chip family from the Mac's `machdep.cpu.brand_string` on MPS (`"Apple M3 Max"` → `"apple-m3"`: the variant suffix only scales core counts, so an M3 and an M3 Max run the same kernels), and `"cpu"` on a `"ram"` host. Keyed on the architecture rather than the SKU because memory per unit follows which kernels run and kernel choice follows compute capability — a 5070 and a 5090 pick the same attention path; what differs between them is throughput and total memory, neither of which the profile stores. Absent, never guessed, when nothing answers. The orchestrator derives the same string itself from `compute_cap` (CUDA) and `gfx_target_version` (ROCm), so this field is the authority only on MPS and CPU, and the cross-check everywhere else |
 | `gpu_bdf` | the GPU's PCI address as the worker read it from `get_device_properties(0)`'s `pci_domain_id`/`pci_bus_id`/`pci_device_id`, rendered `"dddd:bb:dd.0"` in lower-case hex. The function digit is always `.0`: the GPU function of an amdgpu device is 0 (the HDMI/DP audio controller is `.1` of the *same device*), which is how the orchestrator's own probe renders it too, so the two sides join. Reported on CUDA hosts as well — additive, and harmless where the UUID already identifies the GPU. Absent on a torch build that exposes no PCI fields, unless the fdinfo fallback below answered — which today means absent on the shipped CUDA build, whose venv pins torch 2.7.1 (`_CudaDeviceProperties` grew the PCI fields in 2.8, and the fdinfo fallback is HIP-only): this field goes live on CUDA when that pin moves to >= 2.8, and until then the identity chain it feeds is load-bearing on ROCm alone (the `rocm` extra pins torch 2.11) |
-| `gpu_total_mb` | that GPU's total VRAM per torch (`get_device_properties(0).total_memory`), in MiB. Deliberately a *second* source for a number the orchestrator can also read from the driver: it is what a non-UUID GPU match is cross-checked against. **On MPS it is `recommended_max_memory()` and it is not a cross-check but the authoritative figure**: the orchestrator seeds that GPU's total at ≈75 % of RAM (Metal's default) and adopts the reported number on the first load report, sanity-bounded by physical RAM alone — a raised GPU wired limit legitimately puts the real figure 20 % away from the seed (docs/unified-memory-admission.md, DP-4). **On a `"ram"` host it is physical RAM**, and it is a cross-check again — the strictest in the design, since both sides read the same kernel fact and are expected to agree exactly. It is also what makes such a worker identifiable at all: registration's single-GPU fallback needs a report that claims a GPU, and RAM is the only thing this one has to claim. It is emphatically not adopted — the orchestrator read that number itself at probe time |
+| `gpu_total_mb` | that GPU's total VRAM per torch (`get_device_properties(0).total_memory`), in MiB. Deliberately a *second* source for a number the orchestrator can also read from the driver: it is what a non-UUID GPU match is cross-checked against. **On MPS it is `recommended_max_memory()` and it is not a cross-check but the authoritative figure**: the orchestrator seeds that GPU's total at ≈75 % of RAM (Metal's default) and adopts the reported number on the first load report, sanity-bounded by physical RAM alone — a raised GPU wired limit legitimately puts the real figure 20 % away from the seed (docs/unified-memory-admission.md, DP-4). **On a `"ram"` host it is physical RAM**, reported but not cross-checked: `device_kind = "cpu"` alone places such a worker on the CPU device, and no other report ever reaches that device. It is not adopted — the orchestrator read that number itself at probe time |
+| `gpu_integrated` | ROCm only: HIP's `integrated` for that GPU (`get_device_properties(0).is_integrated`), true on an APU. The orchestrator compares it with its own verdict (amdgpu's APU flag) at admission and logs one WARN per GPU when they disagree; it never changes placement or pricing |
 | `max_tokens` | **new 2026-09-06**: the per-item **token window** the worker resolved for the loaded impl by introspecting it (its `max_seq_length`) — tier 2 of the token resolution order in "Memory grants" above, and the same job `canvas_pixels` below does for a `pixel` model. Reported whatever the model's cost unit is, for the same reason: the worker has no unit at load time. Absent when nothing could be read or the reading fell outside the 16..1 000 000-token band |
 | `canvas_pixels` | **new 2026-09-04**: the per-item **pixel canvas** the worker resolved for the loaded impl by introspecting it — tier 2 of the resolution order in "Memory grants" above, run once the impl's own objects exist. This is the orchestrator's only way to learn a ceiling that lives in an `AutoProcessor` config downloaded with the weights (`doctr/dots_ocr`), and it is what the orchestrator prices that model's windows at when the registry declares nothing; a registry declaration always wins. Reported whatever the model's cost unit is — the worker has no unit at load time, since the cost dimension only reaches it on a grant, so the pixel-only rule is applied orchestrator-side. Absent when nothing could be read or the reading fell below the 512x512 floor: absent means "no canvas", never zero and never a guess |
 | `torch_version` | `torch.__version__` (e.g. `"2.7.1+cu128"`), part of the calibration profile key. Only the worker knows which torch its venv holds. Absent when the impl never imported torch |
@@ -991,9 +1011,9 @@ matters most, because too small is the direction the ledger cannot absorb.
 #### The accelerator context probe
 
 `base_method: "alloc_delta_measured"` reports a context this process measured
-for itself rather than the fixed 500 MiB allowance `"alloc_delta"` assumes. How
-it is measured matters, because the sensing module may not create a CUDA
-context of its own:
+for itself rather than the fixed per-backend estimate `"alloc_delta"` assumes
+(700 MiB on CUDA, 300 MiB on HIP). How it is measured matters, because the
+sensing module may not create a CUDA context of its own:
 
 - **A watcher, not a call.** The context is created lazily by whatever the impl
   does first inside `load()`. A daemon thread started by `begin_load` polls
@@ -1027,6 +1047,10 @@ context of its own:
   cannot meaningfully outlive the load it belongs to. It is collected from the
   load-failure path as well as on success, and whatever it measured is kept: a
   context is a fact about the process, not about the load that created it.
+- A worker that measured its context, or whose base the estimate priced, logs
+  one INFO line naming the figure and, for the estimate, why the context went
+  unmeasured: no driver reading before the load, the GPU already initialised,
+  or no usable reading.
 
 Two plausibility bounds elsewhere in the base measurement are built from the
 same allowance, one pointing each way:
@@ -1045,8 +1069,8 @@ same allowance, one pointing each way:
   and the two innocent shortfalls fit inside 256 MiB with room to spare: MiB
   truncation on both sides, and pages the driver has evicted since we committed
   them, since `drm-resident-vram` counts *resident* pages rather than reserved
-  ones. 256 MiB stays well under the context estimate, so a reading that missed
-  a whole HIP context — the failure this guards — cannot pass as jitter.
+  ones. A reading that missed a HIP context under 256 MiB still passes as
+  jitter (199 MiB was measured on gfx1030).
 
 
 `predict` `ok` may additionally carry:
@@ -1062,7 +1086,7 @@ A measurement map describes one GPU batch the worker actually ran:
 |---|---|
 | `items` | number of inputs in the batch — a plain count |
 | `units` | the batch's size in the model's declared cost dimension, as the packing harness priced it (`sum` of per-item units, `max × count`, or the item count). **Reported only when the batch ran to completion and the executed GPU batch matches the planned batch** — see below |
-| `reserved_before_mb` / `peak_reserved_mb` | allocator pool size before the batch and its high-water mark during it |
+| `reserved_before_mb` / `peak_reserved_mb` | allocator pool size before the batch and its high-water mark during it; the mark is null when the pool ended below its pre-batch size without passing it, since torch's mark then still holds the pre-batch pool |
 | `reserved_after_mb` | **new 2026-09-07**: the allocator pool **after** the batch. This, against `reserved_before_mb`, is what answers "did this batch grow the pool" — the question the orchestrator's warm/high-water split turns on. `peak_reserved_mb` cannot answer it on MPS, where it is a 20 ms sampler's in-batch maximum and so exceeds the post-batch reading by construction: every MPS batch read as pool-growing, the knee ring took 0 samples against the control's 914, and the ramp lost its only brake. Absent from a worker too old to report it, where the orchestrator falls back to the peak |
 | `allocated_before_mb` / `peak_allocated_mb` | live-tensor bytes before the batch and their high-water mark during it. `peak_allocated_mb` is the orchestrator's **cost fit** basis, taken over `allocated_at_load_mb`; it has no caching hysteresis, so every clean priced batch is a fit sample whether or not the pool grew |
 | `peak_rss_mb` / `rss_after_mb` | a CUDA or ROCm worker's resident set: its in-batch maximum (the 20 ms RSS sampler) and its level after the batch. The orchestrator books host RAM on the CPU device from them. `peak_rss_mb` is absent wherever `rss_at_load_mb` is. A `"ram"` worker sends `rss_after_mb` too: the orchestrator takes its footprint from that level, not from `reserved_after_mb`, which there is a peak that never falls |
@@ -1070,14 +1094,15 @@ A measurement map describes one GPU batch the worker actually ran:
 | `alloc_retries` | **new**: `torch.cuda.memory_stats()["num_alloc_retries"]` measured across this batch — how many times the caching allocator had to release its cached blocks and retry a `cudaMalloc`. A **per-batch delta**, not the process total, and reported only when both ends of the delta could be read. It is what a full card costs before it costs an out-of-memory: a window that stretched with `alloc_retries = 0` was slow for some other reason. CUDA only, and gated on the *currency* rather than on what torch can see — MPS and a RAM-priced host keep no such counter and omit the key, and so does a RAM-priced host with a CUDA device visible to torch |
 | `oom` | `true` when this batch raised an out-of-memory condition the harness **classified** as one (see `oom_class`), **or** when the impl's own halving loop absorbed one *anywhere* inside the `predict` call (an impl that calls `run_with_oom_retry` more than once per `predict` — a text tower and an image tower, say — has its halvings counted across all of those calls, not just the last). A negative sample for the orchestrator's deflation path; absent/false normally. **Changed 2026-09-04:** a failure the classifier does not recognise now leaves this absent, where before any error text containing the words "out of memory" set it — measured: 15 spurious negatives on a GPU with 96 GB free from one impl's wording |
 | `throughput_collapse` | `true` when this *pool-growing* batch was an upward-or-equal step in `units` against the previous pool-growing batch **and** its units/sec fell below the collapse ratio times that batch's. On Windows' WDDM the driver's sysmem fallback turns over-admission into a silent throughput collapse rather than an OOM, so this is the synthetic negative sample that stands in for the missing exception. A smaller (e.g. tail) batch or a non-growing one is not comparable and is never flagged; a flagged batch does not become the new comparator, so a persistent spill cannot normalise itself. **A candidate, not a negative**: the host deflates on it only where the same batch's pool grew past the device's free reading (design doc, "The worker's verdict is a candidate") |
-| `spilled` | `true` when, after this batch, the worker's pool exceeded NVML's used memory on the GPU by more than 512 MiB, both from one sample: part of the pool is in system memory. Only on CUDA under the Windows display driver (native Windows, WSL2, Docker Desktop). A negative sample the host deflates on without further corroboration; the batch's outputs are valid. Unless the batch was one item, the worker then releases the pool and runs the rest of the window at half this batch's size, never above the grant (design doc, "Windows display driver: the pool outgrows the card") |
+| `spilled` | `true` when, after this batch, the worker's pool exceeded NVML's used memory on the GPU by more than 512 MiB, both from one sample: part of the pool is in system memory. Only on CUDA under the Windows display driver (native Windows, WSL2, Docker Desktop). A negative sample the host deflates on without further corroboration; the batch's outputs are valid. The worker then releases the pool and runs the rest of the window at half this batch's size, never above the grant; once a spill outlives its release, it releases nothing until a batch does not spill, and still halves. On the grantless path it halves nothing, since the window is one call (design doc, "Windows display driver: the pool outgrows the card") |
 | `next_over_budget` | `true` when the next item in packing order would have pushed this batch past the grant's `unit_budget`, as the harness priced it, and the batch carries at least half of that budget: it is as full as whole items allow. Never on a window's last batch, nor on a batch the shape ceiling, the memory clamp or `user_cap_items` stopped while the next item still fit. The orchestrator counts such a batch as having run at its budget even below `FULL_BATCH_RATIO` of it. Absent/false otherwise |
-| `regrow_mb` | **new**: pool MiB the **first** batch after a release grew back, `peak_reserved_mb − reserved_before_mb`. Absent on every other batch. The `cudaMalloc`s happen inside `predict`, so this batch's `duration_ms` *contains* the re-grow and is not a measurement of it |
+| `regrow_mb` | **new**: pool MiB the **first** batch after a release grew back, `peak_reserved_mb − reserved_before_mb`. Absent on every other batch, and after a release that returned nothing. The `cudaMalloc`s happen inside `predict`, so this batch's `duration_ms` *contains* the re-grow and is not a measurement of it |
 | `regrow_after` | **new**: which release the re-grow followed — `"trim"` (the orchestrator asked), `"shrink"` (this worker's own reactive rule), or on a host whose driver spills to system memory `"growth"` (released before a batch larger than every batch since the last release) or `"spill"` (released after a `spilled` batch). Present with `regrow_mb`. Each is a different population with a different remedy; the orchestrator reports only `"trim"` |
 | `trimmed` | `true` on the **first** measurement of a window the worker's reactive shrink released the allocator pool before (see "Reactive shrink and trim"). Advisory: it explains why this batch grew the pool from (near) nothing and why its throughput is not comparable to the previous window's. Absent/false normally |
 | `oom_class` | **new 2026-09-04**: present exactly when `oom` is `true`, as `{source, exception, free_mb_at_failure, device}` — *why* the harness called this an out-of-memory condition, so the orchestrator can trust a structural signal and corroborate a textual one instead of guessing from a message it never sees. Absent when `oom` is absent, and **absent means the worker saw no out-of-memory condition**, including on a batch that failed for some other reason: the orchestrator must not deflate on such a failure |
 | `free_mb` | **new 2026-09-04**: driver-reported free memory on the worker's GPU, read immediately **before** this batch ran — the very sample the defensive clamp compares against `grant.mb`, reported rather than discarded. Absent when nothing could be read, and absent on the grantless compatibility path, which takes no pre-batch reading |
 | `free_source` | **new 2026-09-04**: which driver produced `free_mb`, from the same vocabulary a memory sample's `free_source` uses (`"nvml"`, `"amdgpu-sysfs"`, `"mps"`, `"ram"`, `"torch"`). Present exactly when `free_mb` is |
+| `gtt_free_mb` / `ram_available_mb` | the two terms of an APU's GTT clamp, exactly as a memory sample carries them and from the same read as `free_mb`. Present exactly when that reading is GTT-inclusive |
 | `ram_total_mb` / `ram_available_mb` | **new 2026-09-07**: the RAM domain `free_mb` was clipped from, exactly as a memory sample carries it and from the **same counter read** as `free_mb` itself. Present exactly when `free_source` is `"mps"`. Without it a per-batch reading was priced down the orchestrator's no-basis fallback while the response-level sample beside it took the RAM branch — the same instant, two prices, `hw.memsize - recommended_max_memory()` apart (8 192 MiB on the M3 Max) |
 | `clamped` | **new 2026-09-04**: present only when this batch actually ran **smaller** than its granted budget, as `{from_units, to_units, free_mb}` — the granted per-batch unit budget, what it was shrunk to, and the free reading taken before the batch. Absent on every batch that ran at its granted budget. **Extended** with an optional fourth key, `reason`: `"index_limit"` when what shrank the batch was an impl's shape ceiling (`max_batch_for`, or the impl's own equivalent inside `predict` — see "Memory grants") rather than the defensive memory clamp, and `"host_ram"` when a GPU worker's batch was shrunk by free host RAM against `grant.ram_mb`, which the orchestrator treats as the memory clamp. `reason` is **additive and absent by default**, and absent means the memory clamp, so nothing an older orchestrator reads changes. When both bound the same batch, one map spans them: `from_units` is the granted budget, `to_units` is what ran, and `reason` names the constraint that set `to_units`. `free_mb` is **optional**: the memory clamp always has the reading that decided it, but a shape ceiling is decided by the batch's shapes and carries one only when the worker happened to have taken it |
 
@@ -1433,13 +1458,21 @@ residents"):
   reservation while the pool includes the weights, so that comparison is true
   nearly always and would tear down healthy pools every other window. Against
   slack the rule is also self-limiting — after a release there is no slack, so
-  the next window cannot re-trigger. A **memory-blind** window (`grant.mb` is
-  `0`: the GPU had nothing left to price it against) is the strongest squeeze
-  there is and counts as one of the two, provided the slack is worth returning
-  (256 MiB) — without that clause a pool that has itself consumed the card's
-  headroom pins the card behind the zero-MB grants its own size produced, and
-  no later window is ever priced again. This only ever fires in a
-  worker that is *receiving* windows.
+  the next window cannot re-trigger. MPS has no split counter, so there a
+  release can leave its slack in the pool; after a release that left at
+  least 256 MiB of its slack in the pool, or more than it returned, the rule
+  does not count again for 30 s (the orchestrator's trim interval) unless the
+  slack grows 256 MiB past what it left. A trim or the OOM-retry loop's
+  release ends that wait. A shrink or trim release that returned less than
+  256 MiB is too small to make the next batch's rate incomparable: it keeps
+  the throughput comparator, and a shrink's does not flag `trimmed`. A
+  **memory-blind** window (`grant.mb` is `0`: the GPU had nothing left to
+  price it against) is the strongest squeeze there is and counts as one of
+  the two, provided the slack is worth returning (256 MiB) — without that
+  clause a pool that has itself consumed the card's headroom pins the card
+  behind the zero-MB grants its own size produced, and no later window is
+  ever priced again. This only ever fires in a worker that is *receiving*
+  windows.
 - **Trim** is the orchestrator's, for a resident that is receiving none. An
   idle worker's retained pool squeezes its neighbours indefinitely and it will
   never notice, so the orchestrator sends it a `trim` request. It is a message
@@ -1455,9 +1488,10 @@ reload cost.
 Both events are **calibration opportunities**, not just hygiene: the batches
 that regrow the pool afterwards are high-water batches, which are the only
 ones the cost fit accepts. Both therefore also reset the worker's
-throughput-collapse comparator — a post-`empty_cache()` batch is legitimately
-slower than one on a warm pool, and comparing across the event would
-manufacture a spurious `throughput_collapse`.
+throughput-collapse comparator, unless the release returned under 256 MiB
+(above) — a post-`empty_cache()` batch is legitimately slower than one on a
+warm pool, and comparing across the event would manufacture a spurious
+`throughput_collapse`.
 
 The orchestrator sends `trim` only to a replica it believes is **idle** — no
 window in flight, no demand behind it, and none for the last few seconds — with
@@ -1669,8 +1703,9 @@ The orchestrator sets for every worker:
     then the variable is simply not written and the worker inherits the
     environment. `CUDA_VISIBLE_DEVICES` is deliberately *not* also set there:
     it is a HIP alias, and setting both is documented unintended-behaviour
-    territory. `ROCR_VISIBLE_DEVICES` is never set — torch < 2.6 crashes at
-    init when it is.
+    territory. `ROCR_VISIBLE_DEVICES` is never set: torch < 2.6 fails at its
+    first GPU use when it is set without `HIP_VISIBLE_DEVICES` or
+    `CUDA_VISIBLE_DEVICES` (pytorch#140318).
 
   Exactly one is written, and only when a pin resolved; a worker is never
   handed both. **MPS and CPU hosts get neither**, in any vocabulary: there is
@@ -1720,6 +1755,11 @@ The orchestrator sets for every worker:
   absent, which is the discrete arithmetic and is conservative in both
   directions. MPS workers do not get it: there is one kind of device on a Mac
   and their tiers are unified by construction.
+- `PANOPTIKON_SPILLS_TO_RAM=1|0` — replicas on an NVIDIA GPU the host
+  inventoried: whether a full allocation on that GPU moves memory to system RAM
+  (the Windows display driver model, and MCDM until measured) or fails (Linux,
+  and TCC cards on native Windows). The worker's growth release and spill
+  backstop follow it; without it the worker decides from its platform alone.
 - `INFERIO_DEVICE=cpu` — replicas priced against **system RAM**: every worker
   of a host whose resolved accelerator is `cpu`, and — on a host with GPUs —
   every replica of a model whose registry `devices` entry names the CPU device
@@ -1757,8 +1797,8 @@ The orchestrator sets for every worker:
   - ROCm: the host's HIP library directories (`$ROCM_PATH/lib`,
     `$HIP_PATH/lib`, `/opt/rocm/lib`, and the NixOS driver trees), alongside
     `ROCM_PATH`, `HIP_PATH` and the MIOpen `MIOPEN_FIND_MODE=FAST` /
-    cache-path defaults — each of those written only when unset, so an
-    operator who chose a value keeps it.
+    `MIOPEN_LOG_LEVEL=3` (errors only) / cache-path defaults — each of those
+    written only when unset, so an operator who chose a value keeps it.
 
   MPS and CPU hosts get none of this. `inferio_worker.cudnn` still registers
   Windows DLL directories (`os.add_dll_directory`, which *does* work

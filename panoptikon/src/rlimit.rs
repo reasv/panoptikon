@@ -24,6 +24,7 @@ const NOFILE_FALLBACK_TARGET: u64 = 10_240;
 
 /// Outcome of the startup raise, kept to be logged once logging is configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub enum NofileRaise {
     /// No `RLIMIT_NOFILE` here (Windows); nothing was attempted.
     #[cfg_attr(unix, allow(dead_code))]

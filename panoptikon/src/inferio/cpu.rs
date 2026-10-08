@@ -2,10 +2,10 @@
 //!
 //! Total is physical RAM (`MemTotal`, `ullTotalPhys`, `hw.memsize`) and free
 //! is what the OS could deliver now (`MemAvailable − SReclaimable`,
-//! `ullAvailPhys`, macOS free+inactive pages), matching the worker's `"ram"`
-//! reading. On Linux both are bounded by the cgroup memory limit, since
-//! `/proc/meminfo` is not namespaced. See docs/unified-memory-admission.md
-//! "Backend C: CPU".
+//! `min(ullAvailPhys, ullAvailPageFile)`, macOS `mps::available_bytes`),
+//! matching the worker's `"ram"` reading. On Linux both are bounded by the
+//! cgroup memory limit, since `/proc/meminfo` is not namespaced. See
+//! docs/unified-memory-admission.md "Backend C: CPU".
 
 use std::path::PathBuf;
 
@@ -146,6 +146,7 @@ pub(super) fn query_memory(key: &str, ram_mb: u64, roots: &MemRoots) -> Option<V
         uuid: key.to_owned(),
         total_mb: ram_mb,
         free_mb: free_mb(ram_mb, available),
+        gtt: None,
     }])
 }
 
@@ -168,7 +169,7 @@ fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        return super::mps::physical_ram_mb();
+        super::mps::physical_ram_mb()
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
@@ -180,7 +181,7 @@ fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
 /// counts it. On Linux that is [`super::rocm::ram_deliverable_mb`], bounded
 /// by the cgroup limit.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
+pub(super) fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let available = super::rocm::ram_deliverable_mb(&roots.meminfo)?;
@@ -196,7 +197,7 @@ fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        return super::mps::ram_available_mb();
+        super::mps::ram_available_mb()
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
@@ -215,10 +216,10 @@ mod sys {
     const MIB: u64 = 1024 * 1024;
 
     fn status() -> Option<MEMORYSTATUSEX> {
-        // SAFETY: zeroed is a valid `MEMORYSTATUSEX` (plain integers);
-        // `dwLength` is the only field the API reads rather than writes.
-        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        status.dwLength = u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?;
+        let mut status = MEMORYSTATUSEX {
+            dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?,
+            ..Default::default()
+        };
         // SAFETY: the out-buffer is a whole `MEMORYSTATUSEX` and its
         // `dwLength` says so, as `GlobalMemoryStatusEx` documents.
         let ok = unsafe { GlobalMemoryStatusEx(ptr::from_mut(&mut status)) };
@@ -232,7 +233,31 @@ mod sys {
     }
 
     pub(super) fn available_mb() -> Option<u64> {
-        status().map(|status| status.ullAvailPhys / MIB)
+        status().map(|status| available_bytes(&status) / MIB)
+    }
+
+    /// Free physical memory, bounded by the commit left at the pagefile's
+    /// current size: beyond it Windows refuses the allocation or grows the
+    /// pagefile.
+    fn available_bytes(status: &MEMORYSTATUSEX) -> u64 {
+        status.ullAvailPhys.min(status.ullAvailPageFile)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn free_ram_is_the_lower_of_physical_and_commit() {
+            let gib = 1024 * 1024 * 1024;
+            let status = |phys, commit| MEMORYSTATUSEX {
+                ullAvailPhys: phys,
+                ullAvailPageFile: commit,
+                ..Default::default()
+            };
+            assert_eq!(available_bytes(&status(12 * gib, 3 * gib)), 3 * gib);
+            assert_eq!(available_bytes(&status(12 * gib, 40 * gib)), 12 * gib);
+        }
     }
 }
 

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import traceback
 from typing import Any, BinaryIO, Callable
@@ -43,6 +44,43 @@ EXIT_PROTOCOL_ERROR = 2
 EXIT_INTERNAL_ERROR = 3
 
 logger = logging.getLogger("inferio_worker")
+
+# ROCm torch < 2.6 fails at its first GPU use (an IndexError seeding the
+# devices) while ROCR_VISIBLE_DEVICES is set without HIP_VISIBLE_DEVICES or
+# CUDA_VISIBLE_DEVICES (pytorch#140318, fixed in 2.6).
+ROCR_TORCH_MIN = (2, 6)
+
+
+def rocr_torch_problem() -> str | None:
+    """Why this interpreter's torch would fail at its first GPU use under the
+    inherited `ROCR_VISIBLE_DEVICES`, or None. An empty `HIP_VISIBLE_DEVICES`
+    or `CUDA_VISIBLE_DEVICES` is set. A replica on the CPU device
+    (`INFERIO_DEVICE=cpu`) never uses the GPU. Read from the package
+    metadata, before anything imports torch."""
+    if os.environ.get("INFERIO_DEVICE") == "cpu":
+        return None
+    if not os.environ.get("ROCR_VISIBLE_DEVICES"):
+        return None
+    if {"HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"} & os.environ.keys():
+        return None
+    from importlib import metadata
+
+    try:
+        version = metadata.version("torch")
+    except metadata.PackageNotFoundError:
+        return None
+    release = re.match(r"(\d+)\.(\d+)", version)
+    if "+rocm" not in version or release is None:
+        return None
+    if tuple(map(int, release.groups())) >= ROCR_TORCH_MIN:
+        return None
+    return (
+        f"torch {version} fails at its first GPU use while "
+        "ROCR_VISIBLE_DEVICES is set without HIP_VISIBLE_DEVICES or "
+        "CUDA_VISIBLE_DEVICES (pytorch#140318, fixed in 2.6): install torch "
+        "2.6 or newer in the inference_local python interpreter, or start "
+        "the gateway without ROCR_VISIBLE_DEVICES"
+    )
 
 
 def _setup_stdio() -> tuple[BinaryIO, BinaryIO]:
@@ -149,6 +187,10 @@ def _handshake(
         )
         return None, False
     batch_memory_frames = msg.get("batch_memory_frames") is True
+    problem = rocr_torch_problem()
+    if problem is not None:
+        _send_error(proto_out, req_id, problem)
+        return None, False
 
     # cuDNN path setup before any impl module import; failure is only a
     # warning.
@@ -307,7 +349,7 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
             if not isinstance(grant, dict):
                 grant = None
             if grant is not None:
-                # An impl that batches internally takes the grantless path.
+                # An impl with batching off takes the grantless path.
                 if packing.batching_disabled(instance):
                     if not batching_off_logged:
                         batching_off_logged = True
@@ -366,6 +408,7 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
             # request, and what they occupied goes back to the OS.
             msg = inputs = None
             memory.return_freed_memory()
+            memory.count_paging_from_last_reading(False)
 
         elif mtype == "unload":
             # Valid in every state: a parked prewarmed worker with no

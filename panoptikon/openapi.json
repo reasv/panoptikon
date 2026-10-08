@@ -6031,7 +6031,8 @@
         "description": "One measured GPU batch in [`ReplicaTelemetryHealth`].",
         "required": [
           "seq",
-          "age_ms"
+          "age_ms",
+          "spilled"
         ],
         "properties": {
           "age_ms": {
@@ -6063,6 +6064,15 @@
             ],
             "format": "double"
           },
+          "free_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Free device memory read before the batch.",
+            "minimum": 0
+          },
           "items": {
             "type": [
               "integer",
@@ -6088,6 +6098,13 @@
             "format": "int64",
             "minimum": 0
           },
+          "regrow_after": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pool release this batch re-grew from (`\"trim\"`, `\"shrink\"`,\n`\"growth\"` or `\"spill\"`), on the first batch after it only."
+          },
           "reserved_before_mb": {
             "type": [
               "integer",
@@ -6100,6 +6117,19 @@
             "type": "integer",
             "format": "int64",
             "description": "Per-worker sequence number; a gap means the ring evicted samples.",
+            "minimum": 0
+          },
+          "spilled": {
+            "type": "boolean",
+            "description": "The pool exceeded NVML's used memory on the GPU by more than 512 MiB\nafter this batch: part of it was in system RAM."
+          },
+          "units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Size in cost-dimension units; `None` without a grant or when the batch\nwas unpriced.",
             "minimum": 0
           }
         }
@@ -7890,7 +7920,7 @@
           "external_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.\nOn unified memory the footprints of both devices sharing the RAM count.",
+            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.\nOn unified memory the footprints of every device sharing the RAM\ncount, an APU's only beyond the carve-out it can still use. On a GPU\nthat spills to system RAM, while it reads full or our own memory on it\nchanged since its last reading, at least its value at the last reading\nthat was neither. An APU reports this, the reserve, the limit and the\nheadroom from the side that binds: its VRAM and GTT (its own memory\nonly) or the RAM behind it.",
             "minimum": 0
           },
           "external_sample_age_ms": {
@@ -7938,13 +7968,13 @@
           "headroom_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "`limit − Σ charges − Σ load reservations`; on unified memory the\ncharges of both devices sharing the RAM.",
+            "description": "`limit_mb − charges_mb − load_reservations_mb`.",
             "minimum": 0
           },
           "limit_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "The admission budget: `min(total × cap_fraction,\ntotal − external − reserve_mb)`.",
+            "description": "The admission budget: `min(total × cap_fraction, room − external −\nreserve_mb − the charges and load reservations of the other devices\nsharing the RAM)`, an APU's only beyond the carve-out it can still\nuse. The room is `total`; on an APU's RAM side carve-out plus host\nRAM, of which the reserve withholds at most the deliverable RAM.",
             "minimum": 0
           },
           "load_reservations_mb": {
@@ -7964,7 +7994,7 @@
           },
           "reserve_rule": {
             "type": "string",
-            "description": "`\"user_margin\"` (configured, uncapped), `\"capped_default\"` (default\nfraction, clamped), `\"gpu_floor\"` (3 % of the card, at most 1 GiB,\nwhere the default fraction gives less; not on Apple Silicon),\n`\"flat_default\"` (the cap itself, on a CUDA GPU that spills to system\nRAM) or `\"ram_floor\"` (the minimum on the CPU device and on Apple\nSilicon: a tenth of RAM, at most 16 GiB, at least 2 GiB or a quarter\nof RAM)."
+            "description": "`\"user_margin\"` (configured, uncapped), `\"capped_default\"` (default\nfraction, clamped), `\"gpu_floor\"` (3 % of the card, at most 1 GiB,\nwhere the default fraction gives less; not on Apple Silicon),\n`\"flat_default\"` (the cap itself, on a CUDA GPU that spills to system\nRAM) or `\"ram_floor\"` (the minimum on the CPU device and an APU: a\ntenth of RAM, at most 16 GiB, at least 2 GiB or a quarter of RAM)."
           },
           "total_mb": {
             "type": "integer",
@@ -9099,6 +9129,24 @@
             "description": "Trims that freed memory, and the last one's MiB and `empty_cache()`\ntime. Absent off CUDA and MPS.",
             "minimum": 0
           },
+          "pressure_cap_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The batch a macOS paging episode left: caps `unit_budget` until clean\nfull windows double it back to the batch size admitted at normal\npressure; runtime-only.",
+            "minimum": 0
+          },
+          "pressure_regrow_to_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How far `pressure_cap_units` may grow back while macOS reports\nmemory pressure without paging; caps `unit_budget` while the level is\nabove normal.",
+            "minimum": 0
+          },
           "ram_booked_mb": {
             "type": "integer",
             "format": "int64",
@@ -9177,7 +9225,7 @@
           "unit_budget": {
             "type": "integer",
             "format": "int64",
-            "description": "The unit budget as of this snapshot: the batch size under the ratchet.",
+            "description": "The unit budget as of this snapshot: the batch size under the ratchet,\nat most the working size while macOS reports memory pressure.",
             "minimum": 0
           }
         }

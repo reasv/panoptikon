@@ -137,14 +137,25 @@ SHRINK_WINDOWS = 2
 # a squeeze. Mirrors the host's `TRIM_SLACK_MB`.
 SHRINK_BLIND_SLACK_MB = 256
 
-# Set once a spill outlived its release, or had no release (a one-item batch):
-# the live memory itself does not fit, so later spills are logged at debug.
+# Set once a spill outlived its release, or had no release: later spills
+# release nothing (the next batch would only regrow the pool) and are logged
+# at debug. A batch that does not spill clears it.
 _spill_persists = False
 
 # Consecutive granted windows below `SHRINK_RATIO` × the releasable slack.
 _under_grant_windows = 0
 # Set by a release the blind rule caused; a grant with memory clears it.
 _blind_released = False
+# How long the slack a shrink release left holds the rule off: the host's
+# `TRIM_DEBOUNCE`.
+SHRINK_RESIDUAL_HOLD_S = 30.0
+
+# `(slack_mb, monotonic time)` a shrink release left in the pool, when it left
+# at least `SHRINK_BLIND_SLACK_MB` or more than it returned (the pool is
+# fragmented where no counter says so, as on MPS). For
+# `SHRINK_RESIDUAL_HOLD_S` no shrink release runs unless the slack grows
+# `SHRINK_BLIND_SLACK_MB` past it.
+_unreleased_slack: tuple[int, float] | None = None
 
 
 class WindowFailure(Exception):
@@ -163,7 +174,7 @@ class WindowFailure(Exception):
 
 
 def reset_comparator() -> None:
-    """Forget the throughput comparator; called on every pool release, since a
+    """Forget the throughput comparator; called on a pool release, since a
     regrowing pool is not comparable to a warm one."""
     global _last_growth, _non_comparable_streak
     _last_growth = None
@@ -172,24 +183,33 @@ def reset_comparator() -> None:
 
 def reset_shrink_state() -> None:
     """Forget the reactive-shrink hysteresis."""
-    global _under_grant_windows, _blind_released
+    global _under_grant_windows, _blind_released, _unreleased_slack
     _under_grant_windows = 0
     _blind_released = False
+    _unreleased_slack = None
 
 
 def note_trimmed() -> None:
-    """Reset everything a completed `empty_cache()` invalidates."""
-    reset_comparator()
+    """Reset everything a completed `empty_cache()` invalidates; the throughput
+    comparator is kept when the release returned less than
+    `SHRINK_BLIND_SLACK_MB`, too little to make the next batch's rate
+    incomparable."""
+    released = memory.last_release()[0]
+    if released is None or released >= SHRINK_BLIND_SLACK_MB:
+        reset_comparator()
     reset_shrink_state()
 
 
 def release_pool() -> bool:
     """Release the pool for `inferio.impl.utils.clear_cache()` (the OOM-retry
-    loop); returns whether it ran. Resets only the throughput comparator.
+    loop); returns whether it ran. Resets the throughput comparator and
+    forgets the slack a shrink release left.
     """
+    global _unreleased_slack
     if not memory.empty_cache(memory.IMPL_RELEASE, arm=False):
         return False
     reset_comparator()
+    _unreleased_slack = None
     return True
 
 
@@ -199,36 +219,44 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     Called once per granted window, before its first batch. Slack is what
     `empty_cache()` would return (`reserved - allocated` minus unreturnable
     split blocks); the grant must stay below `SHRINK_RATIO` of it for
-    `SHRINK_WINDOWS` consecutive windows. Returns whether `empty_cache()` ran.
+    `SHRINK_WINDOWS` consecutive windows. Returns whether a release changed
+    the pool.
 
     A memory-blind window (`mb == 0`) counts as a squeeze, so a pool that
     itself filled the device is released. It counts only above
     `SHRINK_BLIND_SLACK_MB`, and only until the first release it causes, so a
-    busy shared device does not release on every other window.
+    busy shared device does not release on every other window. After a release
+    that left at least 256 MiB of its slack in the pool, or more than it
+    returned, neither rule counts for 30 s unless the slack grows 256 MiB past
+    what it left.
     """
-    global _under_grant_windows, _blind_released
+    global _under_grant_windows, _blind_released, _unreleased_slack
     if grant_mb is None or grant_mb < 0:
         _under_grant_windows = 0
         return False
+    if grant_mb > 0:
+        _blind_released = False
     reserved_mb, allocated_mb = memory.pool_stats_mb()
     if reserved_mb is None or allocated_mb is None:
         _under_grant_windows = 0
         return False
     split_mb = memory.unreturnable_split_mb() or 0
     slack_mb = max(0, reserved_mb - allocated_mb - split_mb)
-    if slack_mb <= 0:
+    if slack_mb <= 0 or (
+        _unreleased_slack is not None
+        and slack_mb < _unreleased_slack[0] + SHRINK_BLIND_SLACK_MB
+        and time.monotonic() - _unreleased_slack[1] < SHRINK_RESIDUAL_HOLD_S
+    ):
         _under_grant_windows = 0
         return False
+    _unreleased_slack = None
     if grant_mb == 0:
         if _blind_released or slack_mb < SHRINK_BLIND_SLACK_MB:
             _under_grant_windows = 0
             return False
     elif grant_mb >= SHRINK_RATIO * slack_mb:
         _under_grant_windows = 0
-        _blind_released = False
         return False
-    else:
-        _blind_released = False
     _under_grant_windows += 1
     if _under_grant_windows < SHRINK_WINDOWS:
         logger.debug(
@@ -246,6 +274,24 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     if not memory.empty_cache(memory.SHRINK_RELEASE):
         _under_grant_windows = 0
         return False
+    windows = _under_grant_windows
+    released = memory.last_release()[0]
+    note_trimmed()
+    _blind_released = grant_mb == 0
+    if released is not None:
+        left = slack_mb - released
+        if left >= SHRINK_BLIND_SLACK_MB or released < left:
+            _unreleased_slack = (left, time.monotonic())
+    if released is not None and released < SHRINK_BLIND_SLACK_MB:
+        logger.debug(
+            "released the %d MiB allocator pool against %d MiB of releasable "
+            "slack; it returned %d MiB, under 256 MiB, so the next batch's "
+            "rate stays comparable",
+            reserved_mb,
+            slack_mb,
+            released,
+        )
+        return False
     logger.info(
         "grant fell to %d MiB against %d MiB of releasable slack (a %d MiB "
         "allocator pool) for %d consecutive windows; released the pool "
@@ -253,10 +299,8 @@ def maybe_shrink(grant_mb: int | None) -> bool:
         grant_mb,
         slack_mb,
         reserved_mb,
-        _under_grant_windows,
+        windows,
     )
-    note_trimmed()
-    _blind_released = grant_mb == 0
     return True
 
 
@@ -813,7 +857,8 @@ def plan_batches(
 
 class LiveBudget(NamedTuple):
     """One pre-batch memory reading and the budget it allowed. `ram_mb` is the
-    reading's RAM basis on MPS; `clamped` only when the budget shrank.
+    reading's RAM basis on MPS, `gtt_mb` its `(GTT free, deliverable RAM)` on
+    an APU; `clamped` only when the budget shrank.
     """
 
     units: int
@@ -821,6 +866,7 @@ class LiveBudget(NamedTuple):
     free_source: str | None
     ram_mb: tuple[int | None, int | None] | None
     clamped: dict[str, Any] | None
+    gtt_mb: tuple[int, int] | None = None
 
 
 # `clamped.reason` when host RAM, not the device, shrank a GPU worker's batch.
@@ -862,10 +908,10 @@ def clamp_to_live_memory(
 
     Free host RAM counts only above `ram_reserve_mb`, which the orchestrator
     keeps free: in a RAM-priced worker's reading, in the RAM an MPS reading
-    is clamped by (RAM below the reserve there comes off the pool), and for
-    a GPU worker whose grant books `ram_grant_mb` of host RAM, which is
-    scaled the same way against free RAM and runs at the smaller of the two
-    budgets.
+    is clamped by (RAM below the reserve there comes off the pool), in an
+    APU's RAM term (its free VRAM and GTT do not shrink by it), and for a GPU
+    worker whose grant books `ram_grant_mb` of host RAM, which is scaled the
+    same way against free RAM and runs at the smaller of the two budgets.
     """
     reading = memory.free_total_reading()
     free_mb, free_source = reading.free_mb, reading.source
@@ -874,32 +920,58 @@ def clamp_to_live_memory(
         if reading.ram_total_mb is not None
         else None
     )
+    gtt_mb = None
+    if reading.gtt_free_mb is not None and reading.ram_available_mb is not None:
+        gtt_mb = (reading.gtt_free_mb, reading.ram_available_mb)
     shrunk, clamped = unit_budget, None
     if grant_mb and grant_mb > 0 and free_mb is not None:
-        reserve_mb = ram_reserve_mb if free_source in ("ram", "mps") else 0
-        if free_source == "mps":
+        if gtt_mb is not None:
+            # Free VRAM, plus the GTT that RAM above the reserve backs.
+            gtt_free_mb, available_mb = gtt_mb
+            above_mb = max(available_mb - ram_reserve_mb, 0)
+            room_mb = free_mb - min(gtt_free_mb, available_mb)
+            room_mb += min(gtt_free_mb, above_mb)
+            reserve_mb = free_mb - room_mb
+        elif free_source == "mps":
             # Metal's ceiling, or the RAM above the reserve when that is less;
             # RAM below the reserve comes off the pool, as in the grant.
-            above_mb = min(free_mb, reading.ram_available_mb - reserve_mb)
+            reserve_mb = ram_reserve_mb
+            room_mb = min(free_mb, reading.ram_available_mb - reserve_mb)
         else:
-            above_mb = max(free_mb - reserve_mb, 0)
+            reserve_mb = ram_reserve_mb if free_source == "ram" else 0
+            room_mb = max(free_mb - reserve_mb, 0)
         pool_mb = memory.releasable_pool_mb() or 0
         held_mb = min(fixed_mb, memory.held_since_load_mb())
-        spendable_mb = max(above_mb + pool_mb + held_mb, 0)
+        spendable_mb = max(room_mb + pool_mb + held_mb, 0)
         shrunk = _scaled(unit_budget, spendable_mb, grant_mb, fixed_mb)
         if shrunk < unit_budget:
-            logger.info(
-                "spendable memory fell to %d MiB (%d free plus %d of releasable "
-                "pool) above a %d MiB reserve against a %d MiB grant; shrinking "
-                "this batch's budget from %d to %d units",
-                spendable_mb,
-                above_mb,
-                pool_mb,
-                reserve_mb,
-                grant_mb,
-                unit_budget,
-                shrunk,
-            )
+            if room_mb < 0:
+                logger.info(
+                    "free RAM is %d MiB below its %d MiB reserve, which comes "
+                    "off the %d MiB of releasable pool, leaving %d MiB against "
+                    "a %d MiB grant; shrinking this batch's budget from %d to "
+                    "%d units",
+                    -room_mb,
+                    reserve_mb,
+                    pool_mb,
+                    spendable_mb,
+                    grant_mb,
+                    unit_budget,
+                    shrunk,
+                )
+            else:
+                logger.info(
+                    "spendable memory fell to %d MiB (%d free plus %d of "
+                    "releasable pool) above a %d MiB reserve against a %d MiB "
+                    "grant; shrinking this batch's budget from %d to %d units",
+                    spendable_mb,
+                    free_mb,
+                    pool_mb,
+                    reserve_mb,
+                    grant_mb,
+                    unit_budget,
+                    shrunk,
+                )
             clamped = {"from_units": unit_budget, "to_units": shrunk, "free_mb": free_mb}
     if ram_grant_mb > 0:
         host_free_mb, _ = memory.ram_free_total_mb()
@@ -924,22 +996,60 @@ def clamp_to_live_memory(
                     "free_mb": host_free_mb,
                     "reason": HOST_RAM_REASON,
                 }
-    return LiveBudget(shrunk, free_mb, free_source, ram_mb, clamped)
+    return LiveBudget(shrunk, free_mb, free_source, ram_mb, clamped, gtt_mb)
 
 
 # --- Running a window ---
 
 
+def _input_size(entry: Any) -> int:
+    """An input's size for comparing grantless windows: an image's pixel
+    count, else the bytes of its file or text."""
+    file = getattr(entry, "file", None)
+    shape = _shape(file)
+    if shape is not None:
+        return shape[0] * shape[1]
+    return _text_bytes(file if file is not None else getattr(entry, "data", None))
+
+
 def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]:
     """The grantless path: the whole window in one GPU batch. The `finally`
     stops the batch's peak sampler if `predict` raises.
+
+    Where a full GPU spills to system RAM, the pool is released before a
+    window whose size (its largest input, times its input count when the impl
+    batches) is larger than any since the last release (as `run_window` does
+    before a growing batch), and a window whose pool ends more than
+    `SPILL_TOLERANCE_MB` above NVML's used memory is flagged `spilled`, and
+    the pool is released unless a spill persists.
     """
+    spill_host = memory.spill_capable()
+    size = 0
+    if spill_host:
+        # A batch pads to its largest input.
+        size = max(map(_input_size, inputs), default=0)
+        if not batching_disabled(instance):
+            size *= len(inputs)
+        if memory.outgrows_pool(size, "grantless_size"):
+            memory.empty_cache(memory.GROWTH_RELEASE)
     state = memory.begin_batch()
     try:
         outputs = list(instance.predict(inputs))
-        return {"outputs": outputs, **memory.finish_batch(state, items=len(inputs))}
+        payload = {"outputs": outputs, **memory.finish_batch(state, items=len(inputs))}
     finally:
         memory.abandon_batch(state)
+    if spill_host:
+        memory.note_batch_units(size, "grantless_size")
+        off_device_mb = pool_off_device_mb(payload.get("memory"))
+        if _spilled(off_device_mb):
+            payload["measurements"][0]["spilled"] = True
+            reserved_mb = payload["memory"]["reserved_mb"]
+            released = _release_spilled_pool()
+            if released:
+                payload["memory"] = memory.device_memory_sample() or payload["memory"]
+            after_mb = pool_off_device_mb(payload["memory"])
+            _log_spill(reserved_mb, off_device_mb, released, False, after_mb)
+    return payload
 
 
 
@@ -1056,8 +1166,8 @@ def classify_oom(
 
 
 def batching_disabled(instance: Any) -> bool:
-    """Whether the impl sets `enable_batching`/`enable_batch` falsy: it batches
-    internally, so it takes the grantless path.
+    """Whether the impl sets `enable_batching`/`enable_batch` falsy: it runs
+    one input at a time inside `predict`, so it takes the grantless path.
     """
     for attribute in ("enable_batching", "enable_batch"):
         if not hasattr(instance, attribute):
@@ -1100,6 +1210,19 @@ def _utils_total(name: str) -> int:
         return int(reader())
     except Exception:  # pragma: no cover - defensive
         return 0
+
+
+def _index_limit(exc: BaseException) -> bool:
+    """`inferio.impl.utils.looks_like_index_limit(exc)` via `sys.modules`;
+    False when unavailable."""
+    utils = sys.modules.get("inferio.impl.utils")
+    probe = getattr(utils, "looks_like_index_limit", None)
+    if utils is None or probe is None:
+        return False
+    try:
+        return bool(probe(exc))
+    except Exception:  # pragma: no cover - defensive
+        return False
 
 
 def _executed_shape(
@@ -1203,23 +1326,49 @@ def pool_off_device_mb(sample: dict[str, Any] | None) -> int | None:
     return reserved - (total - free)
 
 
+def _spilled(off_device_mb: int | None) -> bool:
+    """Whether a batch's pool is more than `SPILL_TOLERANCE_MB` above NVML's
+    used memory. A batch that is not clears `_spill_persists`; one with no
+    NVML reading leaves it."""
+    global _spill_persists
+    if off_device_mb is None:
+        return False
+    spilled = off_device_mb > SPILL_TOLERANCE_MB
+    _spill_persists = _spill_persists and spilled
+    return spilled
+
+
+def _release_spilled_pool() -> bool:
+    """Release the pool after a spill, unless a spill persists."""
+    return not _spill_persists and memory.empty_cache(memory.SPILL_RELEASE)
+
+
 def _log_spill(
-    reserved_mb: Any, off_device_mb: int, released: bool, after_mb: int | None
+    reserved_mb: Any,
+    off_device_mb: int,
+    released: bool,
+    halved: bool,
+    after_mb: int | None,
 ) -> None:
     """Warn of a spill; debug once a spill has persisted (`_spill_persists`)."""
     global _spill_persists
     persists = after_mb is not None and after_mb > SPILL_TOLERANCE_MB
     level = logging.DEBUG if persists and _spill_persists else logging.WARNING
     _spill_persists = _spill_persists or persists
+    halve = "halved the batch size for the rest of this window"
+    if released and halved:
+        action = "released the pool and " + halve
+    elif released:
+        action = "released the pool"
+    else:
+        action = halve if halved else "left the pool as it is"
     logger.log(
         level,
         "the %s MiB allocator pool is %d MiB more than NVML reports in use on "
         "the GPU, so part of it is in system memory; %s",
         reserved_mb,
         off_device_mb,
-        "released it and halved the batch size for the rest of this window"
-        if released
-        else "left the pool and the batch size as they are",
+        action,
     )
 
 
@@ -1269,6 +1418,21 @@ def run_window(
     outputs: list[Any] = [None] * len(inputs)
     measurements: list[dict[str, Any]] = []
     pending = list(range(len(inputs)))
+    # The smallest priced units of a batch that failed on a shape ceiling.
+    split_from: int | None = None
+    # The priced units of every batch in this window that ran whole.
+    ran_whole: list[int] = []
+    # The one clamp this window reports for its splits: `to_units` is the
+    # largest batch in this window that ran whole below the smallest batch that
+    # failed; `from_units` is that smallest failed batch.
+    split_clamp: dict[str, Any] | None = None
+
+    def bound_split(clamp: dict[str, Any]) -> None:
+        clamp["from_units"] = split_from
+        # 0: no batch has run whole below it (the ledger ignores 0).
+        clamp["to_units"] = max(
+            (whole for whole in ran_whole if whole < split_from), default=0
+        )
 
     def record(measurement: dict[str, Any]) -> dict[str, Any]:
         """Append a measurement; the first is stamped `trimmed` if the pool was
@@ -1327,6 +1491,7 @@ def run_window(
             reading = memory.free_total_reading()
             live = live._replace(free_mb=reading.free_mb, free_source=reading.source)
 
+        memory.count_paging_from_last_reading(True)
         state = memory.begin_batch()
         # The `finally` stops this batch's sampler on any raise.
         try:
@@ -1343,14 +1508,25 @@ def run_window(
                 )
                 oom_class = classify_oom(exc, absorbed)
                 oom = oom_class is not None
-                if not oom:
+                impl_cut = (
+                    _utils_total("total_index_limit_events")
+                    > index_limits_before
+                )
+                # A shape ceiling the impl did not cut itself: the rest of the
+                # window runs at half this batch's items.
+                split = (
+                    not (oom or impl_cut)
+                    and len(batch) > 1
+                    and _index_limit(exc)
+                )
+                if not (oom or split):
                     logger.debug(
                         "a batch of %d inputs failed with %s, which is not an "
                         "out-of-memory condition; reporting it without the oom flag",
                         len(batch),
                         type(exc).__name__,
                     )
-                if _utils_total("total_index_limit_events") > index_limits_before:
+                if impl_cut:
                     clamped = executed_clamp(
                         clamped, batch, executed, units, aggregation, priced,
                         live.free_mb,
@@ -1364,9 +1540,25 @@ def run_window(
                         free_mb=live.free_mb,
                         free_source=live.free_source,
                         ram_mb=live.ram_mb,
-                        clamped=clamped,
+                        gtt_mb=live.gtt_mb,
+                        clamped=live.clamped if split else clamped,
                     )
                 )
+                if split:
+                    if split_from is None or priced < split_from:
+                        split_from = priced
+                    if split_clamp is not None:
+                        bound_split(split_clamp)
+                    cap_items = len(batch) // 2
+                    logger.warning(
+                        "a batch of %d inputs exceeded a kernel's size limit "
+                        "(%s); running the rest of this window at %d. This is "
+                        "a shape ceiling, not an out-of-memory condition",
+                        len(batch),
+                        exc,
+                        cap_items,
+                    )
+                    continue
                 message = str(exc)
                 if oom and len(batch) > 1 and OOM_WINDOW_PREFIX not in message:
                     # The whole-window OOM signal; batch-1 has its own prefix.
@@ -1374,6 +1566,12 @@ def run_window(
                         f"{OOM_WINDOW_PREFIX} out of GPU memory on a packed batch "
                         f"of {len(batch)} inputs ({priced} {unit} units): {exc}"
                     )
+                if _index_limit(exc):
+                    # Only a window that completes shows a batch-size ceiling.
+                    for done in measurements:
+                        reason = done.get("clamped", {}).get("reason")
+                        if reason == INDEX_LIMIT_REASON:
+                            del done["clamped"]
                 raise WindowFailure(message, measurements, exc) from exc
             elapsed = time.perf_counter() - started
             if len(produced) != len(batch):
@@ -1387,6 +1585,7 @@ def run_window(
                         free_mb=live.free_mb,
                         free_source=live.free_source,
                         ram_mb=live.ram_mb,
+                        gtt_mb=live.gtt_mb,
                         clamped=clamped,
                     ))
                 raise WindowFailure(str(exc), measurements, exc) from exc
@@ -1403,12 +1602,31 @@ def run_window(
                     executed,
                     len(batch),
                 )
-            if _utils_total("total_index_limit_events") > index_limits_before:
-                # The impl hit its own shape ceiling; not a memory event.
+            ran = priceable and not absorbed_ooms
+            if ran:
+                ran_whole.append(priced)
+            split_ran = (
+                split_from is not None
+                and ran
+                and clamped is None
+                and priced < split_from
+            )
+            impl_cut = (
+                _utils_total("total_index_limit_events") > index_limits_before
+            )
+            if impl_cut or (split_ran and split_clamp is None):
+                # A shape ceiling, not a memory event: the impl cut this batch
+                # itself, or it is the first to run whole after a split, below
+                # the smallest batch that failed.
                 clamped = executed_clamp(
                     clamped, batch, executed, units, aggregation, priced,
                     live.free_mb,
                 )
+                if not impl_cut:
+                    split_clamp = clamped
+                    bound_split(split_clamp)
+            elif split_clamp is not None and ran:
+                bound_split(split_clamp)
             measurement = memory.measure_batch(
                 state,
                 items=len(batch),
@@ -1418,6 +1636,7 @@ def run_window(
                 free_mb=live.free_mb,
                 free_source=live.free_source,
                 ram_mb=live.ram_mb,
+                gtt_mb=live.gtt_mb,
                 clamped=clamped,
             )
             if absorbed_ooms:
@@ -1431,7 +1650,7 @@ def run_window(
             # One sample after the batch, so pool and NVML are paired.
             sample = memory.device_memory_sample() if spill_host else None
             off_device_mb = pool_off_device_mb(sample)
-            if off_device_mb is not None and off_device_mb > SPILL_TOLERANCE_MB:
+            if _spilled(off_device_mb):
                 # A negative for this size; its outputs stand.
                 measurement["spilled"] = True
             if next_over_budget:
@@ -1452,11 +1671,14 @@ def run_window(
         # last). A fresh reading, so free and pool describe the same instant.
         if measurement.get("spilled"):
             reserved_mb = sample["reserved_mb"]
-            released = len(batch) > 1 and memory.empty_cache(memory.SPILL_RELEASE)
+            released = _release_spilled_pool()
+            before = budget
+            budget = max(1, min(budget, priced // 2))
             if released:
-                budget = max(1, min(budget, priced // 2))
                 sample = memory.device_memory_sample()
-            _log_spill(reserved_mb, off_device_mb, released, pool_off_device_mb(sample))
+            after_mb = pool_off_device_mb(sample)
+            halved = budget < before and bool(pending)
+            _log_spill(reserved_mb, off_device_mb, released, halved, after_mb)
         if emit_memory is not None and pending:
             if sample is None:
                 sample = memory.device_memory_sample()

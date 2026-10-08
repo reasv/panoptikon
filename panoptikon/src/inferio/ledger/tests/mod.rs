@@ -406,9 +406,14 @@ const MAC_RAM_MB: u64 = 128 * 1024;
 /// The one-GPU unified ledger a Mac gets: the probe's 75 % seed, with the
 /// host's RAM recorded as the unified-memory bound.
 fn mps_ledger() -> Arc<VramLedger> {
+    mps_ledger_with(no_margin())
+}
+
+/// [`mps_ledger`] under `budget`.
+fn mps_ledger_with(budget: VramBudget) -> Arc<VramLedger> {
     let ledger = VramLedger::for_test_gpus_probed(
         &[(MPS_GPU, "Apple M3 Max (128 GB)", MAC_RAM_MB / 4 * 3, None)],
-        no_margin(),
+        budget,
         None,
         GpuMemoryQuery::Mps {
             key: MPS_GPU.to_owned(),
@@ -466,6 +471,7 @@ fn push_ram(
         allocated_mb: Some(allocated_mb),
         ram_total_mb: Some(MAC_RAM_MB),
         ram_available_mb: Some(available_mb),
+        gtt_free_mb: None,
     }));
 }
 
@@ -483,7 +489,8 @@ fn cpu_ledger(budgets: impl Into<VramBudgets>) -> Arc<VramLedger> {
 }
 
 /// A CPU worker's load report: no UUID and no PCI address (there is no GPU),
-/// `psutil`'s RAM total as `gpu_total_mb`, and the RSS-derived base.
+/// `psutil`'s RAM total as `gpu_total_mb`, the RSS-derived base, and the
+/// device it ran on.
 fn loaded_cpu(total_mb: Option<u64>) -> TelemetryHandle {
     let mut telemetry = WorkerTelemetry::default();
     telemetry.load = Some(Timestamped::now(LoadReport {
@@ -493,6 +500,7 @@ fn loaded_cpu(total_mb: Option<u64>) -> TelemetryHandle {
         allocated_at_load_mb: Some(0),
         gpu_name: Some("CPU (64 GB)".to_owned()),
         gpu_total_mb: total_mb,
+        device_kind: Some("cpu".to_owned()),
         torch_version: Some("2.7.1".to_owned()),
         ..LoadReport::default()
     }));

@@ -163,6 +163,9 @@ pub struct InferioState {
     pub registry: Arc<StdMutex<RegistryCache>>,
     /// Probed at startup; drives the `/metadata` availability overlay.
     pub compute_caps: super::capability::HostComputeCaps,
+    /// The backend models run on by default (`cuda`, `rocm`, `mps`, `cpu`),
+    /// for the same overlay.
+    pub worker_backend: &'static str,
     /// Calibration profiles for the `/metadata` overlay; also the ledger's.
     pub calibration: Option<Arc<super::calibration::CalibrationStore>>,
     /// Model name of the default GPU; `None` (no overlay) without inventory.
@@ -240,13 +243,14 @@ impl InferioState {
             ),
             super::calibration::StoreEnv {
                 platform: super::calibration::StoreEnv::platform_name(),
-                backend: accelerator_backend(accelerator).to_owned(),
+                backend: super::gpu::accelerator_backend(accelerator).to_owned(),
                 generator: format!("panoptikon {}", crate::resources::VERSION),
             },
         );
+        let worker_backend = super::gpu::worker_backend(&host.inventory, accelerator);
         let default_gpu_name = host.inventory.default_gpu_name();
         let default_gpu_arch = host.inventory.default_gpu_arch();
-        let spills_to_ram = host.inventory.spills_to_ram();
+        let spilling = host.inventory.spilling_gpus().to_vec();
         let manager = ModelManager::new(
             ManagerConfig {
                 spawn,
@@ -259,7 +263,7 @@ impl InferioState {
                     always_warm: local.prewarm.always_warm.clone(),
                 },
                 gpus: host.inventory,
-                vram: vram_budgets(&local.vram, spills_to_ram),
+                vram: vram_budgets(&local.vram, spilling),
                 calibration: Some(Arc::clone(&calibration) as Arc<_>),
             },
             Arc::clone(&registry),
@@ -268,6 +272,7 @@ impl InferioState {
             manager,
             registry,
             compute_caps: host.caps,
+            worker_backend,
             calibration: Some(calibration),
             default_gpu_name,
             default_gpu_arch,
@@ -289,14 +294,14 @@ impl InferioState {
 /// `[inference_local.vram]` → the ledger's resolved per-GPU [`VramBudget`]s.
 fn vram_budgets(
     config: &crate::config::VramConfig,
-    spills_to_ram: bool,
+    spilling: Vec<String>,
 ) -> super::ledger::VramBudgets {
     let mut budgets = super::ledger::VramBudgets::uniform(super::ledger::VramBudget {
         margin: config.margin,
         cap_fraction: config.cap_fraction,
         knee_max_bucket_dispersion: config.knee_max_bucket_dispersion,
     });
-    budgets.spills_to_ram = spills_to_ram;
+    budgets.spilling = spilling.into_iter().collect();
     for uuid in config.gpu.keys() {
         let (margin, cap_fraction, knee_max_bucket_dispersion) = config.for_gpu(uuid);
         budgets = budgets.with_gpu(
@@ -309,17 +314,6 @@ fn vram_budgets(
         );
     }
     budgets
-}
-
-/// The `backend` component of a calibration profile key. `Auto` (resolution
-/// failed) keys as `cpu`; Apple Silicon keys as `mps`.
-fn accelerator_backend(accelerator: crate::config::Accelerator) -> &'static str {
-    match accelerator {
-        crate::config::Accelerator::Cuda => "cuda",
-        crate::config::Accelerator::Rocm => "rocm",
-        crate::config::Accelerator::Mps => "mps",
-        crate::config::Accelerator::Cpu | crate::config::Accelerator::Auto => "cpu",
-    }
 }
 
 /// Bytes one predict body may carry (one worker frame); over it is a `413`.
@@ -1144,7 +1138,11 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
     match snapshot {
         Ok(registry) => {
             let mut body = registry.metadata_json();
-            super::capability::overlay_metadata(&mut body, &state.compute_caps);
+            super::capability::overlay_metadata(
+                &mut body,
+                &state.compute_caps,
+                state.worker_backend,
+            );
             if let Some(store) = state.calibration.as_ref() {
                 // Fall back to the live inventory where the probe cannot answer.
                 let arch = state
@@ -1657,6 +1655,7 @@ metadata.description = "echo fixture"
             manager,
             registry,
             compute_caps: super::super::capability::HostComputeCaps::unknown(),
+            worker_backend: "cuda",
             calibration: Some(calibration),
             // The overlay still needs *a* GPU to answer for, so name one.
             default_gpu_name: Some(TEST_GPU.to_owned()),
@@ -2786,9 +2785,9 @@ metadata.cost.unit = "none"
     }
 
     #[test]
-    fn the_budgets_carry_the_hosts_spill_flag() {
+    fn the_budgets_carry_the_hosts_spill_verdicts() {
         let config = crate::config::VramConfig::default();
-        assert!(vram_budgets(&config, true).spills_to_ram);
-        assert!(!vram_budgets(&config, false).spills_to_ram);
+        let budgets = vram_budgets(&config, vec!["GPU-a".to_owned()]);
+        assert!(budgets.spills_to_ram("GPU-a") && !budgets.spills_to_ram("GPU-b"));
     }
 }

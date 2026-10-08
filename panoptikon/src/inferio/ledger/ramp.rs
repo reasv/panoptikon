@@ -266,17 +266,27 @@ impl VramLedger {
     /// until one is set), or the size a trial runs next. Twice the working
     /// size while memory has granted nothing above it
     /// ([`ModelCalibration::room_cut`]), once the working size has run in
-    /// this process.
-    pub(super) fn size_locked(state: &LedgerState, entry: &WorkerEntry) -> u64 {
+    /// this process. At most the working size under memory `pressure` above
+    /// normal: nothing grows then.
+    pub(super) fn size_locked(
+        state: &LedgerState,
+        entry: &WorkerEntry,
+        pressure: mps::MemoryPressure,
+    ) -> u64 {
         let working = Self::knee_locked(state, entry).unwrap_or(entry.seed_units.max(1));
         let Some(cal) = cal_locked(state, entry) else {
             return working;
         };
         let ran = |sample: &ThroughputSample| is_size(sample.units, working, working / 2);
-        match cal.trial {
+        let size = match cal.trial {
             Some(trial) => trial.run,
             None if cal.room_cut && cal.throughput.iter().any(ran) => working.saturating_mul(2),
             None => working,
+        };
+        if pressure == mps::MemoryPressure::Normal {
+            size
+        } else {
+            size.min(working)
         }
     }
 
@@ -292,65 +302,106 @@ impl VramLedger {
     /// [`admitted_units`] for [`Self::size_locked`] under the batch ceiling
     /// ([`Self::batch_ceiling_locked`]), capped at the size a paging episode
     /// left ([`PressureCap`]).
-    pub(super) fn budget_locked(state: &LedgerState, entry: &WorkerEntry) -> u64 {
+    pub(super) fn budget_locked(
+        state: &LedgerState,
+        entry: &WorkerEntry,
+        pressure: mps::MemoryPressure,
+    ) -> u64 {
         let admitted = admitted_units(
             entry,
-            Self::size_locked(state, entry),
+            Self::size_locked(state, entry, pressure),
             Self::anchor_locked(state, entry),
             Self::batch_ceiling_locked(state, entry),
         );
-        cal_locked(state, entry)
-            .and_then(|cal| cal.pressure_cap)
-            .map_or(admitted, |cap| admitted.min(cap.units))
+        let cap = cal_locked(state, entry).and_then(|cal| cal.pressure_cap);
+        match cap {
+            None => admitted,
+            Some(cap) if pressure == mps::MemoryPressure::Normal => admitted.min(cap.units),
+            Some(cap) => admitted.min(cap.units).min(cap.regrow_to),
+        }
     }
 
     /// Maintain the [`PressureCap`] with one settled window.
     ///
-    /// A paging window that memory or the batch size set (not the queue) sets the
-    /// cap to its unit budget. The first one of an episode also sets how far
-    /// the cap may grow back at warning: half the budget in force before it,
-    /// or half the previous bound, at least 1. So a batch size that made the
-    /// Mac page is not returned to while the level stays at warning.
+    /// A paging window that memory or the batch size set (not the queue)
+    /// caps the batch at its unit budget, and sets the bound, how far the cap
+    /// may grow back above normal pressure: the largest size the paging
+    /// windows' grants asked. A window whose batch began the paging lowers
+    /// the bound to at most half its unit budget (at least 1); after that
+    /// only such a window moves it. A batch began the paging when its window
+    /// was granted before it, ran a batch at its budget (`ran_full`), and
+    /// grew our pool past the largest pool a paging window of the episode
+    /// left; on the CPU device, or without pool figures, when instead its
+    /// unit budget was at least the smaller of the bound and the size asked,
+    /// and it was granted after the last such window. So paging another
+    /// program began while our batches ran inside the pool they held, or
+    /// refilled it, leaves the bound.
     ///
-    /// Otherwise a clean window that `filled` its budget doubles the cap: at
-    /// warning up to that bound, at normal until it reaches the batch size
-    /// admitted, where it lifts. The bound lasts as long as the cap, so a
-    /// warning that returns first grows back to the same bound.
+    /// Otherwise a clean window that ran full doubles the cap: above normal up
+    /// to that bound, at normal until it reaches the batch size admitted,
+    /// where it lifts. The bound lasts as long as the cap, so a warning that
+    /// returns first grows back to the same bound.
     pub(super) fn note_pressure_size_locked(
         state: &mut LedgerState,
         worker: WorkerId,
         charge: GrantCharge,
-        filled: bool,
+        ingested: &Ingested,
+        negative: bool,
+        paged_at_grant: bool,
     ) {
         let Some(entry) = state.workers.get(&worker) else {
             return;
         };
-        let admitted = admitted_units(
-            entry,
-            Self::size_locked(state, entry),
-            Self::anchor_locked(state, entry),
-            Self::batch_ceiling_locked(state, entry),
-        );
+        let ran_full = ingested.filled;
+        // A CPU replica's pool figure is its peak resident set since start,
+        // which a regrowth never passes.
+        let grew_pool = ingested.grew_pool.filter(|_| entry.gpu != cpu::DEVICE_KEY);
+        let anchor = Self::anchor_locked(state, entry);
+        let ceiling = Self::batch_ceiling_locked(state, entry);
+        let size = Self::size_locked(state, entry, mps::MemoryPressure::Normal);
+        let admitted = admitted_units(entry, size, anchor, ceiling);
+        let asked = charge.units_asked;
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let Some(cal) = state.calibration.get_mut(&key) else {
             return;
         };
         let cap = cal.pressure_cap;
         cal.pressure_cap = if charge.pressure.paging() {
-            if charge.queue_bound && !charge.squeezed {
+            if charge.queue_bound && !charge.memory_cut {
                 return;
             }
-            let regrow_to = match cap {
-                Some(cap) if cap.paging => cap.regrow_to,
-                _ => (cap.map_or(admitted, |cap| cap.regrow_to) / 2).max(1),
+            let halved_at = cap.and_then(|cap| cap.halved_at);
+            let bound = match cap {
+                None => asked,
+                Some(cap) if halved_at.is_some() => cap.regrow_to,
+                Some(cap) => cap.regrow_to.max(asked),
             };
+            let pool_mb = cap.and_then(|cap| cap.pool_mb);
+            let ours = match grew_pool {
+                // Past the episode's largest pool: `None` is below any pool.
+                Some(grew) => grew && ingested.pool_mb > pool_mb,
+                None => {
+                    charge.unit_budget >= bound.min(asked)
+                        && halved_at.is_none_or(|at| charge.granted_at >= at)
+                }
+            };
+            let halves = ran_full && !paged_at_grant && ours;
+            let regrow_to = if halves {
+                bound.min(charge.unit_budget / 2).max(1)
+            } else {
+                bound
+            };
+            // A window granted before a later paging window cut the cap
+            // does not raise it.
+            let units = cap.map_or(charge.unit_budget, |cap| cap.units.min(charge.unit_budget));
             Some(PressureCap {
-                units: charge.unit_budget,
+                units: units.min(regrow_to),
                 regrow_to,
-                paging: true,
+                halved_at: halves.then(Instant::now).or(halved_at),
+                pool_mb: pool_mb.max(ingested.pool_mb),
             })
         } else if let Some(cap) = cap {
-            let grown = if filled {
+            let grown = if ran_full && !negative {
                 cap.units.saturating_mul(2)
             } else {
                 cap.units
@@ -358,13 +409,11 @@ impl VramLedger {
             if charge.pressure != mps::MemoryPressure::Normal {
                 Some(PressureCap {
                     units: grown.min(cap.regrow_to),
-                    paging: false,
                     ..cap
                 })
             } else {
                 (grown < admitted).then_some(PressureCap {
                     units: grown,
-                    paging: false,
                     ..cap
                 })
             }

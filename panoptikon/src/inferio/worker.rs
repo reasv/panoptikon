@@ -169,16 +169,25 @@ pub struct WorkerSpawnConfig {
 }
 
 impl WorkerSpawnConfig {
-    /// Adds `PANOPTIKON_UNIFIED_GPU=<PCI address>` for a unified GPU.
-    pub fn for_unified_device(&self, bdf: Option<&str>) -> Cow<'_, Self> {
-        let Some(bdf) = bdf else {
+    /// Adds `PANOPTIKON_UNIFIED_GPU=<PCI address>` for a unified GPU and the
+    /// spill verdict of an NVIDIA GPU.
+    pub fn for_gpu(&self, bdf: Option<&str>, spills_to_ram: Option<bool>) -> Cow<'_, Self> {
+        if bdf.is_none() && spills_to_ram.is_none() {
             return Cow::Borrowed(self);
-        };
+        }
         let mut cfg = self.clone();
-        cfg.env.push((
-            super::gpu::UNIFIED_GPU_ENV_VAR.to_owned(),
-            bdf.to_ascii_lowercase(),
-        ));
+        if let Some(bdf) = bdf {
+            cfg.env.push((
+                super::gpu::UNIFIED_GPU_ENV_VAR.to_owned(),
+                bdf.to_ascii_lowercase(),
+            ));
+        }
+        if let Some(spills) = spills_to_ram {
+            cfg.env.push((
+                super::gpu::SPILLS_TO_RAM_ENV_VAR.to_owned(),
+                u8::from(spills).to_string(),
+            ));
+        }
         Cow::Owned(cfg)
     }
 
@@ -230,8 +239,12 @@ pub struct MemorySample {
     /// Host RAM a unified device's free reading comes out of (`hw.memsize`);
     /// differs from [`Self::total_mb`] on MPS.
     pub ram_total_mb: Option<u64>,
-    /// RAM `available` before [`Self::free_mb`] clips it to the device total.
+    /// RAM `available` before [`Self::free_mb`] clips it to the device total
+    /// on MPS, or to [`Self::gtt_free_mb`] on an APU.
     pub ram_available_mb: Option<u64>,
+    /// An APU's unclaimed GTT: its `free_mb` is free VRAM plus the smaller of
+    /// this and [`Self::ram_available_mb`].
+    pub gtt_free_mb: Option<u64>,
 }
 
 /// The `load` response's footprint report (protocol doc, `load` `ok` table);
@@ -262,6 +275,9 @@ pub struct LoadReport {
     pub gpu_bdf: Option<String>,
     /// Total VRAM per torch, to cross-check a PCI-address match.
     pub gpu_total_mb: Option<u64>,
+    /// HIP's `integrated` for this GPU, checked against the host's unified
+    /// verdict. ROCm only.
+    pub gpu_integrated: Option<bool>,
     /// `torch.__version__`, part of the profile key.
     pub torch_version: Option<String>,
     /// Where torch put the model (`cpu`, `cuda`, `rocm`, `mps`); decides the
@@ -335,12 +351,14 @@ pub struct BatchMeasurement {
     /// On a unified device, the RAM total [`Self::free_mb`] was clipped from.
     pub ram_total_mb: Option<u64>,
     pub ram_available_mb: Option<u64>,
+    /// As [`MemorySample::gtt_free_mb`].
+    pub gtt_free_mb: Option<u64>,
     /// `num_alloc_retries` delta for this batch; `None` off CUDA.
     pub alloc_retries: Option<u64>,
     /// Pool MiB re-grown after a release, on the first batch after it only;
     /// its `duration_ms` includes the re-grow.
     pub regrow_mb: Option<u64>,
-    /// `"trim"` (host request) or `"shrink"` (worker's own rule).
+    /// The release re-grown from: `"trim"`, `"shrink"`, `"growth"` or `"spill"`.
     pub regrow_after: Option<String>,
     /// A CUDA or ROCm worker's resident set: its in-batch maximum, and after
     /// the batch.
@@ -1582,7 +1600,36 @@ impl Drop for Worker {
 /// oversized chunks are flushed as their own log lines instead.
 const STDERR_LINE_CAP: u64 = 64 * 1024;
 
-/// Forward worker stderr lines to tracing and the shared tail buffer.
+/// A run of identical stderr lines: the first is forwarded, the rest are
+/// counted and reported in one line when the run ends.
+#[derive(Default)]
+struct RepeatedLines {
+    last: Option<String>,
+    repeats: u64,
+}
+
+impl RepeatedLines {
+    /// The lines to forward for `line`: none while it repeats the last one.
+    fn push(&mut self, line: String) -> Vec<String> {
+        if self.last.as_deref() == Some(line.as_str()) {
+            self.repeats += 1;
+            return Vec::new();
+        }
+        let mut out: Vec<String> = self.finish().into_iter().collect();
+        self.last = Some(line.clone());
+        out.push(line);
+        out
+    }
+
+    /// The count line for the run in progress, if it repeated.
+    fn finish(&mut self) -> Option<String> {
+        let repeats = std::mem::take(&mut self.repeats);
+        (repeats > 0).then(|| format!("(the line above repeated {repeats} more times)"))
+    }
+}
+
+/// Forward worker stderr lines to tracing and the shared tail buffer, a run
+/// of identical lines once plus a count.
 ///
 /// The forwarder must stay alive for the worker's whole life no matter what
 /// bytes arrive: if it exits early the stderr pipe fills, the worker blocks
@@ -1593,6 +1640,13 @@ const STDERR_LINE_CAP: u64 = 64 * 1024;
 async fn forward_stderr(stderr: ChildStderr, inference_id: String, tail: Arc<Mutex<StderrTail>>) {
     let mut reader = BufReader::new(stderr);
     let mut buf: Vec<u8> = Vec::new();
+    let mut repeated = RepeatedLines::default();
+    let forward = |line: String| {
+        tracing::info!(worker = %inference_id, "{line}");
+        if let Ok(mut tail) = tail.lock() {
+            tail.push(line);
+        }
+    };
     loop {
         buf.clear();
         // `take` caps a single accumulated line at STDERR_LINE_CAP; a chunk
@@ -1619,11 +1673,9 @@ async fn forward_stderr(stderr: ChildStderr, inference_id: String, tail: Arc<Mut
             continue;
         }
         let line = String::from_utf8_lossy(&buf).into_owned();
-        tracing::info!(worker = %inference_id, "{line}");
-        if let Ok(mut tail) = tail.lock() {
-            tail.push(line);
-        }
+        repeated.push(line).into_iter().for_each(&forward);
     }
+    repeated.finish().into_iter().for_each(&forward);
 }
 
 /// Serialize one frame payload, enforcing [`MAX_FRAME_BYTES`] before any
@@ -1746,6 +1798,7 @@ impl MemorySample {
             allocated_mb: field_u64(map, "allocated_mb"),
             ram_total_mb: field_u64(map, "ram_total_mb"),
             ram_available_mb: field_u64(map, "ram_available_mb"),
+            gtt_free_mb: field_u64(map, "gtt_free_mb"),
         };
         (sample != Self::default()).then_some(sample)
     }
@@ -1772,6 +1825,10 @@ impl LoadReport {
             gpu_arch: field_string(payload, "gpu_arch"),
             gpu_bdf: field_string(payload, "gpu_bdf"),
             gpu_total_mb: field_u64(payload, "gpu_total_mb"),
+            gpu_integrated: match map_get(payload, "gpu_integrated") {
+                Some(Value::Boolean(integrated)) => Some(*integrated),
+                _ => None,
+            },
             torch_version: field_string(payload, "torch_version"),
             device_kind: field_string(payload, "device_kind"),
             rss_at_load_mb: field_u64(payload, "rss_at_load_mb"),
@@ -1811,6 +1868,7 @@ impl BatchMeasurement {
                     free_source: field_string(map, "free_source"),
                     ram_total_mb: field_u64(map, "ram_total_mb"),
                     ram_available_mb: field_u64(map, "ram_available_mb"),
+                    gtt_free_mb: field_u64(map, "gtt_free_mb"),
                     alloc_retries: field_u64(map, "alloc_retries"),
                     regrow_mb: field_u64(map, "regrow_mb"),
                     regrow_after: field_string(map, "regrow_after"),
@@ -2184,7 +2242,7 @@ mod tests {
         // came up on. Lower-cased, the spelling the worker renders its own in;
         // absent, never zero, on a discrete GPU.
         let unified = |cfg: &WorkerSpawnConfig, bdf: Option<&str>, key| {
-            env_of(&cfg.for_unified_device(bdf), Some("0"), key)
+            env_of(&cfg.for_gpu(bdf, None), Some("0"), key)
         };
         let gpu = "PANOPTIKON_UNIFIED_GPU";
         let bdf = Some("0000:03:00.0");
@@ -2205,7 +2263,7 @@ mod tests {
             Some("0")
         );
         assert!(matches!(
-            rocm.for_unified_device(None),
+            rocm.for_gpu(None, None),
             std::borrow::Cow::Borrowed(_)
         ));
 
@@ -2753,6 +2811,25 @@ mod tests {
             let expected = format!("garbage on {step} stdout");
             assert!(text.contains(&expected), "{expected:?} missing from {text}");
         }
+    }
+
+    #[test]
+    fn a_run_of_identical_stderr_lines_is_forwarded_once_with_a_count() {
+        let mut lines = RepeatedLines::default();
+        let mut out = Vec::new();
+        for line in ["a", "w", "w", "w", "b", "b", "w"] {
+            out.extend(lines.push(line.to_owned()));
+        }
+        out.extend(lines.finish());
+        let count = |repeats| {
+            RepeatedLines {
+                last: None,
+                repeats,
+            }
+            .finish()
+            .unwrap()
+        };
+        assert_eq!(out, ["a", "w", &count(2), "b", &count(1), "w"]);
     }
 
     /// The stderr forwarder survives arbitrary bytes: the fixture writes raw
@@ -3596,6 +3673,25 @@ mod tests {
         assert_eq!(frame.reserved_after_mb, Some(1050));
         assert_eq!(frame.ram_total_mb, Some(131072));
         assert_eq!(frame.ram_available_mb, Some(15891));
+
+        // An APU's frame: both terms of its GTT clamp.
+        #[rustfmt::skip]
+        let apu = Value::Array(vec![Value::Map(vec![
+            (Value::from("free_mb"), Value::from(8448u64)),
+            (Value::from("free_source"), Value::from("amdgpu-sysfs")),
+            (Value::from("ram_available_mb"), Value::from(8192u64)),
+            (Value::from("gtt_free_mb"), Value::from(61440u64)),
+        ])]);
+        let frame = &BatchMeasurement::parse_list(Some(&apu))[0];
+        assert_eq!(
+            (frame.gtt_free_mb, frame.ram_available_mb),
+            (Some(61440), Some(8192))
+        );
+        assert_eq!(
+            MemorySample::parse(apu.as_array().and_then(|frames| frames.first()))
+                .map(|sample| (sample.gtt_free_mb, sample.ram_available_mb)),
+            Some((Some(61440), Some(8192)))
+        );
     }
 
     /// The two clamps, including a shape ceiling that arrives without a free

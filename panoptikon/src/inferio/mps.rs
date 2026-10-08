@@ -6,6 +6,7 @@
 //! `None`. See docs/unified-memory-admission.md "Backend A: MPS (Apple
 //! Silicon)".
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::gpu::{GpuInfo, GpuMemory};
@@ -84,6 +85,7 @@ pub(super) fn query_memory(key: &str, ram_mb: u64) -> Option<Vec<GpuMemory>> {
         // Physical RAM, not the device total; the refresh reads only `free_mb`.
         total_mb: ram_mb,
         free_mb: free_mb(ram_mb, available),
+        gtt: None,
     }])
 }
 
@@ -108,7 +110,7 @@ pub(super) fn physical_ram_mb() -> Option<u64> {
 }
 
 /// macOS's memory pressure, from `kern.memorystatus_vm_pressure_level` and
-/// whether the kernel is swapping pages out ([`Swapouts::paging`]).
+/// whether the kernel is swapping pages out ([`Swapouts::pressure`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(super) enum MemoryPressure {
     #[default]
@@ -142,13 +144,28 @@ impl MemoryPressure {
 }
 
 /// The memory pressure now; `Normal` off macOS or when unreadable.
+/// Unused by macOS test builds, where the ledger reads its stub.
+#[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
 pub(super) fn memory_pressure() -> MemoryPressure {
+    pressure(None)
+}
+
+/// [`memory_pressure`], and at least paging when the swap-out counter rose
+/// after `since` at the warning level or above ([`Swapouts::pressure`]).
+#[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
+pub(super) fn memory_pressure_since(since: Instant) -> MemoryPressure {
+    pressure(Some(since))
+}
+
+#[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
+fn pressure(since: Option<Instant>) -> MemoryPressure {
     #[cfg(target_os = "macos")]
     {
-        memory_facts().map_or(MemoryPressure::Normal, |facts| facts.pressure)
+        memory_facts(since).map_or(MemoryPressure::Normal, |facts| facts.pressure)
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = since;
         MemoryPressure::Normal
     }
 }
@@ -165,6 +182,8 @@ pub(super) struct MemoryFacts {
     pub compressed: u64,
     /// `internal_page_count`: anonymous pageable pages, wired ones excluded.
     pub anonymous: u64,
+    /// `external_page_count`: the file cache.
+    pub file_backed: u64,
     /// Read with the counters.
     pub pressure: MemoryPressure,
 }
@@ -174,65 +193,138 @@ pub(super) struct MemoryFacts {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const PAGING_WINDOW: Duration = Duration::from_secs(10);
 
-/// The oldest previous reading a rise is still judged against: an older one
-/// cannot say when the counter rose. Longer than [`PAGING_WINDOW`] so that a
-/// model whose batches take longer than that still sees the kernel paging.
-/// Must match `memory.py::MAC_PAGING_STALE_SECONDS`.
+/// How often a background thread reads the swap-out counter
+/// ([`follow_swapouts`]), so a rise is dated within one tick before a grant
+/// however long the gateway was idle.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const PAGING_STALE: Duration = Duration::from_secs(60);
+const SWAPOUT_TICK: Duration = Duration::from_secs(2);
 
-/// The swap-out counter at the previous reading, when that was, and when the
-/// counter was last seen to rise.
+/// The swap-out counter at the last reading and when that was, and the time
+/// of the earlier reading of the most recent pair whose counter rose: the
+/// rise happened after it. `paged_after` is the same for the most recent
+/// rise whose later reading had the pressure level at warning or above.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct Swapouts {
     last: Option<(u64, Instant)>,
-    rose_at: Option<Instant>,
+    rose_after: Option<Instant>,
+    paged_after: Option<Instant>,
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl Swapouts {
-    /// Whether the kernel swapped pages out between the previous reading and
-    /// this one, or within [`PAGING_WINDOW`] before it. A first reading, or
-    /// one whose predecessor is older than [`PAGING_STALE`], has nothing to
-    /// compare with and is not paging.
-    fn paging(&mut self, count: u64, now: Instant) -> bool {
+    /// Record a reading of the counter and the sysctl pressure level taken
+    /// at `at`; a reading older than the last is ignored.
+    fn record(&mut self, count: u64, level: u32, at: Instant) {
+        if self.last.is_some_and(|(_, read_at)| at < read_at) {
+            return;
+        }
         if let Some((previous, read_at)) = self.last
             && count > previous
-            && now.duration_since(read_at) <= PAGING_STALE
         {
-            self.rose_at = Some(now);
+            self.rose_after = Some(read_at);
+            if level >= 2 {
+                self.paged_after = Some(read_at);
+            }
         }
-        self.last = Some((count, now));
-        self.rose_at
-            .is_some_and(|at| now.duration_since(at) <= PAGING_WINDOW)
+        self.last = Some((count, at));
+    }
+
+    /// The pressure at sysctl `level` and `now`, paging if the counter rose
+    /// within [`PAGING_WINDOW`] before `now`. A rise after `since` read at
+    /// the warning level or above makes it at least `Paging`, whatever the
+    /// level is now.
+    fn pressure(&self, level: u32, now: Instant, since: Option<Instant>) -> MemoryPressure {
+        let recent = self
+            .rose_after
+            .is_some_and(|after| now.saturating_duration_since(after) <= PAGING_WINDOW);
+        let pressure = MemoryPressure::from_level(level, recent);
+        if since.is_some_and(|since| self.paged_after.is_some_and(|after| after >= since)) {
+            pressure.max(MemoryPressure::Paging)
+        } else {
+            pressure
+        }
+    }
+}
+
+/// Feed `swapouts` a reading every [`SWAPOUT_TICK`] until `wait` returns
+/// true. `read` answers the counter, the pressure level and when they were
+/// read, or `None`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn follow_swapouts(
+    swapouts: &Mutex<Swapouts>,
+    mut read: impl FnMut() -> Option<(u64, u32, Instant)>,
+    mut wait: impl FnMut(Duration) -> bool,
+) {
+    while !wait(SWAPOUT_TICK) {
+        if let Some((count, level, at)) = read()
+            && let Ok(mut swapouts) = swapouts.lock()
+        {
+            swapouts.record(count, level, at);
+        }
     }
 }
 
 /// This process's [`Swapouts`].
 #[cfg(target_os = "macos")]
-static SWAPOUTS: std::sync::Mutex<Swapouts> = std::sync::Mutex::new(Swapouts {
+static SWAPOUTS: Mutex<Swapouts> = Mutex::new(Swapouts {
     last: None,
-    rose_at: None,
+    rose_after: None,
+    paged_after: None,
 });
 
+/// Start [`follow_swapouts`] on [`SWAPOUTS`] for the life of the process,
+/// once.
+#[cfg(target_os = "macos")]
+fn start_following_swapouts() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("swap-outs".to_owned())
+            .spawn(|| {
+                follow_swapouts(
+                    &SWAPOUTS,
+                    || {
+                        let at = Instant::now();
+                        sys::swapouts().map(|count| (count, sys::pressure_level(), at))
+                    },
+                    |tick| {
+                        std::thread::sleep(tick);
+                        false
+                    },
+                );
+            });
+        if let Err(err) = spawned {
+            tracing::warn!(
+                error = %err,
+                "could not start reading the swap-out counter in the background; \
+                 a grant after idle judges paging from the last reading before it"
+            );
+        }
+    });
+}
+
 /// RAM a new allocation could get: RAM minus wired, compressed and anonymous
-/// pages (Activity Monitor's "used"). File cache counts as available. Must
-/// not use `free + inactive`: macOS moves pages another process still holds
-/// onto the inactive queue, so that figure rises without anything freed.
+/// pages (Activity Monitor's "used"). File cache counts as available at
+/// normal pressure. Must not use `free + inactive`: macOS moves pages
+/// another process still holds onto the inactive queue, so that figure rises
+/// without anything freed.
 ///
-/// 0 while the kernel is paging ([`MemoryPressure::paging`]): it keeps
-/// several GiB of file cache while it swaps, which this formula would still
-/// count as available. Warning without paging only means memory is held
-/// compressed, and the formula stands.
+/// At warning the file cache is taken too: macOS then makes room by
+/// compressing and swapping other memory, not only by dropping it. 0 while
+/// the kernel is paging ([`MemoryPressure::paging`]): it keeps several GiB
+/// of file cache while it swaps.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn available_bytes(facts: &MemoryFacts) -> u64 {
     if facts.pressure.paging() {
         return 0;
     }
-    let taken = facts
+    let mut taken = facts
         .wired
         .saturating_add(facts.compressed)
         .saturating_add(facts.anonymous);
+    if facts.pressure == MemoryPressure::Warning {
+        taken = taken.saturating_add(facts.file_backed);
+    }
     facts.ram.saturating_sub(taken)
 }
 
@@ -241,7 +333,7 @@ fn available_bytes(facts: &MemoryFacts) -> u64 {
 pub(super) fn ram_available_mb() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
-        memory_facts().map(|facts| available_bytes(&facts) / MIB)
+        memory_facts(None).map(|facts| available_bytes(&facts) / MIB)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -333,7 +425,7 @@ mod sys {
     // `mach_host_self` is deprecated in libc in favour of `mach2`; one call
     // does not earn a dependency.
     #[allow(deprecated)]
-    pub(super) fn memory_facts() -> Option<super::MemoryFacts> {
+    fn vm_statistics() -> Option<libc::vm_statistics64> {
         // SAFETY: zeroed is a valid `vm_statistics64` (plain integers), and
         // the kernel overwrites it wholesale on success.
         let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
@@ -348,24 +440,44 @@ mod sys {
                 &mut count,
             )
         };
-        if result != 0 {
-            return None;
-        }
+        (result == 0).then_some(stats)
+    }
+
+    /// Pages swapped out since boot.
+    pub(super) fn swapouts() -> Option<u64> {
+        vm_statistics().map(|stats| stats.swapouts)
+    }
+
+    /// `kern.memorystatus_vm_pressure_level`, 0 when unreadable.
+    pub(super) fn pressure_level() -> u32 {
+        sysctl_u32("kern.memorystatus_vm_pressure_level").unwrap_or(0)
+    }
+
+    /// The counters now; the pressure as [`super::Swapouts::pressure`] with
+    /// `since`.
+    pub(super) fn memory_facts(since: Option<Instant>) -> Option<super::MemoryFacts> {
+        super::start_following_swapouts();
+        let now = Instant::now();
+        let stats = vm_statistics()?;
         // SAFETY: sysconf takes a name and returns a long; no pointers.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page = u64::try_from(page).ok().filter(|page| *page > 0)?;
         let pages = |count: u32| u64::from(count).saturating_mul(page);
+        let level = pressure_level();
+        let pressure = super::SWAPOUTS.lock().map_or(
+            super::MemoryPressure::from_level(level, false),
+            |mut swapouts| {
+                swapouts.record(stats.swapouts, level, now);
+                swapouts.pressure(level, now, since)
+            },
+        );
         Some(super::MemoryFacts {
             ram: sysctl_u64("hw.memsize").filter(|bytes| *bytes > 0)?,
             wired: pages(stats.wire_count),
             compressed: pages(stats.compressor_page_count),
             anonymous: pages(stats.internal_page_count),
-            pressure: super::MemoryPressure::from_level(
-                sysctl_u32("kern.memorystatus_vm_pressure_level").unwrap_or(0),
-                super::SWAPOUTS
-                    .lock()
-                    .is_ok_and(|mut swapouts| swapouts.paging(stats.swapouts, Instant::now())),
-            ),
+            file_backed: pages(stats.external_page_count),
+            pressure,
         })
     }
 }
@@ -443,6 +555,7 @@ mod tests {
             wired: wired_mb * MIB,
             compressed: compressed_mb * MIB,
             anonymous: anonymous_mb * MIB,
+            file_backed: 0,
             pressure: MemoryPressure::Normal,
         }
     }
@@ -463,19 +576,22 @@ mod tests {
     }
 
     /// Nothing is available at critical pressure, or at warning while the
-    /// kernel is paging; warning without paging leaves the formula's figure,
-    /// here the ~9 GiB of file cache macOS kept.
+    /// kernel is paging. Warning without paging takes the ~9 GiB of file
+    /// cache macOS kept out of the formula's figure.
     #[test]
     fn nothing_is_available_while_the_kernel_pages_under_pressure() {
         use MemoryPressure::{Critical, Normal, Paging, Warning};
-        let counters = facts_mb(5_189, 55_599, 60_321);
+        let counters = MemoryFacts {
+            file_backed: 9_000 * MIB,
+            ..facts_mb(5_189, 55_599, 60_321)
+        };
         for (level, paging, pressure, available) in [
             (0, true, Normal, 9_963),
             (1, false, Normal, 9_963),
             (1, true, Normal, 9_963),
-            (2, false, Warning, 9_963),
+            (2, false, Warning, 963),
             (2, true, Paging, 0),
-            (3, false, Warning, 9_963),
+            (3, false, Warning, 963),
             (3, true, Paging, 0),
             (4, false, Critical, 0),
             (4, true, Critical, 0),
@@ -495,36 +611,151 @@ mod tests {
         }
     }
 
-    /// Paging means the swap-out counter rose since the previous reading or
-    /// within the window before this one. A first reading cannot tell, nor
-    /// can one whose predecessor is too old to say when the counter rose.
+    /// The counter read as `count(secs)` at 0 s and then every tick through
+    /// `to` s, as the background thread reads it.
+    fn followed(start: Instant, count: impl Fn(u64) -> u64, to: u64) -> Swapouts {
+        let swapouts = Mutex::new(Swapouts {
+            last: None,
+            rose_after: None,
+            paged_after: None,
+        });
+        swapouts.lock().unwrap().record(count(0), 2, start);
+        let secs = std::cell::Cell::new(0);
+        let at = |offset: u64| start + Duration::from_secs(offset);
+        follow_swapouts(
+            &swapouts,
+            || Some((count(secs.get()), 2, at(secs.get()))),
+            |tick| {
+                secs.set(secs.get() + tick.as_secs());
+                secs.get() > to
+            },
+        );
+        swapouts.into_inner().unwrap()
+    }
+
+    /// A rise is dated by the earlier reading of the pair that saw it. Paging
+    /// is a rise within the window before now, or one after a given instant,
+    /// such as the grant of the window being settled, however long it ran.
     #[test]
-    fn paging_is_a_swap_out_counter_that_rose_recently() {
+    fn paging_is_a_rise_within_the_window_or_after_an_instant() {
         let start = Instant::now();
         let at = |secs: u64| start + Duration::from_secs(secs);
+        // Two 90 s batches, each settled from a reading at its end, while
+        // the counter rises through both.
         let mut swapouts = Swapouts {
             last: None,
-            rose_at: None,
+            rose_after: None,
+            paged_after: None,
         };
-        assert!(!swapouts.paging(500, at(0)), "nothing to compare with");
-        assert!(!swapouts.paging(500, at(1)), "flat");
-        assert!(swapouts.paging(501, at(2)), "rose since the last reading");
-        assert!(swapouts.paging(501, at(12)), "rose 10 s ago");
+        swapouts.record(500, 2, at(0));
         assert!(
-            !swapouts.paging(501, at(13)),
-            "flat for longer than the window"
+            !swapouts.pressure(2, at(0), Some(at(0))).paging(),
+            "one reading cannot tell"
         );
-        // A reading 60 s after the last still sees the rise between them; a
-        // later one does not, and is the reading the next is compared with.
-        assert!(swapouts.paging(600, at(73)), "60 s after the last reading");
+        swapouts.record(900, 2, at(90));
         assert!(
-            !swapouts.paging(900, at(134)),
-            "61 s: too old to compare with"
+            swapouts.pressure(2, at(90), Some(at(0))).paging(),
+            "rose after batch 1 was granted"
         );
-        assert!(swapouts.paging(901, at(135)));
-        // A counter that fell is not a rise.
-        assert!(!swapouts.paging(100, at(150)));
-        assert!(!swapouts.paging(100, at(151)));
+        assert!(
+            !swapouts.pressure(2, at(90), None).paging(),
+            "the rise is dated 90 s ago, outside the window"
+        );
+        swapouts.record(1300, 2, at(180));
+        assert!(
+            swapouts.pressure(2, at(180), Some(at(90))).paging(),
+            "rose after batch 2 was granted"
+        );
+        swapouts.record(100, 2, at(181));
+        swapouts.record(100, 2, at(200));
+        assert!(
+            !swapouts.pressure(2, at(200), Some(at(181))).paging(),
+            "a counter that fell did not rise"
+        );
+
+        // A burst 20-24 s into a 45 s window, read every tick.
+        let mut swapouts = followed(start, |secs| 500 + secs.clamp(20, 24) - 20, 44);
+        swapouts.record(504, 2, at(45));
+        assert!(
+            swapouts.pressure(2, at(45), Some(at(0))).paging(),
+            "rose after the window was granted"
+        );
+        assert!(
+            !swapouts.pressure(2, at(45), None).paging(),
+            "the rise is dated 23 s ago, outside the window"
+        );
+        swapouts.record(505, 2, at(55));
+        assert!(
+            swapouts.pressure(2, at(55), None).paging(),
+            "a rise dated exactly 10 s ago is paging"
+        );
+
+        // After an instant, only a rise read at warning or above counts, and
+        // it counts whatever the level is now.
+        let mut swapouts = Swapouts {
+            last: None,
+            rose_after: None,
+            paged_after: None,
+        };
+        swapouts.record(500, 2, at(0));
+        swapouts.record(600, 1, at(60));
+        assert_eq!(
+            swapouts.pressure(2, at(90), Some(at(0))),
+            MemoryPressure::Warning,
+            "a rise read at normal"
+        );
+        swapouts.record(700, 2, at(120));
+        assert_eq!(
+            swapouts.pressure(1, at(150), Some(at(0))),
+            MemoryPressure::Paging,
+            "a rise read at warning, normal now"
+        );
+        assert_eq!(
+            swapouts.pressure(4, at(150), Some(at(0))),
+            MemoryPressure::Critical
+        );
+        swapouts.record(800, 2, at(100));
+        assert_eq!(
+            swapouts.pressure(2, at(125), None),
+            MemoryPressure::Warning,
+            "a reading older than the last is ignored"
+        );
+    }
+
+    /// The background readings date a rise that happened while the gateway
+    /// was idle, so the next grant, which asks only about the window, judges
+    /// it by when it happened and not by when the last grant was.
+    #[test]
+    fn background_readings_date_a_rise_before_a_grant() {
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        // A rise in the last 5 s of a 120 s idle wait.
+        let rose_at_115 = |secs: u64| if secs >= 115 { 600 } else { 500 };
+        let mut swapouts = followed(start, rose_at_115, 119);
+        swapouts.record(600, 2, at(120));
+        assert!(
+            swapouts.pressure(2, at(120), None).paging(),
+            "dated 6 s before the grant by the background readings"
+        );
+        let mut unfollowed = followed(start, rose_at_115, 0);
+        unfollowed.record(600, 2, at(120));
+        assert!(
+            !unfollowed.pressure(2, at(120), None).paging(),
+            "without them it is dated at the reading 120 s before"
+        );
+
+        // A rise 50 s before a job.
+        let mut swapouts = followed(start, |secs| if secs >= 5 { 600 } else { 500 }, 54);
+        swapouts.record(600, 2, at(55));
+        assert!(
+            !swapouts.pressure(2, at(55), None).paging(),
+            "dated 51 s before the grant, outside the window"
+        );
+        swapouts.record(600, 2, at(65));
+        assert!(
+            !swapouts.pressure(2, at(65), Some(at(55))).paging(),
+            "the rise came before the job's first window was granted"
+        );
     }
 
     /// A recorded trace of a process holding 61 440 MiB for 167.5 s and
@@ -616,5 +847,9 @@ mod tests {
         assert_eq!(ram_available_mb(), None);
         assert_eq!(query_memory(DEVICE_KEY, 128 * 1024), None);
         assert_eq!(memory_pressure(), MemoryPressure::Normal);
+        assert_eq!(
+            memory_pressure_since(Instant::now()),
+            MemoryPressure::Normal
+        );
     }
 }

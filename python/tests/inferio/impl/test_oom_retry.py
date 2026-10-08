@@ -218,7 +218,11 @@ def test_an_out_of_memory_condition_wins_over_the_ceiling_test():
 def test_the_ceiling_classifier_is_narrow_where_the_oom_one_is_broad():
     """It also decides a failure is *not* a memory event, so a false positive
     would hide a genuine OOM. It matches only what torch emits."""
-    for text in ("integer out of range", "canUse32BitIndexMath(self)"):
+    for text in (
+        "integer out of range",
+        "canUse32BitIndexMath(self)",
+        "Error: total bytes of NDArray > 2**32",
+    ):
         assert looks_like_index_limit(RuntimeError(text)), text
     for text in ("index out of range", "list index out of range", "out of memory"):
         assert not looks_like_index_limit(IndexError(text)), text

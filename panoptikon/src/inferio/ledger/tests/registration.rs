@@ -1,4 +1,5 @@
 //! Registration: which GPU a worker is admitted under, and when it is refused.
+use super::unified_memory::{APU_TOTAL_MB, apu_device, apu_ledger};
 use super::*;
 
 /// `none`-class models, workers with no GPU at all, and GPUs outside
@@ -160,6 +161,7 @@ fn a_rocm_wire_load_report_reaches_the_gpu_it_names() {
         (Value::from("dtype"), Value::from("fp16")),
         (Value::from("gpu_bdf"), Value::from("0000:0c:00.0")),
         (Value::from("gpu_total_mb"), Value::from(24_560u64)),
+        (Value::from("gpu_integrated"), Value::from(false)),
         (
             Value::from("gpu_name"),
             Value::from("AMD Radeon RX 7900 XTX"),
@@ -179,6 +181,34 @@ fn a_rocm_wire_load_report_reaches_the_gpu_it_names() {
     let report = LoadReport::parse(&payload).expect("a ROCm load report");
     assert_eq!(report.gpu_uuid, None, "suppressed on HIP");
     assert_eq!(report.base_method.as_deref(), Some("fdinfo"));
+    assert_eq!(report.gpu_integrated, Some(false));
+
+    // A worker whose HIP runtime disagrees with the host's discrete or
+    // unified call is admitted all the same, and that is logged once per GPU.
+    let apu_report = LoadReport {
+        gpu_bdf: Some("0000:03:00.0".to_owned()),
+        gpu_total_mb: Some(APU_TOTAL_MB),
+        ..report.clone()
+    };
+    let cases = [
+        (rocm_ledger(), &report, true, 1),
+        (rocm_ledger(), &report, false, 0),
+        (apu_ledger(vec![apu_device(0)]), &apu_report, false, 1),
+        (apu_ledger(vec![apu_device(0)]), &apu_report, true, 0),
+    ];
+    for (ledger, report, integrated, logged) in cases {
+        let mut report = report.clone();
+        report.gpu_integrated = Some(integrated);
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(report));
+        let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
+        for model in ["g/a", "g/b"] {
+            ledger
+                .register_worker(model, item_cost(4), &handle, None)
+                .expect("admitted");
+        }
+        assert_eq!(ledger.lock().integrated_mismatch_logged.len(), logged);
+    }
 
     let ledger = rocm_ledger();
     let mut telemetry = WorkerTelemetry::default();
@@ -845,6 +875,7 @@ fn an_adopted_row_reaches_the_ledger_and_the_inventory() {
         uuid: "GPU-3c4d".to_owned(),
         total_mb: 100_000,
         free_mb: 40_000,
+        gtt: None,
     }]));
     let handle = loaded_on("GPU-3c4d", Some(1000), Some(0));
     let admission = ledger

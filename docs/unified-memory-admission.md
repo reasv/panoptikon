@@ -113,17 +113,18 @@ dGPU. No ledger changes are needed for this — it is a property of the
 free reading, produced where the reading is produced (worker samples and
 the orchestrator's staleness refresh).
 
-`ram_available` sources: `psutil.virtual_memory().available` worker-side
-(psutil is already a base dependency); orchestrator-side
-`host_statistics64` via `libc` on macOS, `sysinfo`-free reads of
-`/proc/meminfo` (`MemAvailable`; the CPU device subtracts `SReclaimable`
-on both sides) on Linux, `GlobalMemoryStatusEx` via
-`windows-sys` on Windows. No new crates. The two producers must sum the
-**same terms** — on macOS that is free + inactive pages, which is what
-psutil's `available` is; counting anything more on the orchestrator side
-(purgeable, compressed) would make its refresh the looser of the two and
-systematically understate external pressure, the one error direction the
-ledger cannot absorb.
+`ram_available` sources: worker-side, the same per-platform figure as the
+orchestrator (docs/inferio-worker-protocol.md, "`"ram"` is the CPU-priced
+host's reading"); orchestrator-side `host_statistics64` via `libc` on
+macOS, `sysinfo`-free reads of `/proc/meminfo` (`MemAvailable`) on Linux,
+`GlobalMemoryStatusEx` via `windows-sys` on Windows. On Linux the CPU
+device subtracts `SReclaimable` on both sides. No new crates. The two
+producers must sum the **same terms**: on macOS `mps.rs::available_bytes`
+(the worker's `_mac_available` matches it), on Windows the smaller of
+`ullAvailPhys` and `ullAvailPageFile`; counting anything more on the
+orchestrator side (counting purgeable pages as available) would make its
+refresh the looser of the two and systematically understate external
+pressure, the one error direction the ledger cannot absorb.
 
 Everything else is inherited:
 
@@ -271,47 +272,82 @@ Single synthetic device:
   4 critical). Warning means a large share of memory is held compressed; it
   does not mean anything is being paged out now (an idle neighbour that was
   compressed minutes ago keeps the level at warning with GiBs free). So the
-  reading asks a second question, **is the kernel paging**: the `swapouts`
-  counter of the same `vm_statistics64` rose since the previous reading or
-  within the 10 s before this one (`PAGING_WINDOW` / `MAC_PAGING_SECONDS`,
-  one remembered counter per process). A first reading cannot tell, and
-  neither can one whose predecessor is more than 60 s old (`PAGING_STALE` /
-  `MAC_PAGING_STALE_SECONDS`): an idle worker's first batch of a new job must
-  not read "paging" from swap-outs that happened while it sat idle. The bound
-  is longer than the window because a large batch takes longer than 10 s (a
-  63-item ViT-H batch takes about 10 s on an M3 Max), and consecutive batches
-  must still see the counter rise. `MemoryPressure` is the two facts
-  together: `Normal`, `Warning`, `Paging` (warning while paging), `Critical`.
+  reading asks a second question, **is the kernel paging**, of the
+  `swapouts` counter of the same `vm_statistics64` (one remembered counter
+  per process). A rise is dated by the earlier reading of the pair
+  that saw it, since it happened after that reading. Paging is a rise within
+  the 10 s before now (`PAGING_WINDOW` / `MAC_PAGING_SECONDS`) or after a
+  given instant. The gateway settles a window with the instant its grant
+  began, before the grant's own reading; a rise after it read at warning
+  or above settles the window as paging whatever the level at settle. A
+  worker reads before each batch with the reading its window's previous
+  batch started from, so a batch longer than 10 s still counts paging that
+  began during it and a window's first batch does not count swap-outs from
+  the idle time before it. The gateway also reads the counter and the
+  level on a background thread every 2 s (`SWAPOUT_TICK`), so its first
+  grant after an idle time dates a rise just before it within one tick.
+  While the gateway reads paging, a grant or a load re-reads the device
+  from the host instead of pricing from the worker's last report, which
+  may predate the paging; when the re-read is skipped (a probe of the
+  device in flight or backing off), it records the device's free as 0 at
+  that time instead. Every free reading it records, a worker's included, is
+  0. A load that starts then reserves its whole expected base.
+  `MemoryPressure` is the two facts together: `Normal`, `Warning`, `Paging`
+  (warning while paging), `Critical`.
   - **Paging or critical: `ram_available` is 0.** macOS keeps file-backed
     pages while it swaps — about 9 GiB on the M3 Max while it swapped
     20–38 GiB — so the formula still offered 8–10 GiB that did not exist.
     With 0 available, `external` is everything but our own residents and
     `limit` is what they hold less the reserve: a grant is cut to the
-    replica's own free pool less the reserve (the squeeze path), and the
+    replica's own free pool less the reserve (the squeeze path; before the
+    fit, to the batch that pool covers at the pre-fit price), and the
     worker's live clamp, which reads the same 0, cuts each batch to the pool
     it holds (`releasable_pool_mb`) less the same reserve; a replica with no
     pool above the reserve runs one unit. A squeezed grant asks idle
     residents for their pools (the trim path).
-  - **Warning: the formula stands.**
+  - **Warning: the file cache is taken too** (`external_page_count`). At
+    warning macOS makes room by compressing and swapping other processes'
+    memory, not only by dropping clean file pages, so a grant priced on the
+    file cache swaps someone else out. That price applies to new memory
+    only: a deficit against the reserve does not come out of the pool a
+    replica holds, as it does while paging.
   - **Any window above normal** (the ledger reads `MemoryPressure` itself at
     grant and at settle and keeps the higher) earns no ramp step, feeds no
     knee, does not count as the size the ramp reached or toward a knee's
-    expiry, and its throughput-collapse flags are ignored. So at warning a
-    replica keeps the unit budget it had; a squeeze there (a neighbour, a dip
-    in the reading) lasts only as long as its cause.
+    expiry, and its throughput-collapse flags are ignored. A grant above
+    normal asks for at most the working size: no trial size and no doubling.
+    So at warning no batch runs above the working size; its grant can still
+    be smaller while free memory is short. Below the working size a
+    deflation is still repaid and the cap below still grows back. A squeeze
+    there (a neighbour, a dip in the reading) lasts only as long as its
+    cause.
   - **A paging episode leaves a cap** (`PressureCap`, per model and device, so
     a replica loaded afterwards runs what one that lived through it runs).
-    Each paging window that memory or the ramp sized, not the queue, sets the
-    cap to its unit budget. The first of an episode also sets how far the cap
-    may grow back while the level stays at warning: **half the unit budget in
-    force when the episode began**, and each later episode halves that bound
-    again (at least 1). A batch size that tipped the machine into paging is
-    therefore not returned to at warning, and a replica whose own batches
-    cause the paging settles within log2(size) episodes.
+    Each paging window that memory or the ramp sized caps the batch at its
+    unit budget, at most the bound; one the queue sized does so only when
+    memory cut the batch below the queue. A window granted before a later
+    paging window cut the cap does not raise it. The bound is how far the cap
+    may grow back while the level is above normal: the largest size the
+    paging windows' grants asked. **A window whose batch began the paging
+    lowers the bound to at most half its unit budget (at least 1): it was
+    granted before the paging began, ran a batch at its budget, and grew our
+    pool past the largest pool a paging window of the episode left.** Growth
+    up to that pool refills memory the replica released, and is not new
+    memory. On the CPU device, whose pool figure is the peak resident set
+    since start, or without pool figures, its unit budget must instead be at
+    least the smaller of the bound and the size its grant asked, and it must
+    have been granted after the last window our batch began. After the first lowering only such a
+    window moves the bound. The size asked is read at the grant, so a
+    deflation the settle repays or adds does not change it. So a batch size
+    whose memory growth began the paging is not returned to above normal,
+    and paging that began before the grant, or while our batches ran inside
+    or refilled the pool they held, leaves the bound alone. A batch whose
+    throughput collapse the pressure suppressed still counts here.
   - **Growing back.** Each clean window that filled its budget doubles the
-    cap: at warning up to that bound, at normal until it reaches what the
-    ramp admits, where the cap lifts and the bound is forgotten. A warning
-    that returns before then grows back to the same bound.
+    cap: above normal up to that bound, at normal until it reaches what the
+    ramp admits, where the cap lifts and the bound is forgotten. Above normal
+    the bound also caps the batch when the cap has grown past it, so a
+    warning that returns before the cap lifts runs at most the bound.
   - **Out-of-memory failures in a paging window** still deflate, but do not
     count toward `OOM_WINDOWS_AT_FLOOR` and do not clear it: while paging
     every window is one unit with no room, and three failures there would
@@ -325,7 +361,12 @@ Single synthetic device:
   the same rule; their batches have no pool to reuse and run at one unit
   while the Mac pages. Linux and Windows readings are unchanged. Loads are
   not refused under pressure: refusal on a unified device is judged against
-  capacity.
+  capacity. A load that starts above normal logs one WARN per model and
+  device per episode (until a reading at normal), naming the level and what
+  it does; while paging it does not also log the VRAM-headroom WARN, whose
+  headroom then reads 0. A grant that paging cuts logs its own WARN once
+  per model, device and episode, naming the size it was cut to, so a model
+  already running when the paging begins is named too.
 - **External usage is summed in the RAM domain.** `free` above is
   clipped to a `total` that is `recommended_max_memory()`, so the shipped
   `external = total − free − Σ ours` is arithmetic in two currencies and loses
@@ -433,6 +474,22 @@ dGPU+APU hosts — both GPUs become rows, index integrity is preserved
 (the reason the decline had to be all-or-nothing disappears), and the
 existing VRAM tie-break decides default placement between them.
 
+**What counts as an APU (2026-10-04).** The probe uses HIP's own test for
+`hipDeviceProp_t.integrated`: CLR sets it from ROCr's
+`HSA_AMD_MEMORY_PROPERTY_AGENT_IS_APU` or a full-profile agent; ROCr sets the
+first from libhsakmt's `Integrated`, which is amdgpu's
+`AMDGPU_IDS_FLAGS_FUSION` (`AMD_IS_APU`) read with the `AMDGPU_INFO_DEV_INFO`
+query on the render node, and the second when the GPU's KFD node has CPU
+cores. So: APU flag, or CPU cores on the GPU node. CPU cores alone are not
+enough: amdkfd builds every GPU node from a virtual CRAT
+(`kfd_topology_add_device` → `kfd_create_vcrat_image_gpu`, which sets only
+`CRAT_CU_FLAGS_GPU_PRESENT`), the only path since the ACPI CRAT reader was
+removed with IOMMUv2 support (c99a2e7ae291, Linux 6.7), so a current APU's GPU
+node reports `cpu_cores_count 0` beside a separate CPU node. The fixture is
+built from that source, not from a hardware dump. If the query fails the
+inventory is left unknown. The worker reports torch's `is_integrated`, and the
+ledger logs one WARN per GPU when it disagrees.
+
 ### Readings
 
 - **Total**: `mem_info_vram_total + mem_info_gtt_total`. The GTT files
@@ -521,10 +578,9 @@ the review that followed:
   ranking by it would hand default placement to the slower GPU on
   essentially every dGPU+APU host, since a Strix Halo's nominal budget dwarfs
   any consumer card's VRAM. `GpuInfo::placement_total_mb` therefore ranks a
-  unified-memory device by `max(carve-out, total / 8)`: the carve-out is the memory
-  the operator gave the iGPU outright, and the eighth is a deliberately
-  pessimistic floor so a 128 GB machine left at the 512 MB BIOS default does
-  not lose to a 2 GB display card. This is placement only: the APU is fully
+  unified-memory device by its carve-out, the memory the operator gave the
+  iGPU outright, so a 128 GB machine left at the 512 MB BIOS default ranks
+  below any larger discrete card. This is placement only: the APU is fully
   priced against carve+GTT either way, and a `devices` pin still selects it.
 - **The name's RAM figure is `MemTotal` + the carve-out, rounded up to 4 GiB.**
   Firmware reserves the UMA carve-out before the kernel counts memory, so it

@@ -882,5 +882,10 @@ metadata.cost.aggregation = "sum"
             assert_eq!(cost.unit, unit, "{id} unit");
             assert_eq!(cost.aggregation, aggregation, "{id} aggregation");
         }
+        // dots.ocr is not offered on MPS or the CPU.
+        assert_eq!(
+            registry.groups["doctr"].inference_ids["dots_ocr"].metadata["accelerators"],
+            serde_json::json!(["cuda", "rocm"])
+        );
     }
 }

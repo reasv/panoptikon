@@ -2,10 +2,11 @@
 
 transformers calls SDPA with `enable_gqa=True` (fewer KV heads than query
 heads) whenever there is no attention mask. When no fused kernel of this torch
-build accepts GQA on the device, SDPA falls back to the math kernel, which
-computes in fp32 and holds the full score matrix of every head. In that case
-transformers is made to expand the KV heads (`repeat_kv`) before SDPA, so the
-memory-efficient kernel takes the call instead.
+build accepts a GQA call in the key's dtype on the device, SDPA falls back to
+the math kernel, which holds the full score matrix of every head. For those
+dtypes transformers is made to expand the KV heads (`repeat_kv`) before SDPA,
+so a fused kernel without GQA support (memory-efficient attention, which also
+takes fp32) takes the call instead.
 """
 
 from __future__ import annotations
@@ -22,31 +23,46 @@ logger = logging.getLogger(__name__)
 # the name up in this module's globals on every call.
 SDPA_MODULE = "transformers.integrations.sdpa_attention"
 
-# What `expand_kv_heads_without_fused_gqa` decided.
-PATCHED = "patched"  # no fused kernel takes GQA; transformers expands the KV heads
-FUSED = "fused"  # a fused kernel takes GQA; transformers left untouched
-NOT_APPLICABLE = "not applicable"  # no transformers, or the model is not on a GPU
-CHECK_FAILED = "check failed"  # the check raised; transformers left untouched
+# The dtypes tested after a load: those the models run attention in.
+TEST_DTYPES = ("float16", "bfloat16", "float32")
 
-_decision: str | None = None
+# What torch raises when no enabled SDPA kernel takes a call.
+NO_KERNEL = "No available kernel"
+
+# What a dtype's test call decided, in the record
+# `expand_kv_heads_without_fused_gqa` returns.
+FUSED = "fused"  # a fused kernel takes GQA; transformers' answer stands
+EXPANDED = "expanded"  # no fused kernel takes GQA; the KV heads are expanded
+CHECK_FAILED = "check failed"  # undecided; also returned when the check raises
+# Returned instead of a record: no transformers, or the model is not on a GPU.
+NOT_APPLICABLE = "not applicable"
+
+# Key dtype -> whether a fused kernel took the GQA test call on the model's
+# device. A dtype is absent until a test call answers either way.
+_fused_gqa: dict[Any, bool] = {}
+# transformers' own `use_gqa_in_sdpa`, once the replacement is installed.
+_transformers_use_gqa: Any = None
 
 
-def _never_gqa(attention_mask: Any, key: Any) -> bool:
-    """Replacement for `use_gqa_in_sdpa`: always expand the KV heads."""
-    return False
+def _use_gqa_in_sdpa(attention_mask: Any, key: Any) -> bool:
+    """Replacement for `use_gqa_in_sdpa`: transformers' answer, except False
+    (expand the KV heads) for a key dtype no fused kernel takes GQA in."""
+    return _transformers_use_gqa(attention_mask, key) and _fused_gqa.get(
+        key.dtype, True
+    )
 
 
-def fused_kernel_accepts_gqa(torch: Any, device: Any) -> bool:
-    """Whether flash or memory-efficient attention takes a GQA call on
-    `device`, found by making one: fp16, head_dim 128, causal, no mask, as the
-    language models call it. A call that raises (no kernel, or anything else)
-    answers False.
+def fused_kernel_accepts_gqa(torch: Any, device: Any, dtype: Any) -> bool | None:
+    """Whether flash or memory-efficient attention takes a GQA call in `dtype`
+    on `device`, found by making one: head_dim 128, causal, no mask, as the
+    language models call it. None when the call fails for any other reason
+    than no kernel taking it (out of memory, for one): undecided.
     """
     try:
         from torch.nn.attention import SDPBackend, sdpa_kernel
 
-        query = torch.zeros(1, 2, 16, 128, dtype=torch.float16, device=device)
-        key = torch.zeros(1, 1, 16, 128, dtype=torch.float16, device=device)
+        query = torch.zeros(1, 2, 16, 128, dtype=dtype, device=device)
+        key = torch.zeros(1, 1, 16, 128, dtype=dtype, device=device)
         with warnings.catch_warnings():
             # A rejected kernel is reported through warnings before the raise.
             warnings.simplefilter("ignore")
@@ -58,8 +74,19 @@ def fused_kernel_accepts_gqa(torch: Any, device: Any) -> bool:
                 )
         return True
     except Exception as e:
-        logger.debug("GQA attention test call on %s raised: %s", device, e)
-        return False
+        if NO_KERNEL in str(e):
+            logger.debug(
+                "GQA attention test call in %s on %s raised: %s", dtype, device, e
+            )
+            return False
+        logger.info(
+            "GQA attention test call in %s on %s failed: %s; testing again at "
+            "the next load",
+            dtype,
+            device,
+            e,
+        )
+        return None
 
 
 def _model_device_index(torch: Any) -> int | None:
@@ -72,20 +99,15 @@ def _model_device_index(torch: Any) -> int | None:
     return None
 
 
-def expand_kv_heads_without_fused_gqa() -> str:
-    """Once per process, after a model load: if transformers is imported, the
-    load put memory on a CUDA/HIP device, and no fused kernel accepts GQA on
-    that device, patch `use_gqa_in_sdpa` to return False. Returns the decision
-    (the first call's, on every later call). Never creates a context; never
-    raises.
+def expand_kv_heads_without_fused_gqa() -> dict[str, str] | str:
+    """After a model load: if transformers is imported and the load put memory
+    on a CUDA/HIP device, make the GQA test call in each dtype not decided yet,
+    and install `_use_gqa_in_sdpa` once some dtype has no fused kernel.
+    Returns each dtype's decision, this load's or an earlier one's
+    ({"float16": FUSED, ...}), else NOT_APPLICABLE, or CHECK_FAILED when the
+    check raised. Never creates a context; never raises.
     """
-    global _decision
-    if _decision is None:
-        _decision = _check()
-    return _decision
-
-
-def _check() -> str:
+    global _transformers_use_gqa
     try:
         torch = sys.modules.get("torch")
         sdpa = sys.modules.get(SDPA_MODULE)
@@ -99,19 +121,37 @@ def _check() -> str:
         if index is None:
             return NOT_APPLICABLE
         device = torch.device("cuda", index)
+        expanded = []
+        record = {}
         # Kernel selection reads the current device's properties.
         with torch.cuda.device(index):
-            if fused_kernel_accepts_gqa(torch, device):
-                return FUSED
-        sdpa.use_gqa_in_sdpa = _never_gqa
-        logger.info(
-            "PyTorch %s has no fused attention kernel for grouped-query "
-            "attention on %s; expanding key/value heads before attention "
-            "instead (uses less GPU memory)",
+            for name in TEST_DTYPES:
+                dtype = getattr(torch, name)
+                if dtype not in _fused_gqa:
+                    accepts = fused_kernel_accepts_gqa(torch, device, dtype)
+                    if accepts is not None:
+                        _fused_gqa[dtype] = accepts
+                    if accepts is False:
+                        expanded.append(name)
+                fused = _fused_gqa.get(dtype)
+                record[name] = {True: FUSED, False: EXPANDED}.get(fused, CHECK_FAILED)
+        if not expanded:
+            return record
+        if sdpa.use_gqa_in_sdpa is not _use_gqa_in_sdpa:
+            _transformers_use_gqa = sdpa.use_gqa_in_sdpa
+            sdpa.use_gqa_in_sdpa = _use_gqa_in_sdpa
+        # fp32 alone is the common case: flash attention takes no fp32.
+        level = logging.DEBUG if expanded == ["float32"] else logging.INFO
+        logger.log(
+            level,
+            "PyTorch %s has no fused grouped-query attention kernel in %s on "
+            "%s; such calls expand their key/value heads first (uses less GPU "
+            "memory)",
             torch.__version__,
+            ", ".join(expanded),
             device,
         )
-        return PATCHED
+        return record
     except Exception as e:
         logger.warning("GQA attention check failed: %s", e, exc_info=True)
         return CHECK_FAILED

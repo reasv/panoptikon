@@ -8,10 +8,10 @@ impl VramLedger {
     ///
     /// The expected base is the larger of this run's measurement and the
     /// store's, else [`CONSERVATIVE_BASE_MB`]; the charge is clamped to the
-    /// headroom. `None` for an unknown GPU, a `none`-class model, or a model
-    /// known to put nothing on the device. A known base (or condemned working
-    /// set) above [`Self::refusal_room_locked`] refuses the load
-    /// ([`OversizedLoad`]).
+    /// headroom, except while macOS pages, when the headroom reads 0. `None`
+    /// for an unknown GPU, a `none`-class model, or a model known to put
+    /// nothing on the device. A known base (or condemned working set) above
+    /// [`Self::refusal_room_locked`] refuses the load ([`OversizedLoad`]).
     pub async fn reserve_load(
         self: &Arc<Self>,
         inference_id: &str,
@@ -117,7 +117,8 @@ impl VramLedger {
             };
         // Measure the GPU first: one with no resident has no reading yet.
         self.refresh_external_for_load(inference_id, gpu).await;
-        let (id, expected, reserved, headroom) = {
+        let pressure = self.memory_pressure();
+        let (id, expected, reserved, headroom, pressure_warning) = {
             let mut state = self.lock();
             Self::refresh_pools_locked(&mut state);
             // Re-read: a load may have finished while the lock was dropped.
@@ -163,8 +164,13 @@ impl VramLedger {
             }
             let expected = measured.unwrap_or(CONSERVATIVE_BASE_MB);
             let headroom = self.headroom_locked(&state, gpu);
-            // Charges plus reservations may not exceed the limit.
-            let reserved = expected.min(headroom);
+            // Charges plus reservations may not exceed the limit, except
+            // while macOS pages, when the headroom reads 0.
+            let reserved = if pressure.paging() {
+                expected
+            } else {
+                expected.min(headroom)
+            };
             let id = state.next_id();
             state
                 .gpus
@@ -172,8 +178,26 @@ impl VramLedger {
                 .expect("presence checked above")
                 .load_reservations
                 .insert(id, reserved);
-            (id, expected, reserved, headroom)
+            let pressure_warning = pressure != mps::MemoryPressure::Normal
+                && state.pressure_warned.insert(key.clone());
+            (id, expected, reserved, headroom, pressure_warning)
         };
+        if pressure_warning {
+            let message = if pressure.paging() {
+                "loading while macOS has no memory to spare: this model runs \
+                 smaller batches until the pressure eases"
+            } else {
+                "loading while macOS reports memory pressure: this model \
+                 runs no batch above its working size until the pressure is \
+                 back to normal"
+            };
+            tracing::warn!(
+                model = %inference_id,
+                gpu = %gpu,
+                memory_pressure = ?pressure,
+                "{message}"
+            );
+        }
         if reserved < expected {
             tracing::debug!(
                 model = %inference_id,
@@ -186,7 +210,9 @@ impl VramLedger {
             );
         }
         let exceeds_headroom = expected > headroom;
-        if exceeds_headroom {
+        // While macOS pages the headroom reads 0, not a VRAM shortage; the
+        // pressure line above says what happens.
+        if exceeds_headroom && !pressure.paging() {
             tracing::warn!(
                 model = %inference_id,
                 gpu = %gpu,

@@ -78,13 +78,14 @@ unit         = "item"                  # denormalized from metadata, for readabi
 aggregation  = "count"
 
 base_mb           = 4321               # load footprint, process-level
-base_method       = "nvml"             # nvml | fdinfo | mps | rss | free_delta |
-                                       # alloc_delta_measured | alloc_delta.
+base_method       = "nvml"             # nvml | kfd | fdinfo | mps | rss |
+                                       # free_delta | alloc_delta_measured |
+                                       # alloc_delta.
                                        # The two alloc_delta spellings are two
                                        # formulas: the measured one charges the
                                        # context this process measured across
                                        # its first CUDA init, the other the
-                                       # fixed 500 MiB estimate
+                                       # backend's fixed estimate
 base_platform     = "linux"            # optional: the platform base_mb was
                                        # measured on, when that is not this
                                        # row's own `platform`. Present only on
