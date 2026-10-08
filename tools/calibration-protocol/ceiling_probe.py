@@ -411,8 +411,9 @@ class Nvml:
 
 
 def ram_reserve_mb(total_mb: int) -> int:
-    """RAM the product's CPU device always keeps free (`cpu.rs`): a tenth of
-    `total_mb`, at most 16 GiB and at least 2 GiB, or a quarter under 8 GiB."""
+    """RAM the product's CPU device always keeps free: a tenth of `total_mb`,
+    at most 16 GiB and at least 2 GiB, or a quarter under 8 GiB."""
+    # Mirrors cpu.rs `ram_reserve_mb`.
     return min(max(total_mb // 10, min(2048, total_mb // 4)), 16384)
 
 
@@ -1081,7 +1082,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # process; no batch starts with free memory below the CPU device's reserve.
     ram_floor_mb = 0
     if rocm is not None and rocm.gpu.unified:
-        ram_mb = rocm_sysfs.meminfo_mb(rocm.roots, "MemTotal") or 0
+        ram_mb = rocm_sysfs.ram_total_mb(rocm.roots) or 0
         ram_floor_mb = ram_reserve_mb(ram_mb)
     ram_floor_stops: List[Dict[str, int]] = []
 
@@ -1177,12 +1178,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         return record
 
     for _ in range(max(0, args.warmup)):
+        if below_ram_floor(1):
+            break
         try:
             run_batch(1, -1)
         except Exception:
             break
 
     records: List[Dict[str, Any]] = []
+    sweep_stopped = False
     for count in batches:
         if below_ram_floor(count):
             break
@@ -1197,6 +1201,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             except Exception:
                 pass
         for repeat in range(args.repeats):
+            if repeat and below_ram_floor(count):
+                sweep_stopped = True
+                break
             record = run_batch(count, repeat)
             records.append(record)
             print(
@@ -1215,7 +1222,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             if not ran_whole_batch(record):
                 break
-        if records and not ran_whole_batch(records[-1]):
+        if sweep_stopped or (records and not ran_whole_batch(records[-1])):
             break
 
     whole = [record for record in records if ran_whole_batch(record)]
@@ -1271,8 +1278,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         low, high = 1, args.bisect_max
         # Grow first: double until something fails or the ceiling is hit.
         probe = max(1, args.bisect_start)
+        floor_stopped = False
         while probe <= args.bisect_max:
             if below_ram_floor(probe):
+                floor_stopped = True
                 break
             record = run_batch(probe, -2)
             bisect["trace"].append({"items": probe, "ok": ran_whole_batch(record),
@@ -1292,13 +1301,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 break
         else:
             high = args.bisect_max
-        while high - low > 1:
+        while not floor_stopped and high - low > 1:
             if args.bisect_budget > 0 and (
                     time.monotonic() - bisect_started > args.bisect_budget):
                 bisect["stopped_early"] = True
                 break
             mid = (low + high) // 2
             if below_ram_floor(mid):
+                floor_stopped = True
                 break
             record = run_batch(mid, -2)
             bisect["trace"].append({"items": mid, "ok": ran_whole_batch(record),
@@ -1314,6 +1324,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 high = mid
                 bisect[_boundary_key(record)] = mid
                 settle_after_failure()
+        if floor_stopped:
+            bisect["stopped_early"] = True
+            high = max((step["items"] for step in bisect["trace"]), default=None)
         bisect["low_items"] = low
         bisect["high_items"] = high
 

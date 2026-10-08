@@ -29,6 +29,7 @@ class Roots:
     pci_devices: str = "/sys/bus/pci/devices"
     dev_dri: str = "/dev/dri"
     proc: str = "/proc"
+    cgroup: str = "/sys/fs/cgroup"
 
 
 @dataclass(frozen=True)
@@ -153,6 +154,20 @@ def meminfo_mb(roots: Roots, key: str) -> Optional[int]:
         if name.strip() == key and len(fields) == 2 and fields[1] == "kB":
             return int(fields[0]) // 1024
     return None
+
+
+def ram_total_mb(roots: Roots) -> Optional[int]:
+    """`MemTotal` capped by this cgroup's memory limit, in MiB
+    (`cpu.rs::ram_total_mb`): v2's `memory.max`, else v1's
+    `memory.limit_in_bytes`."""
+    total = meminfo_mb(roots, "MemTotal")
+    if total is None:
+        return None
+    for name in ("memory.max", "memory/memory.limit_in_bytes"):
+        limit = (_read(os.path.join(roots.cgroup, name)) or "").strip()
+        if limit.isdigit():
+            return min(total, int(limit) // MIB)
+    return total
 
 
 def memory_mb(roots: Roots, gpu: Gpu) -> Optional[Tuple[int, int]]:
