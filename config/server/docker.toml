@@ -116,8 +116,8 @@ enabled = true
 # Docker Desktop); a set value applies as written.
 # The "CPU" device, a Mac's GPU and an AMD APU (all host RAM) always keep a
 # tenth of RAM free (at most 16 GiB; at least 2 GiB, or a quarter of RAM under
-# 8 GiB). A margin can raise that, never lower it: margin = 0 and
-# cap_fraction = 1.0 there still keep it.
+# 8 GiB). A margin can raise that, never lower it: even margin = 0 and a
+# cap_fraction of 1.0 there keep it.
 # GET /api/inference/health reports the rule in effect (`reserve_rule`).
 # margin = 0.10
 # Hard ceiling as a fraction of the GPU's total VRAM, for sharing one card
