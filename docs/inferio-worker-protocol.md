@@ -485,7 +485,9 @@ high-water and a freed page is already in the free reading; there the free
 reading counts only above `grant.ram_reserve_mb`
 (`spendable = free − reserve + pool`), so a batch cannot take the RAM the
 ledger left free. On a Mac the `"mps"` reading likewise counts RAM only above
-the reserve (`min(free, RAM available − reserve)`). Any other GPU worker's own
+the reserve, and RAM below it comes off the pool
+(`spendable = max(min(free, RAM available − reserve) + pool + held, 0)`), as
+the ledger's grant does. Any other GPU worker's own
 free reading is the device's and has no reserve taken from it; its host RAM is
 checked separately against `grant.ram_mb`, and a batch that check shrank
 reports `clamped.reason = "host_ram"`. Uncredited, the
