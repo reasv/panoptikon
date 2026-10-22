@@ -1,10 +1,14 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex;
 
 use crate::config::InferenceEndpointConfig;
-use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictResponse};
+use crate::inference_errors::InferenceEndpoint;
+use crate::inferio_client::{
+    InferenceApiClient, InferenceFailure, InferenceInput, PredictResponse, inference_failure,
+};
+use crate::log_throttle::LogThrottle;
 
 #[derive(Clone)]
 pub(crate) struct InferencePool {
@@ -38,6 +42,22 @@ impl InferencePool {
         })
     }
 
+    /// Whether every endpoint is known to multiplex requests (HTTP/2
+    /// cleartext). An unknown transport or an empty pool reads as `false`.
+    pub async fn requests_are_multiplexed(&self) -> bool {
+        let guard = self.state.lock().await;
+        let mut enabled = 0usize;
+        for endpoint in guard.endpoints.iter().filter(|e| e.weight > 0.0) {
+            enabled += 1;
+            match endpoint.client.known_transport() {
+                Some(transport) if transport.is_multiplexed() => {}
+                // One HTTP/1.1 endpoint puts the per-request socket cost back.
+                _ => return false,
+            }
+        }
+        enabled > 0
+    }
+
     pub async fn is_empty(&self) -> bool {
         let guard = self.state.lock().await;
         guard
@@ -48,9 +68,7 @@ impl InferencePool {
 
     /// Weighted round-robin with failover: when the selected endpoint fails
     /// (after the client's own HTTP retries), the request is retried on each
-    /// remaining endpoint before giving up — one endpoint being down costs
-    /// latency on its share of requests, not failed items (matching the
-    /// Python distributed client's shard retry).
+    /// remaining endpoint before giving up.
     #[allow(clippy::too_many_arguments)]
     pub async fn predict(
         &self,
@@ -84,13 +102,25 @@ impl InferencePool {
                 )
                 .await
             {
-                Ok(output) => return Ok(output),
+                Ok(output) => {
+                    // Per endpoint: the figure is about the endpoint that
+                    // published it. The job's `UnitBudget` reads the same header.
+                    if let Some(items) = output.desired_in_flight_items {
+                        client.observe_desired_in_flight(items);
+                    }
+                    return Ok(output);
+                }
                 Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        endpoint = idx,
-                        "inference endpoint failed, trying another"
-                    );
+                    static TRYING_ANOTHER: LazyLock<LogThrottle> = LazyLock::new(|| {
+                        LogThrottle::new("inference endpoint failures", tracing::Level::WARN)
+                    });
+                    if TRYING_ANOTHER.admit_for(&format!("{inference_id} endpoint {idx}")) {
+                        tracing::warn!(
+                            error = %err,
+                            endpoint = idx,
+                            "inference endpoint failed, trying another"
+                        );
+                    }
                     tried.push(idx);
                     last_err = Some(err);
                 }
@@ -118,11 +148,12 @@ impl InferencePool {
         if clients.is_empty() {
             bail!("no inference endpoints available");
         }
-        // Partial availability is fine (like Python's _all_or_ignore):
-        // endpoints that failed the explicit load lazy-load on predict, and
-        // predict fails over past endpoints that are down entirely.
+        // Partial availability is fine: failed endpoints lazy-load on predict.
         let total = clients.len();
-        let mut last_err = None;
+        // Keep the most informative error, not the last: a typed load-failure
+        // cooldown must not be overwritten by a plain 500. Ties go to the last.
+        let mut kept: Option<anyhow::Error> = None;
+        let mut kept_is_cooldown = false;
         let mut failed = 0usize;
         for (idx, client) in clients.into_iter().enumerate() {
             if let Err(err) = client
@@ -136,14 +167,19 @@ impl InferencePool {
                     "failed to load model on inference endpoint"
                 );
                 failed += 1;
-                last_err = Some(err);
+                let is_cooldown =
+                    inference_failure(&err).is_some_and(InferenceFailure::is_load_cooldown);
+                if is_cooldown || !kept_is_cooldown {
+                    kept_is_cooldown = is_cooldown;
+                    kept = Some(err.context(InferenceEndpoint(client.base_url().to_owned())));
+                }
             }
         }
         if failed == total {
-            return Err(last_err
+            return Err(kept
                 .unwrap_or_else(|| anyhow!("model load failed on all inference endpoints"))
                 .context(format!(
-                    "model load failed on all {total} inference endpoints"
+                    "model {inference_id} failed to load on all {total} inference endpoints"
                 )));
         }
         Ok(())
@@ -223,4 +259,120 @@ pub(crate) fn job_inference_context() -> &'static JobInferenceContext {
 /// endpoint exists).
 pub(crate) fn try_job_inference_context() -> Option<&'static JobInferenceContext> {
     JOB_INFERENCE_CONTEXT.get()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::InferenceEndpointConfig;
+    use axum::http::StatusCode;
+    use axum::routing::put;
+    use axum::{Json, Router};
+
+    /// The error the pool keeps names the endpoint it came from, so a 403
+    /// from the second endpoint is reported against that endpoint.
+    #[tokio::test]
+    async fn a_kept_load_error_names_its_endpoint() {
+        async fn spawn(status: StatusCode) -> String {
+            let app = Router::new().fallback(move || async move { status });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            format!("http://{addr}")
+        }
+        let broken = spawn(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let refusing = spawn(StatusCode::FORBIDDEN).await;
+        let pool = InferencePool::new(
+            [&broken, &refusing]
+                .map(|base_url| InferenceEndpointConfig {
+                    base_url: base_url.clone(),
+                    weight: 1.0,
+                    use_for_jobs: true,
+                })
+                .to_vec(),
+        )
+        .expect("pool builds");
+
+        let err = pool
+            .load_model_all("group/model-a", "key", 10, -1, None)
+            .await
+            .expect_err("both endpoints refuse the load");
+        let message = crate::inference_errors::upstream_message(&err, "http://primary:1")
+            .expect("the kept error is the 403");
+        assert!(
+            message.starts_with(&format!(
+                "The inference server at {refusing} refused the request (403)"
+            )),
+            "{message}"
+        );
+    }
+
+    /// When every endpoint fails, the job keeps the most informative error
+    /// (a typed load-failure cooldown), not the last one (a plain 500). The
+    /// cooldown comes from the endpoint asked first, so the two rules differ.
+    #[tokio::test]
+    async fn a_cooldown_survives_a_plainer_failure_on_another_endpoint() {
+        async fn spawn(handler: Router) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, handler).await.unwrap();
+            });
+            format!("http://{addr}")
+        }
+
+        let cooling = spawn(Router::new().route(
+            "/api/inference/load/{group}/{id}",
+            put(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"detail": {
+                        "kind": "load_cooldown",
+                        "message": "model is in a load-failure cooldown",
+                        "model": "group/model-a",
+                        "failures": 3,
+                        "retry_at": "2026-09-04T12:00:00Z",
+                        "last_error": "CUDA out of memory",
+                    }})),
+                )
+            }),
+        ))
+        .await;
+        let broken = spawn(Router::new().route(
+            "/api/inference/load/{group}/{id}",
+            put(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        ))
+        .await;
+
+        let pool = InferencePool::new(vec![
+            InferenceEndpointConfig {
+                base_url: cooling,
+                weight: 1.0,
+                use_for_jobs: true,
+            },
+            InferenceEndpointConfig {
+                base_url: broken,
+                weight: 1.0,
+                use_for_jobs: true,
+            },
+        ])
+        .expect("pool builds");
+
+        let err = pool
+            .load_model_all("group/model-a", "key", 10, -1, None)
+            .await
+            .expect_err("both endpoints refuse the load");
+        let failure = inference_failure(&err).expect("the typed cooldown survives the pool");
+        assert!(failure.is_load_cooldown());
+        assert_eq!(failure.model.as_deref(), Some("group/model-a"));
+        assert_eq!(failure.failures, Some(3));
+        assert_eq!(failure.retry_at.as_deref(), Some("2026-09-04T12:00:00Z"));
+        assert_eq!(failure.last_error.as_deref(), Some("CUDA out of memory"));
+        assert!(
+            format!("{err}").contains("group/model-a"),
+            "and the context names the model: {err}"
+        );
+    }
 }

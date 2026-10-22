@@ -652,7 +652,8 @@ fn extract_video_frames_into(
     args.push(path.into());
     args.push("-vf".into());
     args.push(format!("fps=1/{interval}").into());
-    args.push("-vsync".into());
+    // `-fps_mode`: ffmpeg 9 removed `-vsync`; all bundled toolchains have it.
+    args.push("-fps_mode".into());
     args.push("vfr".into());
     args.push(output_pattern.clone().into());
     // The retry wrapper, not a bare spawn: the decode clamp above is an

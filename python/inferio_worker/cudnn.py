@@ -5,7 +5,12 @@ the `inferio` package. Registers runtime library directories for the current
 process before the impl class is instantiated:
 
 - Windows: `os.add_dll_directory` (PATH prepend as fallback / for children).
-- Linux: prepends LD_LIBRARY_PATH and PATH for the current process.
+- Linux: prepends PATH for child processes, and *checks* the loader path.
+
+On Linux `ld.so` reads `LD_LIBRARY_PATH` only at process start, so the host
+sets it in the spawn environment (`accelerator_env::worker_env`) and this
+module only warns when the NVIDIA dirs are missing. Torch finds them through
+RPATH; CTranslate2 (`faster_whisper`) aborts on load without them.
 
 All failures are non-fatal; the worker proceeds with a warning.
 """
@@ -96,6 +101,37 @@ def _torch_lib_dir() -> Path | None:
     return p if p.exists() else None
 
 
+_warned_about_loader_path = False
+
+
+def _warn_if_not_on_loader_path(dirs: list[Path]) -> None:
+    """Warn once when the NVIDIA wheel `dirs` are not on `LD_LIBRARY_PATH`."""
+    global _warned_about_loader_path
+    if _warned_about_loader_path or not dirs:
+        return
+    current = {
+        os.path.realpath(entry)
+        for entry in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+        if entry
+    }
+    missing = [p for p in dirs if os.path.realpath(p) not in current]
+    if not missing:
+        return
+    _warned_about_loader_path = True
+    logger.warning(
+        "LD_LIBRARY_PATH is missing %d NVIDIA runtime director%s this "
+        "interpreter ships (%s). The dynamic loader read that variable "
+        "before this process started, so it cannot be fixed from here: it "
+        "belongs in the environment the worker is spawned with. Impls that "
+        "find their CUDA libraries through RPATH (torch, and so most of the "
+        "registry) are unaffected; one that does not (CTranslate2, i.e. "
+        "faster_whisper) will abort this process on load.",
+        len(missing),
+        "y" if len(missing) == 1 else "ies",
+        os.pathsep.join(str(p) for p in missing),
+    )
+
+
 def _add_cudnn_to_path() -> None:
     system = platform.system().lower()
 
@@ -132,10 +168,13 @@ def _add_cudnn_to_path() -> None:
         for p in dirs:
             _prepend_env("PATH", str(p))
     else:
-        for p in dirs:
-            _prepend_env("LD_LIBRARY_PATH", str(p))
+        # PATH only, for child processes; see the module docstring.
         for p in dirs:
             _prepend_env("PATH", str(p))
+        if system == "linux":
+            _warn_if_not_on_loader_path(
+                cudnn_dirs + cublas_dirs + cuda_runtime_dirs
+            )
 
     # Legacy compatibility only; harmless when using pip wheels.
     legacy_root = _project_root() / "cudnn"

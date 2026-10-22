@@ -14,8 +14,8 @@
 //!    Intel XPU); add an [`Accelerator`] variant when the managed venv gains
 //!    a matching extra.
 //!
-//! **Warnings:** only when a *GPU* backend is selected but no device name is
-//! found. **CPU is never a warning** — it is reported as using CPU.
+//! **Warnings:** only when a backend with a driver stack to probe is selected
+//! and no device name is found. **CPU and MPS are never a warning.**
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -80,6 +80,8 @@ pub struct AcceleratorReport {
     pub backend_source: BackendSource,
     pub stacks: Vec<GpuStackPresence>,
     pub warnings: Vec<String>,
+    /// This process runs under WSL2.
+    pub under_wsl: bool,
 }
 
 impl AcceleratorReport {
@@ -105,13 +107,18 @@ impl AcceleratorReport {
 
         if is_gpu_backend(self.backend) {
             let devices = self.selected_devices();
-            if devices.is_empty() {
-                lines.push("GPU devices: (none detected)".into());
-            } else {
+            if !devices.is_empty() {
                 lines.push("GPU devices:".into());
                 for d in devices {
                     lines.push(format!("  - [{}] {}", d.stack, d.label()));
                 }
+            } else if stack_id_for_backend(self.backend).is_none() {
+                // Metal is part of macOS; no vendor tool names the device.
+                lines.push("GPU device: the one this OS provides".into());
+            } else if self.backend == Accelerator::Rocm && self.under_wsl {
+                lines.push(crate::inferio::gpu::ROCM_UNDER_WSL.into());
+            } else {
+                lines.push("GPU devices: (none detected)".into());
             }
         } else {
             // CPU is a normal outcome — never a warning.
@@ -133,9 +140,10 @@ impl AcceleratorReport {
     }
 }
 
-/// Whether this backend is a GPU stack (may warn if devices are missing).
+/// Whether this backend runs the model on a GPU (MPS included, though it has
+/// no driver stack to probe: [`stack_id_for_backend`]).
 pub fn is_gpu_backend(a: Accelerator) -> bool {
-    matches!(a, Accelerator::Cuda | Accelerator::Rocm)
+    matches!(a, Accelerator::Cuda | Accelerator::Rocm | Accelerator::Mps)
     // | Accelerator::Xpu
 }
 
@@ -145,7 +153,8 @@ pub fn stack_id_for_backend(a: Accelerator) -> Option<&'static str> {
         Accelerator::Cuda => Some("nvidia"),
         Accelerator::Rocm => Some("amd-rocm"),
         // Accelerator::Xpu => Some("intel-xpu"),
-        Accelerator::Cpu | Accelerator::Auto => None,
+        // MPS has no driver stack to probe: Metal is part of the OS.
+        Accelerator::Cpu | Accelerator::Mps | Accelerator::Auto => None,
     }
 }
 
@@ -156,6 +165,7 @@ pub fn accelerator_slug(a: Accelerator) -> &'static str {
         Accelerator::Cuda => "cuda",
         Accelerator::Rocm => "rocm",
         Accelerator::Cpu => "cpu",
+        Accelerator::Mps => "mps",
         // Accelerator::Xpu => "xpu",
     }
 }
@@ -195,18 +205,27 @@ pub fn resolve_backend_from(
 pub fn build_report(settings: &Settings) -> AcceleratorReport {
     let (backend, backend_source) =
         resolve_backend(settings.inference_local.python_env.accelerator);
-    assemble_report(backend, backend_source, probe_gpu_stacks())
+    assemble_report(
+        backend,
+        backend_source,
+        probe_gpu_stacks(backend),
+        crate::inferio::gpu::under_wsl(),
+    )
 }
 
-/// Pure assembly of warnings + device list (unit-tested).
+/// Pure assembly of warnings + device list (unit-tested). Under WSL a ROCm
+/// GPU has no name to read, so its absence is not warned about.
 pub fn assemble_report(
     backend: Accelerator,
     backend_source: BackendSource,
     stacks: Vec<GpuStackPresence>,
+    under_wsl: bool,
 ) -> AcceleratorReport {
     let mut warnings = Vec::new();
 
-    if let Some(stack_id) = stack_id_for_backend(backend) {
+    if let Some(stack_id) = stack_id_for_backend(backend)
+        && !(backend == Accelerator::Rocm && under_wsl)
+    {
         let named = stacks
             .iter()
             .filter(|s| s.stack == stack_id)
@@ -225,6 +244,7 @@ pub fn assemble_report(
         backend_source,
         stacks,
         warnings,
+        under_wsl,
     }
 }
 
@@ -264,6 +284,30 @@ pub fn log_report(settings: &Settings) {
     for w in &report.warnings {
         tracing::warn!("{w}");
     }
+    if report.backend != Accelerator::Cpu || report.backend_source != BackendSource::InstalledVenv {
+        return;
+    }
+    let configured = settings.inference_local.python_env.accelerator;
+    if let Ok((target, evidence)) = resolve_accelerator(configured)
+        && cpu_venv_beside(&report, target)
+    {
+        let slug = accelerator_slug(target);
+        tracing::info!(
+            backend = slug,
+            evidence,
+            "the managed venv holds the CPU build of torch, but this host can \
+             use {slug}; run `panoptikon setup --accelerator {slug}` to install \
+             it (in Docker, use the {slug} image)"
+        );
+    }
+}
+
+/// The managed venv holds the CPU build of torch while the config resolves
+/// to a GPU backend.
+fn cpu_venv_beside(report: &AcceleratorReport, target: Accelerator) -> bool {
+    report.backend == Accelerator::Cpu
+        && report.backend_source == BackendSource::InstalledVenv
+        && target != Accelerator::Cpu
 }
 
 /// Print to stdout (`panoptikon accelerator`).
@@ -273,15 +317,16 @@ pub fn print_report(settings: &Settings) {
 
 // --- GPU stack probes (append new stacks to the list) -------------------------
 
-type StackProbeFn = fn() -> Option<GpuStackPresence>;
+/// Takes the resolved backend.
+type StackProbeFn = fn(Accelerator) -> Option<GpuStackPresence>;
 
 const GPU_STACK_PROBES: &[StackProbeFn] = &[probe_nvidia_stack, probe_amd_rocm_stack];
 
-fn probe_gpu_stacks() -> Vec<GpuStackPresence> {
-    GPU_STACK_PROBES.iter().filter_map(|p| p()).collect()
+fn probe_gpu_stacks(backend: Accelerator) -> Vec<GpuStackPresence> {
+    GPU_STACK_PROBES.iter().filter_map(|p| p(backend)).collect()
 }
 
-fn probe_nvidia_stack() -> Option<GpuStackPresence> {
+fn probe_nvidia_stack(_backend: Accelerator) -> Option<GpuStackPresence> {
     let mut evidence = Vec::new();
     if which("nvidia-smi").is_some() {
         evidence.push("nvidia-smi on PATH");
@@ -311,10 +356,13 @@ fn probe_nvidia_stack() -> Option<GpuStackPresence> {
     })
 }
 
-fn probe_amd_rocm_stack() -> Option<GpuStackPresence> {
+fn probe_amd_rocm_stack(backend: Accelerator) -> Option<GpuStackPresence> {
     if !cfg!(target_os = "linux") {
         return None;
     }
+    // Opening the devices can resume a suspended GPU: only on a ROCm backend.
+    let check_access = backend == Accelerator::Rocm;
+    let kfd_gpus = crate::inferio::gpu::rocm_topology_gpus(check_access);
     let mut evidence = Vec::new();
     if std::path::Path::new("/opt/rocm").is_dir() {
         evidence.push("/opt/rocm exists");
@@ -325,22 +373,36 @@ fn probe_amd_rocm_stack() -> Option<GpuStackPresence> {
     if which("rocminfo").is_some() {
         evidence.push("rocminfo on PATH");
     }
+    if !kfd_gpus.is_empty() {
+        evidence.push("KFD topology lists a GPU");
+    }
     if evidence.is_empty() {
         return None;
     }
     Some(GpuStackPresence {
         stack: "amd-rocm",
         backend: Accelerator::Rocm,
-        devices: amd_device_names()
-            .into_iter()
-            .map(|name| GpuDevice {
-                stack: "amd-rocm",
-                name,
-                compute_cap: None,
-            })
-            .collect(),
+        devices: amd_devices(&kfd_gpus, check_access),
         evidence: evidence.join("; "),
     })
+}
+
+/// One device per KFD GPU node, named by ISA as the GPU inventory names it;
+/// a GPU this process cannot open, which the inventory leaves out, says so
+/// when `check_access` is set.
+fn amd_devices(kfd_gpus: &[(String, bool)], check_access: bool) -> Vec<GpuDevice> {
+    kfd_gpus
+        .iter()
+        .map(|(gfx, openable)| GpuDevice {
+            stack: "amd-rocm",
+            name: if *openable || !check_access {
+                format!("AMD {gfx}")
+            } else {
+                format!("AMD {gfx} (not openable by this process)")
+            },
+            compute_cap: None,
+        })
+        .collect()
 }
 
 fn nvidia_devices() -> Vec<GpuDevice> {
@@ -393,97 +455,6 @@ fn parse_nvidia_query_lines(text: &str) -> Vec<GpuDevice> {
         .collect()
 }
 
-fn amd_device_names() -> Vec<String> {
-    if let Some(names) = rocm_smi_product_names()
-        && !names.is_empty()
-    {
-        return names;
-    }
-    rocminfo_marketing_names()
-}
-
-fn rocm_smi_product_names() -> Option<Vec<String>> {
-    let bin = which("rocm-smi")?;
-    let output = Command::new(bin)
-        .args(["--showproductname"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut names = Vec::new();
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        for key in ["card series:", "card model:"] {
-            if let Some(idx) = lower.find(key) {
-                let v = line[idx + key.len()..].trim();
-                if !v.is_empty() {
-                    names.push(v.to_string());
-                }
-            }
-        }
-    }
-    Some(names)
-}
-
-fn rocminfo_marketing_names() -> Vec<String> {
-    let Some(bin) = which("rocminfo") else {
-        return Vec::new();
-    };
-    let output = match Command::new(bin).output() {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-    parse_rocminfo_gpu_marketing_names(&String::from_utf8_lossy(&output.stdout))
-}
-
-/// Collect marketing names only for **GPU** agents.
-///
-/// `rocminfo` prints a `Marketing Name` for every HSA agent, including the
-/// host CPU (usually listed first). Naively taking every Marketing Name line
-/// reports "CPU then GPU" under the ROCm stack even when only the GPU is used
-/// for inference. Fields may appear in either order within an agent block;
-/// agent blocks are separated by lines of asterisks.
-fn parse_rocminfo_gpu_marketing_names(text: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut marketing: Option<String> = None;
-    let mut device_type: Option<String> = None;
-
-    let flush = |marketing: &mut Option<String>,
-                 device_type: &mut Option<String>,
-                 names: &mut Vec<String>| {
-        let name = marketing.take();
-        let dtype = device_type.take();
-        if let (Some(name), Some(dtype)) = (name, dtype)
-            && dtype.eq_ignore_ascii_case("GPU")
-            && !name.is_empty()
-            && !name.eq_ignore_ascii_case("N/A")
-        {
-            names.push(name);
-        }
-    };
-
-    for line in text.lines() {
-        let t = line.trim();
-        // Agent separator: "*******" (rocminfo) between Agent blocks.
-        if !t.is_empty() && t.chars().all(|c| c == '*') {
-            flush(&mut marketing, &mut device_type, &mut names);
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix("Marketing Name:") {
-            marketing = Some(rest.trim().to_string());
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix("Device Type:") {
-            device_type = Some(rest.trim().to_string());
-            continue;
-        }
-    }
-    flush(&mut marketing, &mut device_type, &mut names);
-    names
-}
-
 fn which(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths).find_map(|dir| {
@@ -500,6 +471,7 @@ fn which(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inferio::gpu::ROCM_UNDER_WSL;
 
     fn empty_stacks() -> Vec<GpuStackPresence> {
         Vec::new()
@@ -523,6 +495,7 @@ mod tests {
         assert_eq!(accelerator_slug(Accelerator::Cpu), "cpu");
         assert_eq!(accelerator_slug(Accelerator::Cuda), "cuda");
         assert_eq!(accelerator_slug(Accelerator::Rocm), "rocm");
+        assert_eq!(accelerator_slug(Accelerator::Mps), "mps");
         assert_eq!(accelerator_slug(Accelerator::Auto), "auto");
     }
 
@@ -534,6 +507,7 @@ mod tests {
                 evidence: "no NVIDIA or ROCm evidence found".into(),
             },
             empty_stacks(),
+            false,
         );
         let text = report.format_text();
         assert!(text.contains("accelerator backend: cpu"), "{text}");
@@ -554,6 +528,7 @@ mod tests {
                 evidence: "explicitly configured".into(),
             },
             nvidia_named(),
+            false,
         );
         let text = report.format_text();
         assert!(text.contains("backend: cuda"), "{text}");
@@ -567,11 +542,7 @@ mod tests {
             GpuStackPresence {
                 stack: "amd-rocm",
                 backend: Accelerator::Rocm,
-                devices: vec![GpuDevice {
-                    stack: "amd-rocm",
-                    name: "Radeon RX 7900 XTX".into(),
-                    compute_cap: None,
-                }],
+                devices: amd_devices(&[("gfx1100".into(), true), ("gfx1030".into(), false)], true),
                 evidence: "test".into(),
             },
             // Unrelated stack should not appear under selected ROCm devices.
@@ -586,13 +557,26 @@ mod tests {
                 evidence: "test".into(),
             },
         ];
-        let report = assemble_report(Accelerator::Rocm, BackendSource::InstalledVenv, stacks);
+        let report = assemble_report(
+            Accelerator::Rocm,
+            BackendSource::InstalledVenv,
+            stacks,
+            false,
+        );
         let text = report.format_text();
         assert!(text.contains("backend: rocm"), "{text}");
-        assert!(text.contains("[amd-rocm] Radeon RX 7900 XTX"), "{text}");
+        assert!(text.contains("[amd-rocm] AMD gfx1100\n"), "{text}");
+        assert!(
+            text.contains("[amd-rocm] AMD gfx1030 (not openable by this process)"),
+            "{text}"
+        );
         assert!(!text.contains("Should Not Appear"), "{text}");
         assert!(!text.contains("using CPU"), "{text}");
         assert!(report.warnings.is_empty());
+        assert_eq!(
+            amd_devices(&[("gfx1030".into(), false)], false)[0].name,
+            "AMD gfx1030"
+        );
     }
 
     #[test]
@@ -601,11 +585,13 @@ mod tests {
             Accelerator::Cuda,
             BackendSource::InstalledVenv,
             empty_stacks(),
+            true,
         );
         assert_eq!(report.backend, Accelerator::Cuda);
         assert_eq!(report.warnings.len(), 1);
         assert!(report.warnings[0].contains("cuda"));
         assert!(report.format_text().contains("warning:"));
+        assert!(!report.format_text().contains(ROCM_UNDER_WSL));
     }
 
     #[test]
@@ -614,9 +600,19 @@ mod tests {
             Accelerator::Rocm,
             BackendSource::InstalledVenv,
             empty_stacks(),
+            false,
         );
         assert_eq!(report.backend, Accelerator::Rocm);
         assert!(report.warnings.iter().any(|w| w.contains("rocm")));
+        assert!(!report.format_text().contains(ROCM_UNDER_WSL));
+        let wsl = assemble_report(
+            Accelerator::Rocm,
+            BackendSource::InstalledVenv,
+            empty_stacks(),
+            true,
+        );
+        assert!(wsl.warnings.is_empty());
+        assert!(wsl.format_text().contains(ROCM_UNDER_WSL));
     }
 
     #[test]
@@ -627,6 +623,7 @@ mod tests {
                 evidence: "explicitly configured".into(),
             },
             nvidia_named(),
+            false,
         );
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
         let text = report.format_text();
@@ -677,87 +674,55 @@ mod tests {
         assert_eq!(stack_id_for_backend(Accelerator::Cuda), Some("nvidia"));
         assert_eq!(stack_id_for_backend(Accelerator::Rocm), Some("amd-rocm"));
         assert_eq!(stack_id_for_backend(Accelerator::Cpu), None);
+        assert_eq!(stack_id_for_backend(Accelerator::Mps), None);
         assert!(!is_gpu_backend(Accelerator::Cpu));
         assert!(is_gpu_backend(Accelerator::Cuda));
+        assert!(
+            is_gpu_backend(Accelerator::Mps),
+            "a GPU with no stack to probe"
+        );
     }
 
-    /// Minimal rocminfo-shaped output: CPU agent first, then GPU (real tools
-    /// list both Marketing Names; we must keep only Device Type GPU).
+    /// Only a CPU build from the venv sentinel beside a GPU target is reported.
     #[test]
-    fn rocminfo_skips_cpu_agent_marketing_name() {
-        let sample = r#"
-ROCm System Management Interface
-===============================
-*******                      
-Agent 1                      
-*******                      
-  Name:                    AMD Ryzen 9 7950X 16-Core Processor
-  Uuid:                    CPU-XX                             
-  Marketing Name:          AMD Ryzen 9 7950X 16-Core Processor
-  Vendor Name:             CPU                                
-  Feature:                 None specified                     
-  Profile:                 FULL_PROFILE                       
-  Float Round Mode:        NEAR                               
-  Max Queue Number:         0(0x0)                             
-  Queue Min Size:           0(0x0)                             
-  Queue Max Size:           0(0x0)                             
-  Queue Type:              MULTI                              
-  Node:                    0                                  
-  Device Type:             CPU                                
-*******                      
-Agent 2                      
-*******                      
-  Name:                    gfx1100                            
-  Uuid:                    GPU-XX                             
-  Marketing Name:          Radeon RX 7900 XTX                 
-  Vendor Name:             AMD                                
-  Feature:                 KERNEL_DISPATCH                    
-  Profile:                 BASE_PROFILE                       
-  Float Round Mode:        NEAR                               
-  Max Queue Number:         128(0x80)                          
-  Queue Min Size:           64(0x40)                           
-  Queue Max Size:           131072(0x20000)                    
-  Queue Type:              MULTI                              
-  Node:                    1                                  
-  Device Type:             GPU                                
-"#;
-        let names = parse_rocminfo_gpu_marketing_names(sample);
-        assert_eq!(names, vec!["Radeon RX 7900 XTX".to_string()]);
+    fn a_cpu_venv_beside_a_gpu_backend_is_reported() {
+        use Accelerator::{Cpu, Rocm};
+        let venv = BackendSource::InstalledVenv;
+        let probed = BackendSource::ConfigOrProbe {
+            evidence: String::new(),
+        };
+        // (backend, its source, resolved target) -> reported.
+        let cases = [
+            (Cpu, &venv, Rocm, true),
+            (Cpu, &venv, Cpu, false),
+            (Cpu, &probed, Rocm, false),
+            (Rocm, &venv, Rocm, false),
+        ];
+        for (backend, source, target, expected) in cases {
+            let report = assemble_report(backend, source.clone(), empty_stacks(), false);
+            let found = cpu_venv_beside(&report, target);
+            assert_eq!(found, expected, "{backend:?} {source:?} {target:?}");
+        }
     }
 
-    /// Device Type may appear before Marketing Name within an agent block.
+    /// An Apple Silicon host is not a CPU host, and the absence of a vendor
+    /// tool that could name its device is not a missing driver.
     #[test]
-    fn rocminfo_accepts_device_type_before_marketing_name() {
-        let sample = r#"
-*******
-Agent 1
-*******
-  Device Type:             GPU
-  Marketing Name:          Radeon RX 6800 XT
-*******
-Agent 2
-*******
-  Device Type:             CPU
-  Marketing Name:          Some CPU
-"#;
-        let names = parse_rocminfo_gpu_marketing_names(sample);
-        assert_eq!(names, vec!["Radeon RX 6800 XT".to_string()]);
-    }
-
-    #[test]
-    fn rocminfo_drops_na_and_empty_gpu_names() {
-        let sample = r#"
-*******
-  Device Type:             GPU
-  Marketing Name:          N/A
-*******
-  Marketing Name:          
-  Device Type:             GPU
-*******
-  Marketing Name:          Real GPU
-  Device Type:             GPU
-"#;
-        let names = parse_rocminfo_gpu_marketing_names(sample);
-        assert_eq!(names, vec!["Real GPU".to_string()]);
+    fn format_text_mps_is_not_reported_as_cpu() {
+        let report = assemble_report(
+            Accelerator::Mps,
+            BackendSource::InstalledVenv,
+            empty_stacks(),
+            false,
+        );
+        let text = report.format_text();
+        assert!(text.contains("accelerator backend: mps"), "{text}");
+        assert!(
+            text.contains("GPU device: the one this OS provides"),
+            "{text}"
+        );
+        assert!(!text.contains("using CPU"), "{text}");
+        assert!(!text.contains("none detected"), "{text}");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 }

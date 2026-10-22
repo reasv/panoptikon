@@ -143,6 +143,10 @@ nix build .#panoptikon   # from a checkout (development)
 
 - **Git**
 - **A Rust toolchain** (stable, via [rustup](https://rustup.rs/))
+- **On Linux: OpenSSL development headers** (`libssl-dev` on Debian/Ubuntu,
+  `openssl-devel` on Fedora/RHEL, `openssl` on Arch) — `native-tls` builds
+  `openssl-sys` against the system OpenSSL, and without them the build fails
+  with "Could not find directory of OpenSSL installation"
 
 That's it — you do **not** need to install Python, uv, or Node.js.
 `panoptikon setup` (below) finds or downloads [uv](https://docs.astral.sh/uv/),
@@ -177,9 +181,12 @@ runs on the Node.js runtime bundled inside that same environment.
    detects your accelerator, creates `python/.venv`, and installs the locked
    dependency set for it. Accelerator selection is automatic — **CUDA** when
    an NVIDIA driver is present, **ROCm** on Linux with ROCm 7.2.x (pytorch.org
-   multi-arch `rocm7.2` wheels), otherwise **CPU**; macOS always gets PyPI wheels
-   (which include MPS support on Apple Silicon). Override it with
-   `--accelerator cuda|rocm|cpu` or pin it in the config
+   multi-arch `rocm7.2` wheels), **MPS** on Apple Silicon, otherwise **CPU**.
+   (macOS always gets the default PyPI wheels either way — `mps` and `cpu`
+   install exactly the same torch there; the difference is that `mps` runs and
+   prices work on the Metal device, and an explicit `accelerator = "cpu"` is
+   the one way to make an Apple Silicon host run unaccelerated.) Override it
+   with `--accelerator cuda|rocm|mps|cpu` or pin it in the config
    (`[inference_local.python_env] accelerator`). `--force` recreates the
    venv from scratch; re-running without it is a fast no-op.
 
@@ -247,18 +254,102 @@ Then open http://127.0.0.1:6342.
   data folder at the same time** — both would schedule cron and extraction
   jobs.
 
-### Running inference on a separate machine
+### Remote inference
 
-A machine that only lends its GPU can run the standalone inference service:
+A machine that only lends its GPU can run the standalone inference service,
+and other Panoptikon instances (gateways) send it their inference work:
 
 ```bash
 target/release/panoptikon inferio
 ```
 
-This serves only the inference API (`/api/inference/*`). Point other
-Panoptikon instances at it with an `[[upstreams.inference]]` entry in their
-config — see the configuration reference in
-[`panoptikon/README.md`](panoptikon/README.md).
+This serves only the inference API (`/api/inference/*`). Run the same
+Panoptikon version on the gateway and the inference server.
+
+**Inference server.** The shipped `config/server/default.toml` listens on
+`127.0.0.1` and its policies only allow `localhost`, so a gateway on another
+machine cannot connect, or is refused with a 403. Set these keys in its
+existing `[server]` table:
+
+```toml
+host = "0.0.0.0"                 # or the LAN IP; 127.0.0.1 is unreachable from the LAN
+port = 7777
+trust_forwarded_headers = false
+```
+
+and append this policy at the end of the file (the shipped `localhost`
+policy can stay):
+
+```toml
+[[policies]]
+name = "lan"
+ruleset = "allow_all"
+[policies.match]
+hosts = ["192.168.1.16"]         # the name/IP the gateway puts in its inference base_url
+[policies.index_db]
+default = "default"
+allow = "*"
+[policies.user_data_db]
+default = "default"
+allow = "*"
+```
+
+`hosts` matches the host the request was sent to, not the client's address.
+To allow every request that reaches the server's listener instead, use
+`endpoints = ["default"]` in place of `hosts`. `trust_forwarded_headers =
+true` trusts `X-Forwarded-Host` from any client that can reach the port, so
+only enable it behind a reverse proxy you control.
+
+**Gateway.** Set `enabled = false` in its existing `[inference_local]`
+table, and point it at the server:
+
+```toml
+[[upstreams.inference]]
+base_url = "http://192.168.1.16:7777"
+```
+
+**TLS in front of the server.** A reverse proxy that offers HTTP/2 through
+ALPN or only HTTP/1.1 both work. For a self-signed certificate or a private
+CA, the gateway must trust the issuing CA:
+
+- Linux: start the gateway with `SSL_CERT_FILE=/path/to/ca.pem`. The file
+  must contain the issuing CA; it replaces only the CA bundle file, and the
+  system certificate directory (such as `/etc/ssl/certs`) is still read.
+- Windows: import the CA into the Windows certificate store (Trusted Root
+  Certification Authorities). `SSL_CERT_FILE` has no effect.
+- macOS: add the CA to the Keychain and mark it trusted. `SSL_CERT_FILE` has
+  no effect.
+
+The proxy must pass the `Host` the server's policy matches (Caddy does by
+default; nginx needs `proxy_set_header Host $host;`).
+
+A single inference request can be about 1 GiB (one very large input, such
+as long audio, is sent alone and can be larger). Raise the proxy's body
+limit accordingly, or items fail with 413 on every run: nginx's default
+`client_max_body_size` is 1 MiB, so set `client_max_body_size 0;` (no
+limit) or `2g`; Caddy has no limit unless a `request_body { max_size … }`
+is set. A request can also wait minutes for its answer while the server is
+busy, and nginx's 60 s `proxy_read_timeout` then answers 504: set
+`proxy_read_timeout` and `proxy_send_timeout` to a large value such as
+`1h`.
+
+A server that stops answering (a frozen process) is noticed through the
+proxy too: once a request has waited 30 s, the gateway checks the server's
+`/api/inference/health`, and after two checks go unanswered (about 50 s) it
+fails the waiting requests and the new ones until the server answers again.
+A running job then ends `partial`, or `failed` if no item had succeeded;
+either way its items are owed, and the next run retries them.
+
+The check goes through the proxy on a connection of its own, over HTTP/2 or
+HTTP/1.1 as the requests are. A proxy that caps its connections to the
+server (HAProxy `maxconn`, nginx `max_conns`) can queue the check behind
+predictions until it times out, and then a busy server is taken for frozen.
+Raise the cap well above the requests the gateway keeps in flight, or exempt
+`/api/inference/health`.
+
+See the configuration reference in
+[`panoptikon/README.md`](panoptikon/README.md) for every
+`[[upstreams.inference]]` key.
 
 ## First Steps
 
@@ -292,7 +383,7 @@ its managed Server root `.env`.
 Numeric and boolean keys can be templated too, as quoted whole-value
 templates (e.g. `port = "${PORT:-6342}"` — coerced to the key's type at
 load). The remaining real environment variables are bootstrap/diagnostic:
-`PANOPTIKON_CONFIG_PATH` and `RUST_LOG`.
+`PANOPTIKON_ROOT`, `PANOPTIKON_CONFIG_PATH` and `RUST_LOG`.
 
 See [`panoptikon/README.md`](panoptikon/README.md) for the full configuration
 reference: every key, the templating syntax, and policies and rulesets.
@@ -302,10 +393,11 @@ reference: every key, the templating syntax, and policies and rulesets.
 The official image (`ghcr.io/reasv/panoptikon`, linux/amd64) packages
 everything in one container: the Rust binary, a native Node.js for the web
 UI, and the Python inference environment — no nginx, no separate UI services.
-Two variants are published: a CPU image (`:latest`) and a **CUDA/GPU image**
-(`:latest-cuda`) — most users want the GPU one, see [GPU (CUDA)](#gpu-cuda)
-below. Both include the optional PDF and HTML renderers (bundled `libpdfium`
-and a headless Chrome).
+Three variants are published: a CPU image (`:latest`), a **CUDA image**
+(`:latest-cuda`) for NVIDIA GPUs and a **ROCm image** (`:latest-rocm`) for
+AMD GPUs — most users want a GPU one, see [GPU (CUDA)](#gpu-cuda) and
+[GPU (AMD ROCm)](#gpu-amd-rocm) below. All include the optional PDF and HTML
+renderers (bundled `libpdfium` and a headless Chrome).
 
 You do **not** need to clone the repository. Download the compose file into
 an empty directory and start it (this uses the CPU image):
@@ -341,6 +433,45 @@ Since the server cannot open files on *your* machine from inside a
 container, pair it with [Panoptikon Relay](https://github.com/reasv/panoptikon-relay)
 on your client (see above).
 
+**Running as another user.** The container runs as the image's `ubuntu` user
+(uid 1000). `/app` and `/home/ubuntu` belong to that user and to group 0 with
+the same permissions, and `HOME` is `/home/ubuntu` in every process the
+container starts, so root (`--user 0`, `user: "0"`, or a host that only runs
+containers as root) and any other uid in group 0 (`--user 1234`, or
+`--user <uid>:0` when you give a group or the uid exists in the image) work
+too, with models on the cache volume.
+
+What one user writes to the volumes belongs to that user, and no other user
+but root can write to it: a start on another user's database stops with an error
+naming the owner, and model downloads into another user's cache fail. Hand the
+volumes to the user that will run the container first (here the default user;
+`1234:0` for `--user 1234`):
+
+```bash
+docker compose run --rm --user 0 --entrypoint chown panoptikon \
+  -R ubuntu:0 /app/data /app/config /home/ubuntu/.cache
+```
+
+The server uses `/app` whatever the working directory, through
+`PANOPTIKON_ROOT` and `PANOPTIKON_CONFIG_PATH`: the image sets both in its
+environment, and in `/etc/environment` for login sessions (SSH on a rented GPU
+host). A shell with neither starts an empty root in its own directory and
+reports no Python environment; pass both there:
+`panoptikon --root /app --config /app/config/server/docker.toml accelerator`.
+`PANOPTIKON_*` values you override with `-e` reach `docker exec` but not always
+SSH sessions, which read `/etc/environment`: pass `--root`/`--config` there too.
+
+**File descriptors.** Local inference is served over loopback HTTP by the same
+process that calls it, so each batch item in flight costs about two sockets;
+container runtimes commonly start a process at a soft `nofile` limit of 1024.
+The server raises its own soft limit to the hard limit at startup, which is
+enough on Docker's defaults (hard limit 524 288) and needs no configuration.
+If you deliberately run with a low **hard** limit, the server bounds how much
+work it keeps in flight to fit — roughly `(hard_limit - 256) / 2` items — so
+batches simply stop growing instead of failing; for full pipelining give it a
+hard limit of at least ~8 500 (`ulimits: nofile:` in compose, `--ulimit
+nofile=` for `docker run`), which is what the shipped 4096-item ceiling needs.
+
 ### GPU (CUDA)
 
 For NVIDIA GPU inference — recommended, and what most users want — use the
@@ -357,9 +488,29 @@ docker compose -f docker-compose.cuda.yml up -d
 The CUDA compose passes the host GPU(s) into the container; everything else
 (ports, volumes, media mounts) matches the CPU compose.
 
+### GPU (AMD ROCm)
+
+For AMD GPUs, use the published ROCm image
+(`ghcr.io/reasv/panoptikon:latest-rocm`). It needs a Linux host with the
+`amdgpu` kernel driver and a GPU that ROCm 7.2 supports; the image carries its
+own ROCm libraries, so nothing ROCm needs to be installed on the host. The
+container user must be in the host's `render` group, whose id differs between
+distributions, so record it in a `.env` file next to the compose file first:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/reasv/panoptikon/master/deploy/docker-compose.rocm.yml
+echo "RENDER_GID=$(getent group render | cut -d: -f3)" > .env
+docker compose -f docker-compose.rocm.yml up -d
+```
+
+The ROCm compose passes `/dev/kfd` and `/dev/dri` (every AMD GPU) into the
+container; everything else matches the CPU compose.
+
 **Building from source instead of pulling** — for development or local
 changes — use the repo-root `docker-compose.yml`, which builds the image with
-the `ACCELERATOR` build arg (`cuda` by default, `cpu` to override):
+the `ACCELERATOR` build arg (`cuda` by default, `cpu` or `rocm` to override;
+for `rocm`, swap its NVIDIA `deploy:` block for the ROCm compose's `devices:`
+and `group_add:`):
 
 ```bash
 git clone --recurse-submodules https://github.com/reasv/panoptikon.git

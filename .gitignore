@@ -229,3 +229,6 @@ data/
 !/panoptikon-desktop/dist/**
 /result
 /result-*
+
+# calibration tool recordings and corpora
+tools/calibration-protocol/results/

@@ -99,7 +99,7 @@ pub const SKIP_AFTER_CONFIRMED: i64 = 1;
 /// second failure, in a *later* run, before it suppresses anything.
 pub const SKIP_AFTER_AMBIGUOUS: i64 = 2;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApiError {
     status: StatusCode,
     detail: String,

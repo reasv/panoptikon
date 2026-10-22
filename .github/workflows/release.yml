@@ -353,6 +353,9 @@ jobs:
           # runtime; the image itself builds and boots without a GPU.
           - accelerator: cuda
             suffix: "-cuda"
+          # ROCm image: :latest-rocm / :vX.Y.Z-rocm (deploy/docker-compose.rocm.yml).
+          - accelerator: rocm
+            suffix: "-rocm"
     env:
       IMAGE: ghcr.io/${{ github.repository }}
     steps:
@@ -360,10 +363,10 @@ jobs:
         with:
           submodules: recursive
 
-      # The CUDA venv (torch + nvidia-* wheels) is several GB; the default
-      # hosted-runner free space is too tight for that image build.
+      # The CUDA and ROCm venvs (torch + vendor libraries) are several GB;
+      # the default hosted-runner free space is too tight for those builds.
       - name: Free disk space
-        if: matrix.accelerator == 'cuda'
+        if: matrix.accelerator != 'cpu'
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
             /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
@@ -378,6 +381,14 @@ jobs:
           docker build --build-arg ACCELERATOR=${{ matrix.accelerator }} \
             -t "$IMAGE:${GITHUB_REF_NAME}${{ matrix.suffix }}" \
             -t "$IMAGE:latest${{ matrix.suffix }}" .
+
+      # Hosted runners have no AMD GPU, so the smoke test below cannot tell a
+      # HIP build of torch from a CPU one: check the venv's torch directly.
+      - name: ROCm torch build
+        if: matrix.accelerator == 'rocm'
+        run: |
+          docker run --rm --entrypoint sh "$IMAGE:${GITHUB_REF_NAME}${{ matrix.suffix }}" -c \
+            'cd /app/runtime/pysrc/* && /app/runtime/venv/bin/python -c "import torch, inferio_worker; assert torch.version.hip, torch.__version__"'
 
       # Same spirit as the binary smoke test: boot the container with the
       # fixture DB mounted as the data volume, then assert the API and the

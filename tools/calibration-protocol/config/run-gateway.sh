@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Start one calibration gateway by hand, outside legs.py.
+#
+#   run-gateway.sh <C0|C1|C2|C3|C7|C7nc|R1|R2|R3|R7> <root-dir> [-- extra panoptikon args]
+#
+#   <root-dir>  becomes the process's --root: panoptikon chdirs into it at
+#               startup, so everything CWD-relative lands there and nothing is
+#               shared between configurations --
+#                 <root>/data/panoptikon.log          gateway + worker log
+#                 <root>/data/inferio/calibration.toml local calibration store
+#                 <root>/data/index/<name>/            index DBs
+#                 <root>/data/user_data/<name>/
+#                 <root>/data/tmp, <root>/data/transcode-cache
+#               The server config and env file are generated into it first
+#               (`legs.py --write-config`; the table is legs.py's CONFIGS).
+#               Their paths follow this checkout; CALIB_REPO=<checkout>
+#               points them at another one (legs.py --repo),
+#               CALIB_WORKER_PYTHON=<python> names the worker's interpreter
+#               (legs.py --python), CALIB_PORT=<port> moves every listener
+#               so the gateway binds <port> (legs.py --port), and
+#               CALIB_INFERENCE_URL=<url> forwards inference to a server on
+#               another host (legs.py --inference-url).
+#
+# Runs in the FOREGROUND on purpose: the caller decides whether to background
+# it, and the console copy of the log is what gets tailed. Stop it with
+# SIGINT/SIGTERM.
+#
+# Examples
+#   run-gateway.sh C1 "$PWD/results/<run-id>/S2"
+#   run-gateway.sh C0 "$PWD/results/<run-id>/S2-baseline"
+#   run-gateway.sh C2 "$PWD/results/<run-id>/S1-uuid" -- --disable-update-check
+#
+# Ports: C1 6342/6343/6339, C0 6352/6353/6349, C2 6362/6363/6359,
+# C3 6372/6373/6369, C7 6382/6383/6379, C7nc 6392/6393/6389,
+# R1 6402/6403/6399, R2 6412/6413/6409, R3 6422/6423/6419, R7 6432/6433/6429.
+set -euo pipefail
+
+usage() { sed -n '2,35p' "$0"; exit "${1:-2}"; }
+
+ID="${1:-}"; ROOT="${2:-}"
+[ -n "$ID" ] && [ -n "$ROOT" ] || usage
+shift 2
+[ "${1:-}" = "--" ] && shift
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+mkdir -p "$ROOT"
+ROOT="$(cd "$ROOT" && pwd)"
+CONFIG="$("${CALIB_PYTHON:-python3}" "$HERE/../legs.py" --config "$ID" \
+  ${CALIB_REPO:+--repo "$CALIB_REPO"} \
+  $([ "${CALIB_LOAD_DOTENV:-1}" = "1" ] || echo --no-dotenv) \
+  ${CALIB_WORKER_PYTHON:+--python "$CALIB_WORKER_PYTHON"} \
+  ${CALIB_PORT:+--port "$CALIB_PORT"} \
+  ${CALIB_INFERENCE_URL:+--inference-url "$CALIB_INFERENCE_URL"} \
+  --write-config "$ROOT")"
+ENVFILE="$ROOT/env.$ID"
+
+# env.<ID> carries RUST_LOG, INFERIO_WORKER_LOG_LEVEL, any
+# CUDA_VISIBLE_DEVICES restriction, and PANOPTIKON_BIN / PANOPTIKON_TREE.
+set -a
+# shellcheck disable=SC1090
+. "$ENVFILE"
+set +a
+
+# The repo's own .env normally auto-loads from the CWD, but --root chdirs
+# away from it, so the ${PDFIUM_PATH:-} / ${HTML_RENDERER_PATH:-} /
+# ${PANOPTIKON_FONT:-} / ${SAUCENAO_API_KEY} / ${JINA_API_KEY} templates in
+# the config would all fall back to empty. Export it here instead. Never
+# echoed: it holds API keys. CALIB_LOAD_DOTENV=0 skips it.
+if [ "${CALIB_LOAD_DOTENV:-1}" = "1" ] && [ -f "$PANOPTIKON_TREE/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$PANOPTIKON_TREE/.env"
+  set +a
+fi
+# env.<ID>'s RUST_LOG must win over anything .env sets.
+set -a
+# shellcheck disable=SC1090
+. "$ENVFILE"
+set +a
+
+# env.<ID> puts the worker venv's nvidia/cudnn/lib on LD_LIBRARY_PATH when that
+# venv has one, so faster-whisper's CTranslate2 can dlopen cuDNN. A
+# binary that puts those directories in the worker's own spawn environment
+# does not need it -- and keeping it there hides whether that works, since
+# the worker would inherit the variable either way. CALIB_NO_CUDNN_LDPATH=1
+# drops it entirely, which is how that leg is checked. Default off: on
+# master, and on any older binary, the workaround is still required.
+if [ "${CALIB_NO_CUDNN_LDPATH:-0}" = "1" ]; then
+  unset LD_LIBRARY_PATH
+  echo "CALIB_NO_CUDNN_LDPATH=1: LD_LIBRARY_PATH unset" >&2
+fi
+
+[ -x "$PANOPTIKON_BIN" ] || {
+  echo "release binary missing: $PANOPTIKON_BIN (cargo build --release -p panoptikon in $PANOPTIKON_TREE)" >&2
+  exit 3
+}
+
+echo "config=$ID bin=$PANOPTIKON_BIN root=$ROOT" >&2
+echo "RUST_LOG=$RUST_LOG INFERIO_WORKER_LOG_LEVEL=$INFERIO_WORKER_LOG_LEVEL CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-<unset>}" >&2
+echo "log=$ROOT/data/panoptikon.log  calibration=$ROOT/data/inferio/calibration.toml" >&2
+
+# --disable-update-check: no GitHub call at startup; it would add latency and
+# a network dependency to every scenario's t=0.
+exec "$PANOPTIKON_BIN" \
+  --config "$CONFIG" \
+  --root "$ROOT" \
+  --disable-update-check \
+  "$@"

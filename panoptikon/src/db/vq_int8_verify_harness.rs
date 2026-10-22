@@ -57,6 +57,8 @@ async fn used_pages(conn: &mut SqliteConnection) -> i64 {
 /// it as a rowid table and resets every coverage pair to pending — so a
 /// build run through this harness starts from the same state a real
 /// upgrade leaves behind.
+/// The post-migration hook (`db::batch_auto`) also runs, touching only the
+/// copy's own directory.
 async fn open_write() -> SqliteConnection {
     ensure_sqlite_extensions().expect("register SQLite extensions");
     let started = Instant::now();

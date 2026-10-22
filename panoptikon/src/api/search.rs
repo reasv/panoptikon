@@ -1421,8 +1421,7 @@ async fn preprocess_pql(
         state.search_embedding_cache_size,
         Some(index_db),
     )
-    .await
-    .map_err(map_pql_error)?;
+    .await?;
     query.query = preprocessed;
     Ok(Some(elapsed_seconds(start)))
 }

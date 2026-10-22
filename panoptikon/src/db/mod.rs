@@ -1,3 +1,4 @@
+pub(crate) mod batch_auto;
 pub(crate) mod bookmarks;
 mod connection;
 pub(crate) mod epochs;
@@ -12,10 +13,12 @@ pub(crate) mod index_writer;
 pub(crate) mod info;
 pub(crate) mod instance_id;
 pub(crate) mod items;
+pub(crate) mod job_failures;
 pub(crate) mod ledger;
 pub(crate) mod local_dbs;
 pub(crate) mod maintenance_state;
 pub(crate) mod migrations;
+pub(crate) mod output_batch;
 pub(crate) mod pinboard_dbs;
 pub(crate) mod pinboards;
 pub(crate) mod pql;
@@ -35,9 +38,9 @@ pub(crate) mod vq_int8_verify_harness;
 #[allow(unused_imports)] // For the future DB delete/rename/restore flow.
 pub(crate) use connection::invalidate_read_pools;
 pub(crate) use connection::{
-    DbConnection, ReadOnly, ReadOnlyNoUserData, UserDataWrite, ensure_migrations_allowed,
-    open_index_db_read, open_index_db_read_no_user_data, open_index_db_write_no_user_data,
-    open_user_data_write, readonly_mode,
+    DbConnection, ReadOnly, ReadOnlyNoUserData, UserDataWrite, begin_immediate,
+    ensure_migrations_allowed, open_index_db_read, open_index_db_read_no_user_data,
+    open_index_db_write_no_user_data, open_user_data_write, readonly_mode,
 };
 #[cfg(test)]
 pub(crate) use connection::{open_index_db_read_at_path, readonly_test_override};

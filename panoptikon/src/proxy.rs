@@ -9,6 +9,7 @@ use axum::{
     response::IntoResponse,
 };
 use hyper::upgrade::OnUpgrade;
+use hyper_tls::HttpsConnector;
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
@@ -17,7 +18,8 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::watch;
 
 use crate::config::Settings;
-use crate::inferio_client::InferenceApiClient;
+use crate::inference_errors::UpstreamFailure;
+use crate::inferio_client::{InferenceApiClient, InferenceTransportHealth, PeerFrozen};
 use crate::policy::{ListenerEndpoint, PolicyContext};
 use crate::policy_token::{POLICY_TOKEN_HEADER, TokenKey};
 
@@ -41,7 +43,7 @@ impl Upstream {
 }
 
 pub struct ProxyState {
-    pub client: Client<HttpConnector, Body>,
+    pub client: Client<HttpsConnector<HttpConnector>, Body>,
     pub ui: Upstream,
     pub api: Upstream,
     pub inference: Upstream,
@@ -70,9 +72,18 @@ impl ProxyState {
         settings: Arc<Settings>,
         token_key: Arc<TokenKey>,
         shutdown_rx: watch::Receiver<bool>,
-    ) -> Self {
-        let client = Client::builder(TokioExecutor::new()).build_http();
-        Self {
+    ) -> Result<Self> {
+        // A remote inference upstream can be `https://`; `http://` still
+        // connects in the clear. Built by hand because `HttpsConnector::new`
+        // panics on a TLS context the platform cannot create. A private CA is
+        // trusted through `SSL_CERT_FILE`.
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        let tls = hyper_tls::native_tls::TlsConnector::new()
+            .context("building the gateway's TLS client context")?;
+        let client =
+            Client::builder(TokioExecutor::new()).build(HttpsConnector::from((http, tls.into())));
+        Ok(Self {
             client,
             ui,
             api,
@@ -82,7 +93,7 @@ impl ProxyState {
             settings,
             token_key,
             shutdown_rx,
-        }
+        })
     }
 }
 
@@ -120,16 +131,19 @@ base_url = "http://127.0.0.1:9"
 "#,
     )
     .expect("minimal settings");
-    Arc::new(ProxyState::new(
-        upstream.clone(),
-        upstream.clone(),
-        upstream,
-        inference_client,
-        0,
-        Arc::new(settings),
-        Arc::new(TokenKey::random()),
-        watch::channel(false).1,
-    ))
+    Arc::new(
+        ProxyState::new(
+            upstream.clone(),
+            upstream.clone(),
+            upstream,
+            inference_client,
+            0,
+            Arc::new(settings),
+            Arc::new(TokenKey::random()),
+            watch::channel(false).1,
+        )
+        .expect("a TLS client context"),
+    )
 }
 
 pub async fn proxy_ui(
@@ -153,7 +167,88 @@ pub async fn proxy_inference(
     State(state): State<Arc<ProxyState>>,
     req: Request<Body>,
 ) -> impl IntoResponse {
-    proxy_request(addr, state, UpstreamKind::Inference, req).await
+    let health = req.method() == axum::http::Method::GET && req.uri().path() == INFERENCE_HEALTH;
+    if !health {
+        return proxy_request(addr, state, UpstreamKind::Inference, req).await;
+    }
+    let client = state.inference_client.clone();
+    if client.recheck_if_frozen().is_some() {
+        return unanswered_health(&client, PeerFrozen.to_string());
+    }
+    let deadline = client.health_check_timeout();
+    let proxied = async {
+        with_gateway_clients(proxy_request(addr, state, UpstreamKind::Inference, req).await).await
+    };
+    match tokio::time::timeout(deadline, proxied).await {
+        Ok(response) => response,
+        Err(_) => unanswered_health(
+            &client,
+            format!(
+                "it did not answer GET {INFERENCE_HEALTH} within {} s",
+                deadline.as_secs()
+            ),
+        ),
+    }
+}
+
+const INFERENCE_HEALTH: &str = "/api/inference/health";
+
+/// The gateway's 504 to `GET /api/inference/health` when the inference server
+/// it forwards to is declared frozen or does not answer in time.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct UnansweredHealth {
+    /// Why the server's report is missing.
+    pub detail: String,
+    /// This gateway's clients; `frozen_since` says whether the server is
+    /// declared frozen.
+    pub inference_clients: Vec<InferenceTransportHealth>,
+}
+
+fn unanswered_health(client: &InferenceApiClient, reason: String) -> Response<Body> {
+    let failure = UpstreamFailure::Unreachable {
+        reason,
+        timed_out: true,
+    };
+    let body = UnansweredHealth {
+        detail: failure.message(client.base_url()),
+        inference_clients: crate::inferio_client::endpoint_health(),
+    };
+    (failure.status(), axum::Json(body)).into_response()
+}
+
+/// Above any health report the upstream produces.
+const HEALTH_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
+/// The upstream's health report with `inference_clients` replaced by this
+/// gateway's: the clients that talk to the upstream live here, and the
+/// upstream's own list describes its clients, not ours. Anything but a 200
+/// JSON object passes through untouched.
+async fn with_gateway_clients(response: Response<Body>) -> Response<Body> {
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, HEALTH_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(error = %err, "reading the upstream health report failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let mut report = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(serde_json::Value::Object(report)) => report,
+        _ => return Response::from_parts(parts, Body::from(bytes)),
+    };
+    let clients = crate::inferio_client::endpoint_health();
+    report.insert(
+        "inference_clients".to_owned(),
+        serde_json::to_value(clients).unwrap_or_default(),
+    );
+    let Ok(body) = serde_json::to_vec(&report) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(body))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,7 +520,13 @@ async fn proxy_request(
     let mut response = match state.client.request(req).await {
         Ok(response) => response,
         Err(err) => {
-            tracing::error!(error = %err, upstream = %upstream.name, "upstream request failed");
+            // `{:#}` prints the causes: hyper's own message names only the
+            // layer (`client error (Connect)`).
+            tracing::error!(
+                error = %format_args!("{:#}", anyhow::Error::new(err)),
+                upstream = %upstream.name,
+                "upstream request failed"
+            );
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
@@ -587,16 +688,19 @@ base_url = "http://127.0.0.1:6342"
             false,
         )
         .unwrap();
-        Arc::new(ProxyState::new(
-            upstream.clone(),
-            upstream.clone(),
-            upstream,
-            inference_client,
-            0,
-            test_settings(),
-            Arc::new(TokenKey::random()),
-            watch::channel(false).1,
-        ))
+        Arc::new(
+            ProxyState::new(
+                upstream.clone(),
+                upstream.clone(),
+                upstream,
+                inference_client,
+                0,
+                test_settings(),
+                Arc::new(TokenKey::random()),
+                watch::channel(false).1,
+            )
+            .expect("a TLS client context"),
+        )
     }
 
     // Regression test for the /api self-proxy recursion (2026-07-07): an
@@ -1102,16 +1206,19 @@ allow = "*"
         let inference_client =
             InferenceApiClient::new_with_metadata_cache(format!("http://{upstream_addr}"), false)
                 .unwrap();
-        let state = Arc::new(ProxyState::new(
-            upstream.clone(),
-            upstream.clone(),
-            upstream,
-            inference_client,
-            0,
-            Arc::clone(&settings),
-            Arc::clone(&token_key),
-            watch::channel(false).1,
-        ));
+        let state = Arc::new(
+            ProxyState::new(
+                upstream.clone(),
+                upstream.clone(),
+                upstream,
+                inference_client,
+                0,
+                Arc::clone(&settings),
+                Arc::clone(&token_key),
+                watch::channel(false).1,
+            )
+            .expect("a TLS client context"),
+        );
         let app = axum::Router::new()
             .route("/api/{*path}", any(proxy_api))
             .fallback(any(proxy_ui))
@@ -1218,6 +1325,190 @@ allow = "*"
         let mut echo = [0u8; 13];
         client.read_exact(&mut echo).await.unwrap();
         assert_eq!(&echo, b"policy-bridge");
+    }
+
+    /// With inference remote, `/api/inference/health` is the upstream's report
+    /// carrying this gateway's own client section: the upstream's is about
+    /// its clients, and the ones dialing it live here.
+    #[tokio::test]
+    async fn the_proxied_health_report_carries_this_gateways_clients() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = axum::Router::new()
+            .route(
+                "/api/inference/health",
+                any(|| async {
+                    axum::Json(serde_json::json!({"status": "ok", "inference_clients": []}))
+                }),
+            )
+            .route(
+                "/api/inference/metadata",
+                any(|| async { axum::Json(serde_json::json!({"inference_clients": []})) }),
+            );
+        tokio::spawn(async move { axum::serve(upstream_listener, upstream_app).await });
+
+        let upstream = Upstream::parse("inference", &format!("http://{upstream_addr}")).unwrap();
+        let state = test_state(upstream);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/api/inference/{*path}", any(proxy_inference))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+
+        let get = async |path: &str| -> serde_json::Value {
+            reqwest::get(format!("http://{gateway}{path}"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap()
+        };
+        let health = get("/api/inference/health").await;
+        assert_eq!(health["status"], "ok", "the upstream's report: {health}");
+        let ours = format!("http://{upstream_addr}/api/inference");
+        let clients = health["inference_clients"].as_array().unwrap();
+        assert!(
+            clients
+                .iter()
+                .any(|client| client["base_url"] == ours.as_str()),
+            "this gateway's client for the upstream: {health}"
+        );
+        let metadata = get("/api/inference/metadata").await;
+        assert_eq!(metadata["inference_clients"], serde_json::json!([]));
+    }
+
+    /// `/api/inference/health` through the gateway answers 504 at its deadline
+    /// when the server hangs, at once while the gateway holds it frozen, and
+    /// the server's report again once it answers a health check.
+    #[tokio::test]
+    async fn the_proxied_health_report_does_not_wait_on_a_frozen_server() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let answers = Arc::new(AtomicBool::new(false));
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let health = {
+            let answers = Arc::clone(&answers);
+            move || async move {
+                if !answers.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                axum::Json(serde_json::json!({"status": "ok"}))
+            }
+        };
+        let upstream_app = axum::Router::new()
+            .route("/api/inference/health", any(health))
+            .route("/api/inference/metadata", any(std::future::pending::<()>));
+        tokio::spawn(async move { axum::serve(upstream_listener, upstream_app).await });
+
+        let url = format!("http://{upstream_addr}");
+        let client = crate::inferio_client::tests::health_checked_client(
+            &url,
+            crate::inferio_client::Transport::Http11,
+        )
+        .await;
+        let deadline = client.health_check_timeout();
+        let state = test_state(Upstream::parse("inference", &url).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/api/inference/{*path}", any(proxy_inference))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+        let ours = format!("{url}/api/inference");
+        let get_health = async || {
+            let started = std::time::Instant::now();
+            let request = reqwest::get(format!("http://{gateway}/api/inference/health"));
+            let response = tokio::time::timeout(3 * deadline, request)
+                .await
+                .expect("answered")
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            let frozen_since = body["inference_clients"]
+                .as_array()
+                .and_then(|clients| clients.iter().find(|c| c["base_url"] == ours.as_str()))
+                .map(|ours| ours["frozen_since"].clone());
+            (status, body, frozen_since, started.elapsed())
+        };
+
+        let (status, body, frozen_since, elapsed) = get_health().await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert_eq!(
+            body["detail"],
+            format!(
+                "Could not reach the inference server at {url}: it did not answer \
+                 GET /api/inference/health within {} s",
+                deadline.as_secs()
+            )
+        );
+        assert_eq!(frozen_since, Some(serde_json::Value::Null), "{body}");
+        assert!(elapsed >= deadline && elapsed < 2 * deadline, "{elapsed:?}");
+
+        // A stalled request makes the gateway check the server and find it frozen.
+        tokio::time::timeout(5 * deadline, client.get_metadata())
+            .await
+            .expect("declared frozen")
+            .expect_err("frozen");
+        let (status, body, frozen_since, elapsed) = get_health().await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert_eq!(
+            body["detail"],
+            format!("Could not reach the inference server at {url}: {PeerFrozen}")
+        );
+        assert!(
+            frozen_since.is_some_and(|since| since.is_string()),
+            "{body}"
+        );
+        assert!(elapsed < deadline / 2, "at once: {elapsed:?}");
+
+        // Asking for the report is enough for the gateway to find it again.
+        answers.store(true, Ordering::SeqCst);
+        let mut answered = None;
+        for _ in 0..50 {
+            let (status, body, frozen_since, _) = get_health().await;
+            if status == StatusCode::OK {
+                answered = Some((body, frozen_since));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (body, frozen_since) = answered.expect("the report once the server answers");
+        assert_eq!(body["status"], "ok", "{body}");
+        assert_eq!(frozen_since, Some(serde_json::Value::Null), "{body}");
+    }
+
+    /// The `/api/inference/*` routes are proxied on this client, and with
+    /// `inference_local = false` the upstream can be an `https://` TLS front.
+    /// A cleartext-only connector refuses that scheme before a packet leaves,
+    /// which is a 502 on every inference route while the job path works.
+    #[tokio::test]
+    async fn the_proxy_client_dials_an_https_upstream() {
+        let state = test_proxy_state();
+        // Port 1 is below `ip_local_port_range`: nothing answers, so the only
+        // question this asks is which side refused, the connector or the peer.
+        let err = state
+            .client
+            .get("https://127.0.0.1:1/".parse().unwrap())
+            .await
+            .expect_err("nothing is listening on port 1");
+        let chain = format!("{:#}", anyhow::Error::new(err));
+        assert!(
+            !chain.contains("scheme is not http"),
+            "the connector refused the scheme, not the peer: {chain}"
+        );
     }
 
     /// A ruleset-denied upgrade request on an API-surface path is rejected

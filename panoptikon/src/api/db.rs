@@ -5,7 +5,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::api_error::ApiError;
 use crate::db::info::load_db_info;
-use crate::db::migrations::migrate_databases_on_disk;
+use crate::db::migrations::{DbPaths, migrate_databases_on_disk};
 
 #[utoipa::path(
     get,
@@ -60,15 +60,29 @@ pub async fn db_create(
     Query(query): Query<DbCreateQuery>,
 ) -> Result<Json<DbCreateResponse>, ApiError> {
     crate::db::ensure_migrations_allowed()?;
+    let result = create_databases(query.new_index_db, query.new_user_data_db).await?;
+
+    let response = DbCreateResponse {
+        index_db: result.index_db,
+        user_data_db: result.user_data_db,
+    };
+
+    Ok(Json(response))
+}
+
+/// Creates the databases (the defaults for `None`) and brings them up to
+/// date. A failure names another user owning, or a read-only filesystem
+/// holding, what it writes, in the log and in the 500 body.
+pub(crate) async fn create_databases(
+    index_db: Option<String>,
+    user_data_db: Option<String>,
+) -> Result<DbPaths, ApiError> {
     let handle = Handle::current();
-    let DbCreateQuery {
-        new_index_db,
-        new_user_data_db,
-    } = query;
-    let result = tokio::task::spawn_blocking(move || {
+    let index = index_db.clone();
+    tokio::task::spawn_blocking(move || {
         handle.block_on(migrate_databases_on_disk(
-            new_index_db.as_deref(),
-            new_user_data_db.as_deref(),
+            index.as_deref(),
+            user_data_db.as_deref(),
         ))
     })
     .await
@@ -77,16 +91,16 @@ pub async fn db_create(
         ApiError::internal("Failed to create databases")
     })?
     .map_err(|err| {
-        tracing::error!(error = ?err, "failed to create databases");
-        ApiError::internal("Failed to create databases")
-    })?;
-
-    let response = DbCreateResponse {
-        index_db: result.index_db,
-        user_data_db: result.user_data_db,
-    };
-
-    Ok(Json(response))
+        let runtime = crate::config::runtime();
+        let index_db = index_db.as_deref().unwrap_or(&runtime.index_db);
+        let reason =
+            crate::ownership::create_databases_problem(&err, &runtime.data_folder, index_db);
+        tracing::error!(error = %format_args!("{err:#}"), reason, "failed to create databases");
+        ApiError::internal(match reason {
+            Some(reason) => format!("Failed to create databases: {reason}"),
+            None => "Failed to create databases".to_owned(),
+        })
+    })
 }
 
 #[cfg(test)]
@@ -113,6 +127,35 @@ mod tests {
                 .join("readonly_guard.db")
                 .exists()
         );
+    }
+
+    /// An index folder another user owns fails the create with the folder
+    /// and its owner named in the 500 body.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn db_create_names_an_index_folder_another_user_owns() {
+        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        let Some((folder, owner)) = foreign_folder(false) else {
+            return;
+        };
+        let env = crate::test_utils::test_data_dir();
+        let index = env.path().join("index");
+        let aside = env.path().join("index.aside");
+        std::fs::create_dir_all(&index).unwrap();
+        std::fs::rename(&index, &aside).unwrap();
+        std::os::unix::fs::symlink(folder, &index).unwrap();
+        let result = db_create(Query(DbCreateQuery {
+            new_index_db: Some("new".to_string()),
+            new_user_data_db: None,
+        }))
+        .await;
+        std::fs::remove_file(&index).unwrap();
+        std::fs::rename(&aside, &index).unwrap();
+        let error = result.err().expect("the create fails");
+        let expected = owned_by_another_user(&index, owner, folder);
+        assert!(error.detail().ends_with(&expected), "{}", error.detail());
+        let status = error.into_response().status();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     // Positive control for the absence assertions above: the same call

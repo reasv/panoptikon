@@ -1399,13 +1399,10 @@ fn image_response(bytes: Vec<u8>, media_type: &str) -> ApiResult<Response<Body>>
 /// save 500s. Taking the write lock up front routes the contention through
 /// the busy handler instead, with the telemetry write as the loser.
 async fn begin_transaction(conn: &mut sqlx::SqliteConnection) -> ApiResult<()> {
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(conn)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to start transaction");
-            ApiError::internal("Failed to start transaction")
-        })?;
+    crate::db::begin_immediate(conn).await.map_err(|err| {
+        tracing::error!(error = %err, "failed to start transaction");
+        ApiError::internal("Failed to start transaction")
+    })?;
     Ok(())
 }
 

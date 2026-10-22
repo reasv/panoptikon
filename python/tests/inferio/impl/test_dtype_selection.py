@@ -18,6 +18,7 @@ import torch
 from inferio.impl.utils import (
     cuda_capability,
     get_device,
+    last_selected_dtype,
     select_ct2_compute_type,
     select_dtype,
 )
@@ -112,6 +113,22 @@ class TestSelectDtype:
                 torch.cuda, "is_bf16_supported", return_value=False
             ):
                 assert select_dtype(CUDA, "bf16") is torch.float32
+
+    def test_last_decision_is_recorded_for_the_worker(self):
+        # The worker harness reports the *negotiated* dtype on the load
+        # response (it is part of the calibration profile key) and reads it
+        # from here when the impl exposes no attribute of its own. Each
+        # worker process loads exactly one model, so the last decision is
+        # that model's dtype.
+        with _patch_hip(None), _patch_cap(8, 0):
+            got = select_dtype(CUDA, "bf16")
+        assert last_selected_dtype() is got is torch.bfloat16
+        assert select_dtype(CPU, "fp16") is torch.float32
+        assert last_selected_dtype() is torch.float32
+        # A rejected precision must not overwrite the last good decision.
+        with pytest.raises(ValueError):
+            select_dtype(CPU, "int8")
+        assert last_selected_dtype() is torch.float32
 
 
 class TestGetDeviceCapabilityGuard:
@@ -242,3 +259,25 @@ class TestSelectCt2ComputeType:
         # No fake module injected: explicit must return before any import.
         with mock.patch.dict(sys.modules, {"ctranslate2": None}):
             assert select_ct2_compute_type(explicit="int8") == "int8"
+
+    def test_the_callers_device_kind_wins_over_the_probe(self):
+        # A host the orchestrator priced against system RAM has its impls
+        # pinned to the CPU (`INFERIO_DEVICE=cpu`), and the machine may still
+        # have a CUDA device — so `torch.cuda.is_available()` is the wrong
+        # question and the caller's resolved device is the right one
+        # (docs/unified-memory-admission.md, backend C).
+        with _patch_ct2({"cpu": {"float32", "int8"}, "cuda": {"float16"}}):
+            with _patch_cuda_available(True):
+                assert (
+                    select_ct2_compute_type(device_kind="cpu") == "float32"
+                )
+        # Anything that is not CUDA is CPU: CTranslate2 has no Metal backend,
+        # so a device kind it has never heard of must not be asked about.
+        with _patch_ct2({"cpu": {"float32"}}):
+            with _patch_cuda_available(False):
+                assert select_ct2_compute_type(device_kind="mps") == "float32"
+        # And the kind still only chooses which set is queried — the probe's
+        # answer decides the type, as before.
+        with _patch_ct2({"cuda": {"float16", "float32"}}):
+            with _patch_cuda_available(False):
+                assert select_ct2_compute_type(device_kind="cuda") == "float16"

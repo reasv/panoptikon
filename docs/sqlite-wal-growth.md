@@ -60,6 +60,68 @@ to. The fix below was implemented the same day.
 Neither change affects durability: checkpointing is what SQLite does anyway,
 only sooner and with the file bounded.
 
+## Group commit on the extraction writer (2026-09-06)
+
+The extraction writer's cost is commits, not rows. On a measured 8 000-item
+tagging job `COMMIT` was 85.6% of the writer's 186 s, growing from 9 ms to
+35 ms per item as the b-trees and the FTS index filled, against 3.1 ms of row
+work per item. One transaction per item turned a deep inference window into a
+serial tail: 1 573 items were still waiting for the writer when inference
+finished, 48.6 s of it.
+
+Completed items are therefore committed in groups (`db/output_batch.rs`):
+the first submitter flushes at once, and whatever arrives while that group is
+in the writer forms the next one, up to 256 items. There is no timer; a group
+closes when the previous commit returns, so an idle writer keeps per-item
+latency and a busy one groups as deeply as its backlog. An error inside one
+item's write rolls the group back and re-runs it one transaction per item, so
+only that item fails. A SAVEPOINT per item would isolate it in one pass but
+costs far more than the commits it saves: on the same job, 16 000 savepoints
+added 105 s of sub-journal work, against 3.3 s for all 121 group commits.
+
+A transaction that dirties more pages than the page cache holds spills them
+to the WAL as it goes. The index writer connection sets `PRAGMA cache_size =
+-65536` (64 MiB), which cut the job's row writes from 50 s to 26 s. `storage`
+goes through the same writer but keeps SQLite's 2 MiB default: a job's grouped
+output writes never touch it (it writes only a video's frame cache there, one
+small transaction per video on a cache miss), and 64 MiB there added about
+5 s to the job's tail.
+
+Written per item, the job's progress row was half the job's transactions:
+8 000 of the 16 000 it committed before grouping. It is a UI figure, not a
+durability point, so it is written at most once a second
+(`PROGRESS_UPDATE_INTERVAL`) and both job endings write the final counts.
+Items finish in window bursts, so the row can trail by a whole window rather
+than by a second; the cleanup that stamps a killed job's row
+(`remove_incomplete_jobs`) recounts its files from what the job wrote.
+
+## Durability: `synchronous = NORMAL` on index and storage (2026-09-06)
+
+Write connections to the index and storage databases lower `synchronous` from
+SQLite's `FULL` default to `NORMAL` — but only for a schema whose
+`PRAGMA journal_mode=WAL` actually came back `wal` (`connect_db`,
+`panoptikon/src/db/connection.rs`). It is worth 6% of the extraction writer's
+commit cost on the measured 8 000-item tagging job.
+
+What it trades: under WAL, `NORMAL` skips the fsync of the log at each commit,
+so a **power cut or OS crash** can lose the transactions written since the
+last checkpoint — at most one extraction group, 256 items, which the next run
+redoes — and cannot corrupt the database. A process crash (`kill -9`, a panic)
+loses nothing: the log is already in the OS page cache.
+
+Why the mode is checked first: in a rollback journal, `NORMAL` is exactly what
+SQLite documents as able to corrupt the file on power loss, and
+`journal_mode=WAL` silently stays `delete` where shared memory is unavailable
+— a network share, and the data root is the user's to choose. So the pragma's
+*answer* decides, not the request; a database that is not in WAL keeps `FULL`
+and is named once at INFO.
+
+Why `user_data` keeps `FULL`: everything in the index and storage databases is
+derived from the files on disk and can be recomputed, while `user_data` holds
+what the user typed — bookmarks, pinboards, groups — which nothing can
+reproduce. It is also written a row at a time by request handlers, so the
+per-commit fsync costs it nothing worth having.
+
 ## Second fix: the extraction driver was itself a job-long reader (2026-07-30)
 
 A field report on v0.1.6 showed the gap in the fix above: a 1.2M-item WD

@@ -30,7 +30,10 @@ stale pin without gating the binary artifacts. Once that commit is pushed,
 refresh `flake.lock` (`gh workflow run nix.yml --ref master -f update=true`,
 then merge the PR it opens), run the full Nix matrix
 (`gh workflow run nix.yml --ref master`), and wait for it to pass before
-tagging. The tag-time Nix job only reports after the tag exists.
+tagging. The tag-time Nix job only reports after the tag exists. Also run the
+Windows and macOS check (`gh workflow run platforms.yml --ref master`) and
+wait for it to pass: the release workflow is the only other place those
+targets are built.
 
 For a release, push a canonical `vX.Y.Z` tag. The release workflow also
 builds the Nix package matrix (`nix-verify.yml`) from that tag's committed

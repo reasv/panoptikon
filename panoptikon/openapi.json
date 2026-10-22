@@ -855,6 +855,22 @@
         }
       }
     },
+    "/api/desktop/gpu-memory-setting/open": {
+      "post": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "open_desktop_gpu_memory_setting",
+        "responses": {
+          "204": {
+            "description": "Desktop settings opened at the GPU memory setting"
+          },
+          "403": {
+            "description": "Same-origin browser request required"
+          }
+        }
+      }
+    },
     "/api/desktop/setup-continuous/validate": {
       "post": {
         "tags": [
@@ -1099,6 +1115,22 @@
         }
       }
     },
+    "/api/desktop/sysmem-fallback-notice/dismiss": {
+      "post": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "dismiss_desktop_sysmem_fallback_notice",
+        "responses": {
+          "204": {
+            "description": "NVIDIA sysmem fallback notice dismissed permanently"
+          },
+          "403": {
+            "description": "Same-origin browser request required"
+          }
+        }
+      }
+    },
     "/api/desktop/update-ribbon/dismiss": {
       "post": {
         "tags": [
@@ -1165,7 +1197,7 @@
         "operationId": "desktop_update_status",
         "responses": {
           "200": {
-            "description": "Desktop update awareness state",
+            "description": "Desktop update state and the NVIDIA sysmem fallback notice",
             "content": {
               "application/json": {
                 "schema": {
@@ -1395,6 +1427,16 @@
                 }
               }
             }
+          },
+          "504": {
+            "description": "Gateway forwarding to a remote inference server only: the server is declared frozen, or did not answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnansweredHealth"
+                }
+              }
+            }
           }
         }
       }
@@ -1454,7 +1496,7 @@
           {
             "name": "prewarm",
             "in": "query",
-            "description": "Additive over Python: lazy prewarm hint (design §8). Absent = true;\n`prewarm=false` suppresses keeping a warm worker of this model's\nimpl class after the load.",
+            "description": "Additive: lazy prewarm hint (absent = true); false keeps no warm worker.",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -1573,7 +1615,7 @@
           {
             "name": "max_batch",
             "in": "query",
-            "description": "Additive over Python: per-request cap on dispatch-time batch merging.",
+            "description": "Additive: per-request cap on dispatch-time batch merging.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -1584,7 +1626,7 @@
           {
             "name": "prewarm",
             "in": "query",
-            "description": "Additive over Python: lazy prewarm hint, as on load (absent = true).",
+            "description": "Additive: lazy prewarm hint, as on load (absent = true).",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -1604,6 +1646,14 @@
         "responses": {
           "200": {
             "description": "Model outputs",
+            "headers": {
+              "x-panoptikon-desired-in-flight-items": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Items the orchestrator would like the caller to keep inside in-flight predict requests for this model. Additive and optional: absent means the orchestrator has no opinion (an older server, or a model that has not dispatched a window yet) and the caller keeps its own floor."
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -1623,11 +1673,21 @@
             }
           },
           "400": {
-            "description": "Malformed multipart body or inputs",
+            "description": "Malformed multipart body or inputs. `detail` is a plain string when the bytes themselves are wrong, and an object carrying `kind = \"request_incomplete\"` when the request body did not arrive in full — that one says the batch was never parsed and never reached a model, so its items are untouched and re-submitting them is correct.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
+                  "$ref": "#/components/schemas/InferenceErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The request body is larger than this server will read, carrying `kind = \"request_too_large\"`. Nothing was parsed, so the items are untouched; send fewer inputs per request, because re-sending the same body will get the same answer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InferenceErrorBody"
                 }
               }
             }
@@ -1643,11 +1703,21 @@
             }
           },
           "500": {
-            "description": "Model load or prediction failure",
+            "description": "Model load or prediction failure. `detail` is a plain string for an ordinary failure and an object carrying a machine-readable `kind` for the ones a caller must act on differently — `worker_died` says the inference worker process died with the request in flight, so the request's items were never attempted and re-submitting them is correct.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
+                  "$ref": "#/components/schemas/InferenceErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Temporarily refused, with a `Retry-After`. `kind = \"body_budget_exhausted\"` means the server is already holding its whole predict-body budget in memory, so this body was never read and its items were never attempted — re-submit it. `kind = \"load_cooldown\"` is the opposite case and must not be retried before `retry_at`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InferenceErrorBody"
                 }
               }
             }
@@ -2489,7 +2559,7 @@
           {
             "name": "batch_size",
             "in": "query",
-            "description": "Batch Size",
+            "description": "Max Batch Size: optional cap on items processed at once; null = auto.",
             "required": false,
             "schema": {
               "type": [
@@ -2575,7 +2645,7 @@
           {
             "name": "batch_size",
             "in": "query",
-            "description": "Batch Size",
+            "description": "Max Batch Size: optional cap on items processed at once; null = auto.",
             "required": false,
             "schema": {
               "type": [
@@ -2622,7 +2692,7 @@
           "jobs"
         ],
         "summary": "List recorded data extraction failures",
-        "description": "The extraction failure ledger: media a setter has already rejected, which the work query therefore skips. Read-only by design — a row is cleared when the file's content changes, when a missing dependency appears, or by a shipped retry directive, never by an API call. Newest first, paginated with limit/offset against `total`.",
+        "description": "Everything a data extraction has failed on, in three lists. `failures` is the extraction failure ledger: media a setter has already rejected, which the work query therefore skips. Read-only by design — a row is cleared when the file's content changes, when a missing dependency appears, or by a shipped retry directive, never by an API call. `job_failures` is the opposite: items a job attempted and could not finish, with nothing on record explaining why (the inference worker died mid-request, the server was down, a write failed); those items are untouched and the next run selects them again. `failed_jobs` is the jobs behind them, `partial` included — a partial job ran to the end with some of its items left undone. All three are newest first and share the limit/offset window, each against its own total.",
         "operationId": "get_extraction_failures",
         "parameters": [
           {
@@ -2652,7 +2722,7 @@
           {
             "name": "setter",
             "in": "query",
-            "description": "Only failures recorded for this setter. Deliberately *not* validated\nagainst the known setters: the vocabulary is free-form and depends on\nwhich models the user has ever run, so there is no closed list to check\nagainst. A typo therefore answers \"no failures\", which is acceptable\nhere — unlike `error_class`, whose vocabulary is closed and enforced,\nbecause a mistyped class silently reading as \"nothing is wrong\" is\nexactly what an audit surface must not do.",
+            "description": "Only failures recorded for this setter. Deliberately *not* validated\nagainst the known setters, so a typo answers \"no failures\".",
             "required": false,
             "schema": {
               "type": [
@@ -2676,7 +2746,7 @@
           {
             "name": "stage",
             "in": "query",
-            "description": "`prepare` (the gateway could not produce the model's input) or\n`inference` (the worker rejected it).",
+            "description": "`prepare`, `inference` or `output` (`output` only on `job_failures`).",
             "required": false,
             "schema": {
               "type": [
@@ -3227,7 +3297,7 @@
           {
             "name": "counts",
             "in": "query",
-            "description": "Include per-setter vector/quantized counts (progress and size on\ndisk). These are full index scans over each setter's rows; pass\nfalse from latency-sensitive surfaces that only need profile names\nand states. Defaults to true.",
+            "description": "Include per-setter vector/quantized counts. These are full index scans;\npass false when only names and states are needed.",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -5956,6 +6026,114 @@
           }
         }
       },
+      "BatchHealth": {
+        "type": "object",
+        "description": "One measured GPU batch in [`ReplicaTelemetryHealth`].",
+        "required": [
+          "seq",
+          "age_ms",
+          "spilled"
+        ],
+        "properties": {
+          "age_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "alloc_retries": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Allocator retries this batch caused; `None` off CUDA.",
+            "minimum": 0
+          },
+          "allocated_before_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "duration_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "free_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Free device memory read before the batch.",
+            "minimum": 0
+          },
+          "items": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Inputs in the batch, not cost-dimension units.",
+            "minimum": 0
+          },
+          "peak_allocated_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "peak_reserved_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "regrow_after": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pool release this batch re-grew from (`\"trim\"`, `\"shrink\"`,\n`\"growth\"` or `\"spill\"`), on the first batch after it only."
+          },
+          "reserved_before_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Per-worker sequence number; a gap means the ring evicted samples.",
+            "minimum": 0
+          },
+          "spilled": {
+            "type": "boolean",
+            "description": "The pool exceeded NVML's used memory on the GPU by more than 512 MiB\nafter this batch: part of it was in system RAM."
+          },
+          "units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Size in cost-dimension units; `None` without a grant or when the batch\nwas unpriced.",
+            "minimum": 0
+          }
+        }
+      },
       "BinaryBlob": {
         "type": "string",
         "format": "binary",
@@ -6024,7 +6202,7 @@
         "properties": {
           "expirations": {
             "type": "object",
-            "description": "inference_id -> ISO-8601 expiration; never-expiring entries\n(ttl -1) render as `9999-12-31T23:59:59.999999`.",
+            "description": "inference_id -> ISO-8601 expiry; ttl -1 is `9999-12-31T23:59:59.999999`.",
             "additionalProperties": {
               "type": "string"
             },
@@ -6504,6 +6682,64 @@
           }
         }
       },
+      "CostHealth": {
+        "type": "object",
+        "description": "A model's cost dimension, as resolved from `metadata.cost`.",
+        "required": [
+          "unit",
+          "epoch",
+          "degraded"
+        ],
+        "properties": {
+          "aggregation": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`count` | `sum` | `max-times-count`; absent for the `none` class."
+          },
+          "canvas_pixels": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Pixel cap per item (registry or load report); `null` if uncapped.",
+            "minimum": 0
+          },
+          "degraded": {
+            "type": "boolean",
+            "description": "The registry declared nothing usable; `(item, count)` is in force."
+          },
+          "epoch": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "max_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Per-item token cap inputs are priced at; `null` for uncapped.",
+            "minimum": 0
+          },
+          "seed_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "First-touch batch before calibration; absent for the `none` class.",
+            "minimum": 0
+          },
+          "unit": {
+            "type": "string",
+            "description": "`item` | `pixel` | `token` | `audio-second` | `none`."
+          }
+        }
+      },
       "CreatePinboardRequest": {
         "allOf": [
           {
@@ -6534,7 +6770,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Optional cap on GPU batch size; `None` = auto (the default)."
           },
           "inference_id": {
             "type": "string"
@@ -7133,7 +7370,7 @@
         "properties": {
           "active": {
             "type": "boolean",
-            "description": "`attempts >= skip_after`: the verdict is confirmed and the work query\nis skipping this item. False means the verdict is recorded but\nunconfirmed and will be retried."
+            "description": "`attempts >= skip_after`: the verdict is confirmed and the work query\nis skipping this item. False means it is recorded but unconfirmed."
           },
           "attempts": {
             "type": "integer",
@@ -7160,7 +7397,7 @@
           "id": {
             "type": "integer",
             "format": "int64",
-            "description": "Ledger row id. Stable for as long as the row lives, which is what the\nUI keys rows on."
+            "description": "Ledger row id, stable for as long as the row lives; the UI keys on it."
           },
           "last_job_id": {
             "type": [
@@ -7168,7 +7405,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The last job that saw this failure. Null only when it was recorded\noutside a job. This is *not* a foreign key and nothing nulls it when\njob rows are cleaned up, so the id may name a job that no longer\nexists — the ledger has to outlive the job history it refers to."
+            "description": "The last job that saw this failure. Null only when it was recorded\noutside a job; not a foreign key, so the job may no longer exist."
           },
           "last_seen": {
             "type": "string"
@@ -7182,7 +7419,7 @@
               "string",
               "null"
             ],
-            "description": "One of the paths this item is stored under, chosen deterministically\n(an available file first, then the lexicographically smallest path).\nAn item can have several files and the ledger keys on the item, so\nthis is a representative, not the whole story. Null when every file of\nthe item has gone away."
+            "description": "A representative path (an available file first); null if none remain."
           },
           "setter_name": {
             "type": "string"
@@ -7205,19 +7442,48 @@
         "type": "object",
         "required": [
           "total",
-          "failures"
+          "failures",
+          "job_failures_total",
+          "job_failures",
+          "failed_jobs_total",
+          "failed_jobs"
         ],
         "properties": {
+          "failed_jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FailedJobRecord"
+            },
+            "description": "The failures' jobs, newest first; not narrowed by `setter` or `stage`."
+          },
+          "failed_jobs_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Jobs that ended `partial`, `failed` or `cancelled`, ignoring the page."
+          },
           "failures": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ExtractionFailure"
-            }
+            },
+            "description": "The retry ledger: media a setter has already rejected."
+          },
+          "job_failures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobItemFailure"
+            },
+            "description": "Unexplained failures, paged like `failures`; verdict filters empty it."
+          },
+          "job_failures_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Per-job item failures matching the filters, ignoring the page window."
           },
           "total": {
             "type": "integer",
             "format": "int64",
-            "description": "How many failures match the filters, ignoring the page window — the\ndenominator for `limit`/`offset` paging."
+            "description": "Recorded media verdicts matching the filters, ignoring the page window."
           }
         }
       },
@@ -7230,6 +7496,86 @@
           "failed_for": {
             "type": "string",
             "description": "This Item has an active extraction-failure record for this setter name\n(the pipeline rejected its media, or a dependency it needs is missing)"
+          }
+        }
+      },
+      "FailedJobRecord": {
+        "type": "object",
+        "description": "A job that did not complete cleanly, as the failures surface serves it.",
+        "required": [
+          "log_id",
+          "setter",
+          "type",
+          "outcome",
+          "start_time",
+          "end_time",
+          "failed_items",
+          "errors",
+          "input_errors",
+          "total_segments",
+          "total_remaining"
+        ],
+        "properties": {
+          "end_time": {
+            "type": "string",
+            "description": "When the job stopped (one-second resolution; may equal `start_time`)."
+          },
+          "errors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Every item failure the job counted, verdicts included."
+          },
+          "failed_items": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Attempted items with no verdict; the `job_failures` list may be shorter."
+          },
+          "failure_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why, when the job knew. Null for a job whose process went away."
+          },
+          "input_errors": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The subset of `errors` that is a recorded verdict about the media."
+          },
+          "job_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "`data_jobs.id`, what a failure row carries. Null once that row is gone."
+          },
+          "log_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`data_log.id`, the id job history and job-data deletion use."
+          },
+          "outcome": {
+            "type": "string",
+            "description": "`partial`, `failed` or `cancelled`."
+          },
+          "setter": {
+            "type": "string"
+          },
+          "start_time": {
+            "type": "string"
+          },
+          "total_remaining": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Items still matching the job's work query when it stopped."
+          },
+          "total_segments": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "type": {
+            "type": "string"
           }
         }
       },
@@ -7429,6 +7775,40 @@
           }
         }
       },
+      "FitHealth": {
+        "type": "object",
+        "description": "The fitted cost model in `GET /health`.",
+        "required": [
+          "slope_mb_per_unit",
+          "intercept_mb",
+          "residual_mb",
+          "samples",
+          "pool_margin"
+        ],
+        "properties": {
+          "intercept_mb": {
+            "type": "number",
+            "format": "double"
+          },
+          "pool_margin": {
+            "type": "number",
+            "format": "double",
+            "description": "Observed reserved/allocated ratio, raised a tenth (three times at\nmost) by out-of-memory windows at the limit of the device's room; a\ngrant is `(max(0, intercept) + slope × units) × pool_margin`.\nRuntime-only."
+          },
+          "residual_mb": {
+            "type": "number",
+            "format": "double"
+          },
+          "samples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "slope_mb_per_unit": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
       "FolderValidation": {
         "type": "object",
         "required": [
@@ -7493,6 +7873,214 @@
           }
         }
       },
+      "GpuBudgetHealth": {
+        "type": "object",
+        "description": "One GPU's ledger state in `GET /health`.",
+        "required": [
+          "gpu_uuid",
+          "gpu_name",
+          "device_kind",
+          "total_mb",
+          "external_mb",
+          "external_known",
+          "limit_mb",
+          "reserve_mb",
+          "reserve_rule",
+          "headroom_mb",
+          "charges_mb",
+          "footprints_mb",
+          "load_reservations_mb",
+          "grants_mb",
+          "grants_outstanding",
+          "margin",
+          "workers"
+        ],
+        "properties": {
+          "cap_fraction": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "charges_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`Σ` per-worker `footprint + max(0, grants − pool growth)`; what\n`headroom_mb` subtracts. On the CPU device it includes GPU replicas'\nresident sets and RAM bookings, as `footprints_mb` and `grants_mb` do.",
+            "minimum": 0
+          },
+          "device_kind": {
+            "type": "string",
+            "description": "`\"cuda\"`, `\"rocm\"`, `\"mps\"` or `\"cpu\"`; a host can list several kinds."
+          },
+          "external_known": {
+            "type": "boolean",
+            "description": "False when no free reading exists yet and `external_mb` is assumed 0."
+          },
+          "external_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.\nOn unified memory the footprints of every device sharing the RAM\ncount, an APU's only beyond the carve-out it can still use. On a GPU\nthat spills to system RAM, while it reads full or our own memory on it\nchanged since its last reading, at least its value at the last reading\nthat was neither. An APU reports this, the reserve, the limit and the\nheadroom from the side that binds: its VRAM and GTT (its own memory\nonly) or the RAM behind it.",
+            "minimum": 0
+          },
+          "external_sample_age_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "external_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Source of the freshest free reading: `\"nvml\"`, `\"torch\"`,\n`\"nvidia-smi\"` or `\"amdgpu-sysfs\"`."
+          },
+          "footprints_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "gpu_arch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Calibration profile key (`sm_120`, `gfx1100`, `apple-m3`, `cpu`); `null`\nuntil a load report names one."
+          },
+          "gpu_name": {
+            "type": "string"
+          },
+          "gpu_uuid": {
+            "type": "string"
+          },
+          "grants_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "grants_outstanding": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "headroom_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`limit_mb − charges_mb − load_reservations_mb`.",
+            "minimum": 0
+          },
+          "limit_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The admission budget: `min(total × cap_fraction, room − external −\nreserve_mb − the charges and load reservations of the other devices\nsharing the RAM)`, an APU's only beyond the carve-out it can still\nuse. The room is `total`; on an APU's RAM side carve-out plus host\nRAM, of which the reserve withholds at most the deliverable RAM.",
+            "minimum": 0
+          },
+          "load_reservations_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "margin": {
+            "type": "number",
+            "format": "double"
+          },
+          "reserve_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The reserve applied to this GPU on top of `external_mb`.",
+            "minimum": 0
+          },
+          "reserve_rule": {
+            "type": "string",
+            "description": "`\"user_margin\"` (configured, uncapped), `\"capped_default\"` (default\nfraction, clamped), `\"gpu_floor\"` (3 % of the card, at most 1 GiB,\nwhere the default fraction gives less; not on Apple Silicon),\n`\"flat_default\"` (the cap itself, on a CUDA GPU that spills to system\nRAM) or `\"ram_floor\"` (the minimum on the CPU device, an APU and Apple\nSilicon: a tenth of RAM, at most 16 GiB, at least 2 GiB or a quarter\nof RAM)."
+          },
+          "total_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "workers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LedgerWorkerHealth"
+            }
+          }
+        }
+      },
+      "GpuInfo": {
+        "type": "object",
+        "description": "One visible GPU, from nvidia-smi (CUDA) or KFD topology (ROCm).",
+        "required": [
+          "index",
+          "uuid",
+          "name",
+          "total_mb"
+        ],
+        "properties": {
+          "bdf": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "PCI address `dddd:bb:dd.f`, the key into amdgpu sysfs. ROCm only."
+          },
+          "compute_cap": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Compute capability as `major.minor` (`\"12.0\"`); `None` if unreported or ROCm."
+          },
+          "gfx_target_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "KFD's packed ISA target (`110000` = gfx1100). ROCm only.",
+            "minimum": 0
+          },
+          "index": {
+            "type": "integer",
+            "format": "int32",
+            "description": "nvidia-smi or HIP device index, for `devices = [\"3\"]` pins; not unique.",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "Marketing name, e.g. `NVIDIA GeForce RTX 5090`; `AMD gfx…` on ROCm."
+          },
+          "total_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "unified_ram_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Host RAM in MiB behind a unified GPU; `Some` exactly on unified GPUs.",
+            "minimum": 0
+          },
+          "uuid": {
+            "type": "string",
+            "description": "GPU UUID (`GPU-…`; on ROCm possibly a synthetic `GPU-BDF-…`), the ledger key."
+          },
+          "vram_carveout_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Device-local (non-GTT) VRAM of a unified ROCm GPU, in MiB.",
+            "minimum": 0
+          }
+        }
+      },
       "HasUnprocessedData": {
         "type": "object",
         "required": [
@@ -7507,16 +8095,42 @@
       },
       "HealthReport": {
         "type": "object",
-        "description": "`GET /health` response (design §7, additive — Python has no such\nendpoint, so this shape is ours to define). Serialized as-is by the HTTP\nlayer; `Deserialize` exists so tests can round-trip the wire shape.",
+        "description": "`GET /health` response (design §7).",
         "required": [
           "status",
           "shutting_down",
           "registry_ok",
           "model_count",
           "models",
-          "prewarm"
+          "prewarm",
+          "gpus",
+          "vram",
+          "load_cooldowns",
+          "inference_clients",
+          "predict_body_budget"
         ],
         "properties": {
+          "gpus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GpuInfo"
+            },
+            "description": "Visible GPUs by UUID; empty when the host has no inventory."
+          },
+          "inference_clients": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InferenceTransportHealth"
+            },
+            "description": "Inference client transports held by this process, by base URL. A\ngateway forwarding to a remote inference server reports its own here."
+          },
+          "load_cooldowns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoadCooldownHealth"
+            },
+            "description": "Models whose loads are failing, sorted by inference_id."
+          },
           "model_count": {
             "type": "integer",
             "description": "Number of loaded models (== `models.len()`).",
@@ -7529,13 +8143,17 @@
             },
             "description": "Per loaded model liveness/queue snapshot, sorted by inference_id."
           },
+          "predict_body_budget": {
+            "$ref": "#/components/schemas/PredictBodyBudgetHealth",
+            "description": "How much of the predict-body budget is spoken for, and refusals so far."
+          },
           "prewarm": {
             "$ref": "#/components/schemas/PrewarmHealth",
-            "description": "Prewarm pool snapshot (design §8): master/lazy switches plus one\nentry per impl class held (state \"warm\" | \"spawning\" |\n\"failed_prepare\")."
+            "description": "Prewarm snapshot: the switches plus one entry per impl class held."
           },
           "registry_ok": {
             "type": "boolean",
-            "description": "Whether the inference registry currently loads (see `health()` docs\nfor exactly what this checks)."
+            "description": "Whether the inference registry currently loads (see `health()`)."
           },
           "shutting_down": {
             "type": "boolean",
@@ -7544,6 +8162,13 @@
           "status": {
             "type": "string",
             "description": "`\"ok\"` normally, `\"shutting_down\"` once shutdown has begun."
+          },
+          "vram": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GpuBudgetHealth"
+            },
+            "description": "Per-GPU VRAM ledger state; empty with no GPU inventory."
           }
         }
       },
@@ -7667,6 +8292,81 @@
           "ann"
         ]
       },
+      "InferenceErrorBody": {
+        "type": "object",
+        "description": "`{\"detail\": …}` as in [`crate::api_error::ErrorBody`], object allowed.",
+        "required": [
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/InferenceErrorDetail"
+          }
+        }
+      },
+      "InferenceErrorDetail": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "router.py's plain detail strings (built via `ErrorBody`)."
+          },
+          {
+            "$ref": "#/components/schemas/InferenceErrorFields",
+            "description": "Machine-readable: `kind` names the failure, the rest is its context."
+          }
+        ],
+        "description": "An inference error's `{\"detail\": …}`: a router.py string or an object."
+      },
+      "InferenceErrorFields": {
+        "type": "object",
+        "description": "The fields a structured [`InferenceErrorDetail`] can carry.",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "failures": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Consecutive failures counted so far.",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string",
+            "description": "A stable token: [`WORKER_DIED_KIND`], [`REQUEST_INCOMPLETE_KIND`],\n[`BODY_BUDGET_KIND`], `load_cooldown`."
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last error that put the model in this state."
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable summary: the string the plain form would carry."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The model the failure is about, `group/name`."
+          },
+          "retry_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339 instant the model may be retried at."
+          }
+        }
+      },
       "InferencePredictRequest": {
         "type": "object",
         "description": "Multipart form body of `POST /predict/{group}/{inference_id}`.",
@@ -7676,7 +8376,7 @@
         "properties": {
           "data": {
             "type": "string",
-            "description": "JSON string of the batch: `{\"inputs\": [...]}` where each entry is an\nobject, a string, or null (null = file-only input)."
+            "description": "JSON string of the batch: `{\"inputs\": [...]}`, each entry an object,\na string, or null (file-only)."
           },
           "files": {
             "type": [
@@ -7686,7 +8386,60 @@
             "items": {
               "$ref": "#/components/schemas/BinaryBlob"
             },
-            "description": "Binary batch inputs. Each part's *filename* must be the integer\nindex of the `inputs` entry it attaches to."
+            "description": "Binary batch inputs; each part's *filename* is its `inputs` index."
+          }
+        }
+      },
+      "InferenceTransportHealth": {
+        "type": "object",
+        "description": "What one inference endpoint's client is doing right now.",
+        "required": [
+          "base_url",
+          "transport",
+          "max_concurrent_requests",
+          "in_flight_requests"
+        ],
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "description": "The endpoint this describes."
+          },
+          "connections_in_use": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Of those, how many carry a request now; `null` under HTTP/1.1.",
+            "minimum": 0
+          },
+          "frozen_since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339 instant the server was declared frozen: it missed its health\nchecks, and its requests fail until it answers one. `null` while it\nanswers."
+          },
+          "in_flight_requests": {
+            "type": "integer",
+            "description": "Of those, how many are in flight right now.",
+            "minimum": 0
+          },
+          "max_concurrent_requests": {
+            "type": "integer",
+            "description": "Requests the gate currently admits.",
+            "minimum": 0
+          },
+          "pool_connections": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Connections this client may hold; `null` under HTTP/1.1.",
+            "minimum": 0
+          },
+          "transport": {
+            "type": "string",
+            "description": "`h2c` | `h2` (over TLS) | `http/1.1` | `unknown` (not contacted yet)."
           }
         }
       },
@@ -8001,6 +8754,66 @@
           }
         }
       },
+      "JobItemFailure": {
+        "type": "object",
+        "description": "One item a job could not process and has no verdict for. Unlike an\n[`ExtractionFailure`] it suppresses nothing: the next run selects it again.",
+        "required": [
+          "id",
+          "job_id",
+          "sha256",
+          "mime_type",
+          "setter_name",
+          "stage",
+          "error",
+          "requeued",
+          "occurred_at"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "The error text, clamped when it was recorded."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Row id, stable for as long as the row lives."
+          },
+          "job_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The `data_jobs` id of the job that failed the item; see `FailedJob`."
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "occurred_at": {
+            "type": "string",
+            "description": "When the item failed (not when the record was written)."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A representative path of the item; null if none remain."
+          },
+          "requeued": {
+            "type": "boolean",
+            "description": "Whether the item had already been re-submitted once."
+          },
+          "setter_name": {
+            "type": "string",
+            "description": "The model whose job failed the item."
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "stage": {
+            "type": "string",
+            "description": "`prepare`, `inference` or `output`."
+          }
+        }
+      },
       "JobModel": {
         "type": "object",
         "required": [
@@ -8069,7 +8882,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "The failure message for [`JobOutcomeStatus::Failed`], and the summary\nof what was left undone for [`JobOutcomeStatus::Partial`]."
           },
           "queue_id": {
             "type": "integer",
@@ -8084,6 +8898,7 @@
         "type": "string",
         "enum": [
           "completed",
+          "partial",
           "failed",
           "cancelled"
         ]
@@ -8099,7 +8914,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Last-selected cap on GPU batch size; `None` = auto (the default)."
           },
           "default_threshold": {
             "type": [
@@ -8134,6 +8950,329 @@
           "test_report"
         ]
       },
+      "LedgerWorkerHealth": {
+        "type": "object",
+        "description": "One resident replica's ledger state.",
+        "required": [
+          "inference_id",
+          "footprint_mb",
+          "charge_mb",
+          "grants_outstanding",
+          "grants_mb",
+          "pending_requests",
+          "seed_units",
+          "deflation",
+          "clean_windows",
+          "unit_budget",
+          "max_units_measured",
+          "knee_is_local",
+          "retest_after_windows",
+          "throughput_samples",
+          "local_samples",
+          "effective_margin",
+          "ram_booked_mb",
+          "ram_ceiling_binding"
+        ],
+        "properties": {
+          "alloc_retries_last_window": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Allocator retries in the last window that reported them, and the total.\nAbsent off CUDA; absent is not zero.",
+            "minimum": 0
+          },
+          "alloc_retries_total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "base_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "charge_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`footprint + max(0, grants − pool growth)`: this replica's charge now.\nOn the CPU device `footprint + grants`.",
+            "minimum": 0
+          },
+          "clean_windows": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive clean windows since the last negative sample.",
+            "minimum": 0
+          },
+          "death_cap_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Half the batch a replica of this model was running here when its\nprocess died mid-window: caps `unit_budget` until the server restarts.",
+            "minimum": 0
+          },
+          "deflation": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Halvings currently applied by OOM / throughput-collapse deflation.",
+            "minimum": 0
+          },
+          "effective_margin": {
+            "type": "number",
+            "format": "double",
+            "description": "The GPU's margin, widened while the fit is unconfirmed or scattered."
+          },
+          "fit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FitHealth"
+              }
+            ]
+          },
+          "footprint_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`base + max(0, reserved − reserved_at_load)`: this resident's footprint.",
+            "minimum": 0
+          },
+          "grants_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "grants_outstanding": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "inference_id": {
+            "type": "string"
+          },
+          "knee_is_local": {
+            "type": "boolean",
+            "description": "A trial on this machine measured the sizes next to `knee_units` and\nmoved to it or left it in place, in this run or the one that stored\nit. `false` for a size seeded from a shipped profile and one this\nreplica opened at."
+          },
+          "knee_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The working batch size: the smallest whose rate measured within 5 %\nof the best, or the size this replica opened at until a trial has\nmeasured the sizes next to it.",
+            "minimum": 0
+          },
+          "last_regrow_batch_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "last_regrow_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The first batch after a host-requested release: MiB the pool grew back,\nand that batch's whole duration.",
+            "minimum": 0
+          },
+          "last_release_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_release_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "local_samples": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Local fit samples, including restored ones; the margin widens below\n`LOCAL_CONFIRMATION_SAMPLES`.",
+            "minimum": 0
+          },
+          "max_units_measured": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ratchet anchor: largest locally measured clean priced batch.",
+            "minimum": 0
+          },
+          "pending_requests": {
+            "type": "integer",
+            "description": "Demand signal behind the contention split.",
+            "minimum": 0
+          },
+          "pool_releases": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Trims that freed memory, and the last one's MiB and `empty_cache()`\ntime. Absent off CUDA and MPS.",
+            "minimum": 0
+          },
+          "pressure_cap_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The batch a macOS paging episode left: caps `unit_budget` until clean\nfull windows double it back to the batch size admitted at normal\npressure; runtime-only.",
+            "minimum": 0
+          },
+          "pressure_regrow_to_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How far `pressure_cap_units` may grow back while macOS reports\nmemory pressure without paging; caps `unit_budget` while the level is\nabove normal.",
+            "minimum": 0
+          },
+          "ram_booked_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ram_ceiling_binding": {
+            "type": "boolean"
+          },
+          "ram_mb_per_unit": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "ram_resident_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "A GPU replica's host RAM, booked on the CPU device: its resident set\n(absent when its RAM is not booked), the MiB per unit its grants book\n(absent until a batch measured it), what its outstanding grants hold\nbooked, and whether host RAM capped its last grant.",
+            "minimum": 0
+          },
+          "reserved_at_load_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The allocator pool at load and now; on the CPU device the replica's\nresident set.",
+            "minimum": 0
+          },
+          "reserved_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "retest_after_windows": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Full windows at `knee_units` still to run before the next trial.",
+            "minimum": 0
+          },
+          "seed_units": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "shape_ceiling_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Shape ceiling from `index_limit` clamps: caps `unit_budget`; runtime-only.",
+            "minimum": 0
+          },
+          "throughput_samples": {
+            "type": "integer",
+            "description": "Throughput observations held (all occupancies); runtime-only.",
+            "minimum": 0
+          },
+          "trial_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The batch size the trial in progress runs next; absent between trials.",
+            "minimum": 0
+          },
+          "unit_budget": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The unit budget as of this snapshot: the batch size under the ratchet,\nat most the working size while macOS reports memory pressure.",
+            "minimum": 0
+          }
+        }
+      },
+      "LoadCooldownHealth": {
+        "type": "object",
+        "description": "One model's load-failure cooldown; such a model is never in `models[]`.",
+        "required": [
+          "inference_id",
+          "failures",
+          "last_error",
+          "retry_at",
+          "retry_after_secs",
+          "window_secs"
+        ],
+        "properties": {
+          "failures": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive failed loads.",
+            "minimum": 0
+          },
+          "inference_id": {
+            "type": "string"
+          },
+          "last_error": {
+            "type": "string",
+            "description": "The failure that armed the current window (clamped to 2000 bytes)."
+          },
+          "retry_after_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Whole seconds until then; 0 once the window has passed.",
+            "minimum": 0
+          },
+          "retry_at": {
+            "type": "string",
+            "description": "RFC 3339 instant the model may be retried at."
+          },
+          "window_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The window this failure count earned, in seconds.",
+            "minimum": 0
+          }
+        }
+      },
       "LogRecord": {
         "type": "object",
         "required": [
@@ -8154,7 +9293,9 @@
           "data_load_time",
           "inference_time",
           "failed",
-          "completed"
+          "completed",
+          "outcome",
+          "failed_items"
         ],
         "properties": {
           "batch_size": {
@@ -8178,7 +9319,20 @@
           },
           "failed": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Legacy \"did not complete\" flag, 0 or 1; also 1 when [`Self::outcome`] is\n`failed` or `cancelled`."
+          },
+          "failed_items": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Attempted items with no verdict (`errors` minus `input_errors`)."
+          },
+          "failure_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the job ended as it did (`partial`, `failed`, `cancelled`)."
           },
           "id": {
             "type": "integer",
@@ -8204,6 +9358,10 @@
           "other_files": {
             "type": "integer",
             "format": "int64"
+          },
+          "outcome": {
+            "type": "string",
+            "description": "How the job ended: `completed`, `partial`, `failed`, `cancelled` or\n`running`; derived for rows from before the column ([`OUTCOME_SQL`])."
           },
           "setter": {
             "type": "string"
@@ -9193,7 +10351,10 @@
           "queue_depth",
           "in_flight_windows",
           "total_predict_requests",
-          "total_batches"
+          "total_batches",
+          "queue_bound_windows",
+          "cost",
+          "replicas_detail"
         ],
         "properties": {
           "cache_keys": {
@@ -9202,6 +10363,19 @@
               "type": "string"
             },
             "description": "Cache keys currently referencing the model, sorted."
+          },
+          "cost": {
+            "$ref": "#/components/schemas/CostHealth",
+            "description": "Cost dimension resolved from registry metadata at load time."
+          },
+          "desired_in_flight_items": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The `x-panoptikon-desired-in-flight-items` figure; `null` before a window.",
+            "minimum": 0
           },
           "generation": {
             "type": "integer",
@@ -9217,13 +10391,28 @@
           "inference_id": {
             "type": "string"
           },
-          "last_effective_cap": {
+          "last_grant_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unit budget of the last window's grant; `null` on the unpriced path.",
+            "minimum": 0
+          },
+          "last_window_items": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int32",
-            "description": "Effective cap of the most recently dispatched window (design §6);\n`null` until the first window dispatches.",
+            "description": "Inputs in the most recently dispatched window; `null` until the first.",
+            "minimum": 0
+          },
+          "queue_bound_windows": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Of those, the ones the queue rather than the GPU decided the size of.",
             "minimum": 0
           },
           "queue_depth": {
@@ -9233,7 +10422,14 @@
           },
           "replicas": {
             "$ref": "#/components/schemas/ReplicaHealth",
-            "description": "WorkerSet occupancy: `free < total` means replicas are running\nwindows right now."
+            "description": "WorkerSet occupancy: `free < total` means replicas are running windows."
+          },
+          "replicas_detail": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplicaTelemetryHealth"
+            },
+            "description": "Per replica: its GPU and the freshest memory sensing it reported."
           },
           "total_batches": {
             "type": "integer",
@@ -9999,9 +11195,45 @@
           }
         }
       },
+      "PredictBodyBudgetHealth": {
+        "type": "object",
+        "description": "This process's predict-body budget.",
+        "required": [
+          "request_limit_bytes",
+          "budget_bytes",
+          "in_flight_bytes",
+          "refused_requests"
+        ],
+        "properties": {
+          "budget_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "[`PREDICT_INFLIGHT_BODY_BYTES`]: predict body bytes held at once.",
+            "minimum": 0
+          },
+          "in_flight_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Of those, how many are reserved now: arriving plus being parsed.",
+            "minimum": 0
+          },
+          "refused_requests": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Predict requests refused for want of budget since startup.",
+            "minimum": 0
+          },
+          "request_limit_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "[`PREDICT_BODY_LIMIT`]: the largest body read, then `413`.",
+            "minimum": 0
+          }
+        }
+      },
       "PredictJsonResponse": {
         "type": "object",
-        "description": "JSON envelope of a predict response (used whenever the outputs are not\nall binary).",
+        "description": "JSON envelope of a predict response, unless every output is binary.",
         "required": [
           "outputs"
         ],
@@ -10011,7 +11243,7 @@
             "items": {
               "$ref": "#/components/schemas/Value"
             },
-            "description": "One output per input; binary outputs are wrapped as\n`{\"__type__\": \"base64\", \"content\": \"<base64>\"}`, and an input the\nmodel rejected on its own is\n`{\"__error__\": {\"class\": \"input\" | \"transient\", \"message\": \"...\"}}`."
+            "description": "One output per input; binary ones wrapped as\n`{\"__type__\": \"base64\", \"content\": ...}`, a rejected input as\n`{\"__error__\": {\"class\": ..., \"message\": ...}}`."
           }
         }
       },
@@ -10214,6 +11446,143 @@
           }
         }
       },
+      "ReplicaTelemetryHealth": {
+        "type": "object",
+        "description": "Per-replica placement and memory (`null` until reported; RAM or Metal figures on CPU/MPS).",
+        "required": [
+          "measurements_recorded",
+          "recent_batches"
+        ],
+        "properties": {
+          "allocated_at_load_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Live tensor bytes at load: the baseline the cost fit prices over.",
+            "minimum": 0
+          },
+          "allocated_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "base_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Process-level load footprint and how it was measured.",
+            "minimum": 0
+          },
+          "base_method": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dtype": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Negotiated load precision, part of the calibration profile key."
+          },
+          "free_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Freshest device sample, and how long ago it was recorded.",
+            "minimum": 0
+          },
+          "free_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Driver behind `free_mb`/`total_mb`; they disagree by gigabytes."
+          },
+          "gpu": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Device pin the worker was spawned with (UUID on CUDA, index on ROCm)."
+          },
+          "gpu_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "gpu_uuid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The GPU the worker reports being on; `null` on ROCm."
+          },
+          "measurements_recorded": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Measurements reported since load, including ones the ring evicted.",
+            "minimum": 0
+          },
+          "memory_age_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "recent_batches": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchHealth"
+            },
+            "description": "The tail of the measurement ring, oldest first — a sample, not all."
+          },
+          "reserved_at_load_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "reserved_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "torch_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The worker venv's torch, part of the calibration profile key."
+          },
+          "total_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "Results": {
         "type": "object",
         "required": [
@@ -10365,7 +11734,7 @@
         "properties": {
           "active": {
             "type": "boolean",
-            "description": "`attempts >= skip_after`: the verdict is confirmed. Not the same as\n\"this path will be skipped\": the walker also requires the file to still\nhave the `last_modified`/`file_size` the failure was recorded against,\nso a file that has been repaired or otherwise modified since is\nre-attempted on the next scan even though this reads true.\n\nA `decode`-stage row never suppresses anything at any `attempts`: its\nfile *is* indexed (only the visuals failed), so the row is audit-only\nand retry scheduling is the visuals cache's, not this ledger's."
+            "description": "`attempts >= skip_after`: the verdict is confirmed. Not the same as\n\"this path will be skipped\": the walker also requires the file to still\nhave the `last_modified`/`file_size` the failure was recorded against. A\n`decode`-stage row is audit-only."
           },
           "attempts": {
             "type": "integer",
@@ -10397,7 +11766,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The last scan that saw this failure. Null only when it was recorded\noutside a scan. This is *not* a foreign key and nothing nulls it when\n`file_scans` rows are cleaned up, so the id may name a scan that no\nlonger exists."
+            "description": "The last scan that saw this failure. Null only when it was recorded\noutside a scan; not a foreign key, so the scan may no longer exist."
           },
           "last_seen": {
             "type": "string"
@@ -12071,6 +13440,27 @@
             "format": "int32",
             "description": "0-3 clockwise quarter turns.",
             "minimum": 0
+          }
+        }
+      },
+      "UnansweredHealth": {
+        "type": "object",
+        "description": "The gateway's 504 to `GET /api/inference/health` when the inference server\nit forwards to is declared frozen or does not answer in time.",
+        "required": [
+          "detail",
+          "inference_clients"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Why the server's report is missing."
+          },
+          "inference_clients": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InferenceTransportHealth"
+            },
+            "description": "This gateway's clients; `frozen_since` says whether the server is\ndeclared frozen."
           }
         }
       },

@@ -9,12 +9,15 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     marker::PhantomData,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use url::Url;
@@ -304,20 +307,30 @@ async fn acquire_read_conn(
                 },
             )?;
             let paths = db_paths(&names.index_db, &names.user_data_db)?;
-            let pool = build_read_pool(&paths, attach_user_data)?;
+            let pool = build_read_pool(&paths, attach_user_data).await?;
             let mut pools = read_pools().lock().expect("read pool registry poisoned");
             // A concurrent request may have raced us here; keep the first pool.
-            pools.entry(key).or_insert(pool).clone()
+            pools.entry(key.clone()).or_insert(pool).clone()
         }
     };
 
-    pool.acquire().await.map_err(|err| {
-        tracing::error!(error = %err, "failed to acquire read connection");
-        ApiError::internal("Failed to open database")
-    })
+    match pool.acquire().await {
+        Ok(conn) => Ok(conn),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to acquire read connection");
+            // A pool whose connections are all busy times out the same way;
+            // only a database that cannot be opened drops it.
+            let paths = db_paths_unchecked(&names.index_db, &names.user_data_db);
+            if build_read_pool(&paths, attach_user_data).await.is_err() {
+                let mut pools = read_pools().lock().expect("read pool registry poisoned");
+                pools.remove(&key);
+            }
+            Err(ApiError::internal("Failed to open database"))
+        }
+    }
 }
 
-fn build_read_pool(paths: &DbPaths, attach_user_data: bool) -> Result<SqlitePool, ApiError> {
+async fn build_read_pool(paths: &DbPaths, attach_user_data: bool) -> Result<SqlitePool, ApiError> {
     ensure_sqlite_extensions()?;
     let options = SqliteConnectOptions::new()
         .filename(&paths.index_db_file)
@@ -325,36 +338,58 @@ fn build_read_pool(paths: &DbPaths, attach_user_data: bool) -> Result<SqlitePool
     let storage_path = paths.storage_db_file.to_string_lossy().to_string();
     let user_data_path = attach_user_data.then(|| user_data_attach_path(&paths.user_db_file, true));
 
+    // The pool retries a failing connection setup until its acquire timeout
+    // (30 s), so a database that cannot be opened is refused here, at once.
+    let opened = async {
+        let mut conn = SqliteConnection::connect_with(&options).await?;
+        setup_read_conn(&mut conn, storage_path.clone(), user_data_path.clone()).await
+    };
+    if let Err(err) = opened.await {
+        tracing::error!(error = %err, "failed to open read connection");
+        log_open_problem(paths, attach_user_data, false, false);
+        return Err(ApiError::internal("Failed to open database"));
+    }
+    log_open_success(paths, attach_user_data, false, false);
     let pool = SqlitePoolOptions::new()
         .max_connections(READ_POOL_MAX_CONNECTIONS)
         .min_connections(0)
         .idle_timeout(Some(READ_POOL_IDLE_TIMEOUT))
         .test_before_acquire(false)
         .after_connect(move |conn, _meta| {
-            let storage_path = storage_path.clone();
-            let user_data_path = user_data_path.clone();
-            Box::pin(async move {
-                sqlx::query("ATTACH DATABASE ? AS storage")
-                    .bind(storage_path)
-                    .execute(&mut *conn)
-                    .await?;
-                if let Some(user_data_path) = user_data_path {
-                    sqlx::query("ATTACH DATABASE ? AS user_data")
-                        .bind(user_data_path)
-                        .execute(&mut *conn)
-                        .await?;
-                }
-                sqlx::query("PRAGMA foreign_keys = ON")
-                    .execute(&mut *conn)
-                    .await?;
-                sqlx::query("PRAGMA case_sensitive_like = ON")
-                    .execute(&mut *conn)
-                    .await?;
-                Ok(())
-            })
+            Box::pin(setup_read_conn(
+                conn,
+                storage_path.clone(),
+                user_data_path.clone(),
+            ))
         })
         .connect_lazy_with(options);
     Ok(pool)
+}
+
+/// Attaches `storage` (and user data, when given) to a pooled read
+/// connection and sets its per-connection pragmas.
+async fn setup_read_conn(
+    conn: &mut SqliteConnection,
+    storage_path: String,
+    user_data_path: Option<String>,
+) -> sqlx::Result<()> {
+    sqlx::query("ATTACH DATABASE ? AS storage")
+        .bind(storage_path)
+        .execute(&mut *conn)
+        .await?;
+    if let Some(user_data_path) = user_data_path {
+        sqlx::query("ATTACH DATABASE ? AS user_data")
+            .bind(user_data_path)
+            .execute(&mut *conn)
+            .await?;
+    }
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("PRAGMA case_sensitive_like = ON")
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 fn resolve_db_names(query: DbQuery) -> Result<DbNames, ApiError> {
@@ -385,6 +420,16 @@ pub(crate) fn index_storage_paths_unchecked(index_db: &str) -> IndexStoragePaths
     }
 }
 
+fn db_paths_unchecked(index_db: &str, user_data_db: &str) -> DbPaths {
+    let index_paths = index_storage_paths_unchecked(index_db);
+    let user_data_db_dir = crate::config::runtime().data_folder.join("user_data");
+    DbPaths {
+        index_db_file: index_paths.index_db_file,
+        storage_db_file: index_paths.storage_db_file,
+        user_db_file: user_data_db_dir.join(format!("{user_data_db}.db")),
+    }
+}
+
 fn index_storage_paths(index_db: &str) -> Result<IndexStoragePaths, ApiError> {
     let index_paths = index_storage_paths_unchecked(index_db);
     let index_db_dir = index_paths
@@ -411,18 +456,13 @@ fn db_paths_index_only(index_db: &str) -> Result<DbPaths, ApiError> {
 }
 
 fn db_paths(index_db: &str, user_data_db: &str) -> Result<DbPaths, ApiError> {
-    let index_paths = index_storage_paths(index_db)?;
+    index_storage_paths(index_db)?;
     let user_data_db_dir = crate::config::runtime().data_folder.join("user_data");
     fs::create_dir_all(&user_data_db_dir).map_err(|err| {
         tracing::error!(error = %err, "failed to create user data dir");
         ApiError::internal("Failed to prepare database directories")
     })?;
-
-    Ok(DbPaths {
-        index_db_file: index_paths.index_db_file,
-        storage_db_file: index_paths.storage_db_file,
-        user_db_file: user_data_db_dir.join(format!("{user_data_db}.db")),
-    })
+    Ok(db_paths_unchecked(index_db, user_data_db))
 }
 
 fn db_lists() -> Result<(Vec<String>, Vec<String>), ApiError> {
@@ -570,16 +610,213 @@ pub(crate) mod readonly_test_override {
 /// truncate/regrow cycles. See docs/sqlite-wal-growth.md.
 const WAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Lowers one schema's `synchronous` to NORMAL only when it is really in WAL;
+/// under a rollback journal NORMAL can corrupt the file on power loss.
+/// `schema` is `""` for main or `"storage."`. Returns whether NORMAL was set.
+async fn lower_synchronous_under_wal(
+    conn: &mut SqliteConnection,
+    schema: &str,
+    journal_mode: &str,
+    file: &Path,
+) -> Result<bool, ApiError> {
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        log_journal_mode_once(file, journal_mode);
+        return Ok(false);
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PRAGMA {schema}synchronous = NORMAL"
+    )))
+    .execute(conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to set synchronous mode");
+        ApiError::internal("Failed to open database")
+    })?;
+    Ok(true)
+}
+
+/// One INFO line per database file not in WAL (its commits pay a full fsync).
+fn log_journal_mode_once(file: &Path, journal_mode: &str) {
+    static LOGGED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let logged = LOGGED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut logged = logged.lock().unwrap_or_else(|err| err.into_inner());
+    if logged.insert(file.to_path_buf()) {
+        tracing::info!(
+            db = %file.display(),
+            journal_mode,
+            "database is not in WAL mode; keeping synchronous = FULL"
+        );
+    }
+}
+
 async fn connect_db(
     paths: &DbPaths,
     write_lock: bool,
     user_data_wl: bool,
     attach_user_data: bool,
 ) -> Result<SqliteConnection, ApiError> {
-    ensure_sqlite_extensions()?;
     let readonly_mode = readonly_mode();
     let write_lock = write_lock && !readonly_mode;
     let user_data_wl = user_data_wl && attach_user_data && !readonly_mode;
+    let conn = open_db(paths, write_lock, user_data_wl, attach_user_data).await;
+    match conn {
+        Ok(_) => log_open_success(paths, attach_user_data, write_lock, user_data_wl),
+        Err(_) => log_open_problem(paths, attach_user_data, write_lock, user_data_wl),
+    }
+    conn
+}
+
+/// The database files whose open problem was logged, each with whether it
+/// was opened for writing, that have not been opened the same way since.
+static OPEN_PROBLEMS: Mutex<BTreeSet<(PathBuf, bool)>> = Mutex::new(BTreeSet::new());
+
+/// The files an open of `paths` opens, each with whether it is opened for
+/// writing: the user-data file only when attached.
+fn opened_files(
+    paths: &DbPaths,
+    attach_user_data: bool,
+    write_index: bool,
+    write_user_data: bool,
+) -> impl Iterator<Item = (&PathBuf, bool)> {
+    let user_db_file = attach_user_data.then_some((&paths.user_db_file, write_user_data));
+    let files = [
+        Some((&paths.index_db_file, write_index)),
+        Some((&paths.storage_db_file, write_index)),
+        user_db_file,
+    ];
+    files.into_iter().flatten()
+}
+
+/// Logs why a database in `paths` cannot be written: another user owns it or
+/// its filesystem is read-only. Logged once per database file and kind of
+/// open (read or write) of that file until an open of the same kind succeeds.
+fn log_open_problem(
+    paths: &DbPaths,
+    attach_user_data: bool,
+    write_index: bool,
+    write_user_data: bool,
+) {
+    let mut files = opened_files(paths, attach_user_data, write_index, write_user_data);
+    let Some((key, reason)) = files.find_map(|(file, write)| {
+        let name = file.file_name()?.to_str()?;
+        let reason = crate::ownership::database_problem(file.parent()?, name)?;
+        Some(((file.clone(), write), reason))
+    }) else {
+        return;
+    };
+    let mut logged = OPEN_PROBLEMS.lock().unwrap_or_else(|err| err.into_inner());
+    if logged.insert(key) {
+        tracing::warn!(reason, "cannot open a database");
+    }
+}
+
+/// Starts a write transaction. When SQLite refuses it because a file it
+/// writes is read-only (for example a `-shm` another user left behind),
+/// logs why each file the connection writes cannot be written, once per file
+/// until a later transaction on that file starts. While any file is still
+/// logged, every successful call, on any database, also reads the
+/// connection's database list.
+pub(crate) async fn begin_immediate(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    let result = sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await;
+    match &result {
+        Ok(_) if READ_ONLY_WRITE_COUNT.load(Ordering::Relaxed) > 0 => {
+            let files = written_files(conn).await;
+            let mut logged = READ_ONLY_WRITES
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            for file in files {
+                logged.remove(&file);
+            }
+            READ_ONLY_WRITE_COUNT.store(logged.len(), Ordering::Relaxed);
+        }
+        Err(err) if is_read_only(err) => log_read_only_files(conn).await,
+        _ => {}
+    }
+    result.map(drop)
+}
+
+fn is_read_only(err: &sqlx::Error) -> bool {
+    let code = err.as_database_error().and_then(|err| err.code());
+    code.and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(is_read_only_code)
+}
+
+/// SQLITE_READONLY is 8; extended codes keep it in the low byte.
+fn is_read_only_code(code: i32) -> bool {
+    code & 0xff == 8
+}
+
+/// The database files whose read-only write failure was logged.
+static READ_ONLY_WRITES: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+/// The size of [`READ_ONLY_WRITES`].
+static READ_ONLY_WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// The files of the schemas `conn` opened writable.
+async fn written_files(conn: &mut SqliteConnection) -> Vec<PathBuf> {
+    let Ok(schemas) = sqlx::query_as::<_, (i64, String, String)>("PRAGMA database_list")
+        .fetch_all(&mut *conn)
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(mut handle) = conn.lock_handle().await else {
+        return Vec::new();
+    };
+    let db = handle.as_raw_handle().as_ptr();
+    let mut files = Vec::new();
+    for (_, schema, file) in schemas {
+        let Ok(schema) = std::ffi::CString::new(schema) else {
+            continue;
+        };
+        // SAFETY: `db` is the open connection, locked by `handle`, and
+        // `schema` is NUL-terminated.
+        if unsafe { libsqlite3_sys::sqlite3_db_readonly(db, schema.as_ptr()) } == 0 {
+            files.push(PathBuf::from(file));
+        }
+    }
+    files
+}
+
+async fn log_read_only_files(conn: &mut SqliteConnection) {
+    for file in written_files(conn).await {
+        let name = file.file_name().and_then(|name| name.to_str());
+        let folder_and_name = file.parent().zip(name);
+        let Some(reason) = folder_and_name
+            .and_then(|(folder, name)| crate::ownership::database_problem(folder, name))
+        else {
+            continue;
+        };
+        let mut logged = READ_ONLY_WRITES
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if logged.insert(file.clone()) {
+            READ_ONLY_WRITE_COUNT.store(logged.len(), Ordering::Relaxed);
+            tracing::warn!(reason, db = %file.display(), "cannot write a database");
+        }
+    }
+}
+
+/// After an open of `paths` succeeds, a problem with each of its files in an
+/// open of the same kind is logged again.
+fn log_open_success(
+    paths: &DbPaths,
+    attach_user_data: bool,
+    write_index: bool,
+    write_user_data: bool,
+) {
+    let mut logged = OPEN_PROBLEMS.lock().unwrap_or_else(|err| err.into_inner());
+    for (file, write) in opened_files(paths, attach_user_data, write_index, write_user_data) {
+        logged.remove(&(file.clone(), write));
+    }
+}
+
+async fn open_db(
+    paths: &DbPaths,
+    write_lock: bool,
+    user_data_wl: bool,
+    attach_user_data: bool,
+) -> Result<SqliteConnection, ApiError> {
+    ensure_sqlite_extensions()?;
     let open_readonly = !write_lock && !user_data_wl;
 
     let mut conn = if open_readonly {
@@ -649,13 +886,26 @@ async fn connect_db(
                 tracing::error!(error = %err, "failed to attach storage database");
                 ApiError::internal("Failed to open database")
             })?;
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&mut conn)
+        // WAL needs shared memory, so the mode SQLite settles on may differ
+        // (some network shares stay on a journal).
+        let index_mode: String = sqlx::query_scalar("PRAGMA journal_mode=WAL")
+            .fetch_one(&mut conn)
             .await
             .map_err(|err| {
                 tracing::error!(error = %err, "failed to enable WAL mode");
                 ApiError::internal("Failed to open database")
             })?;
+        lower_synchronous_under_wal(&mut conn, "", &index_mode, &paths.index_db_file).await?;
+        // `storage` takes WAL from its own migration; only read the mode here.
+        let storage_mode: String = sqlx::query_scalar("PRAGMA storage.journal_mode")
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to read the storage journal mode");
+                ApiError::internal("Failed to open database")
+            })?;
+        lower_synchronous_under_wal(&mut conn, "storage.", &storage_mode, &paths.storage_db_file)
+            .await?;
         // Bound the WAL high-water mark: with a limit set, any checkpoint
         // that resets the log truncates the file back to the limit instead
         // of leaving it at peak size until every connection closes. The
@@ -707,6 +957,28 @@ async fn connect_db(
         }
     }
 
+    // SQLite opens a file it cannot write read-only, without an error.
+    {
+        let mut handle = conn.lock_handle().await.map_err(|err| {
+            tracing::error!(error = %err, "failed to lock the connection");
+            ApiError::internal("Failed to open database")
+        })?;
+        let db = handle.as_raw_handle().as_ptr();
+        let schemas = [
+            (c"main", write_lock),
+            (c"storage", write_lock),
+            (c"user_data", user_data_wl),
+        ];
+        for (schema, written) in schemas {
+            // SAFETY: `db` is the open connection, locked by `handle`, and
+            // `schema` is NUL-terminated.
+            if written && unsafe { libsqlite3_sys::sqlite3_db_readonly(db, schema.as_ptr()) } == 1 {
+                tracing::error!(?schema, "database opened read-only");
+                return Err(ApiError::internal("Failed to open database"));
+            }
+        }
+    }
+
     sqlx::query("PRAGMA foreign_keys = ON")
         .execute(&mut conn)
         .await
@@ -749,6 +1021,310 @@ fn read_only_db_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A database that did not take WAL keeps `synchronous = FULL`: under a
+    /// rollback journal NORMAL is what SQLite documents as able to corrupt the
+    /// file on power loss, and the pragma's *result* is the only evidence of
+    /// which mode the file is in.
+    #[tokio::test]
+    async fn a_database_off_wal_keeps_synchronous_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("index.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&file)
+            .create_if_missing(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+
+        let forced: String = sqlx::query_scalar("PRAGMA journal_mode=DELETE")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(forced, "delete");
+        assert!(
+            !lower_synchronous_under_wal(&mut conn, "", &forced, &file)
+                .await
+                .unwrap(),
+            "a journalled database must not be lowered to NORMAL"
+        );
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(sync, 2, "synchronous stays at FULL");
+
+        let wal: String = sqlx::query_scalar("PRAGMA journal_mode=WAL")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(wal, "wal");
+        assert!(
+            lower_synchronous_under_wal(&mut conn, "", &wal, &file)
+                .await
+                .unwrap(),
+            "under WAL the lowering is safe and happens"
+        );
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(sync, 1, "synchronous is NORMAL");
+    }
+
+    /// A database that cannot be opened fails a request at once, and each
+    /// file another user owns is logged once per kind of open of that file
+    /// until an open of the same kind succeeds, naming the folder and its
+    /// owner. A cached read pool for it is dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_database_that_cannot_be_opened_fails_at_once_and_names_the_owner() {
+        use crate::ownership::tests::{foreign_folder, owned_by_another_user};
+        use std::os::unix::fs::symlink;
+        let env = crate::test_utils::test_data_dir();
+        let folder = env.path().join("index/index_only");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("index.db"), "").unwrap();
+        let query = DbQuery {
+            index_db: Some("index_only".to_owned()),
+            user_data_db: None,
+        };
+        let names = resolve_db_names_unchecked(&query);
+        let started = std::time::Instant::now();
+        let result = acquire_read_conn(&query, &names, false).await;
+        let elapsed = started.elapsed();
+        fs::remove_dir_all(&folder).unwrap();
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+
+        let Some((foreign, owner)) = foreign_folder(false) else {
+            return;
+        };
+        let names = |index_db: &str| {
+            resolve_db_names_unchecked(&DbQuery {
+                index_db: Some(index_db.to_owned()),
+                user_data_db: None,
+            })
+        };
+        let [link, read_link, pool_link] = ["foreign_owned", "foreign_read", "foreign_pool"]
+            .map(|name| env.path().join("index").join(name));
+        for link in [&link, &read_link, &pool_link] {
+            symlink(foreign, link).unwrap();
+        }
+        let (_guard, reasons) = crate::test_utils::warned_reasons();
+        let no_names = DbQuery {
+            index_db: None,
+            user_data_db: None,
+        };
+        let read_names = names("foreign_read");
+        let read = || acquire_read_conn(&no_names, &read_names, false);
+        let open = || open_index_db_write_no_user_data("foreign_owned");
+        let mut failed = vec![read().await.is_err(), open().await.is_err()];
+        failed.push(open().await.is_err());
+        let make_openable = |link: &Path, openable: bool| {
+            if openable {
+                fs::remove_file(link).unwrap();
+                fs::create_dir(link).unwrap();
+                for db in ["index.db", "storage.db"] {
+                    fs::write(link.join(db), "").unwrap();
+                }
+            } else {
+                fs::remove_dir_all(link).unwrap();
+                symlink(foreign, link).unwrap();
+            }
+        };
+        make_openable(&link, true);
+        let pooled = acquire_read_conn(&no_names, &names("foreign_owned"), false).await;
+        drop(pooled.unwrap());
+        assert!(
+            open_index_db_read_no_user_data("foreign_owned")
+                .await
+                .is_ok()
+        );
+        make_openable(&link, false);
+        failed.push(open().await.is_err());
+        assert_eq!(reasons.lock().unwrap().len(), 2);
+        make_openable(&link, true);
+        assert!(open().await.is_ok());
+        make_openable(&link, false);
+        failed.push(open().await.is_err());
+        let user_db = env.path().join("user_data/foreign_user.db");
+        make_openable(&link, true);
+        fs::write(&user_db, "").unwrap();
+        let user_write = || open_user_data_write("foreign_owned", "foreign_user");
+        assert!(user_write().await.is_ok());
+        make_openable(&link, false);
+        failed.push(open().await.is_err());
+        make_openable(&link, true);
+        fs::remove_file(&user_db).unwrap();
+        symlink(foreign, &user_db).unwrap();
+        let user_read = || open_index_db_read("foreign_owned", "foreign_user");
+        failed.extend([user_read().await.is_err(), user_write().await.is_err()]);
+        let owned_key = ("foreign_owned".to_owned(), String::new(), false);
+        read_pools().lock().unwrap().remove(&owned_key);
+        let user_names = DbNames {
+            index_db: "foreign_owned".to_owned(),
+            user_data_db: "foreign_user".to_owned(),
+        };
+        assert!(
+            acquire_read_conn(&no_names, &user_names, false)
+                .await
+                .is_ok()
+        );
+        failed.extend([user_read().await.is_err(), user_write().await.is_err()]);
+        make_openable(&link, false);
+        failed.push(read().await.is_err());
+        make_openable(&read_link, true);
+        drop(read().await.unwrap());
+        read_pools()
+            .lock()
+            .unwrap()
+            .remove(&("foreign_read".to_owned(), String::new(), false));
+        make_openable(&read_link, false);
+        failed.push(read().await.is_err());
+
+        let key = ("foreign_pool".to_owned(), String::new(), false);
+        let pool = SqlitePoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy_with(SqliteConnectOptions::new().filename(pool_link.join("index.db")));
+        read_pools().lock().unwrap().insert(key.clone(), pool);
+        let pooled = acquire_read_conn(&no_names, &names("foreign_pool"), false).await;
+        failed.push(pooled.is_err());
+        let dropped = !read_pools().lock().unwrap().contains_key(&key);
+        read_pools().lock().unwrap().remove(&owned_key);
+        for link in [&link, &read_link, &pool_link, &user_db] {
+            fs::remove_file(link).unwrap();
+        }
+        assert!(failed.iter().all(|failed| *failed) && dropped, "{failed:?}");
+        let [read, write, user, pool] = [&read_link, &link, &user_db, &pool_link]
+            .map(|link| Some(owned_by_another_user(link, owner, foreign)));
+        let expected = [&read, &write, &write, &user, &user, &read, &pool].map(Clone::clone);
+        assert_eq!(*reasons.lock().unwrap(), expected);
+    }
+
+    /// A write open fails when SQLite can open a file it writes only read-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_open_of_a_read_only_file_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _env = crate::test_utils::test_data_dir();
+        let name = "read_only_files";
+        let paths = db_paths(name, name).unwrap();
+        let index = open_index_db_write_no_user_data(name).await.unwrap();
+        index.close().await.unwrap();
+        fs::write(&paths.user_db_file, "").unwrap();
+        let user_data = open_user_data_write(name, name).await.unwrap();
+        user_data.close().await.unwrap();
+        let files = [
+            (&paths.index_db_file, false),
+            (&paths.storage_db_file, false),
+            (&paths.user_db_file, true),
+        ];
+        for (file, user_data) in files {
+            fs::set_permissions(file, fs::Permissions::from_mode(0o444)).unwrap();
+            if fs::OpenOptions::new().write(true).open(file).is_ok() {
+                return;
+            }
+            let opened = if user_data {
+                open_user_data_write(name, name).await
+            } else {
+                open_index_db_write_no_user_data(name).await
+            };
+            fs::set_permissions(file, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(opened.is_err(), "{}", file.display());
+        }
+    }
+
+    /// SQLITE_READONLY and each of its extended codes count as read-only.
+    #[test]
+    fn the_extended_read_only_codes_are_read_only() {
+        let read_only = (0..7).map(|n| 8 | (n << 8));
+        assert!(read_only.clone().all(is_read_only_code));
+        assert!(![0, 5, 9, 8 << 8, 777].into_iter().any(is_read_only_code));
+    }
+
+    /// A write open succeeds beside a `-shm` another user left behind, but
+    /// its writes fail. The first failure names that file and its owner, and
+    /// not the index the connection only reads. After a write succeeds, a new
+    /// failure is named again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_refused_by_another_users_shm_names_the_owner() {
+        use crate::ownership::tests::{DENIED_OWNER, owned_by_another_user};
+        use std::os::unix::fs::PermissionsExt as _;
+        let _env = crate::test_utils::test_data_dir();
+        let name = "foreign_shm";
+        let paths = db_paths(name, name).unwrap();
+        let index = open_index_db_write_no_user_data(name).await.unwrap();
+        index.close().await.unwrap();
+        fs::write(&paths.user_db_file, "").unwrap();
+        let user_data = open_user_data_write(name, name).await.unwrap();
+        user_data.close().await.unwrap();
+        let read_only = fs::Permissions::from_mode(0o444);
+        fs::set_permissions(&paths.index_db_file, read_only.clone()).unwrap();
+        let mut shm = paths.user_db_file.clone().into_os_string();
+        shm.push("-shm");
+        let shm = PathBuf::from(shm);
+        let leave_shm = || {
+            // Not empty: SQLite changes an empty `-shm` to the database's
+            // mode, which it cannot do to another user's file.
+            fs::write(&shm, [0; 32768]).unwrap();
+            fs::set_permissions(&shm, read_only.clone()).unwrap();
+        };
+        leave_shm();
+        if fs::OpenOptions::new().write(true).open(&shm).is_ok() {
+            return;
+        }
+        let (_guard, reasons) = crate::test_utils::warned_reasons();
+        DENIED_OWNER.set(Some(0));
+        let mut conn = open_user_data_write(name, name).await.unwrap();
+        let mut failed = vec![
+            begin_immediate(&mut conn).await.is_err(),
+            begin_immediate(&mut conn).await.is_err(),
+        ];
+        conn.close().await.unwrap();
+        fs::remove_file(&shm).unwrap();
+        let mut conn = open_user_data_write(name, name).await.unwrap();
+        failed.push(begin_immediate(&mut conn).await.is_err());
+        conn.close().await.unwrap();
+        leave_shm();
+        let mut conn = open_user_data_write(name, name).await.unwrap();
+        failed.push(begin_immediate(&mut conn).await.is_err());
+        DENIED_OWNER.set(None);
+        conn.close().await.unwrap();
+        fs::remove_file(&shm).unwrap();
+        fs::set_permissions(&paths.index_db_file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(failed, [true, true, false, true]);
+        let folder = paths.user_db_file.parent().unwrap();
+        let expected = Some(owned_by_another_user(&shm, 0, folder));
+        assert_eq!(*reasons.lock().unwrap(), [expected.clone(), expected]);
+    }
+
+    /// A read pool whose connections are all busy times out and is kept.
+    #[tokio::test]
+    async fn a_read_pool_that_is_busy_is_kept() {
+        let env = crate::test_utils::test_data_dir();
+        let folder = env.path().join("index/busy_pool");
+        fs::create_dir_all(&folder).unwrap();
+        for db in ["index.db", "storage.db"] {
+            fs::write(folder.join(db), "").unwrap();
+        }
+        let query = DbQuery {
+            index_db: Some("busy_pool".to_owned()),
+            user_data_db: None,
+        };
+        let names = resolve_db_names_unchecked(&query);
+        let key = ("busy_pool".to_owned(), String::new(), false);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy_with(SqliteConnectOptions::new().filename(folder.join("index.db")));
+        let held = pool.acquire().await.unwrap();
+        read_pools().lock().unwrap().insert(key.clone(), pool);
+        let busy = acquire_read_conn(&query, &names, false).await;
+        let kept = read_pools().lock().unwrap().remove(&key).is_some();
+        drop(held);
+        fs::remove_dir_all(&folder).unwrap();
+        assert!(busy.is_err() && kept);
+    }
 
     /// Pins the `UserDataWrite` connection shape: index (`main`) and
     /// `storage` are attached read-only, so its `BEGIN IMMEDIATE` write lock

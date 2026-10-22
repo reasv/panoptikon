@@ -16,6 +16,7 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub(crate) struct CronJob {
     pub inference_id: String,
+    /// Optional cap on GPU batch size; `None` = auto (the default).
     #[serde(default)]
     pub batch_size: Option<i64>,
     #[serde(default)]
@@ -27,6 +28,7 @@ pub(crate) struct JobSettings {
     pub group_name: String,
     #[serde(default)]
     pub inference_id: Option<String>,
+    /// Last-selected cap on GPU batch size; `None` = auto (the default).
     #[serde(default)]
     pub default_batch_size: Option<i64>,
     #[serde(default)]

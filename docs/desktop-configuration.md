@@ -98,7 +98,10 @@ Installation-wide controls:
 - lazy prewarm behavior;
 - concurrent file loaders;
 - intermediate input-data memory budget;
-- search embedding-cache size.
+- search embedding-cache size;
+- GPU memory kept free (`[inference_local.vram] margin`), shown only with
+  local inference: Default removes the key, Custom writes it as a fraction;
+  per-GPU `margin` tables are left as written.
 
 Database controls remain on the Scan page:
 
@@ -106,7 +109,9 @@ Database controls remain on the Scan page:
   latency, but does not load model weights;
 - `preload_embedding_models` keeps full embedding models loaded and can consume
   substantial RAM or VRAM;
-- per-model extraction batch sizes trade throughput for GPU memory.
+- per-model extraction **max batch size** is an optional cap, not a target:
+  left on auto (the default) the inference server sizes batches from its own
+  VRAM cost model, and setting a number only lowers that ceiling.
 
 The UI must describe these as different memory/latency mechanisms rather than
 as interchangeable “preload/prewarm” switches.

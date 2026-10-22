@@ -11,6 +11,8 @@ pub struct DesktopSettings {
     pub startup: StartupSettings,
     #[serde(default)]
     pub updates: UpdateSettings,
+    #[serde(default)]
+    pub notices: NoticeSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,6 +27,13 @@ pub struct LocalServerSettings {
 pub struct StartupSettings {
     #[serde(default)]
     pub start_at_login: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoticeSettings {
+    /// The NVIDIA sysmem fallback notice was dismissed; it never returns.
+    #[serde(default)]
+    pub sysmem_fallback_dismissed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

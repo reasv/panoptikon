@@ -55,8 +55,9 @@ services:
     # This file runs the CPU-only image (ghcr.io/reasv/panoptikon:latest).
     # For GPU inference — which is what most users want — use
     # docker-compose.cuda.yml instead: it pulls the published CUDA image
-    # (:latest-cuda) and adds the NVIDIA device reservation. No repo clone
-    # needed for either.
+    # (:latest-cuda) and adds the NVIDIA device reservation. For an AMD GPU,
+    # use docker-compose.rocm.yml (:latest-rocm). No repo clone needed for
+    # any of them.
 
 volumes:
   panoptikon-data:
