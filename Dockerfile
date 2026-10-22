@@ -11,7 +11,7 @@
 # (torch's pinned triton publishes no aarch64 wheels).
 
 # ---- UI build: Next.js standalone bundle, embedded into the binary ----
-FROM node:24-trixie-slim AS ui-build
+FROM node:24.22.1-trixie-slim AS ui-build
 WORKDIR /ui
 COPY ui/ ./
 ENV BUILD_STANDALONE=true
@@ -62,7 +62,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg libgl1 libglib2.0-0t64 libsm6 libxext6 libxrender1 \
         curl ca-certificates \
     && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
+    && apt-get install -y --no-install-recommends nodejs=24.22.1-1nodesource1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Headless Chrome for HTML thumbnails/extraction. google-chrome-stable lands
